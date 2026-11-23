@@ -1,7 +1,11 @@
+mod package;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "xtask", about = "Vantry Rust build, packaging, delta, and icon automation")]
+#[command(
+    name = "xtask",
+    about = "Vantry Rust build, packaging, delta, and icon automation"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -9,11 +13,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Package desktop, service, relay, and helper artifacts
-    Package {
-        #[arg(long)]
-        target: Option<String>,
-    },
+    /// Assemble a macOS arm64 app and ZIP from existing Rust binaries
+    Package(package::Options),
     /// Build update delta package
     MakeDelta,
     /// Prepare application icons
@@ -23,9 +24,7 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Package { target } => {
-            println!("xtask package skeleton (target={target:?})");
-        }
+        Commands::Package(options) => package::run(options)?,
         Commands::MakeDelta => println!("xtask make-delta skeleton"),
         Commands::PrepareIcon => println!("xtask prepare-icon skeleton"),
     }
