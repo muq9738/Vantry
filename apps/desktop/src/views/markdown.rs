@@ -1,0 +1,283 @@
+//! Markdown blocks as native views: headings, paragraphs with inline spans
+//! (strong, emphasis, strike, code, links), lists with their markers and
+//! task boxes, fenced code with its language label and a copy button, diff
+//! blocks with added / removed / hunk lines colored, quotes, rules, tables.
+//!
+//! A document is a keyed list of blocks (keyed by where they start), so a
+//! streamed reply re-renders only the block that grew.
+
+use std::sync::Arc;
+
+use nsh_core::{LineHeight, prelude::*};
+
+use crate::{
+    controller,
+    state::markdown::{Block, DiffKind, Inline, ListItem, MarkdownDoc, Spanned},
+    theme::{PALETTE, metrics},
+};
+
+const MONO: &str = "Menlo";
+
+/// The blocks of `doc` (a memo of the document).
+pub(crate) fn document(doc: Memo<Option<Arc<MarkdownDoc>>>) -> impl IntoElement {
+    let blocks = computed(move || doc.with(|d| d.as_ref().map(|d| d.blocks.clone()).unwrap_or_default()));
+    view().flex_col().gap_2().child(each(
+        move || blocks.get(),
+        |b: &Spanned| b.start,
+        |block, _| {
+            let shown = computed(move || block.with(|b| b.block.clone()));
+            dynamic(move || block_view(&shown.get()).into_element())
+        },
+    ))
+}
+
+/// A document that does not change (previews, settings notes).
+pub(crate) fn static_document(doc: &MarkdownDoc) -> impl IntoElement {
+    let mut column = view().flex_col().gap_2();
+    for spanned in &doc.blocks {
+        column = column.child(block_view(&spanned.block));
+    }
+    column
+}
+
+fn block_view(block: &Block) -> AnyElement {
+    match block {
+        Block::Heading { level, inlines } => {
+            let size = match level {
+                1 => 20.0,
+                2 => 17.5,
+                3 => 15.5,
+                _ => 14.5,
+            };
+            inline_text(inlines)
+                .text_size(px(size))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(PALETTE.ink)
+                .mt_1()
+                .into_element()
+        }
+        Block::Paragraph(inlines) => body(inline_text(inlines)).into_element(),
+        Block::List { items, .. } => list_view(items).into_element(),
+        Block::Code { lang, code, closed } => code_view(lang, code, *closed).into_element(),
+        Block::Diff { lines, .. } => {
+            let source: String = lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut column = view().flex_col().py_2();
+            for line in lines {
+                let (fill, ink) = diff_colors(line.kind);
+                column = column.child(
+                    text(if line.text.is_empty() { " ".to_owned() } else { line.text.clone() })
+                        .select_text()
+                        .font_family(MONO)
+                        .text_size(px(12.0))
+                        .line_height(LineHeight::Multiple(1.45))
+                        .text_color(ink)
+                        .bg(fill)
+                        .px_3(),
+                );
+            }
+            code_frame("diff", source, column).into_element()
+        }
+        Block::Quote(lines) => {
+            let mut column = view().flex_col().gap_1();
+            for line in lines {
+                column = column.child(
+                    inline_text(line)
+                        .select_text()
+                        .text_size(px(metrics::BODY))
+                        .line_height(LineHeight::Multiple(1.6))
+                        .text_color(PALETTE.muted),
+                );
+            }
+            view()
+                .pl_3()
+                .border_l(px(3.0))
+                .border_l_color(PALETTE.line)
+                .child(column)
+                .into_element()
+        }
+        Block::Rule => view()
+            .h(px(1.0))
+            .my_2()
+            .bg(PALETTE.line)
+            .into_element(),
+        Block::Table { header, rows } => table_view(header, rows).into_element(),
+    }
+}
+
+fn body(text: Text) -> Text {
+    text.select_text()
+        .text_size(px(metrics::BODY + 0.5))
+        .line_height(LineHeight::Multiple(1.65))
+        .text_color(PALETTE.ink)
+}
+
+/// A text block of inline spans.
+pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
+    let mut block = text("");
+    for inline in inlines {
+        block = block.child(match inline {
+            Inline::Text(t) => text(t.clone()),
+            Inline::Strong(t) => text(t.clone()).font_weight(FontWeight::SEMIBOLD),
+            Inline::Emphasis(t) => text(t.clone()).italic(),
+            Inline::Strike(t) => text(t.clone()).line_through(),
+            Inline::Code(t) => text(t.clone())
+                .font_family(MONO)
+                .text_size(px(12.5))
+                .bg(PALETTE.code)
+                .rounded(px(4.0))
+                .text_color(PALETTE.ink),
+            Inline::Link { text: label, url } => text(label.clone())
+                .underline()
+                .text_color(PALETTE.accent)
+                .tooltip(text(url.clone()).text_size(px(11.5))),
+        });
+    }
+    block
+}
+
+fn list_view(items: &[ListItem]) -> impl IntoElement {
+    let mut column = view().flex_col().gap_1();
+    for item in items {
+        let marker = match item.checked {
+            Some(true) => "☑".to_owned(),
+            Some(false) => "☐".to_owned(),
+            None => item.marker.clone(),
+        };
+        column = column.child(
+            view()
+                .flex_row()
+                .gap_2()
+                .pl(px(f32::from(item.depth) * 18.0))
+                .child(
+                    text(marker)
+                        .min_w(px(18.0))
+                        .text_size(px(metrics::BODY))
+                        .line_height(LineHeight::Multiple(1.65))
+                        .text_color(PALETTE.muted),
+                )
+                .child(body(inline_text(&item.inlines)).flex_1()),
+        );
+    }
+    column
+}
+
+fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
+    let label = if lang.is_empty() { "代码" } else { lang };
+    let inner = view().child(
+        text(if code.is_empty() { " ".to_owned() } else { code.to_owned() })
+            .select_text()
+            .font_family(MONO)
+            .text_size(px(12.5))
+            .line_height(LineHeight::Multiple(1.5))
+            .text_color(PALETTE.ink)
+            .px_3()
+            .py_2(),
+    );
+    let frame = code_frame(label, code.to_owned(), inner);
+    if closed {
+        frame
+    } else {
+        frame.opacity(0.92)
+    }
+}
+
+/// A code well: its label and copy button over `content`, scrolling
+/// sideways for long lines.
+fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
+    view()
+        .flex_col()
+        .rounded(px(metrics::CARD_RADIUS))
+        .bg(PALETTE.code)
+        .border_1()
+        .border_color(PALETTE.line_soft)
+        .overflow_hidden()
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_b_color(PALETTE.line_soft)
+                .child(
+                    text(label.to_owned())
+                        .flex_1()
+                        .font_family(MONO)
+                        .text_size(px(11.0))
+                        .text_color(PALETTE.faint),
+                )
+                .child(super::link_button("复制", move || controller::copy(source.clone()))),
+        )
+        .child(scroll().horizontal().child(content))
+}
+
+fn diff_colors(kind: DiffKind) -> (AdaptiveColor, AdaptiveColor) {
+    match kind {
+        DiffKind::Added => (
+            AdaptiveColor::rgb(0xE6F6EA, 0x15301E),
+            AdaptiveColor::rgb(0x1A6B34, 0x7EE2A0),
+        ),
+        DiffKind::Removed => (
+            AdaptiveColor::rgb(0xFCE8E8, 0x3A1A1C),
+            AdaptiveColor::rgb(0xA4262C, 0xFF9CA0),
+        ),
+        DiffKind::Hunk => (AdaptiveColor::TRANSPARENT, PALETTE.accent),
+        DiffKind::Meta => (AdaptiveColor::TRANSPARENT, PALETTE.faint),
+        DiffKind::Context => (AdaptiveColor::TRANSPARENT, PALETTE.muted),
+    }
+}
+
+/// A unified diff (the Git panel, previews), colored per line.
+pub(crate) fn diff_text(diff: &str) -> impl IntoElement {
+    let mut column = view().flex_col().py_1();
+    for line in crate::state::markdown::diff_lines(diff).into_iter().take(4000) {
+        let (fill, ink) = diff_colors(line.kind);
+        column = column.child(
+            text(if line.text.is_empty() { " ".to_owned() } else { line.text })
+                .select_text()
+                .font_family(MONO)
+                .text_size(px(11.5))
+                .line_height(LineHeight::Multiple(1.4))
+                .text_color(ink)
+                .bg(fill)
+                .px_2(),
+        );
+    }
+    scroll().horizontal().child(column)
+}
+
+fn table_view(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> impl IntoElement {
+    let cell = |inlines: &[Inline], strong: bool| {
+        let t = inline_text(inlines)
+            .text_size(px(13.0))
+            .text_color(PALETTE.ink);
+        view()
+            .flex_1()
+            .min_w(px(80.0))
+            .px_2()
+            .py_1()
+            .child(if strong { t.font_weight(FontWeight::SEMIBOLD) } else { t })
+    };
+    let mut grid = view()
+        .flex_col()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(PALETTE.line);
+    let mut head = view().flex_row().bg(PALETTE.soft);
+    for h in header {
+        head = head.child(cell(h, true));
+    }
+    grid = grid.child(head);
+    for row in rows {
+        let mut line = view().flex_row().border_t_1().border_t_color(PALETTE.line_soft);
+        for c in row {
+            line = line.child(cell(c, false));
+        }
+        grid = grid.child(line);
+    }
+    scroll().horizontal().child(grid)
+}

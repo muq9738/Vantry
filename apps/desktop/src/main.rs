@@ -45,12 +45,8 @@ fn main() -> impl Termination {
             Exit::Code(ExitCode::from(2))
         }
         Ok(Invocation::Desktop(config)) => {
-            if config.target != cli::Target::Local {
-                eprintln!(
-                    "vantry: 远程环境（--remote / --peer）尚未接入 NSH 桌面，请暂用 0.1.42 桌面。"
-                );
-                return Exit::Code(ExitCode::from(2));
-            }
+            // `--remote` / `--peer` open the window on that environment; its
+            // transport reports what is not wired yet (bridge::RemoteBridge).
             vantry_desktop::set_launch_config(*config);
             Exit::Window(platform::run_app(
                 platform::AppSource::Rust(platform::Root::of::<vantry_desktop::App>()),

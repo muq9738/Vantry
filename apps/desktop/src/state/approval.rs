@@ -1,4 +1,4 @@
-//! Extension UI requests (`api.ProviderRequest`) as the approval modal shows
+//! Extension UI requests (`api.PendingRequest`) as the approval modal shows
 //! them, and the answer each decision sends (`request.respond`).
 //!
 //! The mapping follows the 0.1.42 desktop (`controls_view.go`): an approval
@@ -6,7 +6,7 @@
 //! `confirm` answers `confirmed`; `select` / `input` / `editor` answer a
 //! value or `cancelled`.
 
-use crate::bridge::wire::{Command, ProviderRequest, kind};
+use vantry_protocol::{Command, CommandKind, PendingRequest};
 
 /// How risky the request looks, from what it says it will do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,7 +68,7 @@ impl ApprovalView {
 const MAX_BODY_CHARS: usize = 1200;
 
 /// The modal's view of `request`.
-pub fn approval_view(request: &ProviderRequest) -> ApprovalView {
+pub fn approval_view(request: &PendingRequest) -> ApprovalView {
     let (headline, body) = split_title(request);
     let body = truncate_chars(&body, MAX_BODY_CHARS);
     let (allow_once, allow_session, deny) = approval_options(request);
@@ -93,7 +93,7 @@ pub fn approval_view(request: &ProviderRequest) -> ApprovalView {
 
 /// `splitApprovalTitle`: the message is the body when there is one, else
 /// what follows the title's first line.
-fn split_title(request: &ProviderRequest) -> (String, String) {
+fn split_title(request: &PendingRequest) -> (String, String) {
     if !request.message.trim().is_empty() {
         return (
             request.title.trim().to_owned(),
@@ -107,7 +107,7 @@ fn split_title(request: &ProviderRequest) -> (String, String) {
 }
 
 /// `parseApprovalSelect`.
-fn approval_options(request: &ProviderRequest) -> (Option<String>, Option<String>, Option<String>) {
+fn approval_options(request: &PendingRequest) -> (Option<String>, Option<String>, Option<String>) {
     if request.method != "select" || request.options.len() < 2 {
         return (None, None, None);
     }
@@ -199,13 +199,13 @@ pub enum DecisionError {
 /// The `request.respond` command for `decision`, without its command id
 /// (the caller names it once and reuses it on retry).
 pub fn respond_command(
-    request: &ProviderRequest,
+    request: &PendingRequest,
     decision: &ApprovalDecision,
 ) -> Result<Command, DecisionError> {
     if request.status != "pending" {
         return Err(DecisionError::NotPending);
     }
-    let mut command = Command::new(kind::RESPOND_REQUEST, "");
+    let mut command = Command::new("", CommandKind::RespondRequest);
     command.thread_id = request.thread_id.clone();
     command.run_id = request.run_id.clone();
     command.request_id = request.id.clone();

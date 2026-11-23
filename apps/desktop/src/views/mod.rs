@@ -1,18 +1,24 @@
 //! The workbench's views. Each module is one region of the window; they
-//! read the state through `computed` memos and change it only through the
-//! controller's intents.
+//! read the states through `computed` memos and change them only through
+//! the controller's intents.
 //!
-//! Layout (desktop-ui.md): sidebar | (header / timeline / composer), with
-//! the approval modal over everything. Wave 2 adds the right panel (project,
-//! subtasks, tool dock) beside the reading column without moving these.
+//! Layout (desktop-ui.md): sidebar | (header / timeline or remote desktop or
+//! plugin panel / composer) | dock, with the approval modal, settings and
+//! the small dialogs over everything.
 
 pub(crate) mod approval_modal;
 pub(crate) mod composer;
+pub(crate) mod dialogs;
+pub(crate) mod dock;
 pub(crate) mod header;
+pub(crate) mod markdown;
+pub(crate) mod remote_desktop;
+pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod timeline;
 
 use nsh_core::prelude::*;
+use vantry_protocol::RunStatus;
 
 use crate::{state::ThreadStatus, theme::PALETTE};
 
@@ -33,6 +39,16 @@ pub(crate) fn status_label(status: ThreadStatus) -> &'static str {
         ThreadStatus::Running => "运行中",
         ThreadStatus::NeedsApproval => "待确认",
         ThreadStatus::Failed => "异常",
+    }
+}
+
+/// A task status's badge color.
+pub(crate) fn run_status_color(status: RunStatus) -> AdaptiveColor {
+    match status {
+        RunStatus::Completed => PALETTE.success,
+        RunStatus::Failed | RunStatus::Interrupted => PALETTE.danger,
+        RunStatus::Running | RunStatus::Waiting | RunStatus::Queued => PALETTE.accent,
+        RunStatus::Cancelled | RunStatus::Unspecified => PALETTE.faint,
     }
 }
 
@@ -86,5 +102,116 @@ pub(crate) fn primary_button(
                 .text_size(px(12.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(PALETTE.on_accent),
+        )
+}
+
+/// A borderless small text button (row actions, toolbar items).
+pub(crate) fn link_button(
+    label: impl IntoReactive<SharedString>,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    nsh_base::button()
+        .on_press(on_press)
+        .px_1p5()
+        .py_0p5()
+        .rounded(px(6.0))
+        .hover(|s| s.bg(PALETTE.soft))
+        .active(|s| s.opacity(0.6))
+        .disabled_style(|s| s.opacity(0.35))
+        .child(text(label).text_size(px(11.5)).text_color(PALETTE.muted))
+}
+
+/// A pill that shows whether it is on (tabs, segmented switches, filters).
+pub(crate) fn pill(
+    label: impl IntoReactive<SharedString>,
+    on: impl Fn() -> bool + Clone + 'static,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let (a, b, c, d) = (on.clone(), on.clone(), on.clone(), on);
+    nsh_base::button()
+        .selected(a)
+        .on_press(on_press)
+        .px_2p5()
+        .py_0p5()
+        .rounded_full()
+        .bg(move || {
+            if b() {
+                PALETTE.card
+            } else {
+                AdaptiveColor::TRANSPARENT
+            }
+        })
+        .border_1()
+        .border_color(move || {
+            if c() {
+                PALETTE.line
+            } else {
+                AdaptiveColor::TRANSPARENT
+            }
+        })
+        .active(|s| s.opacity(0.7))
+        .child(text(label).text_size(px(11.5)).text_color(move || {
+            if d() {
+                PALETTE.ink
+            } else {
+                PALETTE.muted
+            }
+        }))
+}
+
+/// A small rounded badge.
+pub(crate) fn badge(
+    label: impl IntoReactive<SharedString>,
+    color: impl IntoReactive<AdaptiveColor>,
+) -> View {
+    view()
+        .px_1p5()
+        .rounded(px(5.0))
+        .bg(PALETTE.soft)
+        .child(text(label).text_size(px(10.0)).text_color(color))
+}
+
+/// A section's small caption.
+pub(crate) fn caption(label: impl IntoReactive<SharedString>) -> Text {
+    text(label)
+        .text_size(px(11.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(PALETTE.faint)
+}
+
+/// An on/off switch row: label, hint, its state.
+pub(crate) fn switch_row(
+    label: impl IntoReactive<SharedString>,
+    hint: impl IntoReactive<SharedString>,
+    on: impl Fn() -> bool + Clone + 'static,
+    toggle: impl Fn() + 'static,
+) -> View {
+    let (a, b, c) = (on.clone(), on.clone(), on);
+    view()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .py_1p5()
+        .child(
+            view()
+                .flex_1()
+                .flex_col()
+                .child(text(label).text_size(px(13.0)).text_color(PALETTE.ink))
+                .child(text(hint).text_size(px(11.5)).text_color(PALETTE.muted)),
+        )
+        .child(
+            nsh_base::button()
+                .selected(a)
+                .on_press(toggle)
+                .w(px(38.0))
+                .h(px(22.0))
+                .p_0p5()
+                .rounded_full()
+                .flex_row()
+                .justify_start()
+                .bg(move || if b() { PALETTE.accent } else { PALETTE.line })
+                .active(|s| s.opacity(0.75))
+                .child(when(c, || view().w(px(16.0))))
+                .child(view().w(px(18.0)).h(px(18.0)).rounded_full().bg(PALETTE.card)),
         )
 }

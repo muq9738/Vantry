@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, CommandFactory, Parser};
 
-use crate::bridge::{Endpoint, wire::WorkspaceSpec};
+use vantry_protocol::WorkspaceSpec;
+
+use crate::bridge::Endpoint;
 
 /// What the command line asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Invocation {
     /// Open the desktop.
     Desktop(Box<LaunchConfig>),
@@ -113,7 +115,7 @@ pub enum Target {
 }
 
 /// Everything the window needs to start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaunchConfig {
     pub data_dir: PathBuf,
     pub endpoint: Endpoint,
@@ -141,6 +143,41 @@ impl LaunchConfig {
             workspace: None,
             core_flags: Vec::new(),
         }
+    }
+
+    /// Where `desktop-state.json` lives: the data directory for the local
+    /// Core, a per-environment folder beside it for a remote one (as
+    /// 0.1.42 keeps them), none for the in-memory demo.
+    pub fn state_path(&self) -> Option<PathBuf> {
+        let file = crate::state::persist::FILE_NAME;
+        match (&self.endpoint, &self.target) {
+            (Endpoint::Mock, _) => None,
+            (_, Target::Local) => Some(self.data_dir.join(file)),
+            (_, Target::Ssh { host, .. }) => Some(
+                self.data_dir
+                    .join("environment-state")
+                    .join(format!("ssh-{}", safe_component(host)))
+                    .join(file),
+            ),
+            (_, Target::Peer { id, .. }) => Some(
+                self.data_dir
+                    .join("environment-state")
+                    .join(format!("peer-{}", safe_component(id)))
+                    .join(file),
+            ),
+        }
+    }
+
+    /// The workspace directory the dock works in: the command line's, else
+    /// the current directory.
+    pub fn workspace_root(&self) -> PathBuf {
+        self.workspace
+            .as_ref()
+            .map(|w| if w.path.is_empty() { w.repository.clone() } else { w.path.clone() })
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// What the header names as the workspace.
@@ -282,15 +319,25 @@ fn resolve(
     if args.mock && target != Target::Local {
         return Err(CliError("--mock 不能与远程连接同时使用".to_owned()));
     }
-    let endpoint = if args.mock {
-        Endpoint::Mock
-    } else {
-        Endpoint::Local {
+    if args.socket.is_some() && target != Target::Local {
+        return Err(CliError("--socket 只用于本机 Core；远端请用 --remote-socket".to_owned()));
+    }
+    let endpoint = match &target {
+        _ if args.mock => Endpoint::Mock,
+        Target::Local => Endpoint::Local {
             socket: match &args.socket {
                 Some(socket) => absolute(socket)?,
                 None => data_dir.join("core.sock"),
             },
-        }
+        },
+        Target::Ssh { host, socket } => Endpoint::Ssh {
+            host: host.clone(),
+            remote_socket: socket.clone(),
+        },
+        Target::Peer { id, mode } => Endpoint::Peer {
+            id: id.clone(),
+            mode: mode.clone(),
+        },
     };
     let mut core_flags = Vec::new();
     for (name, value) in [
@@ -352,6 +399,19 @@ fn workspace_spec(args: &DesktopArgs) -> Result<Option<WorkspaceSpec>, CliError>
         return Err(CliError("worktree 工作区需要 --repository".to_owned()));
     }
     Ok(Some(spec))
+}
+
+/// `text` as one safe path component (letters, digits, `-`, `_`, `.`).
+fn safe_component(text: &str) -> String {
+    let safe: String = text
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    if safe.trim_matches('.').is_empty() {
+        "_".to_owned()
+    } else {
+        safe
+    }
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, CliError> {
@@ -561,6 +621,17 @@ mod tests {
             }
         );
         assert_eq!(config.workspace_label(), "devbox");
+        assert_eq!(
+            config.endpoint,
+            Endpoint::Ssh {
+                host: "devbox".into(),
+                remote_socket: Some("/run/core.sock".into())
+            }
+        );
+        assert_eq!(
+            config.state_path(),
+            Some(config.data_dir.join("environment-state/ssh-devbox/desktop-state.json"))
+        );
         let config = desktop(&["-peer", "p1", "-peer-mode", "relay"], &env);
         assert_eq!(
             config.target,
@@ -569,6 +640,19 @@ mod tests {
                 mode: "relay".into()
             }
         );
+        assert_eq!(
+            config.endpoint,
+            Endpoint::Peer {
+                id: "p1".into(),
+                mode: "relay".into()
+            }
+        );
+        let err = parse(&args(&["--remote", "h", "--socket", "/x.sock"]), &env).unwrap_err();
+        assert!(err.0.contains("--remote-socket"));
+        // The mock keeps no state; the local desktop keeps it in its data dir.
+        assert_eq!(desktop(&["--mock"], &env).state_path(), None);
+        let local = desktop(&[], &env);
+        assert_eq!(local.state_path(), Some(local.data_dir.join("desktop-state.json")));
     }
 
     #[test]

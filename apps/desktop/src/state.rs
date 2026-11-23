@@ -1,36 +1,50 @@
 //! The desktop's state and every change to it, as plain Rust.
 //!
-//! [`AppState`] is a value: the UI keeps it in one signal and replaces it
-//! through these methods (`signal.update(|s| s.apply_event(&e))`), so what
-//! the views read is always a consistent whole, and every transition here
-//! is tested without a window. Nothing in this module does I/O: intents
+//! [`AppState`] is the conversation: the Core's entities (threads, runs,
+//! tools, requests, inputs, tasks), the incremental [`TimelineIndex`], the
+//! drafts and the commands in flight. The UI keeps it in one signal and
+//! changes it through these methods (`signal.update(|s| s.apply_event(&e))`),
+//! so what the views read is always a consistent whole, and every
+//! transition is tested without a window. Nothing here does I/O: intents
 //! return the [`Command`] to dispatch, and results come back through
 //! [`AppState::on_command_result`].
+//!
+//! The dock and settings have their own states ([`workbench`], [`ui`]) so a
+//! terminal's output never wakes the timeline; [`persist`] saves what
+//! `desktop-state.json` keeps.
 
+mod actions;
 pub mod approval;
+pub mod markdown;
+pub mod persist;
+pub mod sidebar;
 pub mod timeline;
+pub mod ui;
+pub mod workbench;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wave2_tests;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::Duration,
 };
 
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use vantry_protocol::{
+    Attachment, Command, CommandKind, CoreEvent, Input, PendingRequest, Receipt, Run, RunStatus,
+    RunTelemetry, Snapshot, Task, Thread, ToolCall, WorkspaceSpec,
+};
 
 pub use self::{
+    actions::{QueueItem, QueueItemKind},
     approval::{ApprovalDecision, ApprovalView, DecisionError, Risk, approval_view},
-    timeline::{TimelineItem, ToolStatus, build_timeline},
+    timeline::{RunParts, TimelineIndex, TimelineItem, ToolStatus},
 };
-use crate::bridge::{
-    BridgeError, new_command_id,
-    wire::{
-        Command, Event, ProviderRequest, Receipt, Run, RunStatus, RunTelemetry, Snapshot, Thread,
-        ToolCall, event, kind,
-    },
-};
+use crate::bridge::{BridgeError, events, new_command_id};
 
 /// The draft key of the unsaved new thread (it has no id until its first
 /// message creates it).
@@ -73,10 +87,52 @@ pub enum RunningAction {
 }
 
 /// One thread's unsent input.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Draft {
     pub text: String,
     pub mode: InteractionMode,
+    /// Files picked for the next message (their content is the Core's).
+    pub attachments: Vec<Attachment>,
+}
+
+impl Draft {
+    fn is_blank(&self) -> bool {
+        self.text.trim().is_empty() && self.attachments.is_empty()
+    }
+}
+
+/// How new threads start (the composer's model and permission choices
+/// before the thread exists).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NewThreadConfig {
+    pub provider_id: String,
+    pub model: String,
+    pub approval_policy: String,
+    pub workspace: Option<WorkspaceSpec>,
+}
+
+/// The approval policies the composer offers: wire value, label.
+pub const APPROVAL_POLICIES: &[(&str, &str)] = &[
+    ("auto", "自动"),
+    ("auto-accept-edits", "改文件自动"),
+    ("ask", "询问"),
+];
+
+/// A policy's label ("询问"), or the value itself when unknown.
+pub fn policy_label(policy: &str) -> String {
+    APPROVAL_POLICIES
+        .iter()
+        .find(|(value, _)| *value == policy)
+        .map_or_else(
+            || {
+                if policy.is_empty() {
+                    "默认权限".to_owned()
+                } else {
+                    policy.to_owned()
+                }
+            },
+            |(_, label)| (*label).to_owned(),
+        )
 }
 
 /// The connection to the Core.
@@ -127,7 +183,7 @@ pub struct Notice {
 }
 
 impl Notice {
-    fn new(level: NoticeLevel, text: impl Into<String>) -> Self {
+    pub fn new(level: NoticeLevel, text: impl Into<String>) -> Self {
         Notice {
             level,
             text: text.into(),
@@ -135,26 +191,41 @@ impl Notice {
     }
 }
 
-/// What a pending command is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a pending command is for, and what to undo when it fails.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Purpose {
     /// Creates the thread a draft's first message goes to; the message
     /// follows once it is accepted.
-    CreateThread { then_send: Command, draft: Draft },
+    CreateThread { then_send: Box<Command>, draft: Draft },
     /// A message (send, queue or steer) from the draft of `draft_key`.
     Message { draft_key: String, draft: Draft },
     /// Stops a run.
     Stop,
     /// Answers an extension request.
     Respond { request_id: String },
+    /// Changes one of a thread's fields; that field of `previous` comes
+    /// back when it fails (other changes made meanwhile stay).
+    ThreadUpdate {
+        previous: Box<Thread>,
+        field: &'static str,
+    },
+    /// Deletes a thread.
+    Delete,
+    /// Forks, merges back: the accepted receipt's thread is shown.
+    OpenResult,
+    /// Rewinds a thread.
+    Rewind,
+    /// Changes a queued input; `previous` copies are restored on failure.
+    Queue { previous: Vec<Input> },
 }
 
 /// A command sent or waiting for a retry. A retry resends exactly this
 /// command (same id, same content): the Core returns the original receipt
 /// if the first try committed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingCommand {
-    /// What it is about: `submit:<draft key>`, `stop:<run>`, `request:<id>`.
+    /// What it is about: `submit:<draft key>`, `stop:<run>`,
+    /// `request:<id>`, `thread:<id>:<field>`, `queue:<input>:<action>`.
     pub key: String,
     pub command: Command,
     pub purpose: Purpose,
@@ -204,6 +275,8 @@ pub struct ComposerStatus {
     pub sending: bool,
     /// A submission's outcome is unknown: its key, for a retry.
     pub retry: Option<String>,
+    /// The composer edits a queued message.
+    pub editing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +284,8 @@ pub enum PrimaryAction {
     Send,
     Steer,
     Queue,
+    /// Saves an edited queued message.
+    Save,
 }
 
 impl PrimaryAction {
@@ -219,6 +294,7 @@ impl PrimaryAction {
             PrimaryAction::Send => "发送",
             PrimaryAction::Steer => "追加",
             PrimaryAction::Queue => "排队",
+            PrimaryAction::Save => "保存",
         }
     }
 }
@@ -231,7 +307,16 @@ pub struct FoldStats {
     pub ignored: u64,
 }
 
-/// The desktop's whole state.
+/// A queued message being edited in the composer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueEdit {
+    pub input_id: String,
+    pub thread_id: String,
+    /// The draft the composer held before; it comes back afterwards.
+    pub saved: Draft,
+}
+
+/// The desktop's conversation state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
     /// The last applied event's sequence: the subscription's cursor.
@@ -239,12 +324,18 @@ pub struct AppState {
     pub threads: Vec<Thread>,
     pub runs: Vec<Run>,
     pub tools: Vec<ToolCall>,
-    pub requests: Vec<ProviderRequest>,
+    pub requests: Vec<PendingRequest>,
+    pub inputs: Vec<Input>,
+    pub tasks: Vec<Task>,
+    /// Every run's rows, kept incrementally.
+    pub timeline: TimelineIndex,
     /// The thread shown; `None` is the new thread's draft.
     pub selected: Option<String>,
     /// Drafts by thread id ([`NEW_THREAD`] for the new one).
     pub drafts: BTreeMap<String, Draft>,
     pub running_action: RunningAction,
+    pub new_thread: NewThreadConfig,
+    pub queue_edit: Option<QueueEdit>,
     pub connection: Connection,
     pub snapshot_loaded: bool,
     pub notice: Option<Notice>,
@@ -256,6 +347,9 @@ pub struct AppState {
     pub endpoint_label: String,
     /// The workspace the header names.
     pub workspace_label: String,
+    /// Bumped when what the sidebar shows may have changed (not on output
+    /// deltas), so its rows are not rebuilt per streamed character.
+    pub sidebar_revision: u64,
     pub stats: FoldStats,
 }
 
@@ -267,9 +361,17 @@ impl Default for AppState {
             runs: Vec::new(),
             tools: Vec::new(),
             requests: Vec::new(),
+            inputs: Vec::new(),
+            tasks: Vec::new(),
+            timeline: TimelineIndex::default(),
             selected: None,
             drafts: BTreeMap::new(),
             running_action: RunningAction::default(),
+            new_thread: NewThreadConfig {
+                provider_id: "pi".to_owned(),
+                ..NewThreadConfig::default()
+            },
+            queue_edit: None,
             connection: Connection::Connecting,
             snapshot_loaded: false,
             notice: None,
@@ -277,6 +379,7 @@ impl Default for AppState {
             deferred: BTreeSet::new(),
             endpoint_label: String::new(),
             workspace_label: String::new(),
+            sidebar_revision: 0,
             stats: FoldStats::default(),
         }
     }
@@ -300,6 +403,32 @@ pub fn title_from_message(text: &str) -> String {
         "新会话".to_owned()
     } else {
         title
+    }
+}
+
+/// `T` from an event's JSON: as is, else laid over `T::default()` (a newer
+/// or older Core leaving out fields the desktop does not need).
+pub(crate) fn decode<T: DeserializeOwned + Serialize + Default>(value: &Value) -> Option<T> {
+    if let Ok(decoded) = serde_json::from_value::<T>(value.clone()) {
+        return Some(decoded);
+    }
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    let mut base = serde_json::to_value(T::default()).ok()?;
+    let Value::Object(map) = &mut base else {
+        return None;
+    };
+    for (key, field) in fields {
+        map.insert(key.clone(), field.clone());
+    }
+    serde_json::from_value(base).ok()
+}
+
+/// Go's zero time (`0001-01-01T00:00:00Z`) is no time.
+fn clear_zero_time(time: &mut String) {
+    if time.starts_with("0001-01-01") {
+        time.clear();
     }
 }
 
@@ -329,7 +458,7 @@ impl AppState {
         self.selected.as_deref().and_then(|id| self.thread(id))
     }
 
-    /// Sidebar threads: not archived, newest first.
+    /// Threads not archived, pinned first, newest first.
     pub fn visible_threads(&self) -> Vec<&Thread> {
         let mut threads: Vec<&Thread> = self.threads.iter().filter(|t| !t.archived).collect();
         threads.sort_by(|a, b| {
@@ -343,22 +472,38 @@ impl AppState {
 
     /// A thread's runs, oldest first.
     pub fn thread_runs(&self, thread_id: &str) -> Vec<&Run> {
+        let order = self.timeline.run_order(thread_id);
+        if order.len()
+            == self
+                .runs
+                .iter()
+                .filter(|r| r.thread_id == thread_id)
+                .count()
+        {
+            return order
+                .iter()
+                .filter_map(|id| self.runs.iter().find(|r| r.id == *id))
+                .collect();
+        }
         let mut runs: Vec<&Run> = self
             .runs
             .iter()
             .filter(|r| r.thread_id == thread_id)
             .collect();
-        // Stable: runs arrive in creation order; created_at refines it.
         runs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         runs
     }
 
+    pub fn run(&self, id: &str) -> Option<&Run> {
+        self.runs.iter().find(|r| r.id == id)
+    }
+
     /// The thread's run that is not finished yet (the latest one).
     pub fn active_run(&self, thread_id: &str) -> Option<&Run> {
-        self.thread_runs(thread_id)
-            .into_iter()
-            .rev()
-            .find(|r| !r.status.terminal())
+        self.runs
+            .iter()
+            .filter(|r| r.thread_id == thread_id && !r.status.terminal())
+            .last()
     }
 
     pub fn thread_status(&self, thread_id: &str) -> ThreadStatus {
@@ -369,11 +514,14 @@ impl AppState {
         {
             return ThreadStatus::NeedsApproval;
         }
-        let runs = self.thread_runs(thread_id);
-        if runs.iter().any(|r| !r.status.terminal()) {
-            return ThreadStatus::Running;
+        let mut last = None;
+        for run in self.runs.iter().filter(|r| r.thread_id == thread_id) {
+            if !run.status.terminal() {
+                return ThreadStatus::Running;
+            }
+            last = Some(run);
         }
-        match runs.last() {
+        match last {
             Some(run) if matches!(run.status, RunStatus::Failed | RunStatus::Interrupted) => {
                 ThreadStatus::Failed
             }
@@ -381,17 +529,25 @@ impl AppState {
         }
     }
 
-    /// The shown thread's timeline.
+    /// The shown thread's rows (tests; the view reads them by index).
     pub fn timeline(&self) -> Vec<TimelineItem> {
-        let Some(thread_id) = self.selected.as_deref() else {
-            return Vec::new();
-        };
-        build_timeline(&self.thread_runs(thread_id), &self.tools, &self.requests)
+        match self.selected.as_deref() {
+            Some(thread) => self.timeline.rows(thread).cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The source text of a text row (copying).
+    pub fn text_of(&self, run_id: &str, start: usize, end: usize) -> String {
+        self.run(run_id)
+            .and_then(|r| r.output.get(start..end.min(r.output.len())))
+            .unwrap_or_default()
+            .to_owned()
     }
 
     /// Unanswered requests, oldest first: the approval queue.
-    pub fn approval_queue(&self) -> Vec<&ProviderRequest> {
-        let mut queue: Vec<&ProviderRequest> = self
+    pub fn approval_queue(&self) -> Vec<&PendingRequest> {
+        let mut queue: Vec<&PendingRequest> = self
             .requests
             .iter()
             .filter(|r| r.status == "pending" || r.status == "responding")
@@ -403,7 +559,7 @@ impl AppState {
     /// The request the modal shows: the shown thread's first, else any
     /// thread's first, skipping those put aside.
     pub fn modal_request(&self) -> Option<ApprovalView> {
-        let queue: Vec<&ProviderRequest> = self
+        let queue: Vec<&PendingRequest> = self
             .approval_queue()
             .into_iter()
             .filter(|r| !self.deferred.contains(&r.id))
@@ -425,28 +581,104 @@ impl AppState {
         self.pending_by_key(key).is_some_and(|p| p.in_flight)
     }
 
+    /// Whether any command whose key starts with `prefix` is pending.
+    pub fn busy(&self, prefix: &str) -> bool {
+        self.pending.iter().any(|p| p.key.starts_with(prefix))
+    }
+
+    /// Pending commands whose outcome is unknown (retry / give up).
+    pub fn unconfirmed(&self) -> Vec<&PendingCommand> {
+        self.pending
+            .iter()
+            .filter(|p| !p.in_flight && p.unconfirmed.is_some())
+            .collect()
+    }
+
     pub fn composer_status(&self) -> ComposerStatus {
         let draft = self.draft();
+        let editing = self
+            .queue_edit
+            .as_ref()
+            .is_some_and(|e| Some(&e.thread_id) == self.selected.as_ref());
         let submit_key = format!("submit:{}", self.draft_key());
         let pending = self.pending_by_key(&submit_key);
         let active = self.selected.as_deref().and_then(|id| self.active_run(id));
-        let primary = match active {
-            Some(run) if run.status == RunStatus::Running => match self.running_action {
-                RunningAction::Steer => PrimaryAction::Steer,
-                RunningAction::Queue => PrimaryAction::Queue,
-            },
-            Some(_) => PrimaryAction::Queue,
-            None => PrimaryAction::Send,
+        let primary = if editing {
+            PrimaryAction::Save
+        } else {
+            match active {
+                Some(run) if run.status == RunStatus::Running => match self.running_action {
+                    RunningAction::Steer => PrimaryAction::Steer,
+                    RunningAction::Queue => PrimaryAction::Queue,
+                },
+                Some(_) => PrimaryAction::Queue,
+                None => PrimaryAction::Send,
+            }
         };
+        let has_content = !draft.text.trim().is_empty()
+            || (!editing && !draft.attachments.is_empty() && primary == PrimaryAction::Send);
         ComposerStatus {
-            can_submit: !draft.text.trim().is_empty() && pending.is_none() && self.snapshot_loaded,
+            can_submit: has_content && (editing || pending.is_none()) && self.snapshot_loaded,
             primary,
             can_stop: active.is_some_and(|run| !self.in_flight(&format!("stop:{}", run.id))),
-            sending: pending.is_some_and(|p| p.in_flight),
+            sending: !editing && pending.is_some_and(|p| p.in_flight),
             retry: pending
                 .filter(|p| !p.in_flight && p.unconfirmed.is_some())
                 .map(|p| p.key.clone()),
+            editing,
         }
+    }
+
+    /// The model the composer shows: the thread's, or the new thread's.
+    pub fn current_model(&self) -> String {
+        match self.selected_thread() {
+            Some(thread) => thread.model.clone(),
+            None => self.new_thread.model.clone(),
+        }
+    }
+
+    /// The approval policy the composer shows.
+    pub fn current_policy(&self) -> String {
+        match self.selected_thread() {
+            Some(thread) => thread.approval_policy.clone(),
+            None => self.new_thread.approval_policy.clone(),
+        }
+    }
+
+    /// The run parts of `run` for the timeline.
+    fn parts<'a>(&'a self, run: &'a Run) -> RunParts<'a> {
+        RunParts {
+            run,
+            tools: self.tools.iter().filter(|t| t.run_id == run.id).collect(),
+            requests: self
+                .requests
+                .iter()
+                .filter(|r| r.run_id == run.id)
+                .collect(),
+        }
+    }
+
+    /// Rebuilds run `run_id`'s rows.
+    fn refresh_run(&mut self, run_id: &str) {
+        let Some(run) = self.runs.iter().find(|r| r.id == run_id) else {
+            return;
+        };
+        let parts = RunParts {
+            run,
+            tools: self.tools.iter().filter(|t| t.run_id == run_id).collect(),
+            requests: self
+                .requests
+                .iter()
+                .filter(|r| r.run_id == run_id)
+                .collect(),
+        };
+        self.timeline.refresh_run(parts);
+    }
+
+    fn rebuild_timeline(&mut self) {
+        let mut timeline = std::mem::take(&mut self.timeline);
+        timeline.rebuild_all(self.runs.iter().map(|run| self.parts(run)));
+        self.timeline = timeline;
     }
 }
 
@@ -457,11 +689,21 @@ impl AppState {
     /// resync. Local intents (drafts, pending commands) stay.
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
         self.sequence = snapshot.sequence;
-        self.threads = snapshot.threads;
-        self.runs = snapshot.runs;
+        self.threads = snapshot.threads.unwrap_or_default();
+        self.runs = snapshot.runs.unwrap_or_default();
+        self.tasks = snapshot.tasks.unwrap_or_default();
         self.tools = snapshot.tools;
         self.requests = snapshot.requests;
+        self.inputs = snapshot.inputs;
+        for thread in &mut self.threads {
+            clear_zero_time(&mut thread.created_at);
+        }
+        for run in &mut self.runs {
+            clear_zero_time(&mut run.created_at);
+        }
         self.snapshot_loaded = true;
+        self.rebuild_timeline();
+        self.sidebar_revision += 1;
         if let Some(id) = &self.selected
             && self.thread(id).is_none()
         {
@@ -475,11 +717,19 @@ impl AppState {
         {
             self.selected = self.visible_threads().first().map(|t| t.id.clone());
         }
+        if let Some(edit) = &self.queue_edit
+            && !self
+                .inputs
+                .iter()
+                .any(|i| i.id == edit.input_id && i.status == "pending")
+        {
+            self.end_queue_edit();
+        }
     }
 
     /// Folds one event. Deltas are appended exactly once: an event at or
     /// before the applied sequence is a replay and changes nothing.
-    pub fn apply_event(&mut self, event: &Event) -> Applied {
+    pub fn apply_event(&mut self, event: &CoreEvent) -> Applied {
         if event.sequence <= self.sequence {
             self.stats.stale += 1;
             return Applied::Stale;
@@ -487,20 +737,31 @@ impl AppState {
         // The cursor follows every committed event, shown or not, so a
         // resubscription never replays what was already seen.
         self.sequence = event.sequence;
-        let changed = match event.kind.as_str() {
-            event::RUN_OUTPUT => self.fold_output(event),
-            event::RUN_REASONING => self.fold_reasoning(event),
-            event::RUN_TELEMETRY => self.fold_telemetry(event),
-            event::THREAD_CREATED | event::THREAD_UPDATED => self.fold_thread(event),
-            event::THREAD_DELETED => self.fold_thread_deleted(event),
-            event::TOOL_UPDATED => self.fold_tool(event),
-            event::REQUEST_UPDATED => self.fold_request(event),
-            other => match RunStatus::from_event_type(other) {
+        let kind = event.r#type.as_str();
+        let changed = match kind {
+            events::RUN_OUTPUT => self.fold_output(event),
+            events::RUN_REASONING => self.fold_reasoning(event),
+            events::RUN_TELEMETRY => self.fold_telemetry(event),
+            events::THREAD_CREATED | events::THREAD_UPDATED => self.fold_thread(event),
+            events::THREAD_DELETED => self.fold_thread_deleted(event),
+            events::THREAD_REWOUND => self.fold_rewound(event),
+            events::TOOL_UPDATED => self.fold_tool(event),
+            events::REQUEST_UPDATED => self.fold_request(event),
+            events::INPUT_UPDATED => self.fold_input(event),
+            events::TASK_CREATED | events::TASK_UPDATED => self.fold_task(event),
+            other => match events::run_status(other) {
                 Some(status) => self.fold_run(event, Some(status)),
                 None if other.starts_with("run.") => self.fold_run(event, None),
                 None => false,
             },
         };
+        let quiet = matches!(
+            kind,
+            events::RUN_OUTPUT | events::RUN_REASONING | events::RUN_TELEMETRY
+        );
+        if changed && !quiet {
+            self.sidebar_revision += 1;
+        }
         if changed {
             self.stats.applied += 1;
             Applied::Changed
@@ -516,7 +777,7 @@ impl AppState {
 
     /// `decodeOutput`: a delta (`delta` / `text` / `chunk` / bare string) is
     /// appended; a full `output` without one reconciles the run's output.
-    fn fold_output(&mut self, event: &Event) -> bool {
+    fn fold_output(&mut self, event: &CoreEvent) -> bool {
         let (delta, full) = match &event.data {
             Value::String(text) => (Some(text.clone()), None),
             Value::Object(map) => {
@@ -528,42 +789,65 @@ impl AppState {
             }
             _ => (None, None),
         };
-        let Some(run) = self.run_mut(&event.run_id) else {
+        let run_id = event.run_id.clone();
+        let Some(run) = self.run_mut(&run_id) else {
             return false;
         };
-        match (delta, full) {
+        let appended = match (delta, full) {
             (Some(delta), _) if !delta.is_empty() => {
                 run.output.push_str(&delta);
                 true
             }
             (_, Some(full)) if !full.is_empty() => {
-                if !run.output.starts_with(&full) {
-                    run.output = full;
+                if run.output.starts_with(&full) {
+                    return true;
                 }
-                true
+                // A rewrite, not an extension: rebuild the rows.
+                let extends = full.starts_with(&run.output);
+                run.output = full;
+                if !extends {
+                    self.timeline.forget_text(&run_id);
+                }
+                extends
             }
-            (None, None) => false,
-            _ => true,
+            (None, None) => return false,
+            _ => return true,
+        };
+        let fast = appended && {
+            let run = self.runs.iter().find(|r| r.id == run_id);
+            run.is_some_and(|run| self.timeline.append_output(run))
+        };
+        if !fast {
+            self.refresh_run(&run_id);
         }
+        true
     }
 
-    fn fold_reasoning(&mut self, event: &Event) -> bool {
+    fn fold_reasoning(&mut self, event: &CoreEvent) -> bool {
         let Some(delta) = event.data.get("reasoningDelta").and_then(Value::as_str) else {
             return false;
         };
         let delta = delta.to_owned();
-        match self.run_mut(&event.run_id) {
+        let run_id = event.run_id.clone();
+        match self.run_mut(&run_id) {
             Some(run) => {
                 run.reasoning.push_str(&delta);
+                let updated = {
+                    let run = self.runs.iter().find(|r| r.id == run_id);
+                    run.is_some_and(|run| self.timeline.update_reasoning(run))
+                };
+                if !updated {
+                    self.refresh_run(&run_id);
+                }
                 true
             }
             None => false,
         }
     }
 
-    fn fold_telemetry(&mut self, event: &Event) -> bool {
+    fn fold_telemetry(&mut self, event: &CoreEvent) -> bool {
         let value = event.data.get("telemetry").unwrap_or(&event.data);
-        let Ok(telemetry) = serde_json::from_value::<RunTelemetry>(value.clone()) else {
+        let Some(telemetry) = decode::<RunTelemetry>(value) else {
             return false;
         };
         match self.run_mut(&event.run_id) {
@@ -576,9 +860,9 @@ impl AppState {
     }
 
     /// `decodeRun`: the run bare or as `{ "run": … }`.
-    fn fold_run(&mut self, event: &Event, status: Option<RunStatus>) -> bool {
+    fn fold_run(&mut self, event: &CoreEvent, status: Option<RunStatus>) -> bool {
         let value = event.data.get("run").unwrap_or(&event.data);
-        let Ok(mut run) = serde_json::from_value::<Run>(value.clone()) else {
+        let Some(mut run) = decode::<Run>(value) else {
             return false;
         };
         if run.id.is_empty() {
@@ -587,8 +871,13 @@ impl AppState {
         if run.thread_id.is_empty() {
             run.thread_id = event.thread_id.clone();
         }
-        // A bare run without a `status` field takes the event's.
-        let has_status = value.get("status").is_some();
+        clear_zero_time(&mut run.created_at);
+        clear_zero_time(&mut run.updated_at);
+        // A run without a `status` field takes the event's.
+        let has_status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
         if !has_status {
             match status {
                 Some(status) => run.status = status,
@@ -598,21 +887,33 @@ impl AppState {
         if run.id.is_empty() || run.thread_id.is_empty() {
             return false;
         }
-        match self.run_mut(&run.id) {
-            Some(existing) => merge_run(existing, run),
+        let id = run.id.clone();
+        let mut rewritten = false;
+        match self.run_mut(&id) {
+            Some(existing) => {
+                rewritten = !run.output.is_empty()
+                    && !run.output.starts_with(&existing.output)
+                    && !existing.output.starts_with(&run.output);
+                merge_run(existing, run);
+            }
             None => self.runs.push(run),
         }
+        if rewritten {
+            self.timeline.forget_text(&id);
+        }
+        self.refresh_run(&id);
         true
     }
 
-    fn fold_thread(&mut self, event: &Event) -> bool {
+    fn fold_thread(&mut self, event: &CoreEvent) -> bool {
         let value = event.data.get("thread").unwrap_or(&event.data);
-        let Ok(thread) = serde_json::from_value::<Thread>(value.clone()) else {
+        let Some(mut thread) = decode::<Thread>(value) else {
             return false;
         };
         if thread.id.is_empty() {
             return false;
         }
+        clear_zero_time(&mut thread.created_at);
         match self.threads.iter_mut().find(|t| t.id == thread.id) {
             Some(existing) => *existing = thread,
             None => self.threads.push(thread),
@@ -620,7 +921,7 @@ impl AppState {
         true
     }
 
-    fn fold_thread_deleted(&mut self, event: &Event) -> bool {
+    fn fold_thread_deleted(&mut self, event: &CoreEvent) -> bool {
         let id = event
             .data
             .get("threadId")
@@ -634,20 +935,68 @@ impl AppState {
         self.runs.retain(|r| r.thread_id != id);
         self.tools.retain(|t| t.thread_id != id);
         self.requests.retain(|r| r.thread_id != id);
+        self.inputs.retain(|i| i.thread_id != id);
         self.drafts.remove(&id);
+        self.timeline.remove_thread(&id);
         if self.selected.as_deref() == Some(id.as_str()) {
             self.selected = None;
+        }
+        if self.queue_edit.as_ref().is_some_and(|e| e.thread_id == id) {
+            self.queue_edit = None;
         }
         true
     }
 
-    fn fold_tool(&mut self, event: &Event) -> bool {
+    /// `thread.rewound`: the target run and every later one are gone.
+    fn fold_rewound(&mut self, event: &CoreEvent) -> bool {
+        let mut removed: HashSet<String> = event
+            .data
+            .get("removedRunIds")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let target = event
+            .data
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or(&event.run_id)
+            .to_owned();
+        if removed.is_empty() && !target.is_empty() {
+            // Older records: the target and what followed it.
+            let order: Vec<String> = self
+                .thread_runs(&event.thread_id)
+                .iter()
+                .map(|r| r.id.clone())
+                .collect();
+            if let Some(at) = order.iter().position(|id| *id == target) {
+                removed.extend(order[at..].iter().cloned());
+            }
+        }
+        if removed.is_empty() {
+            return false;
+        }
+        self.runs.retain(|r| !removed.contains(&r.id));
+        self.tools.retain(|t| !removed.contains(&t.run_id));
+        self.requests.retain(|r| !removed.contains(&r.run_id));
+        self.timeline.remove_runs(&removed);
+        true
+    }
+
+    fn fold_tool(&mut self, event: &CoreEvent) -> bool {
         let Some(value) = event.data.get("tool") else {
             return false;
         };
-        let Ok(mut tool) = serde_json::from_value::<ToolCall>(value.clone()) else {
+        let Some(mut tool) = decode::<ToolCall>(value) else {
             return false;
         };
+        if value.get("outputOffset").is_none() {
+            tool.output_offset = -1;
+        }
         if tool.thread_id.is_empty() {
             tool.thread_id = event.thread_id.clone();
         }
@@ -657,18 +1006,20 @@ impl AppState {
         if tool.id.is_empty() || tool.run_id.is_empty() {
             return false;
         }
+        let run_id = tool.run_id.clone();
         match self.tools.iter_mut().find(|t| t.id == tool.id) {
             Some(existing) => *existing = tool,
             None => self.tools.push(tool),
         }
+        self.refresh_run(&run_id);
         true
     }
 
-    fn fold_request(&mut self, event: &Event) -> bool {
+    fn fold_request(&mut self, event: &CoreEvent) -> bool {
         let Some(value) = event.data.get("request") else {
             return false;
         };
-        let Ok(mut request) = serde_json::from_value::<ProviderRequest>(value.clone()) else {
+        let Some(mut request) = decode::<PendingRequest>(value) else {
             return false;
         };
         if request.thread_id.is_empty() {
@@ -688,9 +1039,61 @@ impl AppState {
                 self.deferred.remove(&request.id);
             }
         }
+        let run_id = request.run_id.clone();
         match self.requests.iter_mut().find(|r| r.id == request.id) {
             Some(existing) => *existing = request,
             None => self.requests.push(request),
+        }
+        self.refresh_run(&run_id);
+        true
+    }
+
+    /// `input.updated`: the queue's and steers' one authority.
+    fn fold_input(&mut self, event: &CoreEvent) -> bool {
+        let Some(value) = event.data.get("input") else {
+            return false;
+        };
+        let Some(mut input) = decode::<Input>(value) else {
+            return false;
+        };
+        if input.thread_id.is_empty() {
+            input.thread_id = event.thread_id.clone();
+        }
+        if input.id.is_empty() {
+            return false;
+        }
+        if input.status != "pending"
+            && self
+                .queue_edit
+                .as_ref()
+                .is_some_and(|e| e.input_id == input.id)
+        {
+            self.end_queue_edit();
+            self.notice = Some(Notice::new(
+                NoticeLevel::Info,
+                "这条排队消息已开始或已取消，编辑已结束。",
+            ));
+        }
+        match self.inputs.iter_mut().find(|i| i.id == input.id) {
+            Some(existing) => *existing = input,
+            None => self.inputs.push(input),
+        }
+        true
+    }
+
+    fn fold_task(&mut self, event: &CoreEvent) -> bool {
+        let Some(value) = event.data.get("task") else {
+            return false;
+        };
+        let Some(task) = decode::<Task>(value) else {
+            return false;
+        };
+        if task.id.is_empty() {
+            return false;
+        }
+        match self.tasks.iter_mut().find(|t| t.id == task.id) {
+            Some(existing) => *existing = task,
+            None => self.tasks.push(task),
         }
         true
     }
@@ -720,6 +1123,11 @@ fn merge_run(existing: &mut Run, incoming: Run) {
     } else {
         incoming.created_at.clone()
     };
+    let attachments = if incoming.attachments.is_empty() {
+        std::mem::take(&mut existing.attachments)
+    } else {
+        incoming.attachments.clone()
+    };
     let telemetry = incoming.telemetry.clone().or(existing.telemetry.take());
     // A terminal status never goes back to an active one (a late event).
     let status = if existing.status.terminal() && !incoming.status.terminal() {
@@ -732,6 +1140,7 @@ fn merge_run(existing: &mut Run, incoming: Run) {
         reasoning,
         input,
         created_at,
+        attachments,
         telemetry,
         status,
         ..incoming
@@ -789,8 +1198,8 @@ impl AppState {
             self.drafts.insert(
                 key,
                 Draft {
-                    text: String::new(),
                     mode: draft.mode,
+                    ..Draft::default()
                 },
             );
         }
@@ -811,51 +1220,60 @@ impl AppState {
 
     /// Sends the shown draft: creates the thread first when it is new; while
     /// a run is going, steers it or queues (as [`Self::running_action`]
-    /// says). Returns the command to dispatch; the draft moves into the
-    /// pending command until the Core accepts it.
+    /// says); saves the queued message being edited. Returns the command to
+    /// dispatch; the draft moves into the pending command until the Core
+    /// accepts it.
     pub fn submit(&mut self) -> Option<Command> {
-        if !self.composer_status().can_submit {
+        let status = self.composer_status();
+        if !status.can_submit {
             return None;
+        }
+        if status.editing {
+            return self.save_queue_edit();
         }
         let draft_key = self.draft_key();
         let key = format!("submit:{draft_key}");
         let draft = self.take_draft();
         let text = draft.text.trim().to_owned();
         let Some(thread_id) = self.selected.clone() else {
-            let mut send = Command::new(kind::SEND_MESSAGE, new_command_id("send"));
+            let mut send = Command::new(new_command_id("send"), CommandKind::SendMessage);
             send.message = text.clone();
             send.interaction_mode = draft.mode.wire().to_owned();
-            let mut create = Command::new(kind::CREATE_THREAD, new_command_id("thread"));
+            send.attachments = draft.attachments.clone();
+            let mut create = Command::new(new_command_id("thread"), CommandKind::CreateThread);
             create.title = title_from_message(&text);
-            create.provider_id = "pi".to_owned();
+            create.provider_id = self.new_thread.provider_id.clone();
+            create.model = self.new_thread.model.clone();
+            create.approval_policy = self.new_thread.approval_policy.clone();
+            create.workspace = self.new_thread.workspace.clone();
             create.interaction_mode = draft.mode.wire().to_owned();
             self.notice = Some(Notice::new(NoticeLevel::Info, "正在创建会话…"));
             return Some(self.track(
                 key,
                 create,
                 Purpose::CreateThread {
-                    then_send: send,
+                    then_send: Box::new(send),
                     draft,
                 },
             ));
         };
         let active = self.active_run(&thread_id).cloned();
-        let command = match active {
+        let mut command = match active {
             Some(run)
                 if run.status == RunStatus::Running
                     && self.running_action == RunningAction::Steer =>
             {
-                let mut steer = Command::new(kind::STEER_MESSAGE, new_command_id("steer"));
+                let mut steer = Command::new(new_command_id("steer"), CommandKind::SteerMessage);
                 steer.run_id = run.id;
                 steer
             }
-            Some(_) => Command::new(kind::QUEUE_MESSAGE, new_command_id("queue")),
-            None => Command::new(kind::SEND_MESSAGE, new_command_id("send")),
+            Some(_) => Command::new(new_command_id("queue"), CommandKind::QueueMessage),
+            None => Command::new(new_command_id("send"), CommandKind::SendMessage),
         };
-        let mut command = command;
         command.thread_id = thread_id;
         command.message = text;
         command.interaction_mode = draft.mode.wire().to_owned();
+        command.attachments = draft.attachments.clone();
         self.notice = None;
         Some(self.track(key, command, Purpose::Message { draft_key, draft }))
     }
@@ -868,7 +1286,7 @@ impl AppState {
         if self.in_flight(&key) {
             return None;
         }
-        let mut command = Command::new(kind::STOP_RUN, new_command_id("stop"));
+        let mut command = Command::new(new_command_id("stop"), CommandKind::StopRun);
         command.thread_id = run.thread_id;
         command.run_id = run.id;
         Some(self.track(key, command, Purpose::Stop))
@@ -893,9 +1311,11 @@ impl AppState {
             .ok_or(DecisionError::NotPending)?;
         let mut command = approval::respond_command(&request, decision)?;
         command.command_id = new_command_id("request");
+        let run_id = request.run_id.clone();
         if let Some(r) = self.requests.iter_mut().find(|r| r.id == request_id) {
             r.status = "responding".to_owned();
         }
+        self.refresh_run(&run_id);
         Ok(self.track(
             key,
             command,
@@ -917,8 +1337,8 @@ impl AppState {
         Some(pending.command.clone())
     }
 
-    /// Gives up a pending command whose outcome is unknown, restoring its
-    /// draft (the Core may still have it: the timeline will tell).
+    /// Gives up a pending command whose outcome is unknown, restoring what
+    /// it took (the Core may still have it: the timeline will tell).
     pub fn abandon(&mut self, key: &str) {
         let Some(index) = self
             .pending
@@ -936,20 +1356,49 @@ impl AppState {
             Purpose::CreateThread { draft, .. } => self.restore_draft(NEW_THREAD.to_owned(), draft),
             Purpose::Message { draft_key, draft } => self.restore_draft(draft_key, draft),
             Purpose::Respond { request_id } => {
+                let mut run_id = None;
                 if let Some(r) = self.requests.iter_mut().find(|r| r.id == request_id)
                     && r.status == "responding"
                 {
                     r.status = "pending".to_owned();
+                    run_id = Some(r.run_id.clone());
+                }
+                if let Some(run_id) = run_id {
+                    self.refresh_run(&run_id);
                 }
             }
-            Purpose::Stop => {}
+            Purpose::ThreadUpdate { previous, field } => {
+                if let Some(t) = self.threads.iter_mut().find(|t| t.id == previous.id) {
+                    match field {
+                        "title" => t.title = previous.title,
+                        "pin" => t.pinned = previous.pinned,
+                        "archive" => t.archived = previous.archived,
+                        "snooze" => t.snoozed_until = previous.snoozed_until,
+                        "policy" => t.approval_policy = previous.approval_policy,
+                        "model" => {
+                            t.model = previous.model;
+                            t.provider_id = previous.provider_id;
+                        }
+                        _ => *t = *previous,
+                    }
+                    self.sidebar_revision += 1;
+                }
+            }
+            Purpose::Queue { previous } => {
+                for input in previous {
+                    if let Some(i) = self.inputs.iter_mut().find(|i| i.id == input.id) {
+                        *i = input;
+                    }
+                }
+            }
+            Purpose::Stop | Purpose::Delete | Purpose::OpenResult | Purpose::Rewind => {}
         }
     }
 
     /// Puts an unsent draft back, unless the user wrote a new one meanwhile.
     fn restore_draft(&mut self, key: String, draft: Draft) {
         let slot = self.drafts.entry(key).or_default();
-        if slot.text.trim().is_empty() {
+        if slot.is_blank() {
             *slot = draft;
         }
     }
@@ -968,55 +1417,7 @@ impl AppState {
         match result {
             Ok(receipt) if receipt.accepted => {
                 let pending = self.pending.remove(index);
-                match pending.purpose {
-                    Purpose::CreateThread {
-                        mut then_send,
-                        draft,
-                    } => {
-                        let thread_id = receipt.thread_id.clone();
-                        if thread_id.is_empty() {
-                            self.notice =
-                                Some(Notice::new(NoticeLevel::Error, "Core 未返回新会话 ID。"));
-                            self.restore_draft(NEW_THREAD.to_owned(), draft);
-                            return None;
-                        }
-                        // The thread may not have arrived as an event yet:
-                        // show it now; its event replaces this.
-                        if self.thread(&thread_id).is_none() {
-                            self.threads.push(Thread {
-                                id: thread_id.clone(),
-                                title: pending.command.title.clone(),
-                                provider_id: pending.command.provider_id.clone(),
-                                ..Thread::default()
-                            });
-                        }
-                        if self.selected.is_none() {
-                            self.selected = Some(thread_id.clone());
-                        }
-                        if draft.mode != InteractionMode::Default {
-                            self.drafts.entry(thread_id.clone()).or_default().mode = draft.mode;
-                        }
-                        then_send.thread_id = thread_id.clone();
-                        self.notice = None;
-                        Some(self.track(
-                            format!("submit:{thread_id}"),
-                            then_send,
-                            Purpose::Message {
-                                draft_key: thread_id,
-                                draft,
-                            },
-                        ))
-                    }
-                    Purpose::Message { .. } => {
-                        if receipt.delivery == "queued"
-                            || pending.command.kind == kind::QUEUE_MESSAGE
-                        {
-                            self.notice = Some(Notice::new(NoticeLevel::Info, "已加入队列。"));
-                        }
-                        None
-                    }
-                    Purpose::Stop | Purpose::Respond { .. } => None,
-                }
+                self.on_accepted(pending, receipt)
             }
             Ok(_) => {
                 let pending = self.pending.remove(index);
@@ -1049,16 +1450,108 @@ impl AppState {
             }
         }
     }
+
+    fn on_accepted(&mut self, pending: PendingCommand, receipt: Receipt) -> Option<Command> {
+        match pending.purpose {
+            Purpose::CreateThread { then_send, draft } => {
+                let mut then_send = *then_send;
+                let thread_id = receipt.thread_id.clone();
+                if thread_id.is_empty() {
+                    self.notice = Some(Notice::new(NoticeLevel::Error, "Core 未返回新会话 ID。"));
+                    self.restore_draft(NEW_THREAD.to_owned(), draft);
+                    return None;
+                }
+                self.show_new_thread(&thread_id, &pending.command);
+                if draft.mode != InteractionMode::Default {
+                    self.drafts.entry(thread_id.clone()).or_default().mode = draft.mode;
+                }
+                then_send.thread_id = thread_id.clone();
+                self.notice = None;
+                Some(self.track(
+                    format!("submit:{thread_id}"),
+                    then_send,
+                    Purpose::Message {
+                        draft_key: thread_id,
+                        draft,
+                    },
+                ))
+            }
+            Purpose::Message { .. } => {
+                if receipt.delivery == "queued"
+                    || pending.command.kind == CommandKind::QueueMessage
+                {
+                    self.notice = Some(Notice::new(NoticeLevel::Info, "已加入队列。"));
+                }
+                None
+            }
+            Purpose::OpenResult => {
+                let thread_id = receipt.thread_id.clone();
+                if !thread_id.is_empty() {
+                    self.show_new_thread(&thread_id, &pending.command);
+                    self.selected = Some(thread_id);
+                }
+                self.notice = Some(Notice::new(
+                    NoticeLevel::Info,
+                    match pending.command.kind {
+                        CommandKind::ForkThread => "已分叉为新会话。",
+                        _ => "已合并回原会话。",
+                    },
+                ));
+                None
+            }
+            Purpose::Rewind => {
+                self.notice = Some(Notice::new(NoticeLevel::Info, "已回退到所选轮次之前。"));
+                None
+            }
+            Purpose::Delete => {
+                self.notice = Some(Notice::new(NoticeLevel::Info, "会话已删除。"));
+                None
+            }
+            Purpose::Stop
+            | Purpose::Respond { .. }
+            | Purpose::ThreadUpdate { .. }
+            | Purpose::Queue { .. } => None,
+        }
+    }
+
+    /// A thread a receipt named may not have arrived as an event yet: show
+    /// it now; its event replaces this.
+    fn show_new_thread(&mut self, thread_id: &str, command: &Command) {
+        if self.thread(thread_id).is_none() {
+            self.threads.push(Thread {
+                id: thread_id.to_owned(),
+                title: command.title.clone(),
+                provider_id: command.provider_id.clone(),
+                model: command.model.clone(),
+                approval_policy: command.approval_policy.clone(),
+                ..Thread::default()
+            });
+            self.sidebar_revision += 1;
+        }
+        if self.selected.is_none() {
+            self.selected = Some(thread_id.to_owned());
+        }
+    }
 }
 
 fn action_label(command: &Command) -> &'static str {
-    match command.kind.as_str() {
-        kind::CREATE_THREAD => "创建会话",
-        kind::SEND_MESSAGE => "发送",
-        kind::QUEUE_MESSAGE => "排队",
-        kind::STEER_MESSAGE => "追加",
-        kind::STOP_RUN => "停止",
-        kind::RESPOND_REQUEST => "请求响应",
+    match command.kind {
+        CommandKind::CreateThread => "创建会话",
+        CommandKind::SendMessage => "发送",
+        CommandKind::QueueMessage => "排队",
+        CommandKind::SteerMessage | CommandKind::SteerRun => "追加",
+        CommandKind::StopRun => "停止",
+        CommandKind::RespondRequest => "请求响应",
+        CommandKind::UpdateThread => "更新会话",
+        CommandKind::DeleteThread => "删除会话",
+        CommandKind::ForkThread => "分叉",
+        CommandKind::RewindThread => "回退",
+        CommandKind::MergeBackThread => "合并回原会话",
+        CommandKind::SetThreadModel => "切换模型",
+        CommandKind::EditInput => "编辑排队消息",
+        CommandKind::ReorderInput => "调整队列",
+        CommandKind::PromoteInputToSteer => "改为追加",
+        CommandKind::CancelInput | CommandKind::CancelMessage => "取消排队",
         _ => "操作",
     }
 }

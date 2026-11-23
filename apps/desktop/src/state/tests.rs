@@ -4,10 +4,11 @@
 use serde_json::json;
 
 use super::*;
-use crate::bridge::{
-    BridgeError, ErrorCode,
-    wire::{Event, ProviderRequest, Receipt, Run, RunStatus, Snapshot, Thread, ToolCall},
+use vantry_protocol::{
+    CommandKind, CoreEvent, PendingRequest, Receipt, Run, RunStatus, Snapshot, Thread, ToolCall,
 };
+
+use crate::bridge::{BridgeError, ErrorCode};
 
 fn thread(id: &str, created_at: &str) -> Thread {
     Thread {
@@ -29,15 +30,15 @@ fn run(id: &str, thread_id: &str, status: RunStatus) -> Run {
     }
 }
 
-fn ev(sequence: i64, kind: &str, thread_id: &str, run_id: &str, data: serde_json::Value) -> Event {
-    Event {
+fn ev(sequence: i64, kind: &str, thread_id: &str, run_id: &str, data: serde_json::Value) -> CoreEvent {
+    CoreEvent {
         sequence,
         id: format!("e{sequence}"),
-        kind: kind.into(),
+        r#type: kind.into(),
         thread_id: thread_id.into(),
         run_id: run_id.into(),
         data,
-        ..Event::default()
+        ..CoreEvent::default()
     }
 }
 
@@ -46,17 +47,16 @@ fn live_state() -> AppState {
     let mut state = AppState::default();
     state.apply_snapshot(Snapshot {
         sequence: 10,
-        threads: vec![thread("t1", "2026-11-23T00:00:00Z")],
-        runs: vec![run("r1", "t1", RunStatus::Running)],
-        tools: vec![],
-        requests: vec![],
+        threads: Some(vec![thread("t1", "2026-11-23T00:00:00Z")]),
+        runs: Some(vec![run("r1", "t1", RunStatus::Running)]),
+        ..Snapshot::default()
     });
     state.on_live();
     state
 }
 
-fn approval_request(id: &str, status: &str) -> ProviderRequest {
-    ProviderRequest {
+fn approval_request(id: &str, status: &str) -> PendingRequest {
+    PendingRequest {
         id: id.into(),
         thread_id: "t1".into(),
         run_id: "r1".into(),
@@ -65,11 +65,11 @@ fn approval_request(id: &str, status: &str) -> ProviderRequest {
         options: vec!["允许本次".into(), "本会话允许 bash".into(), "拒绝".into()],
         status: status.into(),
         created_at: "2026-11-23T00:00:01Z".into(),
-        ..ProviderRequest::default()
+        ..PendingRequest::default()
     }
 }
 
-fn request_event(sequence: i64, request: &ProviderRequest) -> Event {
+fn request_event(sequence: i64, request: &PendingRequest) -> CoreEvent {
     ev(
         sequence,
         "request.updated",
@@ -95,7 +95,9 @@ fn texts(state: &AppState) -> Vec<String> {
         .map(|item| match item {
             TimelineItem::User { text, .. } => format!("user:{text}"),
             TimelineItem::Reasoning { text, .. } => format!("think:{text}"),
-            TimelineItem::Text { text, .. } => format!("text:{text}"),
+            TimelineItem::Text {
+                run_id, start, end, ..
+            } => format!("text:{}", state.text_of(run_id, *start, *end)),
             TimelineItem::Tool { name, status, .. } => format!("tool:{name}:{}", status.label()),
             TimelineItem::Approval { view, .. } => format!("approval:{}", view.request_id),
             TimelineItem::Status { text, .. } => format!("status:{text}"),
@@ -170,7 +172,7 @@ fn reasoning_streams_then_text_takes_over() {
     let timeline = state.timeline();
     assert!(matches!(
         &timeline[1],
-        TimelineItem::Reasoning { text, streaming: true, .. } if text == "想一想"
+        TimelineItem::Reasoning { text, streaming: true, .. } if &**text == "想一想"
     ));
     state.apply_event(&ev(13, "run.output", "t1", "r1", json!({ "delta": "好" })));
     let timeline = state.timeline();
@@ -328,15 +330,10 @@ fn tools_with_unknown_offsets_follow_the_text() {
         "r1",
         json!({ "delta": "回复" }),
     ));
-    let tool = ToolCall {
-        id: "k1".into(),
-        run_id: "r1".into(),
-        name: "grep".into(),
-        status: "failed".into(),
-        ..ToolCall::default()
-    };
-    assert_eq!(tool.output_offset, -1);
+    // An older record without `outputOffset` (and other fields): unknown.
+    let tool = json!({ "id": "k1", "runId": "r1", "name": "grep", "status": "failed" });
     state.apply_event(&ev(12, "tool.updated", "t1", "r1", json!({ "tool": tool })));
+    assert_eq!(state.tools[0].output_offset, -1);
     assert_eq!(
         texts(&state),
         vec!["user:你好", "text:回复", "tool:grep:失败"]
@@ -378,7 +375,7 @@ fn allowing_sends_the_option_and_the_core_closes_the_request() {
     let mut state = live_state();
     state.apply_event(&request_event(11, &approval_request("q1", "pending")));
     let command = state.respond("q1", &ApprovalDecision::Allow).unwrap();
-    assert_eq!(command.kind, "request.respond");
+    assert_eq!(command.kind, CommandKind::RespondRequest);
     assert_eq!(command.request_id, "q1");
     assert_eq!(command.run_id, "r1");
     assert_eq!(command.value, "允许本次");
@@ -418,7 +415,7 @@ fn denying_and_allowing_for_the_session_send_their_options() {
 
 #[test]
 fn confirm_select_and_input_requests_answer_their_own_way() {
-    let confirm = ProviderRequest {
+    let confirm = PendingRequest {
         method: "confirm".into(),
         ..approval_request("q1", "pending")
     };
@@ -427,7 +424,7 @@ fn confirm_select_and_input_requests_answer_their_own_way() {
     let deny = approval::respond_command(&confirm, &ApprovalDecision::Deny).unwrap();
     assert!(!deny.confirmed && !deny.cancelled);
 
-    let select = ProviderRequest {
+    let select = PendingRequest {
         options: vec!["A".into(), "B".into()],
         ..approval_request("q2", "pending")
     };
@@ -441,7 +438,7 @@ fn confirm_select_and_input_requests_answer_their_own_way() {
     let cancelled = approval::respond_command(&select, &ApprovalDecision::Cancel).unwrap();
     assert!(cancelled.cancelled);
 
-    let input = ProviderRequest {
+    let input = PendingRequest {
         method: "input".into(),
         ..approval_request("q3", "pending")
     };
@@ -495,7 +492,7 @@ fn the_modal_prefers_the_shown_threads_request() {
         "",
         json!({ "thread": thread("t2", "2026-11-23T01:00:00Z") }),
     ));
-    let other = ProviderRequest {
+    let other = PendingRequest {
         thread_id: "t2".into(),
         created_at: "2026-11-23T00:00:00Z".into(),
         ..approval_request("q-other", "pending")
@@ -512,7 +509,7 @@ fn the_modal_prefers_the_shown_threads_request() {
 fn a_request_put_aside_leaves_the_modal_but_stays_queued() {
     let mut state = live_state();
     state.apply_event(&request_event(11, &approval_request("q1", "pending")));
-    let second = ProviderRequest {
+    let second = PendingRequest {
         created_at: "2026-11-23T00:00:02Z".into(),
         ..approval_request("q2", "pending")
     };
@@ -541,7 +538,7 @@ fn the_first_message_creates_the_thread_then_sends() {
     state.set_draft_text("  帮我看看这个仓库\n第二行  ");
     state.toggle_mode();
     let create = state.submit().unwrap();
-    assert_eq!(create.kind, "thread.create");
+    assert_eq!(create.kind, CommandKind::CreateThread);
     assert_eq!(create.title, "帮我看看这个仓库");
     assert_eq!(create.interaction_mode, "plan");
     assert!(state.draft().text.is_empty());
@@ -555,7 +552,7 @@ fn the_first_message_creates_the_thread_then_sends() {
     let send = state
         .on_command_result(&create.command_id, Ok(receipt))
         .unwrap();
-    assert_eq!(send.kind, "message.send");
+    assert_eq!(send.kind, CommandKind::SendMessage);
     assert_eq!(send.thread_id, "t9");
     assert_eq!(send.message, "帮我看看这个仓库\n第二行");
     assert_eq!(send.interaction_mode, "plan");
@@ -581,7 +578,7 @@ fn a_rejected_send_restores_the_draft() {
     ));
     state.set_draft_text("再来一次");
     let send = state.submit().unwrap();
-    assert_eq!(send.kind, "message.send");
+    assert_eq!(send.kind, CommandKind::SendMessage);
     state.on_command_result(
         &send.command_id,
         Err(BridgeError::new(ErrorCode::InvalidCommand, "bad")),
@@ -619,7 +616,7 @@ fn while_running_the_draft_steers_or_queues() {
     assert_eq!(state.composer_status().primary, PrimaryAction::Steer);
     state.set_draft_text("改成中文");
     let steer = state.submit().unwrap();
-    assert_eq!(steer.kind, "message.steer");
+    assert_eq!(steer.kind, CommandKind::SteerMessage);
     assert_eq!(steer.run_id, "r1");
     state.on_command_result(&steer.command_id, Ok(accepted(&steer)));
 
@@ -627,7 +624,7 @@ fn while_running_the_draft_steers_or_queues() {
     assert_eq!(state.composer_status().primary, PrimaryAction::Queue);
     state.set_draft_text("之后再做");
     let queue = state.submit().unwrap();
-    assert_eq!(queue.kind, "message.queue");
+    assert_eq!(queue.kind, CommandKind::QueueMessage);
     assert!(queue.run_id.is_empty());
     state.on_command_result(&queue.command_id, Ok(accepted(&queue)));
     assert_eq!(state.notice.as_ref().unwrap().text, "已加入队列。");
@@ -638,7 +635,7 @@ fn stop_targets_the_active_run_once() {
     let mut state = live_state();
     assert!(state.composer_status().can_stop);
     let stop = state.stop().unwrap();
-    assert_eq!(stop.kind, "run.stop");
+    assert_eq!(stop.kind, CommandKind::StopRun);
     assert_eq!(stop.run_id, "r1");
     assert!(state.stop().is_none(), "already stopping");
     assert!(!state.composer_status().can_stop);
@@ -721,8 +718,8 @@ fn resync_required_reloads_the_snapshot_and_keeps_local_intents() {
     done.output = "完整回复".into();
     state.apply_snapshot(Snapshot {
         sequence: 40,
-        threads: vec![thread("t1", "2026-11-23T00:00:00Z")],
-        runs: vec![done],
+        threads: Some(vec![thread("t1", "2026-11-23T00:00:00Z")]),
+        runs: Some(vec![done]),
         ..Snapshot::default()
     });
     state.on_live();
@@ -743,10 +740,10 @@ fn a_snapshot_without_the_selected_thread_selects_the_newest() {
     state.select_thread(Some("t1".into()));
     state.apply_snapshot(Snapshot {
         sequence: 50,
-        threads: vec![
+        threads: Some(vec![
             thread("a", "2026-11-20T00:00:00Z"),
             thread("b", "2026-11-22T00:00:00Z"),
-        ],
+        ]),
         ..Snapshot::default()
     });
     assert_eq!(state.selected.as_deref(), Some("b"));
@@ -786,12 +783,12 @@ fn sidebar_orders_pinned_then_newest_and_hides_archived() {
     archived.archived = true;
     state.apply_snapshot(Snapshot {
         sequence: 1,
-        threads: vec![
+        threads: Some(vec![
             thread("older", "2026-11-01T00:00:00Z"),
             pinned,
             archived,
             thread("newer", "2026-11-20T00:00:00Z"),
-        ],
+        ]),
         ..Snapshot::default()
     });
     let ids: Vec<&str> = state
