@@ -21,6 +21,4 @@ serde_json.workspace = true
 tar.workspace = true
 vantry-updater.workspace = true
 zip.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

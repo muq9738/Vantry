@@ -1,45 +1,225 @@
-use anyhow::{Context, Result, ensure};
-use clap::Args;
+use anyhow::{Context, Result, bail, ensure};
+use clap::{Args, ValueEnum};
+use flate2::{Compression, write::GzEncoder};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use zip::{ZipWriter, write::SimpleFileOptions};
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Kind {
+    #[default]
+    Desktop,
+    Service,
+    Relay,
+}
 #[derive(Debug, Args)]
 pub struct Options {
-    #[arg(long, default_value = "aarch64-apple-darwin")]
-    target: String,
-    /// Defaults to the vantry desktop binary in the release target directory.
+    /// Product to package (default desktop).
+    #[arg(value_enum, conflicts_with = "kind")]
+    product: Option<Kind>,
+    #[arg(long, value_enum, alias = "package")]
+    kind: Option<Kind>,
+    /// Cargo target triple (defaults to the host).
+    #[arg(long)]
+    target: Option<String>,
+    #[arg(long, default_value = "release")]
+    profile: String,
+    /// Use artifacts already present in CARGO_TARGET_DIR or explicit binary paths.
+    #[arg(long)]
+    skip_build: bool,
     #[arg(long)]
     desktop: Option<PathBuf>,
-    /// Defaults to vantry-service in the release target directory.
     #[arg(long)]
     service: Option<PathBuf>,
-    /// Additional arm64 executable to place in Contents/Helpers (repeatable).
+    #[arg(long)]
+    relay: Option<PathBuf>,
+    /// Additional platform executable (repeatable).
     #[arg(long)]
     helper: Vec<PathBuf>,
-    /// Destination for Vantry.app, its ZIP, and the JSON size report.
+    /// Directory of prebuilt platform helpers.
     #[arg(long)]
+    helper_dir: Option<PathBuf>,
+    #[arg(long = "out-dir", visible_alias = "out")]
     out: Option<PathBuf>,
+}
+fn host() -> String {
+    let arch = std::env::consts::ARCH;
+    let suffix = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else if cfg!(windows) {
+        if cfg!(target_env = "gnu") {
+            "pc-windows-gnu"
+        } else {
+            "pc-windows-msvc"
+        }
+    } else if cfg!(target_env = "musl") {
+        "unknown-linux-musl"
+    } else {
+        "unknown-linux-gnu"
+    };
+    format!("{arch}-{suffix}")
+}
+struct Platform<'a> {
+    os: &'a str,
+    arch: &'a str,
+    cargo_arch: &'a str,
+}
+impl<'a> Platform<'a> {
+    fn parse(target: &'a str) -> Result<Self> {
+        let arch = target.split('-').next().unwrap();
+        ensure!(
+            target
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
+            "invalid Cargo target"
+        );
+        let os = if target.ends_with("-apple-darwin") {
+            "darwin"
+        } else if target.contains("-windows-") {
+            "windows"
+        } else if target.contains("-linux-") {
+            "linux"
+        } else {
+            bail!("unsupported target {target}")
+        };
+        Ok(Self {
+            os,
+            cargo_arch: arch,
+            arch: match arch {
+                "aarch64" => "arm64",
+                "x86_64" => "amd64",
+                "i686" => "386",
+                a => a,
+            },
+        })
+    }
 }
 #[derive(Serialize)]
 struct Entry {
     path: PathBuf,
     component: &'static str,
     bytes: u64,
+    source: String,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Report {
-    target: String,
-    files: Vec<Entry>,
+struct Report<'a> {
+    target: &'a str,
+    product: Kind,
+    profile: &'a str,
+    files: &'a [Entry],
     component_bytes: BTreeMap<&'static str, u64>,
     installed_bytes: u64,
-    zip_bytes: u64,
+    archive: String,
+    archive_bytes: u64,
+    zip_bytes: Option<u64>,
+    budget_bytes: u64,
+    within_budget: bool,
+}
+struct Bundle {
+    root: PathBuf,
+    files: Vec<Entry>,
+}
+impl Bundle {
+    fn copy(
+        &mut self,
+        src: &Path,
+        rel: &Path,
+        component: &'static str,
+        source: &str,
+    ) -> Result<()> {
+        let meta = fs::symlink_metadata(src).with_context(|| format!("open {}", src.display()))?;
+        if meta.is_dir() {
+            let mut children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
+            children.sort_by_key(|e| e.file_name());
+            for child in children {
+                let name = child.file_name();
+                self.copy(
+                    &child.path(),
+                    &rel.join(&name),
+                    component,
+                    &format!("{source}/{}", name.to_string_lossy()),
+                )?;
+            }
+            return Ok(());
+        }
+        ensure!(
+            meta.is_file(),
+            "expected a regular file at {}",
+            src.display()
+        );
+        let out = self.root.join(rel);
+        ensure!(
+            !out.try_exists()?,
+            "duplicate destination {}",
+            rel.display()
+        );
+        fs::create_dir_all(crate::parent(&out))?;
+        let bytes = fs::copy(src, out)?;
+        self.files.push(Entry {
+            path: rel.to_owned(),
+            component,
+            bytes,
+            source: source.into(),
+        });
+        Ok(())
+    }
+    fn generated(&mut self, rel: &str, source: &str) -> Result<()> {
+        self.files.push(Entry {
+            path: rel.into(),
+            component: "resources",
+            bytes: self.root.join(rel).metadata()?.len(),
+            source: source.into(),
+        });
+        Ok(())
+    }
+    fn archive(&self, stage: &Path, name: &str) -> Result<u64> {
+        let path = stage.join(name);
+        let dir = self.root.file_name().unwrap();
+        let file = File::create(&path)?;
+        if name.ends_with(".zip") {
+            let mut zip = ZipWriter::new(file);
+            for entry in &self.files {
+                let src = self.root.join(&entry.path);
+                let mut input = File::open(src)?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    input.metadata()?.permissions().mode()
+                };
+                #[cfg(not(unix))]
+                let mode = 0o644;
+                let rel = Path::new(dir).join(&entry.path);
+                zip.start_file(
+                    rel.to_str()
+                        .context("non-UTF-8 release path")?
+                        .replace('\\', "/"),
+                    SimpleFileOptions::default()
+                        .unix_permissions(mode)
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )?;
+                io::copy(&mut input, &mut zip)?;
+            }
+            zip.finish()?.sync_all()?;
+        } else {
+            let mut tar = tar::Builder::new(GzEncoder::new(file, Compression::best()));
+            for entry in &self.files {
+                tar.append_path_with_name(
+                    self.root.join(&entry.path),
+                    Path::new(dir).join(&entry.path),
+                )?;
+            }
+            tar.into_inner()?.finish()?.sync_all()?;
+        }
+        Ok(path.metadata()?.len())
+    }
 }
 const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
@@ -47,255 +227,333 @@ const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundleExecutable</key><string>Vantry</string>
 <key>CFBundleName</key><string>Vantry</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>Vantry.icns</string>
 <key>CFBundleShortVersionString</key><string>@VERSION@</string>
 <key>CFBundleVersion</key><string>@VERSION@</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+<key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
+<key>CFBundleLocalizations</key><array><string>zh-Hans</string><string>en</string><string>ja</string></array>
+<key>NSLocalNetworkUsageDescription</key><string>Vantry 需要发现并直连局域网中的电脑，以访问你的项目和会话。</string>
+<key>NSScreenCaptureUsageDescription</key><string>Vantry 仅在你开启本机桌面共享且经你确认授权时采集屏幕，并通过局域网直连或你配置的自建中继加密传输。</string>
+<key>NSBonjourServices</key><array><string>_vantry._tcp</string></array>
 </dict></plist>
 "#;
-fn copy(
-    src: &Path,
-    dest: &Path,
-    label: &'static str,
-    app: &Path,
-    list: &mut Vec<Entry>,
-) -> Result<()> {
-    let meta = fs::metadata(src).with_context(|| format!("open {}", src.display()))?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy(
-                &entry.path(),
-                &dest.join(entry.file_name()),
-                label,
-                app,
-                list,
-            )?;
-        }
-        return Ok(());
+fn verify_executable(src: &Path, p: &Platform) -> Result<()> {
+    #[cfg(unix)]
+    if p.os != "windows" {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            src.metadata()?.permissions().mode() & 0o111 != 0,
+            "missing executable permission on {}",
+            src.display()
+        );
     }
-    ensure!(meta.is_file(), "expected file: {}", src.display());
-    if matches!(label, "desktop" | "service" | "helpers") {
-        let status = Command::new("/usr/bin/lipo")
-            .arg(src)
-            .args(["-verify_arch", "arm64"])
-            .status()?;
-        ensure!(status.success(), "{} lacks arm64 slice", src.display());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                meta.permissions().mode() & 0o111 != 0,
-                "{} lacks executable permission",
-                src.display()
-            );
-        }
+    if cfg!(target_os = "macos") && p.os == "darwin" {
+        let arch = if p.cargo_arch == "aarch64" {
+            "arm64"
+        } else {
+            p.cargo_arch
+        };
+        ensure!(
+            Command::new("/usr/bin/lipo")
+                .arg(src)
+                .args(["-verify_arch", arch])
+                .status()?
+                .success(),
+            "{} lacks {arch} slice",
+            src.display()
+        );
     }
-    let file = app.join(dest);
-    ensure!(
-        !file.try_exists()?,
-        "duplicate destination {}",
-        dest.display()
-    );
-    fs::create_dir_all(file.parent().unwrap())?;
-    let bytes = fs::copy(src, file)?;
-    list.push(Entry {
-        path: dest.to_owned(),
-        component: label,
-        bytes,
-    });
     Ok(())
 }
-fn assemble(stage: &Path, root: &Path, target_dir: &Path, options: Options) -> Result<Report> {
-    let app = stage.join("Vantry.app");
-    let mut files = vec![];
-    let release = |name: &str| {
-        let explicit = target_dir.join(&options.target).join("release").join(name);
-        if explicit.is_file() {
-            explicit
-        } else {
-            target_dir.join("release").join(name)
-        }
-    };
-    copy(
-        &options.desktop.unwrap_or_else(|| release("vantry")),
-        Path::new("Contents/MacOS/Vantry"),
-        "desktop",
-        &app,
-        &mut files,
-    )?;
-    copy(
-        &options.service.unwrap_or_else(|| release("vantry-service")),
-        Path::new("Contents/MacOS/vantry-service"),
-        "service",
-        &app,
-        &mut files,
-    )?;
-    for path in options.helper {
-        copy(
-            &path,
-            &Path::new("Contents/Helpers").join(path.file_name().context("helper filename")?),
-            "helpers",
-            &app,
-            &mut files,
-        )?;
-    }
-    let resources = Path::new("Contents/Resources");
-    for path in ["LICENSE", "THIRD_PARTY_NOTICES.md", "third_party/licenses"] {
-        copy(
-            &root.join(path),
-            &resources.join(path),
-            "licenses",
-            &app,
-            &mut files,
-        )?;
-    }
-    copy(
-        &root.join("resources/icon.png"),
-        &resources.join("icon.png"),
-        "resources",
-        &app,
-        &mut files,
-    )?;
-    let plist = PLIST.replace("@VERSION@", env!("CARGO_PKG_VERSION"));
-    fs::write(app.join("Contents/Info.plist"), &plist)?;
-    files.push(Entry {
-        path: "Contents/Info.plist".into(),
-        component: "resources",
-        bytes: plist.len() as u64,
-    });
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    let archive = stage.join("Vantry-macos-arm64.zip");
-    let status = Command::new("/usr/bin/ditto")
-        .args(["-c", "-k", "--norsrc", "--keepParent"])
-        .arg(&app)
-        .arg(&archive)
-        .status()?;
-    ensure!(status.success(), "ditto failed: {status}");
-    let mut component_bytes = BTreeMap::new();
-    for entry in &files {
-        *component_bytes.entry(entry.component).or_default() += entry.bytes;
-    }
-    let report = Report {
-        target: options.target,
-        installed_bytes: component_bytes.values().sum(),
-        zip_bytes: archive.metadata()?.len(),
-        files,
-        component_bytes,
-    };
-    fs::write(
-        stage.join("package-report.json"),
-        serde_json::to_vec_pretty(&report)?,
-    )?;
-    Ok(report)
-}
-pub fn run(options: Options) -> Result<()> {
-    ensure!(
-        cfg!(target_os = "macos") && options.target == "aarch64-apple-darwin",
-        "package requires macOS and target aarch64-apple-darwin"
-    );
+pub fn run(o: Options) -> Result<()> {
+    let kind = o.product.or(o.kind).unwrap_or_default();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .unwrap();
-    let target = std::env::var_os("CARGO_TARGET_DIR")
+    let target = o.target.clone().unwrap_or_else(host);
+    let p = Platform::parse(&target)?;
+    ensure!(
+        !o.profile.is_empty()
+            && o.profile
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+        "invalid Cargo profile"
+    );
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target"));
-    let out = options
-        .out
-        .clone()
-        .unwrap_or_else(|| target.join("package-macos-arm64"));
-    let parent = out
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let stage = parent.join(format!(
-        ".vantry-package-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    ));
-    fs::create_dir(&stage)?;
-    let result = assemble(&stage, root, &target, options).and_then(|report| {
-        fs::rename(&stage, &out).with_context(|| {
-            format!("publish to {} (choose an empty destination)", out.display())
-        })?;
-        Ok(report)
+    let target_dir = std::path::absolute(target_dir)?;
+    let platform = format!("{}-{}", p.os, p.arch);
+    let mac = kind == Kind::Desktop && p.os == "darwin";
+    let exe = if p.os == "windows" { ".exe" } else { "" };
+    let slug = match kind {
+        Kind::Desktop => "vantry",
+        Kind::Service => "vantry-service",
+        Kind::Relay => "vantry-relay",
+    };
+    let out = o.out.clone().unwrap_or_else(|| {
+        target_dir.join(if mac {
+            format!("package-macos-{}", p.arch)
+        } else {
+            format!("package-{slug}-{platform}")
+        })
     });
-    if result.is_err() {
-        fs::remove_dir_all(&stage)?;
+    let parent = crate::parent(&out);
+    fs::create_dir_all(parent)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".vantry-package-")
+        .tempdir_in(parent)?;
+    let mut bundle = Bundle {
+        root: stage.path().join(if mac {
+            "Vantry.app"
+        } else if kind == Kind::Desktop {
+            "Vantry"
+        } else {
+            slug
+        }),
+        files: vec![],
+    };
+    let profile_dir = match o.profile.as_str() {
+        "dev" | "test" => "debug",
+        "bench" => "release",
+        name => name,
+    };
+    let mut binaries = Vec::new();
+    if kind == Kind::Desktop {
+        binaries.push(("vantry-desktop", "vantry", "desktop", o.desktop.as_ref()));
     }
-    let report = result?;
+    if kind != Kind::Relay {
+        binaries.push((
+            "vantry-service",
+            "vantry-service",
+            "service",
+            o.service.as_ref(),
+        ));
+    } else {
+        binaries.push(("vantry-relay", "vantry-relay", "relay", o.relay.as_ref()));
+    }
+    if !o.skip_build && binaries.iter().any(|(_, _, _, src)| src.is_none()) {
+        let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        cmd.current_dir(root)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .args([
+                "build",
+                "--locked",
+                "--profile",
+                &o.profile,
+                "--target",
+                &target,
+            ]);
+        for (pkg, _, _, src) in &binaries {
+            if src.is_none() {
+                cmd.args(["-p", pkg]);
+            }
+        }
+        ensure!(cmd.status()?.success(), "Cargo build failed");
+    }
+    for (pkg, bin, component, explicit) in binaries {
+        let name = format!("{bin}{exe}");
+        let mut src = target_dir.join(&target).join(profile_dir).join(&name);
+        if !src.is_file() && target == host() {
+            src = target_dir.join(profile_dir).join(&name);
+        }
+        let src = explicit.unwrap_or(&src);
+        let dest = if mac {
+            Path::new("Contents/MacOS").join(if component == "desktop" {
+                "Vantry"
+            } else {
+                bin
+            })
+        } else if component == "service" && kind == Kind::Desktop {
+            Path::new("libexec").join(&name)
+        } else if component == "desktop" && p.os == "windows" {
+            "Vantry.exe".into()
+        } else {
+            name.into()
+        };
+        verify_executable(src, &p)?;
+        let origin = if explicit.is_some() {
+            format!("supplied {pkg}/{bin}: {}", src.display())
+        } else {
+            format!(
+                "cargo {pkg}/{bin} ({target}, {}): {}",
+                o.profile,
+                src.display()
+            )
+        };
+        bundle.copy(src, &dest, component, &origin)?;
+    }
+    let resources = if mac {
+        Path::new("Contents/Resources")
+    } else {
+        Path::new("")
+    };
+    for asset in ["LICENSE", "THIRD_PARTY_NOTICES.md", "third_party/licenses"] {
+        bundle.copy(&root.join(asset), &resources.join(asset), "licenses", asset)?;
+    }
+    if kind == Kind::Relay && p.os == "linux" {
+        let unit = "deploy/relay/vantry-relay.service";
+        bundle.copy(
+            &root.join(unit),
+            Path::new("vantry-relay.service"),
+            "resources",
+            unit,
+        )?;
+    }
+    if kind == Kind::Desktop {
+        let icon = "resources/icon.png";
+        bundle.copy(
+            &root.join(icon),
+            &resources.join("icon.png"),
+            "resources",
+            icon,
+        )?;
+        if root.join("resources/update-token").is_file() {
+            bundle.copy(
+                &root.join("resources/update-token"),
+                &resources.join("update-token"),
+                "resources",
+                "resources/update-token",
+            )?;
+        }
+    }
+    if kind == Kind::Desktop || !o.helper.is_empty() || o.helper_dir.is_some() {
+        let mut helpers = o.helper;
+        if let Some(dir) = o.helper_dir {
+            for e in fs::read_dir(dir)? {
+                helpers.push(e?.path());
+            }
+        }
+        let native = format!("vantry-remote-helper{exe}");
+        let prebuilt = root
+            .join("resources")
+            .join(&platform)
+            .join("remote-desktop")
+            .join(&native);
+        if kind == Kind::Desktop
+            && prebuilt.is_file()
+            && !helpers
+                .iter()
+                .any(|h| h.file_name() == prebuilt.file_name())
+        {
+            helpers.push(prebuilt);
+        }
+        for path in helpers {
+            verify_executable(&path, &p)?;
+            let name = path.file_name().context("missing helper name")?;
+            let dir = if name == native.as_str() {
+                resources.join("remote-desktop")
+            } else if mac {
+                "Contents/Helpers".into()
+            } else {
+                "helpers".into()
+            };
+            bundle.copy(
+                &path,
+                &dir.join(name),
+                "helpers",
+                &format!("platform helper ({platform}): {}", path.display()),
+            )?;
+        }
+    }
+    if mac {
+        fs::write(
+            bundle.root.join("Contents/Info.plist"),
+            PLIST.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+        )?;
+        bundle.generated("Contents/Info.plist", "xtask bundle metadata")?;
+        let rel = "Contents/Resources/Vantry.icns";
+        crate::icon::icns(
+            &image::open(root.join("resources/icon.png"))?.to_rgba8(),
+            &bundle.root.join(rel),
+        )?;
+        bundle.generated(rel, "xtask from resources/icon.png")?;
+        // The existing macOS release profile uses an ad-hoc identity. Sign the
+        // copied bundle before archiving so the offline codesign check succeeds.
+        ensure!(
+            cfg!(target_os = "macos"),
+            "assembling a signed .app requires macOS"
+        );
+        let status = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&bundle.root)
+            .status()?;
+        ensure!(status.success(), "could not sign macOS bundle");
+        bundle.generated(
+            "Contents/_CodeSignature/CodeResources",
+            "macOS codesign bundle resources",
+        )?;
+        for entry in &mut bundle.files {
+            entry.bytes = bundle.root.join(&entry.path).metadata()?.len();
+        }
+    }
+    bundle.files.sort_by(|a, b| a.path.cmp(&b.path));
+    let ext = if p.os == "linux" { "tar.gz" } else { "zip" };
+    let archive = format!("{slug}-{}-{platform}.{ext}", env!("CARGO_PKG_VERSION"));
+    let bytes = bundle.archive(stage.path(), &archive)?;
+    if mac && p.arch == "arm64" {
+        fs::hard_link(
+            stage.path().join(&archive),
+            stage.path().join("Vantry-macos-arm64.zip"),
+        )?;
+    }
+    let mut components = BTreeMap::from([
+        ("desktop", 0),
+        ("service", 0),
+        ("relay", 0),
+        ("helpers", 0),
+        ("resources", 0),
+        ("licenses", 0),
+    ]);
+    for e in &bundle.files {
+        *components.get_mut(e.component).unwrap() += e.bytes;
+    }
+    let report = Report {
+        target: &target,
+        profile: &o.profile,
+        product: kind,
+        files: &bundle.files,
+        installed_bytes: components.values().sum(),
+        component_bytes: components,
+        archive,
+        archive_bytes: bytes,
+        zip_bytes: (ext == "zip").then_some(bytes),
+        budget_bytes: 25_000_000,
+        within_budget: bytes <= 25_000_000,
+    };
+    let data = serde_json::to_vec_pretty(&report)?;
+    for name in ["package-report.json", "size-report.json"] {
+        fs::write(stage.path().join(name), &data)?;
+    }
+    fs::write(
+        stage.path().join("provenance.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"target":target,"product":kind,"profile":o.profile,"files":bundle.files}),
+        )?,
+    )?;
+    fs::rename(stage.path(), &out)
+        .with_context(|| format!("publish to {} (choose an empty destination)", out.display()))?;
     println!("{:<16} {:>14}", "Component", "Bytes");
     for (name, bytes) in report.component_bytes {
         println!("{name:<16} {bytes:>14}");
     }
     println!(
-        "{:<16} {:>14}\n{:<16} {:>14}\n{}",
+        "{:<16} {:>14}\n{:<16} {:>14}\n{:<16} {:>14} ({})\n{}",
         "Installed",
         report.installed_bytes,
-        "ZIP",
-        report.zip_bytes,
+        ext,
+        bytes,
+        "Budget",
+        report.budget_bytes,
+        if report.within_budget {
+            "within budget"
+        } else {
+            "over budget"
+        },
         out.display()
     );
     Ok(())
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn package_includes_arm64_executables_licenses_icon_and_size_report() -> Result<()> {
-    let path = std::env::temp_dir().join(format!(
-        "vantry-xtask-test-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    ));
-    let out = path.join("package");
-    let fixture = std::env::current_exe()?;
-    let helper_name = fixture.file_name().unwrap().to_owned();
-    let result = (|| -> Result<()> {
-        run(Options {
-            target: "aarch64-apple-darwin".into(),
-            desktop: Some(fixture.clone()),
-            service: Some(fixture.clone()),
-            helper: vec![fixture],
-            out: Some(out.clone()),
-        })?;
-        let doc: serde_json::Value =
-            serde_json::from_reader(fs::File::open(out.join("package-report.json"))?)?;
-        let extracted = path.join("unpacked");
-        ensure!(
-            Command::new("/usr/bin/ditto")
-                .args(["-x", "-k"])
-                .arg(out.join("Vantry-macos-arm64.zip"))
-                .arg(&extracted)
-                .status()?
-                .success()
-        );
-        let app = extracted.join("Vantry.app");
-        let mut total = 0;
-        for file in doc["files"].as_array().unwrap() {
-            let bytes = app.join(file["path"].as_str().unwrap()).metadata()?.len();
-            assert_eq!(file["bytes"], bytes);
-            total += bytes;
-        }
-        assert_eq!(doc["installedBytes"], total);
-        assert_eq!(
-            doc["zipBytes"],
-            out.join("Vantry-macos-arm64.zip").metadata()?.len()
-        );
-        assert!(app.join("Contents/Helpers").join(helper_name).is_file());
-        for p in [
-            "MacOS/Vantry",
-            "MacOS/vantry-service",
-            "Resources/icon.png",
-            "Resources/LICENSE",
-            "Resources/THIRD_PARTY_NOTICES.md",
-            "Resources/third_party/licenses",
-            "Info.plist",
-        ] {
-            assert!(app.join("Contents").join(p).exists(), "{p}");
-        }
-        Ok(())
-    })();
-    fs::remove_dir_all(path)?;
-    result
 }
