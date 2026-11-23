@@ -632,7 +632,15 @@ func seedInterRun(t *testing.T, c *Core, thread, commandID, input, output, reaso
 	cmd.SenderThreadID = "source-session"
 	receipt := dispatchOrFail(t, c, cmd)
 	if err := c.write(context.Background(), func(tx *txn) error {
-		if _, err := tx.exec(`UPDATE runs SET status = 'completed', active_attempt_id = '', output = ?, reasoning = ?, updated_at = ? WHERE id = ?`, output, reasoning, nowNanos(), receipt.RunID); err != nil {
+		var maxCreated int64
+		if err := tx.tx.QueryRowContext(tx.ctx, `SELECT COALESCE(MAX(created_at), 0) FROM runs WHERE thread_id = ? AND id != ?`, thread, receipt.RunID).Scan(&maxCreated); err != nil {
+			return err
+		}
+		stamp := nowNanos()
+		if stamp <= maxCreated {
+			stamp = maxCreated + 1
+		}
+		if _, err := tx.exec(`UPDATE runs SET status = 'completed', active_attempt_id = '', output = ?, reasoning = ?, created_at = ?, updated_at = ? WHERE id = ?`, output, reasoning, stamp, stamp, receipt.RunID); err != nil {
 			return err
 		}
 		if _, err := tx.exec(`UPDATE attempts SET status = 'completed' WHERE run_id = ?`, receipt.RunID); err != nil {

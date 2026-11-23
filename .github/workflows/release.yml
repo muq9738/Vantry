@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   darwin-arm64:
-    runs-on: macos-15
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -163,8 +163,13 @@ jobs:
           (cd staging && sha256sum * > SHA256SUMS.txt)
           cat staging/SHA256SUMS.txt
 
-          cat > release-notes.md <<EOF
-          Vantry ${VERSION} desktop release.
+          python3 - "$VERSION" <<'PY'
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          checksums = Path("staging/SHA256SUMS.txt").read_text(encoding="utf-8").strip()
+          notes = f"""Vantry {version} desktop release.
 
           ### Highlights
           - Fix external Pi upgrade button visibility when already on the latest version
@@ -174,14 +179,17 @@ jobs:
           - Redesign active-turn follow-up (steer) bubbles and fix ghost steer entries leaking into legacy queue UI
           - Surface workspace directory lock waiting state with the holding thread title instead of appearing hung
           - Enhance right-side subagent panel with live tab switcher, quick launch, and slash command entry
-          - Simplify MCP panel to align with external Pi (mcp.json + default codemode) and Codex/T3 Code interactions
+          - Simplify MCP panel to align with external Pi (`mcp.json` + default `codemode`) and Codex/T3 Code interactions
           - Redesign Git workflow with an IDEA-style branch popover (search, recent/local/remote folder tree, branch submenus for checkout/update/merge/rebase/compare/rename/delete), branch compare view, and streamlined Git drawer
 
           ### SHA-256 Checksums
-          \`\`\`
-          $(cat staging/SHA256SUMS.txt)
-          \`\`\`
-          EOF
+          ```
+          {checksums}
+          ```
+          """
+          cleaned = "\n".join(line[10:] if line.startswith("          ") else line for line in notes.splitlines()) + "\n"
+          Path("release-notes.md").write_text(cleaned, encoding="utf-8")
+          PY
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" staging/* --clobber
