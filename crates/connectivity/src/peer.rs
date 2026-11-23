@@ -1,0 +1,589 @@
+//! Device-side relay registration, TLS routing and authenticated Core proxy.
+use crate::{
+    identity::{Configuration, IdentityStore, Pair, client_tls},
+    pairing::token,
+    relay::{Open, Rate},
+    transport::{
+        self, HandshakeStatus, Heartbeat, Stream, Tasks, byte_stream, relay_url, send, websocket,
+    },
+    web::*,
+};
+use anyhow::{Result, anyhow, bail, ensure};
+use bytes::Bytes;
+use futures::{StreamExt, stream::FuturesUnordered};
+use http::{Method, Request, Uri};
+use http_body_util::{BodyExt, Limited};
+use hyper::{body::Incoming, service::service_fn};
+use hyper_util::rt::TokioIo;
+use rand::Rng;
+use rustls::pki_types::ServerName;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    io::DuplexStream,
+    net::{TcpListener, TcpStream},
+    sync::{Semaphore, watch},
+    time::{Instant, timeout},
+};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
+fn private_http() -> bool {
+    std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1")
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostState {
+    Connecting,
+    Online,
+    Denied,
+    Conflict,
+    Reconnecting,
+    Stopped,
+}
+pub struct HostConfig {
+    pub relay: String,
+    pub route: String,
+    pub key: String,
+    pub instance: String,
+    /// Local authenticated TLS gateway. Never point this at an unprotected Core endpoint.
+    pub gateway: SocketAddr,
+    pub t3: Option<SocketAddr>,
+}
+impl HostConfig {
+    pub async fn run(self, state: watch::Sender<HostState>, stop: CancellationToken) -> Result<()> {
+        let base = relay_url(&self.relay, private_http())?;
+        let client = transport::http_client()?;
+        let instance = if self.instance.is_empty() {
+            token()
+        } else {
+            self.instance.clone()
+        };
+        let tasks = Tasks::new(stop.child_token());
+        let slots = Arc::new(Semaphore::new(128));
+        let mut delay = 500;
+        state.send_replace(HostState::Connecting);
+        loop {
+            let query = [
+                ("route", self.route.as_str()),
+                ("instance", instance.as_str()),
+            ];
+            let dial = websocket(&client, &base, "/relay/host", &query, Some(&self.key), 4096);
+            let result = tokio::select! {_=stop.cancelled()=>break,r=dial=>r};
+            match result {
+                Ok(mut ws) => {
+                    let start = Instant::now();
+                    state.send_replace(HostState::Online);
+                    let mut heartbeat = Heartbeat::new();
+                    loop {
+                        let frame = tokio::select! {_=stop.cancelled()=>break,t=heartbeat.tick()=>{if t.is_err()||send(&mut ws,Message::Ping(Bytes::new())).await.is_err(){break}continue},f=ws.next()=>f};
+                        let Some(Ok(frame)) = frame else { break };
+                        heartbeat.activity();
+                        if let Message::Ping(b) = frame {
+                            if send(&mut ws, Message::Pong(b)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if frame.is_close() {
+                            break;
+                        }
+                        if !frame.is_text() && !frame.is_binary() {
+                            continue;
+                        }
+                        let Ok(open) = serde_json::from_slice::<Open>(&frame.into_data()) else {
+                            break;
+                        };
+                        let target = match open.channel.as_str() {
+                            "core" | "stream" => Some(self.gateway),
+                            "http" | "t3" => self.t3,
+                            _ => None,
+                        };
+                        let Some(target) = target else { continue };
+                        let Ok(permit) = slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        let (base, client, route, key) = (
+                            base.clone(),
+                            client.clone(),
+                            self.route.clone(),
+                            self.key.clone(),
+                        );
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            let setup = async {
+                                let socket = TcpStream::connect(target).await?;
+                                let ws = websocket(
+                                    &client,
+                                    &base,
+                                    "/relay/attach",
+                                    &[("route", &route), ("id", &open.id)],
+                                    Some(&key),
+                                    1 << 20,
+                                )
+                                .await?;
+                                Ok::<_, anyhow::Error>((socket, ws))
+                            };
+                            if let Ok(Ok((socket, ws))) =
+                                timeout(Duration::from_secs(15), setup).await
+                            {
+                                let _ = transport::bridge(ws, socket).await;
+                            }
+                        });
+                    }
+                    if start.elapsed() >= Duration::from_secs(30) {
+                        delay = 500
+                    }
+                    state.send_replace(HostState::Reconnecting);
+                }
+                Err(e) => {
+                    match e.downcast_ref::<HandshakeStatus>().map(|e| e.0) {
+                        Some(401 | 403) => {
+                            state.send_replace(HostState::Denied);
+                            tasks.close().await;
+                            return Ok(());
+                        }
+                        Some(409) => state.send_replace(HostState::Conflict),
+                        _ => state.send_replace(HostState::Reconnecting),
+                    };
+                }
+            }
+            let wait = rand::thread_rng().gen_range(delay * 3 / 4..=delay * 5 / 4);
+            tokio::select! {_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(wait))=>{}}
+            delay = (delay * 2).min(15000);
+        }
+        tasks.close().await;
+        state.send_replace(HostState::Stopped);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub enum Route {
+    Auto,
+    Direct,
+    Relay,
+    /// An OpenSSH host alias and the remote authenticated gateway's host:port.
+    Ssh {
+        alias: String,
+        address: String,
+    },
+}
+async fn ssh(alias: &str, address: &str, tasks: &Tasks) -> Result<DuplexStream> {
+    use std::process::Stdio;
+    ensure!(
+        !alias.is_empty()
+            && !alias.starts_with('-')
+            && alias
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b)),
+        "invalid SSH host"
+    );
+    let a: http::uri::Authority = address.parse().map_err(|_| anyhow!("invalid SSH target"))?;
+    ensure!(
+        a.port_u16().is_some() && !address.contains('@'),
+        "invalid SSH target"
+    );
+    let mut child = tokio::process::Command::new("ssh")
+        .args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-W",
+            address,
+            "--",
+            alias,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (a, b) = tokio::io::duplex(64 << 10);
+    let (mut r, mut w) = tokio::io::split(b);
+    let stop = tasks.stop.clone();
+    tasks.owned(async move{tokio::select!{_=stop.cancelled()=>{},_=tokio::io::copy(&mut r,&mut stdin)=>{},_=tokio::io::copy(&mut stdout,&mut w)=>{}}let _=child.kill().await;let _=child.wait().await;});
+    Ok(a)
+}
+pub struct PeerConnection {
+    pub mode: &'static str,
+    pub handshake: Duration,
+    stream: Stream,
+    tasks: Tasks,
+    secret: String,
+}
+impl PeerConnection {
+    pub async fn connect(
+        pair: &Pair,
+        identity: Option<&Configuration>,
+        route: Route,
+        stop: CancellationToken,
+    ) -> Result<Self> {
+        let tls = TlsConnector::from(client_tls(pair, identity)?);
+        let tasks = Tasks::new(stop.child_token());
+        let client = transport::http_client()?;
+        let start = Instant::now();
+        let candidates = async {
+            let mut attempts = FuturesUnordered::new();
+            let mut targets = Vec::new();
+            match route {
+                Route::Ssh { alias, address } => targets.push(("ssh", address, Some(alias), 0)),
+                mode => {
+                    if !matches!(mode, Route::Relay) {
+                        for (i, v) in pair.direct.iter().take(8).enumerate() {
+                            targets.push(("direct", v.clone(), None, i as u64 * 150))
+                        }
+                    }
+                    if !matches!(mode, Route::Direct) {
+                        for (i, url) in std::iter::once(&pair.relay)
+                            .chain(&pair.relays)
+                            .filter(|s| !s.is_empty())
+                            .take(8)
+                            .enumerate()
+                        {
+                            if !targets.iter().any(|(m, v, _, _)| *m == "relay" && v == url) {
+                                targets.push((
+                                    "relay",
+                                    url.clone(),
+                                    None,
+                                    if matches!(mode, Route::Auto) && !pair.direct.is_empty() {
+                                        450
+                                    } else {
+                                        0
+                                    } + i as u64 * 150,
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            let slots = Arc::new(Semaphore::new(4));
+            for (mode, target, alias, delay) in targets {
+                let tls = tls.clone();
+                let tasks = &tasks;
+                let client = &client;
+                let slots = slots.clone();
+                attempts.push(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let _permit = if mode == "direct" {
+                        Some(slots.acquire().await?)
+                    } else {
+                        None
+                    };
+                    let dial = async {
+                        let raw: Stream = match mode {
+                            "direct" => Box::new(TcpStream::connect(target).await?),
+                            "ssh" => Box::new(ssh(&alias.unwrap(), &target, tasks).await?),
+                            _ => {
+                                let u = relay_url(&target, private_http())?;
+                                let ws = websocket(
+                                    client,
+                                    &u,
+                                    "/relay/connect",
+                                    &[("route", &pair.route)],
+                                    None,
+                                    1 << 20,
+                                )
+                                .await?;
+                                Box::new(byte_stream(ws, tasks))
+                            }
+                        };
+                        let socket = tls
+                            .connect(ServerName::try_from("vantry.remote")?, raw)
+                            .await?;
+                        Ok::<_, anyhow::Error>((mode, Box::new(socket) as Stream))
+                    };
+                    timeout(Duration::from_secs(12), dial).await?
+                });
+            }
+            while let Some(result) = attempts.next().await {
+                if result.is_ok() {
+                    return result;
+                }
+            }
+            bail!("peer unavailable or TLS authentication failed")
+        };
+        let (mode, stream) = tokio::select! {_=stop.cancelled()=>bail!("connection cancelled"),v=timeout(Duration::from_secs(15),candidates)=>v??};
+        Ok(Self {
+            mode,
+            stream,
+            tasks,
+            handshake: start.elapsed(),
+            secret: pair.secret.clone(),
+        })
+    }
+    pub async fn request(
+        self,
+        method: Method,
+        path: &str,
+        value: Option<Value>,
+    ) -> Result<hyper::Response<Incoming>> {
+        let uri: Uri = path.parse()?;
+        ensure!(
+            path.starts_with('/') && uri.authority().is_none(),
+            "invalid Core path"
+        );
+        let (req, body) = (
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "vantry.remote")
+                .header("content-type", "application/json"),
+            value.map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let req = if self.secret.is_empty() {
+            req
+        } else {
+            req.header("authorization", format!("Bearer {}", self.secret))
+        };
+        let (mut tx, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(self.stream)).await?;
+        self.tasks.spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        Ok(tx.send_request(req.body(full(body.into()))?).await?)
+    }
+    pub async fn get_json(self, path: &str) -> Result<Value> {
+        let res = self.request(Method::GET, path, None).await?;
+        ensure!(
+            res.status().is_success(),
+            "Core rejected request (HTTP {})",
+            res.status()
+        );
+        Ok(serde_json::from_slice(
+            &Limited::new(res.into_body(), 1 << 20)
+                .collect()
+                .await
+                .map_err(|_| anyhow!("invalid Core response body"))?
+                .to_bytes(),
+        )?)
+    }
+    pub async fn check_update(self) -> Result<Value> {
+        let response = self
+            .request(
+                Method::POST,
+                "/v1/workbench",
+                Some(json!({"action":"update.check"})),
+            )
+            .await?;
+        ensure!(response.status().is_success(), "peer update query failed");
+        let body = Limited::new(response.into_body(), 1 << 20)
+            .collect()
+            .await
+            .map_err(|_| anyhow!("invalid update response"))?;
+        Ok(serde_json::from_slice(&body.to_bytes())?)
+    }
+    pub async fn version(self) -> Result<Value> {
+        self.get_json("/v1/status").await
+    }
+    pub async fn health(self) -> Result<Value> {
+        self.get_json("/v1/health").await
+    }
+}
+pub async fn redeem(
+    bootstrap: &Pair,
+    local: &IdentityStore,
+    name: &str,
+    route: Route,
+    stop: CancellationToken,
+) -> Result<String> {
+    bootstrap.validate(private_http())?;
+    ensure!(bootstrap.v == 2, "expected pairing invitation");
+    let c = PeerConnection::connect(bootstrap, None, route, stop).await?;
+    let res=c.request(Method::POST,"/pairings/redeem",Some(json!({"code":bootstrap.code,"name":name,"scope":"session","certificate":local.snapshot().host.certificate}))).await?;
+    ensure!(res.status() == 200, "device rejected pairing");
+    let v: Value = serde_json::from_slice(
+        &Limited::new(res.into_body(), 32 << 10)
+            .collect()
+            .await
+            .map_err(|_| anyhow!("invalid pairing response body"))?
+            .to_bytes(),
+    )?;
+    let p: Pair = serde_json::from_value(v["payload"].clone())
+        .map_err(|_| anyhow!("invalid pairing response"))?;
+    ensure!(
+        p.v == 1
+            && p.route == bootstrap.route
+            && (bootstrap.device_id.is_empty() || bootstrap.device_id == p.device_id)
+            && (p.certificate == bootstrap.certificate
+                || p.certificate == bootstrap.next_certificate),
+        "peer identity changed"
+    );
+    local.save_peer(p)
+}
+
+#[cfg(unix)]
+pub async fn serve_gateway(
+    listener: TcpListener,
+    identity: Arc<IdentityStore>,
+    core: PathBuf,
+    mtls: bool,
+    stop: CancellationToken,
+) -> Result<()> {
+    serve_gateway_with_t3(listener, identity, core, mtls, None, stop).await
+}
+/// The optional loopback T3 adapter enforces its own device and WebSocket ticket authentication.
+#[cfg(unix)]
+pub async fn serve_gateway_with_t3(
+    listener: TcpListener,
+    identity: Arc<IdentityStore>,
+    core: PathBuf,
+    mtls: bool,
+    t3: Option<SocketAddr>,
+    stop: CancellationToken,
+) -> Result<()> {
+    ensure!(
+        t3.is_none_or(|a| a.ip().is_loopback()),
+        "T3 backend must be local"
+    );
+    let tasks = Tasks::new(stop.clone());
+    let rates = Arc::new(Mutex::new(Rate::default()));
+    let result = loop {
+        let accepted = tokio::select! {_=stop.cancelled()=>break Ok(()),v=listener.accept()=>v};
+        let (socket, peer) = match accepted {
+            Ok(v) => v,
+            Err(e) => break Err(e.into()),
+        };
+        let (identity, core, rates, group) =
+            (identity.clone(), core.clone(), rates.clone(), tasks.clone());
+        tasks.spawn(async move {
+            let Ok(cfg) = identity.snapshot().server_tls(mtls) else {
+                return;
+            };
+            let Ok(Ok(tls)) = timeout(
+                Duration::from_secs(10),
+                TlsAcceptor::from(cfg).accept(socket),
+            )
+            .await
+            else {
+                return;
+            };
+            let handler = service_fn(move |req: Request<Incoming>| {
+                let (identity, core, rates, group) =
+                    (identity.clone(), core.clone(), rates.clone(), group.clone());
+                async move {
+                    Ok::<_, Infallible>(
+                        gateway_request(req, identity, core, t3, peer, rates, group)
+                            .await
+                            .unwrap_or_else(error),
+                    )
+                }
+            });
+            let _ = http_server()
+                .serve_connection_with_upgrades(TokioIo::new(tls), handler)
+                .await;
+        });
+    };
+    tasks.close().await;
+    result
+}
+#[cfg(unix)]
+async fn gateway_request(
+    mut req: Request<Incoming>,
+    identity: Arc<IdentityStore>,
+    core: PathBuf,
+    t3: Option<SocketAddr>,
+    peer: SocketAddr,
+    rates: Arc<Mutex<Rate>>,
+    group: Tasks,
+) -> Result<Reply, u16> {
+    let path = req.uri().path().to_owned();
+    if path.contains('%')
+        || path.contains('\\')
+        || path.contains("//")
+        || path.split('/').any(|s| s == ".." || s == ".")
+    {
+        return Err(400);
+    }
+    if let Some(address) = t3
+        && (path.starts_with("/api/")
+            || matches!(
+                path.as_str(),
+                "/.well-known/t3/environment" | "/oauth/token" | "/ws"
+            ))
+    {
+        let io = TcpStream::connect(address).await.map_err(|_| 502u16)?;
+        return proxy(
+            req.map(|b| b.map_err(Into::into).boxed_unsync()),
+            Box::new(io),
+            &group,
+        )
+        .await
+        .map_err(|_| 502);
+    }
+    if path == "/pairings/redeem" {
+        if req.method() != Method::POST {
+            return Err(405);
+        }
+        if !rates.lock().unwrap().allow(peer.ip(), 20) {
+            return Err(429);
+        }
+        #[derive(Deserialize)]
+        #[serde(default)]
+        #[derive(Default)]
+        struct Input {
+            code: String,
+            name: String,
+            scope: String,
+            certificate: String,
+        }
+        let v: Input = decode(req).await?;
+        if !v.scope.is_empty() && v.scope != "session" {
+            return Err(400);
+        }
+        return identity
+            .redeem(&v.code, &v.name, &v.certificate)
+            .map(|v| json(200, v))
+            .map_err(|_| 400);
+    }
+    let revoke = identity.authorize(bearer(req.headers())).ok_or(401u16)?;
+    if path.starts_with("/v1/admin/") || path == "/v1/admin" {
+        return Err(403);
+    }
+    if path == "/v1/access/identity" && req.method() == Method::GET {
+        return Ok(json(200, identity.public_identity()));
+    }
+    req.headers_mut().remove("authorization");
+    let request = if path == "/v1/workbench" {
+        let (parts, b) = req.into_parts();
+        let data = Limited::new(b, 16 << 20)
+            .collect()
+            .await
+            .map_err(|_| 413u16)?
+            .to_bytes();
+        let command: Value = serde_json::from_slice(&data).map_err(|_| 400u16)?;
+        let mut actions = command
+            .as_object()
+            .ok_or(400u16)?
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("action"));
+        let action = actions.next().and_then(|(_, v)| v.as_str()).ok_or(400u16)?;
+        if actions.next().is_some() {
+            return Err(400);
+        }
+        if action.starts_with("rd.") || action.starts_with("plugins.") {
+            return Err(403);
+        }
+        Request::from_parts(parts, full(data))
+    } else {
+        req.map(|b| b.map_err(Into::into).boxed_unsync())
+    };
+    let io = tokio::net::UnixStream::connect(core)
+        .await
+        .map_err(|_| 502u16)?;
+    let (a, mut b) = tokio::io::duplex(64 << 10);
+    group.spawn(async move{let mut io=io;tokio::select!{_=revoke.cancelled()=>{},_=tokio::io::copy_bidirectional(&mut b,&mut io)=>{}}});
+    proxy(request, Box::new(a), &group).await.map_err(|_| 502)
+}

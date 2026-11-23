@@ -36,6 +36,4 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 vantry-protocol.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
