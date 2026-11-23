@@ -1,0 +1,294 @@
+use anyhow::{Context, Result, ensure};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+use tokio::time::{Instant, sleep};
+use vantry_core::{
+    DurableProvider, ProviderError,
+    runner::{Emit, ProviderResult, StartMode},
+};
+use vantry_pi_runtime::{
+    ControlledStep, ControlledTestProvider, JobEvents, JobRequest, JournalCursor, MagpieSelection,
+};
+use vantry_platform::{hostfs, workspace};
+use vantry_protocol::{ControlResponse, ProviderRequest, WorkspaceSpec};
+
+pub struct Provider {
+    pub data: PathBuf,
+    pub default_provider: String,
+    pub model: String,
+    pub magpie: Option<PathBuf>,
+    pub delay: Duration,
+}
+fn failed(e: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Failed(e.to_string())
+}
+fn interrupted(e: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Interrupted(e.to_string())
+}
+impl Provider {
+    fn directory(&self, request: &ProviderRequest) -> Result<PathBuf> {
+        let id = &request.attempt_id;
+        ensure!(
+            !id.is_empty()
+                && !matches!(id.as_str(), "." | "..")
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+            "invalid attempt id"
+        );
+        Ok(self.data.join("jobs").join(id))
+    }
+    async fn submit(&self, mut request: ProviderRequest) -> Result<()> {
+        if request.provider_id.is_empty() {
+            request.provider_id.clone_from(&self.default_provider);
+        }
+        ensure!(
+            matches!(request.provider_id.as_str(), "controlled" | "pi"),
+            "unknown provider"
+        );
+        let controlled = request.provider_id == "controlled";
+        let selected = if request.model.is_empty() {
+            &self.model
+        } else {
+            &request.model
+        };
+        let expected_model = if controlled {
+            String::new()
+        } else {
+            let selection = self
+                .magpie
+                .as_ref()
+                .map(|p| MagpieSelection::load(Some(p)))
+                .transpose()?;
+            let model = vantry_pi_runtime::resolve_model_catalog(
+                &vantry_pi_runtime::agent_dir(),
+                Some(selected),
+                selection.as_ref(),
+            )
+            .await?;
+            ensure!(!model.selected_model.is_empty(), "no Pi model configured");
+            request.model.clone_from(&model.selected_model);
+            model.selected_model
+        };
+        request.workspace = Some(match request.workspace.take() {
+            Some(spec) => workspace::prepare(&self.data, &request.thread_id, spec)?,
+            None => WorkspaceSpec {
+                kind: "directory".into(),
+                path: workspace::chat_directory(&self.data, &request.thread_id, true)?
+                    .display()
+                    .to_string(),
+                ..Default::default()
+            },
+        });
+        let exe = std::env::current_exe()?;
+        let job = JobRequest {
+            data_dir: self.data.clone(),
+            socket_path: self.data.join("core.sock"),
+            default_model: self.model.clone(),
+            expected_model,
+            executable: exe.clone(),
+            interaction_mode: request.interaction_mode.clone(),
+            request,
+            enable_native_subagents: false,
+            enable_user_extensions: true,
+            enable_user_mcp: true,
+            sandbox_mode: String::new(),
+        };
+        let dir = if controlled {
+            let pause = ControlledStep::Delay {
+                millis: self.delay.as_millis().try_into()?,
+            };
+            let mut steps = vec![
+                ControlledStep::Thinking {
+                    delta: "正在处理消息".into(),
+                },
+                pause.clone(),
+                ControlledStep::Tool {
+                    name: "echo".into(),
+                    id: "echo-1".into(),
+                    arguments: serde_json::json!({}),
+                    result: serde_json::json!({"ok":true}),
+                },
+            ];
+            for chunk in format!(
+                "这是 Vantry 的本机受控 Provider。\n\n已收到：{}\n\n任务已完成。",
+                job.request.message
+            )
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(12)
+            {
+                steps.extend([
+                    pause.clone(),
+                    ControlledStep::Text {
+                        delta: chunk.iter().collect(),
+                    },
+                ]);
+            }
+            ControlledTestProvider { steps }.prepare(&job)?
+        } else {
+            vantry_pi_runtime::prepare_job(&job)?
+        };
+        let mut child = tokio::process::Command::new(exe)
+            .args(["provider-worker", "--job-dir"])
+            .arg(dir)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        Ok(())
+    }
+}
+fn live(dir: &Path) -> Result<bool> {
+    let file = File::open(dir.join("worker.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Outcome {
+    attempt_id: String,
+    status: String,
+    last_sequence: i64,
+    #[serde(default)]
+    error: String,
+}
+
+#[async_trait::async_trait]
+impl DurableProvider for Provider {
+    async fn run_events(
+        &self,
+        request: ProviderRequest,
+        mode: StartMode,
+        emit: Emit,
+    ) -> ProviderResult {
+        let dir = self.directory(&request).map_err(failed)?;
+        let after = request.after_sequence;
+        if mode == StartMode::Submit {
+            self.submit(request.clone()).await.map_err(failed)?;
+        }
+        let start = Instant::now();
+        let checkpoint = dir.join("observer-cursor.json");
+        let mut reader: Option<JobEvents> = None;
+        loop {
+            // Inspect the terminal marker before draining. The worker syncs all events first.
+            let outcome: Option<Outcome> = if dir.join("result.json").is_file() {
+                Some(
+                    serde_json::from_reader(
+                        File::open(dir.join("result.json")).map_err(interrupted)?,
+                    )
+                    .map_err(interrupted)?,
+                )
+            } else {
+                None
+            };
+            if reader.is_none() && dir.join("events.jsonl").is_file() {
+                let cursor = File::open(&checkpoint)
+                    .ok()
+                    .and_then(|f| serde_json::from_reader::<_, JournalCursor>(f).ok())
+                    .filter(|c| c.sequence == after);
+                reader = Some(
+                    match cursor {
+                        Some(c) => {
+                            JobEvents::resume(&dir, c).or_else(|_| JobEvents::open(&dir, after))
+                        }
+                        None => JobEvents::open(&dir, after),
+                    }
+                    .map_err(interrupted)?,
+                );
+            }
+            if let Some(reader) = reader.as_mut() {
+                let before = reader.cursor();
+                while let Some(event) = reader.next_event().map_err(interrupted)? {
+                    emit(event).map_err(|error| match error.code() {
+                        vantry_protocol::ErrorCode::Conflict
+                        | vantry_protocol::ErrorCode::NotReady => ProviderError::Detached,
+                        _ => interrupted(error),
+                    })?;
+                }
+                if reader.cursor() != before {
+                    // SQLite's committed sequence is authoritative. An offset only accelerates Attach.
+                    if let Err(error) = hostfs::atomic_write(
+                        &checkpoint,
+                        &serde_json::to_vec(&reader.checkpoint()).map_err(failed)?,
+                    ) {
+                        tracing::warn!(%error, "could not save journal byte offset");
+                    }
+                }
+            }
+            if let Some(end) = outcome {
+                if end.attempt_id != request.attempt_id
+                    || reader.as_ref().map(JobEvents::cursor) != Some(end.last_sequence)
+                {
+                    return Err(interrupted("inconsistent worker outcome"));
+                }
+                return match end.status.as_str() {
+                    "completed" => Ok(()),
+                    "cancelled" => Err(ProviderError::ExecutionCancelled),
+                    "failed" => Err(failed(end.error)),
+                    _ => Err(interrupted(end.error)),
+                };
+            }
+            if start.elapsed() > Duration::from_secs(3)
+                && !live(&dir).map_err(interrupted)?
+                && !dir.join("result.json").is_file()
+            {
+                return Err(interrupted("worker exited without a durable result"));
+            }
+            sleep(Duration::from_millis(15)).await;
+        }
+    }
+    async fn recoverable(&self, request: &ProviderRequest) -> bool {
+        let Ok(dir) = self.directory(request) else {
+            return false;
+        };
+        let job = File::open(dir.join("request.json"))
+            .ok()
+            .and_then(|f| serde_json::from_reader::<_, JobRequest>(f).ok());
+        job.is_some_and(|j| {
+            j.request.attempt_id == request.attempt_id
+                && j.request.thread_id == request.thread_id
+                && j.request.run_id == request.run_id
+                && j.data_dir == self.data
+        }) && (dir.join("result.json").exists()
+            || dir.join("events.jsonl").is_file()
+            || live(&dir).unwrap_or(false)
+            || !dir.join("worker.json").exists())
+    }
+    async fn stop(&self, request: &ProviderRequest) -> ProviderResult {
+        let dir = self.directory(request).map_err(failed)?;
+        if !dir.join("request.json").try_exists().map_err(failed)? {
+            // Cancellation can commit before the submission task publishes request.json.
+            // A worker starting later checks this intent before sending its initial prompt.
+            let intent = serde_json::json!({"attemptId":request.attempt_id,"runId":request.run_id,"threadId":request.thread_id,"updatedAt":chrono::Utc::now()});
+            hostfs::atomic_write(
+                &dir.join("stop.json"),
+                &serde_json::to_vec(&intent).map_err(failed)?,
+            )
+            .map_err(failed)?;
+            return Ok(());
+        }
+        vantry_pi_runtime::request_stop(&dir)
+            .context("stop provider worker")
+            .map_err(failed)
+    }
+    async fn control(
+        &self,
+        request: &ProviderRequest,
+        control: &ControlResponse,
+    ) -> ProviderResult {
+        vantry_pi_runtime::deliver_control(&self.directory(request).map_err(failed)?, control)
+            .map_err(failed)
+    }
+}
