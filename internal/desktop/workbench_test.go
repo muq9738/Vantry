@@ -146,7 +146,7 @@ func TestQueueSteerAndCancelUseExactCommittedIdentity(t *testing.T) {
 	if steer.Kind != api.SteerRun || steer.ThreadID != "t1" || steer.RunID != "r1" || steer.ParentAttemptID != "r1-attempt" || steer.Message != "纠正当前方向" {
 		t.Fatalf("steer lost exact identity: %+v", steer)
 	}
-	if strings.Contains(w.actionNotice.Text, "Pi 已接收") {
+	if strings.Contains(w.actionNotice.Text, "已追加到本轮") {
 		t.Fatal("accepted steer receipt must not claim Pi delivery")
 	}
 
@@ -172,13 +172,13 @@ func TestQueueSteerAndCancelUseExactCommittedIdentity(t *testing.T) {
 	w.applyEvent(workbenchEvent(6, eventInputUpdated, pending))
 	tt := ui.NewTester(w.view, 1080, 900)
 	mustClick(t, tt, "查看队列")
-	if !tt.HasText("等待 Pi 接收") || tt.HasText("Pi 已接收") {
+	if !tt.HasText("正在追加…") || tt.HasText("已追加到本轮") {
 		t.Fatalf("pending steer delivery state is wrong: %q", tt.Texts())
 	}
 	pending.Status = "delivered"
 	w.applyEvent(workbenchEvent(7, eventInputUpdated, pending))
 	tt.Frame()
-	if !tt.HasText("Pi 已接收") || tt.HasText("等待 Pi 接收") || tt.HasText("查看队列") {
+	if !tt.HasText("已追加到本轮") || tt.HasText("正在追加…") || tt.HasText("查看队列") {
 		t.Fatalf("delivered steer did not replace its pending state: %q", tt.Texts())
 	}
 }

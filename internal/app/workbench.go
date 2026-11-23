@@ -498,7 +498,7 @@ func (s *workbenchService) Workbench(ctx context.Context, request api.WorkbenchR
 		return s.gitCheckpoints(ctx, request)
 	case "git.worktree.status", "git.worktree.merge_cleanup", "git.worktree.cleanup":
 		return s.gitWorktree(ctx, request)
-	case "workspace", "git.status", "git.log", "git.commit_detail", "git.merge", "git.stage", "git.unstage", "git.commit", "git.discard", "git.hunk.stage", "git.hunk.unstage", "git.hunk.revert", "git.checkout", "git.branch.create", "git.branch.delete", "git.fetch", "git.pull", "git.push", "git.stash", "git.stash.pop", "git.stash_pop", "git.stash.drop", "git.stash_drop", "git.commit_op":
+	case "workspace", "git.status", "git.log", "git.commit_detail", "git.compare", "git.merge", "git.rebase", "git.stage", "git.unstage", "git.commit", "git.discard", "git.hunk.stage", "git.hunk.unstage", "git.hunk.revert", "git.checkout", "git.branch.create", "git.branch.delete", "git.branch.update", "git.branch.rename", "git.fetch", "git.pull", "git.push", "git.stash", "git.stash.pop", "git.stash_pop", "git.stash.drop", "git.stash_drop", "git.commit_op":
 		var (
 			path string
 			err  error
@@ -544,6 +544,15 @@ func (s *workbenchService) Workbench(ctx context.Context, request api.WorkbenchR
 			response.Output = string(raw)
 			return response, err
 		}
+		if request.Action == "git.compare" {
+			cmp, err := gitwork.CompareBranches(ctx, path, request.Branch, request.Name)
+			if err != nil {
+				return response, err
+			}
+			raw, err := json.Marshal(cmp)
+			response.Output = string(raw)
+			return response, err
+		}
 		if request.Action == "git.commit_op" && request.Message == "patch" {
 			response.Output, err = gitwork.CommitOperation(ctx, path, request.Name, request.Message, request.Input)
 			return response, err
@@ -564,6 +573,12 @@ func (s *workbenchService) Workbench(ctx context.Context, request api.WorkbenchR
 			switch request.Action {
 			case "git.merge":
 				output, err = gitwork.Merge(ctx, path, request.Branch)
+			case "git.rebase":
+				target := strings.TrimSpace(request.Name)
+				if target == "" {
+					target = strings.TrimSpace(request.Branch)
+				}
+				output, err = gitwork.RebaseBranch(ctx, path, target)
 			case "git.checkout":
 				target := strings.TrimSpace(request.Branch)
 				if target == "" {
@@ -572,6 +587,14 @@ func (s *workbenchService) Workbench(ctx context.Context, request api.WorkbenchR
 				output, err = gitwork.CheckoutBranch(ctx, path, target, false, "")
 			case "git.branch.create":
 				output, err = gitwork.CheckoutBranch(ctx, path, request.Name, true, request.Branch)
+			case "git.branch.update":
+				target := strings.TrimSpace(request.Name)
+				if target == "" {
+					target = strings.TrimSpace(request.Branch)
+				}
+				output, err = gitwork.UpdateBranch(ctx, path, target)
+			case "git.branch.rename":
+				output, err = gitwork.RenameBranch(ctx, path, request.Branch, request.Name)
 			case "git.branch.delete":
 				target := strings.TrimSpace(request.Branch)
 				if target == "" {

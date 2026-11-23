@@ -127,18 +127,7 @@ func (w *workbench) piCard(c *ui.Context, p palette) {
 						if checkBtn.Clicked() {
 							w.checkPiUpdate()
 						}
-						bannerHasUpgrade := st != nil && st.UpdateAvailable && st.CanUpgrade && st.CompatVerified
-						canDirectUpgrade := st != nil && !st.CompatBlocked && !bannerHasUpgrade &&
-							st.ActiveSource != piprovider.RuntimeSourceMissing &&
-							st.NPMAvailable && st.SystemIsNPM &&
-							(st.ActiveSource != piprovider.RuntimeSourceCustom || st.ActivePath == st.SystemPath)
-						if canDirectUpgrade {
-							upBtn := primaryAction(c, p, "settings-pi-upgrade-direct", w.tr3("升级 Pi", "Upgrade Pi", "Pi を更新"))
-							upBtn.Disabled(w.providers.upgrading || w.providers.checking)
-							if upBtn.Clicked() {
-								w.upgradePi(false)
-							}
-						} else if st != nil && !st.CompatBlocked && st.ActiveSource == piprovider.RuntimeSourceMissing && st.NPMAvailable && !(st.CanInstall && st.CompatVerified) {
+						if st != nil && !st.CompatBlocked && st.ActiveSource == piprovider.RuntimeSourceMissing && st.NPMAvailable && !(st.CanInstall && st.CompatVerified) {
 							installBtn := primaryAction(c, p, "settings-pi-install-direct", w.tr3("安装 Pi", "Install Pi", "Pi を導入"))
 							installBtn.Disabled(w.providers.upgrading || w.providers.checking)
 							if installBtn.Clicked() {

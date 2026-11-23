@@ -170,6 +170,9 @@ func TestProviderSettingsShowsVerifiedExternalPiUpgradeAndMirrorRouting(t *testi
 	if !tt.HasText("本机 Pi v1.6.0") || !strings.Contains(strings.Join(tt.Texts(), "\n"), "将外置 Pi 升级到 v1.6.0") {
 		t.Fatalf("upgraded version not reflected in UI: %v", tt.Texts())
 	}
+	if tt.HasText("升级 Pi") {
+		t.Fatalf("upgrade button must hide once Pi is already at the latest version: %v", tt.Texts())
+	}
 }
 
 func TestProviderSettingsWithholdsUnverifiedPiUpgrade(t *testing.T) {
@@ -214,28 +217,10 @@ func TestProviderSettingsWithholdsUnverifiedPiUpgrade(t *testing.T) {
 	}
 }
 
-func TestProviderSettingsShowsDirectUpgradeButtonForLocalNPMPi(t *testing.T) {
+func TestProviderSettingsHidesUpgradeButtonWhenAlreadyLatestOrUnchecked(t *testing.T) {
 	w, rec := v3Workbench(t, func(r api.WorkbenchRequest) (api.WorkbenchResponse, error) {
 		switch r.Action {
 		case "pi.status":
-			return api.WorkbenchResponse{
-				PiRuntime: &api.PiRuntimeStatus{
-					ActiveSource:  "system",
-					ActivePath:    "/Users/demo/.nvm/versions/node/v26.12.1/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-					ActiveVersion: "1.5.2",
-					SystemPath:    "/Users/demo/.nvm/versions/node/v26.12.1/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-					SystemVersion: "1.5.2",
-					SystemIsNPM:   true,
-					NPMAvailable:  true,
-					NodeVersion:   "26.12.1",
-					MirrorMode:    "auto",
-					ResolvedRoute: "国内镜像（registry.npmmirror.com）",
-					AgentDir:      "/Users/demo/.pi/agent",
-					Configured:    true,
-					ModelCount:    2,
-				},
-			}, nil
-		case "pi.upgrade":
 			return api.WorkbenchResponse{
 				PiRuntime: &api.PiRuntimeStatus{
 					ActiveSource:  "system",
@@ -246,14 +231,34 @@ func TestProviderSettingsShowsDirectUpgradeButtonForLocalNPMPi(t *testing.T) {
 					SystemIsNPM:   true,
 					NPMAvailable:  true,
 					NodeVersion:   "26.12.1",
-					LatestVersion: "1.6.0",
 					MirrorMode:    "auto",
 					ResolvedRoute: "国内镜像（registry.npmmirror.com）",
 					AgentDir:      "/Users/demo/.pi/agent",
 					Configured:    true,
 					ModelCount:    2,
 				},
-				Output: "已通过 registry.npmmirror.com 将外置 Pi 升级到 v1.6.0，并完成 Vantry 兼容验证",
+			}, nil
+		case "pi.check_update":
+			return api.WorkbenchResponse{
+				PiRuntime: &api.PiRuntimeStatus{
+					ActiveSource:    "system",
+					ActivePath:      "/Users/demo/.nvm/versions/node/v26.12.1/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+					ActiveVersion:   "1.6.0",
+					SystemPath:      "/Users/demo/.nvm/versions/node/v26.12.1/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+					SystemVersion:   "1.6.0",
+					SystemIsNPM:     true,
+					NPMAvailable:    true,
+					NodeVersion:     "26.12.1",
+					LatestVersion:   "1.6.0",
+					UpdateAvailable: false,
+					CompatVerified:  true,
+					CanUpgrade:      false,
+					MirrorMode:      "auto",
+					ResolvedRoute:   "国内镜像（registry.npmmirror.com）",
+					AgentDir:        "/Users/demo/.pi/agent",
+					Configured:      true,
+					ModelCount:      2,
+				},
 			}, nil
 		}
 		return api.WorkbenchResponse{}, nil
@@ -263,15 +268,18 @@ func TestProviderSettingsShowsDirectUpgradeButtonForLocalNPMPi(t *testing.T) {
 	tt := ui.NewTester(w.view, 1100, 900)
 	tt.Frame()
 
-	if !tt.HasText("升级 Pi") {
-		t.Fatalf("expected direct 升级 Pi button for local npm-managed Pi; texts=%v", tt.Texts())
+	if tt.HasText("升级 Pi") {
+		t.Fatalf("upgrade button must NOT appear before an update is verified available; texts=%v", tt.Texts())
 	}
-	mustClick(t, tt, "升级 Pi")
+	mustClick(t, tt, "检查更新")
 	tt.Frame()
-	if _, ok := rec.find("pi.upgrade"); !ok {
-		t.Fatal("pi.upgrade action was not dispatched from direct upgrade button")
+	if _, ok := rec.find("pi.check_update"); !ok {
+		t.Fatal("pi.check_update action was not dispatched")
 	}
-	if !tt.HasText("本机 Pi v1.6.0") {
-		t.Fatalf("upgraded version not reflected in UI: %v", tt.Texts())
+	if tt.HasText("升级 Pi") {
+		t.Fatalf("upgrade button must NOT appear when Pi is already at the latest version; texts=%v", tt.Texts())
+	}
+	if !tt.HasText("外置 Pi 已是最新兼容版本") {
+		t.Fatalf("expected up-to-date message after checking updates; texts=%v", tt.Texts())
 	}
 }

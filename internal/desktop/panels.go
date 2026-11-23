@@ -77,7 +77,7 @@ func (w *workbench) queuedView(c *ui.Context, p palette) {
 		}
 		projected := false
 		for _, input := range w.inputs {
-			if input.ID == message.ID && input.Kind == "queue" {
+			if input.ID == message.ID {
 				projected = true
 				break
 			}
@@ -90,19 +90,27 @@ func (w *workbench) queuedView(c *ui.Context, p palette) {
 		return
 	}
 	_, height := c.Size()
-	limit := float32(64)
+	limit := float32(76)
 	if height < 560 {
-		limit = 32
+		limit = 38
 	}
-	ui.Scroll(c.Key("queued-messages:" + w.selected)).Height(min(limit, float32(len(pending))*32)).Shrink(0).Children(func() {
-		for _, message := range pending {
-			ui.Row(c.Key(message.ID)).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, w.tr("待发送 · ", "Pending · ")+titleFromInstruction(message.Message)).FontSize(11).TextColor(p.muted).Grow(1).SingleLine().Ellipsis("…")
-				if ui.Button(c, w.tr("撤回", "Withdraw")).Label(w.tr("撤回 ", "Withdraw ") + message.ID).Clicked() {
-					w.taskAction("cancel-message:"+message.ID, api.Command{Kind: api.CancelMessage, ThreadID: message.ThreadID, MessageID: message.ID})
-				}
-			})
-		}
+	ui.Scroll(c.Key("queued-messages:"+w.selected)).FillWidth().MaxHeight(limit).Padding(0, 4, 6).Shrink(0).Children(func() {
+		ui.Column(c).FillWidth().Gap(4).Children(func() {
+			for _, message := range pending {
+				message := message
+				ui.Row(c.Key(message.ID)).FillWidth().Height(32).Padding(0, 6, 0, 10).Gap(8).Radius(10).
+					Background(p.raised).Border(1, p.lineSoft).AlignItems(ui.Center).Children(func() {
+					ui.Icon(c, queueIcon).FontSize(12).TextColor(p.faint).Shrink(0)
+					ui.Text(c, w.tr("待发送", "Queued")).FontSize(11).FontWeight(500).TextColor(p.faint).NoWrap().Shrink(0)
+					ui.Text(c, titleFromInstruction(message.Message)).FontSize(12).TextColor(p.ink).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+					withdraw := quietButton(c, p, "withdraw:"+message.ID, w.tr("撤回", "Withdraw")).
+						Label(w.tr("撤回 ", "Withdraw ") + message.ID).Height(22).Padding(0, 8).Radius(6).FontSize(11)
+					if withdraw.Clicked() {
+						w.taskAction("cancel-message:"+message.ID, api.Command{Kind: api.CancelMessage, ThreadID: message.ThreadID, MessageID: message.ID})
+					}
+				})
+			}
+		})
 	})
 }
 

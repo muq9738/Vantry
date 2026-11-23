@@ -13,8 +13,13 @@ import (
 type subagentPanelMemory struct {
 	open         bool
 	threadID     string
+	dismissed    bool
+	creating     bool
+	newPrompt    string
+	newWorktree  bool
 	focusPending bool
 	draftFocus   ui.Handle
+	createFocus  ui.Handle
 }
 
 func (w *workbench) subagentPanelState(key string) *subagentPanelMemory {
@@ -52,7 +57,7 @@ func (w *workbench) currentSubagentPanel() *subagentPanelMemory {
 
 func (w *workbench) subagentPanelOpen() bool {
 	st := w.currentSubagentPanel()
-	return st != nil && st.open && st.threadID != ""
+	return st != nil && st.open && (st.threadID != "" || st.creating)
 }
 
 func (w *workbench) subagentPanelShows(id string) bool {
@@ -73,11 +78,50 @@ func (w *workbench) openSubagentPanel(threadID string) {
 	}
 	st := w.subagentPanelState(key)
 	st.open = true
+	st.dismissed = false
+	st.creating = false
 	if st.threadID != threadID {
 		st.threadID = threadID
 	}
 	st.focusPending = true
 	w.saveState()
+}
+
+// openSubagentCreator opens the right-side panel with an inline task composer
+// so the user can delegate a new subagent without leaving the current chat.
+func (w *workbench) openSubagentCreator(rootID string) {
+	key := w.subagentPanelKey(rootID)
+	if key == "" {
+		return
+	}
+	st := w.subagentPanelState(key)
+	st.open = true
+	st.dismissed = false
+	st.creating = true
+	st.focusPending = true
+}
+
+// maybeAutoOpenSubagentPanel opens the right-side panel automatically when a
+// new live subagent is delegated on the active session, unless the user
+// explicitly closed the panel for this session.
+func (w *workbench) maybeAutoOpenSubagentPanel(task api.Task) {
+	if task.ChildThreadID == "" || task.Status.Terminal() {
+		return
+	}
+	rootID := w.subagentPanelKey(w.selected)
+	if rootID == "" || task.ParentThreadID != rootID {
+		return
+	}
+	st := w.subagentPanelState(rootID)
+	if st.dismissed {
+		return
+	}
+	if !st.open || (st.creating && st.threadID == "") {
+		st.open = true
+		st.creating = false
+		st.threadID = task.ChildThreadID
+		st.focusPending = false
+	}
 }
 
 func (w *workbench) closeSubagentPanel() {
@@ -86,6 +130,8 @@ func (w *workbench) closeSubagentPanel() {
 		return
 	}
 	st.open = false
+	st.creating = false
+	st.dismissed = true
 	w.widgets.composerFocus.Focus()
 	w.saveState()
 }
@@ -176,18 +222,148 @@ func (w *workbench) subagentFloatingView(c *ui.Context, p palette) {
 
 func (w *workbench) subagentPanelBody(c *ui.Context, p palette, floating bool) {
 	if !floating && c.Shortcut(0, ui.KeyEscape) {
+		if st := w.currentSubagentPanel(); st != nil && st.creating && st.threadID != "" {
+			st.creating = false
+			return
+		}
 		w.closeSubagentPanel()
 		return
 	}
 	st := w.currentSubagentPanel()
-	if st == nil || st.threadID == "" {
+	if st == nil || (st.threadID == "" && !st.creating) {
 		return
 	}
+	rootID := w.subagentPanelKey(w.selected)
 	threadID := st.threadID
 	ui.Column(c).Grow(1).MinHeight(0).Children(func() {
-		w.subagentPanelHeader(c, p, st, threadID)
-		w.subagentTranscript(c, p, threadID)
-		w.subagentComposer(c, p, st, threadID)
+		w.subagentPanelTabBar(c, p, st, rootID, threadID)
+		if st.creating {
+			w.subagentCreatorCard(c, p, st, rootID, threadID == "")
+		}
+		if threadID != "" {
+			w.subagentPanelHeader(c, p, st, threadID)
+			w.subagentTranscript(c, p, threadID)
+			w.subagentComposer(c, p, st, threadID)
+		}
+	})
+}
+
+func (w *workbench) subagentPanelTabBar(c *ui.Context, p palette, st *subagentPanelMemory, rootID, activeID string) {
+	items := w.subagentNavItems(rootID)
+	canCreate := w.canDelegateThread(rootID)
+	ui.Row(c.Key("subagent-tab-bar")).Shrink(0).Height(38).Padding(0, 8, 0, 10).Gap(6).AlignItems(ui.Center).
+		BorderWidth(0, 0, 1, 0).BorderColor(p.lineSoft).Children(func() {
+		if len(items) > 0 {
+			ui.ScrollHorizontal(c.Key("subagent-tabs")).Grow(1).MinWidth(0).Children(func() {
+				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+					for _, item := range items {
+						item := item
+						selected := !st.creating && item.threadID == activeID
+						tone := taskStatusTone(p, item.status)
+						label := stripInlineMarkdownTitle(nonEmptyString(item.title, w.tr("子代理", "Subagent")))
+						tab := ui.Button(c.Key("subagent-tab:"+item.threadID), "").Label(label).Tooltip(label).
+							Height(26).Padding(0, 8).Radius(7).Border(1, ui.Transparent).Background(ui.Transparent).TextColor(p.muted).Shrink(0)
+						if selected {
+							tab.Background(p.selected).BorderColor(p.line).TextColor(p.ink)
+						} else if tab.Hovered() {
+							tab.Background(p.rowHover).TextColor(p.ink)
+						}
+						tab.Children(func() {
+							ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+								if item.status == api.RunRunning || item.status == api.RunQueued {
+									activityIndicator(c, tone).Size(7, 7).Shrink(0)
+								} else {
+									ui.Box(c).Size(6, 6).Radius(3).Background(tone).Shrink(0)
+								}
+								ui.Text(c, label).FontSize(11.5).FontWeight(500).MaxWidth(132).SingleLine().Ellipsis("…")
+							})
+						})
+						if tab.Clicked() {
+							w.openSubagentPanel(item.threadID)
+						}
+					}
+				})
+			})
+		} else {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Grow(1).MinWidth(0).Children(func() {
+				ui.Icon(c, agentsIcon).FontSize(13).TextColor(p.accentInk)
+				ui.Text(c, w.tr("子代理", "Subagents")).FontSize(12.5).FontWeight(600).TextColor(p.ink).NoWrap()
+			})
+		}
+		if canCreate {
+			add := iconButton(c, p, "subagent-new", w.tr("派出新子代理", "New subagent"), lucide("plus")).Size(26, 26).Padding(5)
+			if st.creating {
+				add.Background(p.selected).TextColor(p.ink)
+			}
+			if add.Clicked() {
+				if st.creating && activeID != "" {
+					st.creating = false
+				} else {
+					st.creating = true
+					st.focusPending = true
+				}
+			}
+		}
+		if iconButton(c, p, "subagent-close", w.tr("关闭子代理面板", "Close subagent panel"), closeIcon).Size(26, 26).Padding(5).Clicked() {
+			w.closeSubagentPanel()
+		}
+	})
+}
+
+func (w *workbench) subagentCreatorCard(c *ui.Context, p palette, st *subagentPanelMemory, rootID string, fullPane bool) {
+	canDelegate := w.canDelegateThread(rootID)
+	hasWorkspace := false
+	if th, ok := w.threadByID(rootID); ok && th.Workspace != nil && nonEmptyString(th.Workspace.Repository, th.Workspace.Path) != "" {
+		hasWorkspace = true
+	}
+	container := ui.Column(c.Key("subagent-creator")).Padding(12).Gap(8).Background(p.soft).BorderWidth(0, 0, 1, 0).BorderColor(p.lineSoft)
+	if fullPane {
+		container.Grow(1).BorderWidth(0, 0, 0, 0).Background(p.surface)
+	} else {
+		container.Shrink(0)
+	}
+	container.Children(func() {
+		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, agentsIcon).FontSize(13).TextColor(p.accentInk)
+			ui.Text(c, w.tr("派出新子代理", "Delegate new subagent")).FontSize(12.5).FontWeight(600).TextColor(p.ink).Grow(1)
+			if !fullPane {
+				if quietButton(c, p, "subagent-create-cancel", w.tr("收起", "Hide")).Height(22).FontSize(11).Clicked() {
+					st.creating = false
+				}
+			}
+		})
+		if !canDelegate {
+			ui.Text(c, w.tr("请先在左侧发送一条消息建立会话，再派出子代理。", "Send a message in the main thread before delegating a subagent.")).FontSize(12).TextColor(p.muted).Wrap()
+			return
+		}
+		box := ui.Column(c).FillWidth().Padding(2).Radius(12).Background(p.raised).Border(1, p.line)
+		box.Children(func() {
+			field := ui.TextAreaBase(c.Key("subagent-new-prompt"), &st.newPrompt).Lines(2, 5).FillWidth().Padding(8, 10, 6).FontSize(13).LineHeight(1.45)
+			field.Placeholder(w.tr("描述子代理要独立完成的任务…", "Describe the task for the new subagent…")).Label(w.tr("新子代理任务", "New subagent task"))
+			field.Bind(&st.createFocus)
+			if st.focusPending {
+				st.focusPending = false
+				st.createFocus.Focus()
+			}
+		})
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			if hasWorkspace {
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					checkBox(c, p, "subagent-new-worktree", &st.newWorktree, w.tr("独立 Worktree 隔离", "Isolated worktree"), false)
+					ui.Text(c, w.tr("独立 Worktree", "Worktree")).FontSize(11.5).TextColor(p.muted).NoWrap()
+				})
+			}
+			ui.Spacer(c)
+			submit := primaryAction(c, p, "subagent-create-submit", w.tr("派出子代理", "Delegate"))
+			submit.Disabled(strings.TrimSpace(st.newPrompt) == "")
+			if submit.Clicked() {
+				prompt := strings.TrimSpace(st.newPrompt)
+				if w.delegateMessage(rootID, prompt, st.newWorktree) {
+					st.newPrompt = ""
+					st.creating = false
+				}
+			}
+		})
 	})
 }
 
@@ -204,65 +380,42 @@ func (w *workbench) subagentPanelHeader(c *ui.Context, p palette, st *subagentPa
 	if parent, ok := w.existingParentID(threadID); ok {
 		parentTitle = w.displayTitleFor(parent)
 	}
-	items := w.subagentNavItems(w.subagentPanelKey(threadID))
 	if live {
 		c.After(time.Second)
 	}
-	ui.Column(c.Key("subagent-header")).Shrink(0).Padding(12, 12, 10).Gap(8).
+	ui.Column(c.Key("subagent-header")).Shrink(0).Padding(10, 12, 10).Gap(7).
 		BorderWidth(0, 0, 1, 0).BorderColor(p.lineSoft).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Box(c).Size(28, 28).Shrink(0).Children(func() {
-				agentAvatar(c, p, title, 28)
-				ui.Box(c).Absolute().Right(-1).Bottom(-1).Size(9, 9).Radius(5).Background(tone).Border(1.5, p.surface)
+			ui.Box(c).Size(26, 26).Shrink(0).Children(func() {
+				agentAvatar(c, p, title, 26)
+				ui.Box(c).Absolute().Right(-1).Bottom(-1).Size(8, 8).Radius(4).Background(tone).Border(1.5, p.surface)
 			})
 			ui.Column(c).Gap(2).Grow(1).MinWidth(0).Children(func() {
-				ui.Text(c, w.tr("子代理", "Subagent")).FontSize(10.5).FontWeight(600).TextColor(p.faint).NoWrap()
-				ui.Text(c, title).FontSize(14).FontWeight(600).TextColor(p.ink).SingleLine().Ellipsis("…")
-			})
-			if iconButton(c, p, "subagent-close", w.tr("关闭子代理面板", "Close subagent panel"), closeIcon).Size(26, 26).Padding(5).Clicked() {
-				w.closeSubagentPanel()
-			}
-		})
-		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-			w.subagentStatusChip(c, p, status)
-			if model != "" {
-				ui.Text(c, model).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…").Shrink(1).MinWidth(0)
-			}
-			if elapsed > 0 {
-				ui.Text(c, spanDuration(elapsed)).FontSize(11).TextColor(p.faint).NoWrap().Shrink(0)
-			}
-		})
-		if parentTitle != "" {
-			ui.Text(c, w.tr("父会话", "Parent")+" · "+parentTitle).FontSize(11).TextColor(p.faint).SingleLine().Ellipsis("…")
-		}
-		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-			if len(items) > 1 {
-				current := title
-				switcher := quietButton(c, p, "subagent-switch", "").Label(w.tr("切换子代理", "Switch subagent")).Height(26).Padding(0, 8).Radius(8).Shrink(1).MinWidth(0)
-				switcher.Children(func() {
-					ui.Row(c).Gap(4).AlignItems(ui.Center).MinWidth(0).Children(func() {
-						ui.Text(c, current).FontSize(11.5).SingleLine().Ellipsis("…").Shrink(1).MinWidth(0)
-						ui.Icon(c, chevronIcon).FontSize(10).TextColor(p.faint).Shrink(0)
-					})
-				})
-				switcher.PopoverMenuButton(func(m *ui.Menu) {
-					for _, item := range items {
-						item := item
-						label := stripInlineMarkdownTitle(item.title)
-						if m.Item(label).Radio(item.threadID == threadID).Chosen() {
-							w.openSubagentPanel(item.threadID)
-						}
+				ui.Text(c, title).FontSize(13.5).FontWeight(600).TextColor(p.ink).SingleLine().Ellipsis("…")
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					w.subagentStatusChip(c, p, status)
+					if model != "" {
+						ui.Text(c, model).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…").Shrink(1).MinWidth(0)
 					}
-				}, ui.PopoverMenuButtonOptions{At: ui.AnchorBottomStart, Self: ui.AnchorTopStart})
+					if elapsed > 0 {
+						ui.Text(c, spanDuration(elapsed)).FontSize(11).TextColor(p.faint).NoWrap().Shrink(0)
+					}
+				})
+			})
+		})
+		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			if parentTitle != "" {
+				ui.Text(c, w.tr("父会话", "Parent")+" · "+parentTitle).FontSize(11).TextColor(p.faint).SingleLine().Ellipsis("…").Grow(1).MinWidth(0)
+			} else {
+				ui.Spacer(c)
 			}
-			ui.Spacer(c)
 			run, active := w.activeRun(threadID)
 			if active {
 				stopLabel := w.tr("停止子代理", "Stop subagent")
 				if w.stoppingRuns[run.ID] {
 					stopLabel = w.tr("正在停止", "Stopping")
 				}
-				stop := quietButton(c, p, "subagent-stop", stopLabel).Height(26).Radius(8)
+				stop := quietButton(c, p, "subagent-stop", stopLabel).Height(24).Radius(7)
 				if w.stoppingRuns[run.ID] {
 					stop.Disabled(true)
 				}
@@ -270,7 +423,7 @@ func (w *workbench) subagentPanelHeader(c *ui.Context, p palette, st *subagentPa
 					w.stopThread(threadID)
 				}
 			}
-			if quietButton(c, p, "subagent-main", w.tr("在主视图打开", "Open in main view")).Height(26).Radius(8).Clicked() {
+			if quietButton(c, p, "subagent-main", w.tr("在主视图打开", "Open in main view")).Height(24).Radius(7).Clicked() {
 				w.closeSubagentPanel()
 				w.selectThread(threadID)
 				w.widgets.composerFocus.Focus()
@@ -418,6 +571,7 @@ func (w *workbench) subagentComposer(c *ui.Context, p palette, st *subagentPanel
 				w.setDraft(threadID, draft)
 			}
 			field.OnTextKey(func(k ui.TextKey) bool { return w.composerKey(threadID, k) })
+			w.applyPendingComposerNewline(c, field, comp, threadID, &draft)
 			ui.Row(c).Padding(0, 4, 4).Gap(6).AlignItems(ui.Center).Children(func() {
 				hint := w.tr("结束后作为新的一轮", "Sends a new turn when idle")
 				if active && steer {

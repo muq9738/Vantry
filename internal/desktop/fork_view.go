@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/muq9738/Vantry/pkg/api"
 )
 
 type forkDialogState struct {
@@ -20,6 +21,41 @@ type forkDialogState struct {
 func (w *workbench) tryBuiltinSlashCommand(threadID string, comp *composer, text string) bool {
 	trimmed := strings.TrimSpace(text)
 	switch {
+	case trimmed == "/subagent" || strings.HasPrefix(trimmed, "/subagent ") || trimmed == "/delegate" || strings.HasPrefix(trimmed, "/delegate "):
+		arg := trimmed
+		if strings.HasPrefix(arg, "/subagent") {
+			arg = strings.TrimSpace(strings.TrimPrefix(arg, "/subagent"))
+		} else {
+			arg = strings.TrimSpace(strings.TrimPrefix(arg, "/delegate"))
+		}
+		comp.draft = ""
+		comp.mentions = nil
+		comp.feedback = notice{}
+		w.saveState()
+		rootID := w.subagentPanelKey(threadID)
+		if arg != "" {
+			if !w.delegateMessage(rootID, arg, false) {
+				comp.draft = text
+				comp.feedback = notice{
+					Text:  w.tr("请先发送一条消息建立会话后再派出子代理。", "Send a first message to create the thread before delegating a subagent."),
+					Level: noticeWarn,
+				}
+			}
+			return true
+		}
+		if items := w.subagentNavItems(rootID); len(items) > 0 {
+			pick := items[len(items)-1].threadID
+			for _, item := range items {
+				if item.status == api.RunRunning || item.status == api.RunQueued {
+					pick = item.threadID
+					break
+				}
+			}
+			w.openSubagentPanel(pick)
+		} else {
+			w.openSubagentCreator(rootID)
+		}
+		return true
 	case trimmed == "/fork" || strings.HasPrefix(trimmed, "/fork "):
 		arg := strings.TrimSpace(strings.TrimPrefix(trimmed, "/fork"))
 		comp.draft = ""

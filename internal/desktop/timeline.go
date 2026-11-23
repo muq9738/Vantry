@@ -291,27 +291,29 @@ func reasoningPreview(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// workGroup shows consecutive tool calls in T3 Code / Codex's WorkLog style:
-// a compact summary line when folded, and an indented vertical timeline rail
-// (never a heavy outer box) when expanded, with inline diff counts directly
-// beside each file path instead of floated to the far right edge.
+// workGroup shows consecutive tool calls in Codex / Antigravity's quiet
+// WorkLog style: collapsed by default into a single summary line (with an
+// inline live preview while running), expanding into an indented vertical
+// timeline rail only when the user opens it (or via Ctrl+O).
 func (w *workbench) workGroup(c *ui.Context, p palette, run api.Run, index int, tools []api.ToolCall, live bool) {
 	if w.widgets.workOpen == nil {
 		w.widgets.workOpen = map[string]bool{}
 	}
 	key := run.ID + ":" + strconv.Itoa(index)
 	running, failed := 0, 0
-	for _, tool := range tools {
-		switch tool.Status {
+	var activeTool *api.ToolCall
+	for i := range tools {
+		switch tools[i].Status {
 		case "running":
 			running++
+			activeTool = &tools[i]
 		case "failed", "interrupted":
 			failed++
 		}
 	}
 	open, chosen := w.widgets.workOpen[key]
 	if !chosen {
-		open = live || running > 0 || len(tools) == 1 || w.widgets.defaultToolsExpanded
+		open = len(tools) == 1 || w.widgets.defaultToolsExpanded
 	}
 	if len(tools) == 1 {
 		ui.Column(c).FillWidth().Children(func() {
@@ -329,8 +331,6 @@ func (w *workbench) workGroup(c *ui.Context, p palette, run api.Run, index int, 
 			label = w.tr("展开步骤", "Expand steps")
 		}
 		toggle := disclosureRow(c, p, "toggle-work", label, open, func(hovered bool) {
-			// Stardust step card summary: wrench/hammer glyph + human-readable
-			// sentence, subtle count tag when folded, expandable to raw calls.
 			if running > 0 {
 				activityIndicator(c, p.accent).Size(11, 11).Shrink(0)
 			} else {
@@ -345,6 +345,17 @@ func (w *workbench) workGroup(c *ui.Context, p palette, run api.Run, index int, 
 				summaryColor = p.ink
 			}
 			ui.Text(c, w.workSummary(tools)).FontSize(12.5).FontWeight(500).TextColor(summaryColor).SingleLine().Ellipsis("…").Shrink(1).MinWidth(0)
+			if !open && (live || running > 0) {
+				previewTool := activeTool
+				if previewTool == nil && len(tools) > 0 {
+					previewTool = &tools[len(tools)-1]
+				}
+				if previewTool != nil {
+					if hint := w.compactToolHint(run.ThreadID, *previewTool); hint != "" {
+						ui.Text(c, "· "+hint).FontSize(11.5).TextColor(p.faint).SingleLine().Ellipsis("…").Shrink(2).MinWidth(0)
+					}
+				}
+			}
 			if failed > 0 {
 				ui.Row(c).Height(17).Padding(0, 6).Radius(9).Background(p.danger.Alpha(0.12)).AlignItems(ui.Center).Shrink(0).Children(func() {
 					ui.Text(c, fmt.Sprintf(w.tr3("%d 失败", "%d failed", "%d 失敗"), failed)).FontSize(10.5).FontWeight(500).TextColor(p.danger).NoWrap()
@@ -359,14 +370,38 @@ func (w *workbench) workGroup(c *ui.Context, p palette, run api.Run, index int, 
 		if !open {
 			return
 		}
-		ui.Column(c).FillWidth().Padding(2, 0, 2, 10).Children(func() {
-			ui.Column(c).FillWidth().Padding(0, 0, 0, 10).Gap(1).BorderWidth(0, 0, 0, 1.5).BorderColor(p.line).Children(func() {
-				for _, tool := range tools {
-					w.toolEntry(c.Key("tool:"+tool.ID), p, run, tool)
-				}
+		renderTools := func() {
+			ui.Column(c).FillWidth().Padding(2, 0, 2, 10).Children(func() {
+				ui.Column(c).FillWidth().Padding(0, 0, 0, 10).Gap(1).BorderWidth(0, 0, 0, 1.5).BorderColor(p.line).Children(func() {
+					for _, tool := range tools {
+						w.toolEntry(c.Key("tool:"+tool.ID), p, run, tool)
+					}
+				})
 			})
-		})
+		}
+		if len(tools) > 10 {
+			ui.Scroll(c.Key("work-scroll:" + key)).FillWidth().MaxHeight(280).Children(renderTools)
+		} else {
+			renderTools()
+		}
 	})
+}
+
+func (w *workbench) compactToolHint(threadID string, tool api.ToolCall) string {
+	view := w.toolView(tool)
+	verb := strings.TrimSpace(w.toolVerb(view))
+	target := strings.TrimSpace(view.target)
+	if view.path != "" && (view.kind == toolRead || view.kind == toolEdit || view.kind == toolWrite || view.kind == toolList) {
+		target = w.relativePath(threadID, view.path)
+	}
+	switch {
+	case verb != "" && target != "":
+		return verb + " " + target
+	case target != "":
+		return target
+	default:
+		return verb
+	}
 }
 
 func (w *workbench) toolEntry(c *ui.Context, p palette, run api.Run, tool api.ToolCall) {
@@ -540,6 +575,35 @@ func (w *workbench) inlineDiff(c *ui.Context, key, path, oldText, newText string
 	})
 }
 
+// workspaceLockHolder returns another active thread currently running in the
+// exact same directory workspace, which serializes writes via LockDirectory.
+func (w *workbench) workspaceLockHolder(run api.Run) (string, string) {
+	th, ok := w.threadByID(run.ThreadID)
+	if !ok || th.Workspace == nil {
+		return "", ""
+	}
+	if th.Workspace.Kind == "worktree" {
+		return "", ""
+	}
+	dir := strings.TrimSpace(th.Workspace.Path)
+	if dir == "" {
+		return "", ""
+	}
+	for _, otherRun := range w.runs {
+		if otherRun.ID == run.ID || otherRun.ThreadID == run.ThreadID || otherRun.Status != api.RunRunning {
+			continue
+		}
+		otherThread, ok := w.threadByID(otherRun.ThreadID)
+		if !ok || otherThread.Workspace == nil || otherThread.Workspace.Kind == "worktree" {
+			continue
+		}
+		if strings.TrimSpace(otherThread.Workspace.Path) == dir {
+			return otherThread.ID, nonEmptyString(w.displayTitleFor(otherThread.ID), otherThread.ID)
+		}
+	}
+	return "", ""
+}
+
 // liveActivity is the line under a working turn: what it does now, the active
 // tool target, silence warning when a tool stalls, and a quick stop action.
 func (w *workbench) liveActivity(c *ui.Context, p palette, run api.Run, tools []api.ToolCall) {
@@ -556,6 +620,12 @@ func (w *workbench) liveActivity(c *ui.Context, p palette, run api.Run, tools []
 		label = w.tr("等待开始…", "Waiting to start…")
 	case run.Status == api.RunWaiting:
 		label = w.tr("等待子任务结果", "Waiting on subtasks")
+	case run.Telemetry != nil && run.Telemetry.Phase == "waiting_workspace":
+		label = w.tr("等待工作区释放", "Waiting for workspace")
+		if _, holderTitle := w.workspaceLockHolder(run); holderTitle != "" {
+			runningTarget = fmt.Sprintf(w.tr("「%s」正在使用同一目录", "“%s” is using this directory"), holderTitle)
+		}
+		phaseWarn = true
 	case run.Telemetry != nil && run.Telemetry.Compacting:
 		label = w.tr("正在压缩上下文…", "Compacting context…")
 		phaseWarn = true
@@ -582,6 +652,13 @@ func (w *workbench) liveActivity(c *ui.Context, p palette, run api.Run, tools []
 		}
 		if label == w.tr("正在回复", "Replying") && run.Output == "" && run.Reasoning != "" {
 			label = w.tr("正在思考", "Thinking")
+		}
+		if label == w.tr("正在回复", "Replying") && run.Output == "" && run.Reasoning == "" && len(tools) == 0 {
+			if _, holderTitle := w.workspaceLockHolder(run); holderTitle != "" {
+				label = w.tr("等待工作区释放", "Waiting for workspace")
+				runningTarget = fmt.Sprintf(w.tr("「%s」正在使用同一目录", "“%s” is using this directory"), holderTitle)
+				phaseWarn = true
+			}
 		}
 	}
 	if label == w.tr("需要你的确认", "Needs your confirmation") && !w.stoppingRuns[run.ID] {

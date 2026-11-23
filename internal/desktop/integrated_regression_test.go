@@ -79,6 +79,7 @@ func TestActiveRunDisablesMergeButAllowsRefresh(t *testing.T) {
 	w.features.gitBranches = map[string]string{"t1": "feature"}
 	tt := ui.NewTester(w.view, 1080, 700)
 	mustClick(t, tt, "分支：main") // merge lives in the branch popover, as in IDEA
+	mustClick(t, tt, "feature")
 	merge, ok := tt.Access("自动合并到当前分支")
 	if !ok || !merge.Disabled {
 		t.Fatal("merge must be disabled")

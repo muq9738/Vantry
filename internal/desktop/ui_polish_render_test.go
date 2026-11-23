@@ -119,3 +119,73 @@ func TestSentImageOpensLightbox(t *testing.T) {
 		t.Fatal("lightbox stayed open")
 	}
 }
+
+func TestIdeaGitAndMCPRender(t *testing.T) {
+	output := os.Getenv("VANTRY_DESKTOP_RENDER_DIR")
+	if output == "" {
+		t.Skip("set VANTRY_DESKTOP_RENDER_DIR")
+	}
+	if err := os.MkdirAll(output, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cleanState := &api.GitState{
+		Branch:         "release-ready",
+		RemoteBranch:   "origin/release-ready",
+		Ahead:          2,
+		Behind:         1,
+		Branches:       []string{"release-ready", "release-main", "feature/uav-share-readonlypage", "feature/review-drawingReview"},
+		RemoteBranches: []string{"origin/release-ready", "origin/release-main", "origin/feature/uav-share-readonlypage"},
+		Files:          []api.GitFile{},
+		Stashes:        []api.GitStash{{Ref: "stash@{0}", Branch: "release-ready", Message: "WIP"}},
+	}
+	compareJSON := `{"base":"release-ready","target":"release-main","aheadCommits":[{"id":"aaa1111","shortId":"aaa1111","subject":"fix: upstream map sync","author":"Alice"},{"id":"ccc3333","shortId":"ccc3333","subject":"perf: tile cache trim","author":"Eve"}],"behindCommits":[{"id":"bbb2222","shortId":"bbb2222","subject":"feat: IDEA branch widget","author":"Bob"}],"files":[{"path":"src/plugins/cesium/pvRangeHelper.ts","index":"M","worktree":" "}],"diff":"diff --git a/src/plugins/cesium/pvRangeHelper.ts b/src/plugins/cesium/pvRangeHelper.ts\n--- a/src/plugins/cesium/pvRangeHelper.ts\n+++ b/src/plugins/cesium/pvRangeHelper.ts\n@@ -1,2 +1,2 @@\n-old\n+new\n"}`
+	mcpCat := &api.MCPCatalog{
+		Workspace:       "/repo/aioutputchart",
+		UserFile:        "/Users/demo/.pi/agent/mcp.json",
+		ProjectFile:     "/repo/aioutputchart/.pi/mcp.json",
+		ProjectTrusted:  true,
+		CodemodeDefault: true,
+		Probed:          true,
+		Servers: []api.MCPServerInfo{
+			{Name: "magpie", Scope: "user", Transport: "http", Endpoint: "http://127.0.0.1:3425/mcp/magpie/hub/pi", Enabled: true, Exposure: "codemode", LiveState: "connected", Tools: []string{"web_search", "get_design_context", "search_graph"}},
+			{Name: "docs", Scope: "project", Transport: "http", Endpoint: "https://mcp.example.com/mcp", Enabled: false, Exposure: "codemode"},
+		},
+	}
+
+	w, _ := v3Workbench(t, func(r api.WorkbenchRequest) (api.WorkbenchResponse, error) {
+		switch r.Action {
+		case actionGitCompare:
+			return api.WorkbenchResponse{Output: compareJSON}, nil
+		case "mcp.list", "mcp.probe":
+			return api.WorkbenchResponse{MCP: mcpCat}, nil
+		default:
+			return api.WorkbenchResponse{Git: cleanState}, nil
+		}
+	})
+	w.threads[0].Workspace = &api.WorkspaceSpec{Kind: "directory", Path: "/repo/aioutputchart"}
+	w.features.git = map[string]*api.GitState{"t1": cleanState}
+	tt := ui.NewTesterWith(w.view, 1360, 860, ui.TesterOptions{Dark: true})
+	tt.Advance(time.Second)
+
+	// 1. IDEA Branch Popover from top-left header
+	mustClick(t, tt, "分支：release-ready")
+	tt.Frame()
+	mustClick(t, tt, "release-main")
+	tt.Frame()
+	savePNG(t, tt, output, "idea-branch-popover-dark.png")
+
+	// 2. Compare Branches tab in right Git drawer
+	mustClick(t, tt, "比较 release-main")
+	tt.Advance(time.Second)
+	savePNG(t, tt, output, "git-compare-dark.png")
+
+	// 3. Clean Git drawer (no black void)
+	mustClick(t, tt, "Git 提交页")
+	tt.Advance(time.Second)
+	savePNG(t, tt, output, "git-clean-dark.png")
+
+	// 4. Redesigned Codex/Pi MCP panel
+	mustClick(t, tt, "MCP")
+	tt.Advance(time.Second)
+	savePNG(t, tt, output, "mcp-codex-dark.png")
+}

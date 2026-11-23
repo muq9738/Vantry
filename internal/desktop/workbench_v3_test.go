@@ -402,11 +402,13 @@ func TestIdeaGitBranchPopoverChecksOutAndCreates(t *testing.T) {
 	tt := ui.NewTester(w.view, 1440, 900)
 	mustClick(t, tt, "分支：main")
 	tt.Frame()
-	for _, text := range []string{"本地分支", "远程分支", "origin/feature/dock"} {
+	for _, text := range []string{"最近", "本地分支", "远程分支", "origin/feature/dock"} {
 		if !tt.HasText(text) {
 			t.Fatalf("branch popover missing %q", text)
 		}
 	}
+	mustClick(t, tt, "feature/dock")
+	tt.Frame()
 	mustClick(t, tt, "签出 feature/dock")
 	if r, ok := service.find(actionGitCheckout); !ok || r.Branch != "feature/dock" {
 		t.Fatalf("checkout=%+v", service.requests)
@@ -421,6 +423,77 @@ func TestIdeaGitBranchPopoverChecksOutAndCreates(t *testing.T) {
 	}
 	if w.gitCreateBranch("bad name") {
 		t.Fatal("invalid branch names must not reach Core")
+	}
+}
+
+func TestIdeaGitHeaderBranchPopoverCompareUpdateAndCleanState(t *testing.T) {
+	cleanState := &api.GitState{
+		Branch:         "release-ready",
+		RemoteBranch:   "origin/release-ready",
+		Ahead:          1,
+		Behind:         0,
+		Branches:       []string{"release-ready", "release-main", "feature/uav-share"},
+		RemoteBranches: []string{"origin/release-ready", "origin/release-main"},
+		Files:          []api.GitFile{},
+		Stashes:        []api.GitStash{{Ref: "stash@{0}", Branch: "release-ready", Message: "WIP"}},
+	}
+	compareJSON := `{"base":"release-ready","target":"release-main","aheadCommits":[{"id":"aaa1111","shortId":"aaa1111","subject":"fix: upstream patch","author":"Alice"}],"behindCommits":[{"id":"bbb2222","shortId":"bbb2222","subject":"feat: ready branch","author":"Bob"}],"files":[{"path":"src/app.go","index":"M","worktree":" "}],"diff":"diff --git a/src/app.go b/src/app.go\n--- a/src/app.go\n+++ b/src/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n"}`
+	w, service := v3Workbench(t, func(r api.WorkbenchRequest) (api.WorkbenchResponse, error) {
+		switch r.Action {
+		case actionGitCompare:
+			return api.WorkbenchResponse{Output: compareJSON}, nil
+		default:
+			return api.WorkbenchResponse{Git: cleanState}, nil
+		}
+	})
+	// Attach a real workspace so the top-left IDEA header branch pill renders directly.
+	w.threads[0].Workspace = &api.WorkspaceSpec{Kind: "directory", Path: "/repo/aioutputchart"}
+	w.features.git = map[string]*api.GitState{"t1": cleanState}
+	tt := ui.NewTester(w.view, 1440, 900)
+	tt.Frame()
+
+	// 1. Top-left header renders the IDEA branch pill without needing to open the right Git drawer.
+	if w.features.panel == "git" {
+		t.Fatal("git dock should start closed")
+	}
+	mustClick(t, tt, "分支：release-ready")
+	tt.Frame()
+	for _, want := range []string{"更新项目 (Pull)…", "提交变更…", "推送…", "最近", "feature"} {
+		if !tt.HasText(want) {
+			t.Fatalf("header IDEA branch popover missing %q: %v", want, tt.Texts())
+		}
+	}
+
+	// 2. Branch row -> Update triggers git.branch.update on non-current branch.
+	mustClick(t, tt, "release-main")
+	tt.Frame()
+	mustClick(t, tt, "更新 release-main")
+	if r, ok := service.find(actionGitBranchUpdate); !ok || r.Name != "release-main" {
+		t.Fatalf("expected git.branch.update for release-main, got %+v", service.requests)
+	}
+
+	// 3. Branch row -> Compare opens the right Git drawer straight to the Compare tab.
+	mustClick(t, tt, "分支：release-ready")
+	tt.Frame()
+	mustClick(t, tt, "release-main")
+	tt.Frame()
+	mustClick(t, tt, "比较 release-main")
+	tt.Frame()
+	if w.features.panel != "git" || w.gitView.tab != 2 {
+		t.Fatalf("compare did not open Git drawer compare tab: panel=%q tab=%d", w.features.panel, w.gitView.tab)
+	}
+	if !tt.HasText("fix: upstream patch") || !tt.HasText("feat: ready branch") {
+		t.Fatalf("compare commits view missing entries: %v", tt.Texts())
+	}
+
+	// 4. Switching back to Commit tab on a clean tree shows the calm empty state (no empty diff black box).
+	mustClick(t, tt, "Git 提交页")
+	tt.Frame()
+	if !tt.HasText("工作区干净") || !tt.HasText("查看提交日志") || !tt.HasText("与其他分支比较") {
+		t.Fatalf("clean empty state missing actions: %v", tt.Texts())
+	}
+	if tt.HasText("选择文件查看差异") {
+		t.Fatalf("clean working tree should not render empty diff black box: %v", tt.Texts())
 	}
 }
 

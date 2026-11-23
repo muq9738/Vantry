@@ -201,20 +201,35 @@ func (w *workbench) gitSyncBar(c *ui.Context, p palette, state *api.GitState, co
 		for _, item := range []struct {
 			action, text, label string
 			icon                *ui.SVG
+			badge               string
+			badgeTone           ui.Color
 		}{
-			{actionGitFetch, "Fetch", w.tr3("Fetch", "Fetch", "フェッチ"), refreshIcon},
-			{actionGitPull, "Pull", w.tr3("Pull（仅快进）", "Pull (fast-forward)", "プル (Fast-forward)"), pullIcon},
-			{actionGitPush, "Push", w.tr3("Push", "Push", "プッシュ"), pushIcon},
-			{actionGitStash, "Stash", "Stash", stashIcon},
+			{actionGitFetch, "Fetch", w.tr3("Fetch", "Fetch", "フェッチ"), refreshIcon, "", p.faint},
+			{actionGitPull, "Pull", w.tr3("Pull（仅快进）", "Pull (fast-forward)", "プル (Fast-forward)"), pullIcon, func() string {
+				if state != nil && state.Behind > 0 {
+					return fmt.Sprintf("%d", state.Behind)
+				}
+				return ""
+			}(), p.warning},
+			{actionGitPush, "Push", w.tr3("Push", "Push", "プッシュ"), pushIcon, func() string {
+				if state != nil && state.Ahead > 0 {
+					return fmt.Sprintf("%d", state.Ahead)
+				}
+				return ""
+			}(), p.success},
+			{actionGitStash, "Stash", "Stash", stashIcon, "", p.faint},
 		} {
 			item := item
 			button := quietButton(c, p, item.action, "").Label(item.label).Height(24).Padding(0, padH).Radius(6)
 			button.Tooltip(item.label)
 			button.Children(func() {
-				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+				ui.Row(c).Gap(3).AlignItems(ui.Center).Children(func() {
 					ui.Icon(c, item.icon).FontSize(11.5).Shrink(0)
 					if !iconOnly {
 						ui.Text(c, item.text).FontSize(11).NoWrap()
+					}
+					if item.badge != "" {
+						ui.Text(c, item.badge).Font("Menlo").FontSize(9.5).FontWeight(600).TextColor(item.badgeTone).NoWrap()
 					}
 				})
 			})

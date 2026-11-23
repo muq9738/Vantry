@@ -40,6 +40,7 @@ func (s skillEntry) token() string {
 
 func builtinSlashCommands(w *workbench) []skillEntry {
 	return []skillEntry{
+		{Name: "subagent", Description: w.tr("派出子代理在右侧并行执行，或打开子代理面板", "Delegate a subagent in the right panel, or open subagents"), Source: "builtin", Command: "subagent"},
 		{Name: "fork", Description: w.tr("分叉当前会话（支持切换模型或独立 Worktree）", "Fork current thread with optional model or worktree"), Source: "builtin", Command: "fork"},
 		{Name: "rewind", Description: w.tr("从历史轮次或文件检查点回退", "Rewind conversation turns or workspace checkpoints"), Source: "builtin", Command: "rewind"},
 	}

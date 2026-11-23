@@ -51,19 +51,33 @@ func (w *workbench) steerHistoryView(c *ui.Context, p palette, runID string) {
 		if input.RunID != runID || input.Kind != "steer" || input.Status != "delivered" && input.Status != "failed" && input.Status != "unknown" {
 			continue
 		}
-		ui.Column(c.Key("steer-history:"+input.ID)).Gap(5).Padding(8, 12).Background(p.soft).Radius(8).Children(func() {
-			color := p.muted
-			if input.Status == "failed" || input.Status == "unknown" {
-				color = p.danger
+		input := input
+		isErr := input.Status == "failed" || input.Status == "unknown"
+		ui.Column(c.Key("steer-history:"+input.ID)).FillWidth().Gap(3).Padding(4, 0, 2).AlignItems(ui.End).Children(func() {
+			bubble := ui.Column(c).MaxWidth(min(float32(540), readingWidth*0.78)).Padding(8, 13).Gap(4).Radius(16).Background(p.user).Border(1, p.lineSoft)
+			if isErr {
+				bubble.BorderColor(p.danger.Alpha(0.4))
 			}
-			ui.Text(c, inputStatusLabel(input)).FontSize(11).TextColor(color)
-			ui.Text(c, w.tr("补充指令：", "Follow-up: ")+input.Message).FontSize(12).Wrap().Selectable()
-			for _, attachment := range input.Attachments {
-				ui.Text(c, w.tr("附件 · ", "Attachment · ")+attachment.Name).FontSize(11).TextColor(p.muted).Wrap()
+			bubble.Children(func() {
+				ui.Text(c, strings.TrimSpace(input.Message)).FontSize(13.5).LineHeight(1.45).TextColor(p.ink).Wrap().Selectable()
+				for _, attachment := range input.Attachments {
+					ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+						ui.Icon(c, fileIcon).FontSize(11).TextColor(p.faint)
+						ui.Text(c, attachment.Name).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…")
+					})
+				}
+			})
+			metaColor := p.faint
+			if isErr {
+				metaColor = p.danger
 			}
-			if (input.Status == "failed" || input.Status == "unknown") && input.Error != "" {
-				ui.Text(c, input.Error).FontSize(11).TextColor(p.danger).Wrap()
-			}
+			ui.Row(c).Gap(5).Padding(0, 4).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, steerIcon).FontSize(10.5).TextColor(metaColor)
+				ui.Text(c, inputStatusLabel(input)).FontSize(11).TextColor(metaColor).NoWrap()
+				if isErr && input.Error != "" {
+					ui.Text(c, "· "+input.Error).FontSize(11).TextColor(p.danger).SingleLine().Ellipsis("…").MaxWidth(360)
+				}
+			})
 		})
 	}
 }

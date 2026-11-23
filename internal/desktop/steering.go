@@ -108,21 +108,17 @@ func (w *workbench) retrySteering(threadID string) bool {
 func steeringStatusText(message api.SteeringMessage) string {
 	switch message.Status {
 	case api.SteeringPending:
-		return "本地服务已接纳 · 等待发送"
+		return "正在追加…"
 	case api.SteeringSending:
-		return "正在向 Pi 交付 · 不会自动重发"
+		return "正在追加…"
 	case api.SteeringAccepted:
-		text := "Pi 已接纳"
-		if message.Disposition != "" {
-			text += "（" + message.Disposition + "）"
-		}
-		return text + " · 不代表模型已消费"
+		return "已追加到本轮"
 	case api.SteeringRejected:
-		return "调整未送达"
+		return "追加未送达"
 	case api.SteeringUnknown:
-		return "交付状态未知 · 不会自动重试或新建指令"
+		return "交付状态未知 · 不会自动重发"
 	default:
-		return "交付状态 " + fmt.Sprint(message.Status)
+		return fmt.Sprint(message.Status)
 	}
 }
 
@@ -151,33 +147,58 @@ func (w *workbench) steeringView(c *ui.Context, p palette, run api.Run) {
 			continue
 		}
 		message := message
-		ui.Column(c.Key("steering:"+message.ID)).Gap(3).Padding(7, 9).Background(p.soft).Radius(7).Children(func() {
-			ui.Text(c, "调整当前任务 · "+message.Message).FontSize(11).TextColor(p.ink).Wrap().Selectable()
-			for _, attachment := range message.Attachments {
-				ui.Text(c, "附件 · "+attachment.Name).FontSize(11).TextColor(p.muted).Wrap()
+		isErr := steeringStatusLevel(message) == noticeError
+		ui.Column(c.Key("steering:"+message.ID)).FillWidth().Gap(3).Padding(4, 0, 2).AlignItems(ui.End).Children(func() {
+			bubble := ui.Column(c).MaxWidth(min(float32(540), readingWidth*0.78)).Padding(8, 13).Gap(4).Radius(16).Background(p.user).Border(1, p.lineSoft)
+			if isErr {
+				bubble.BorderColor(p.danger.Alpha(0.4))
 			}
-			w.noticeLine(c, p, notice{Text: steeringStatusText(message), Level: steeringStatusLevel(message)})
-			if message.Error != "" {
-				ui.Text(c, message.Error).FontSize(11).TextColor(w.noticeColor(p, steeringStatusLevel(message))).Wrap().Selectable()
+			bubble.Children(func() {
+				ui.Text(c, strings.TrimSpace(message.Message)).FontSize(13.5).LineHeight(1.45).TextColor(p.ink).Wrap().Selectable()
+				for _, attachment := range message.Attachments {
+					ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+						ui.Icon(c, fileIcon).FontSize(11).TextColor(p.faint)
+						ui.Text(c, attachment.Name).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…")
+					})
+				}
+			})
+			metaColor := p.faint
+			if isErr {
+				metaColor = p.danger
 			}
+			ui.Row(c).Gap(5).Padding(0, 4).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, steerIcon).FontSize(10.5).TextColor(metaColor)
+				ui.Text(c, steeringStatusText(message)).FontSize(11).TextColor(metaColor).NoWrap()
+				if message.Error != "" {
+					ui.Text(c, "· "+message.Error).FontSize(11).TextColor(w.noticeColor(p, steeringStatusLevel(message))).SingleLine().Ellipsis("…").MaxWidth(360)
+				}
+			})
 		})
 	}
 	pending := w.composerFor(run.ThreadID).steering
 	if pending == nil || pending.command.RunID != run.ID {
 		return
 	}
-	ui.Column(c.Key("steering-outbox:"+pending.command.CommandID)).Gap(4).Padding(7, 9).Background(p.soft).Radius(7).Children(func() {
-		ui.Text(c, "调整当前任务 · "+pending.command.Message).FontSize(11).TextColor(p.ink).Wrap().Selectable()
-		for _, attachment := range pending.command.Attachments {
-			ui.Text(c, "附件 · "+attachment.Name).FontSize(11).TextColor(p.muted).Wrap()
-		}
-		w.noticeLine(c, p, pending.feedback)
-		if !pending.accepted && !pending.inFlight {
-			retry := ui.Button(c, "重试原调整")
-			retry.Description("沿用原 commandId、原始文本和附件；不使用之后编辑的草稿")
-			if retry.Clicked() {
-				w.retrySteering(run.ThreadID)
+	ui.Column(c.Key("steering-outbox:"+pending.command.CommandID)).FillWidth().Gap(3).Padding(4, 0, 2).AlignItems(ui.End).Children(func() {
+		bubble := ui.Column(c).MaxWidth(min(float32(540), readingWidth*0.78)).Padding(8, 13).Gap(4).Radius(16).Background(p.user).Border(1, p.lineSoft)
+		bubble.Children(func() {
+			ui.Text(c, strings.TrimSpace(pending.command.Message)).FontSize(13.5).LineHeight(1.45).TextColor(p.ink).Wrap().Selectable()
+			for _, attachment := range pending.command.Attachments {
+				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+					ui.Icon(c, fileIcon).FontSize(11).TextColor(p.faint)
+					ui.Text(c, attachment.Name).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…")
+				})
 			}
-		}
+		})
+		ui.Row(c).Gap(6).Padding(0, 4).AlignItems(ui.Center).Children(func() {
+			w.noticeLine(c, p, pending.feedback)
+			if !pending.accepted && !pending.inFlight {
+				retry := quietButton(c, p, "retry-steer", "重试").Height(22).Padding(0, 8).FontSize(11)
+				retry.Description("沿用原 commandId、原始文本和附件；不使用之后编辑的草稿")
+				if retry.Clicked() {
+					w.retrySteering(run.ThreadID)
+				}
+			}
+		})
 	})
 }

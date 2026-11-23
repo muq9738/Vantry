@@ -129,19 +129,7 @@ func (w *workbench) contextStrip(c *ui.Context, p palette) {
 			branch = spec.Branch
 		}
 		if branch != "" {
-			git := quietButton(c, p, "context-git", "").Label(w.tr("分支 ", "Branch ")+branch).Height(22).Padding(0, 6).Radius(6).MinWidth(0).Shrink(1)
-			git.Tooltip(w.tr("打开 Git 面板", "Open Git"))
-			git.Children(func() {
-				ui.Icon(c, branchIcon).FontSize(11).TextColor(p.faint)
-				ui.Text(c, branch).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…").MaxWidth(min(float32(180), width*0.2))
-			})
-			if ok, _ := w.toolAvailable("git"); !ok {
-				git.Disabled(true)
-			}
-			if git.Clicked() {
-				w.features.panel = ""
-				w.openDock("git")
-			}
+			w.footerBranchPill(c, p, branch, width)
 		}
 	})
 }

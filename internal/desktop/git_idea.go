@@ -326,7 +326,9 @@ func (w *workbench) gitAction(action, label string, configure func(*api.Workbenc
 
 func (w *workbench) gitCheckout(branch string) bool {
 	w.gitView.branchOpen = false
-	return w.gitAction(actionGitCheckout, w.tr("签出 ", "Checkout ")+branch, func(r *api.WorkbenchRequest) { r.Branch, r.Name = branch, branch }, nil)
+	return w.gitAction(actionGitCheckout, w.tr("签出 ", "Checkout ")+branch, func(r *api.WorkbenchRequest) { r.Branch, r.Name = branch, branch }, func() {
+		w.recordRecentBranch(w.selected, branch)
+	})
 }
 
 func (w *workbench) gitCreateBranch(name string) bool {
@@ -336,6 +338,7 @@ func (w *workbench) gitCreateBranch(name string) bool {
 		return false
 	}
 	return w.gitAction(actionGitBranchCreate, w.tr("新建分支 ", "New branch ")+name, func(r *api.WorkbenchRequest) { r.Name = name; r.Message = "checkout" }, func() {
+		w.recordRecentBranch(w.selected, name)
 		w.gitView.newBranch = ""
 		w.gitView.branchOpen = false
 	})
@@ -424,43 +427,35 @@ func (w *workbench) dockContentWidth(c *ui.Context, mode dockMode) float32 {
 	return max(float32(260), raw-28)
 }
 
-// ideaGitPanel is the Git tool window: branch and sync toolbar, then the
-// Commit page (grouped changelist, live diff, always-visible commit box) or
-// the Log page (commit graph and the selected commit's changes).
+// ideaGitPanel is the Git tool window: a single consolidated header bar (page
+// tabs + icon sync actions, plus branch pill when not already shown in the
+// top-left header), then Commit (with clean empty-state), Log, or Compare.
 func (w *workbench) ideaGitPanel(c *ui.Context, p palette, mode dockMode) {
 	target := w.selected
 	state := w.features.git[target]
 	_, active := w.activeRun(target)
 	busy := w.features.busy["git:"+target]
+	winW, _ := c.Size()
+	narrowWin := winW < narrowWidth
 	width := w.dockContentWidth(c, mode)
 	if w.gitView.expanded {
-		winW, _ := c.Size()
 		width = max(float32(260), winW-32)
 	}
-	compact := width < 590
-	iconOnlySync := width < 430
-	ui.Row(c.Key("git-toolbar")).Gap(6).Padding(0, 0, 2).Wrap().AlignItems(ui.Center).Shrink(0).Role(ui.RoleToolbar).Label(w.tr("Git 工具栏", "Git toolbar")).Children(func() {
-		if state != nil {
-			w.gitBranchPill(c, p, state, active || busy, compact, iconOnlySync)
-			ui.Spacer(c)
-			w.gitSyncBar(c, p, state, compact, iconOnlySync)
-		} else {
+	showBranchHere := state != nil && (!w.headerShowsBranchPill(narrowWin) || w.gitView.expanded)
+	compact := width < 680
+	iconOnlySync := width < 640
+
+	if state == nil {
+		ui.Row(c.Key("git-toolbar")).Gap(6).Padding(0, 0, 2).AlignItems(ui.Center).Shrink(0).Role(ui.RoleToolbar).Label(w.tr("Git 工具栏", "Git toolbar")).Children(func() {
 			ui.Icon(c, branchIcon).FontSize(13).TextColor(p.muted)
 			text := w.tr("尚未读取 Git 状态", "Git state not read yet")
 			if busy {
 				text = w.tr("正在读取 Git…", "Reading Git…")
 			}
-			ui.Text(c, text).FontSize(11).TextColor(p.muted).NoWrap()
+			ui.Text(c, text).FontSize(11.5).TextColor(p.muted).NoWrap()
 			ui.Spacer(c)
-		}
-		if state == nil || state.Files == nil {
 			w.gitRefreshButton(c, p, busy)
-		}
-	})
-	if state != nil {
-		w.gitPushConfirm(c, p, state)
-	}
-	if state == nil {
+		})
 		if output := w.features.gitOutputs[target]; output != "" {
 			ui.Scroll(c.Key("git-output:" + target)).Grow(1).MinHeight(0).Children(func() {
 				ui.Text(c, w.tr("合并结果", "Merge result")).FontSize(11).Bold().TextColor(p.muted)
@@ -470,20 +465,46 @@ func (w *workbench) ideaGitPanel(c *ui.Context, p palette, mode dockMode) {
 		return
 	}
 	if state.Files == nil {
+		ui.Row(c.Key("git-toolbar")).Gap(6).Padding(0, 0, 2).Wrap().AlignItems(ui.Center).Shrink(0).Role(ui.RoleToolbar).Label(w.tr("Git 工具栏", "Git toolbar")).Children(func() {
+			if showBranchHere {
+				w.gitBranchPill(c, p, state, active || busy, compact, iconOnlySync)
+			}
+			ui.Spacer(c)
+			w.gitSyncBar(c, p, state, compact, iconOnlySync)
+			w.gitRefreshButton(c, p, busy)
+		})
+		w.gitPushConfirm(c, p, state)
 		w.legacyGitView(c, p, state)
 		return
 	}
+
 	groups := groupGitFiles(state.Files)
+	// Single consolidated top bar: Page tabs (+ dock branch pill when needed) on left, compact sync icons + refresh on right.
+	ui.Row(c.Key("git-toolbar")).Gap(6).Padding(0, 0, 2).Wrap().AlignItems(ui.Center).Shrink(0).Role(ui.RoleToolbar).Label(w.tr("Git 工具栏", "Git toolbar")).Children(func() {
+		w.gitPageTabStrip(c, p, len(state.Files))
+		if showBranchHere {
+			w.gitBranchPill(c, p, state, active || busy, compact, iconOnlySync)
+		}
+		ui.Spacer(c)
+		w.prBadge(c, p, target)
+		w.gitSyncBar(c, p, state, compact, iconOnlySync)
+		if w.gitView.tab != 1 {
+			w.gitRefreshButton(c, p, busy)
+		}
+	})
+	w.gitPushConfirm(c, p, state)
 	w.worktreeBanner(c, p, target, active || busy)
-	w.gitPageTabs(c, p, len(state.Files))
 	if output := w.features.gitOutputs[target]; output != "" {
 		ui.Text(c, firstLine(output)).FontSize(11).TextColor(p.muted).SingleLine().Ellipsis("…").Tooltip(output).Shrink(0)
 	}
-	if w.gitView.tab == 1 {
+	switch w.gitView.tab {
+	case 1:
 		w.gitLogPage(c, p, state, width)
-		return
+	case 2:
+		w.gitComparePage(c, p, state, width, active || busy)
+	default:
+		w.gitCommitPage(c, p, state, groups, width, active || busy)
 	}
-	w.gitCommitPage(c, p, state, groups, width, active || busy)
 }
 
 func (w *workbench) gitRefreshButton(c *ui.Context, p palette, busy bool) {
@@ -496,230 +517,70 @@ func (w *workbench) gitRefreshButton(c *ui.Context, p palette, busy bool) {
 	}
 }
 
-func (w *workbench) gitPageTabs(c *ui.Context, p palette, changes int) {
-	ui.Row(c.Key("git-pages")).Height(32).Gap(8).AlignItems(ui.Center).Shrink(0).Children(func() {
-		ui.Row(c.Key("git-pages-tabs")).Height(30).Padding(2).Gap(2).Radius(8).Background(p.soft).AlignItems(ui.Center).Shrink(0).
-			Role(ui.RoleTabList).Label(w.tr("Git 页面", "Git pages")).Children(func() {
-			for i, page := range []struct {
-				zh, en, labelZh, labelEn string
-				icon                     *ui.SVG
-			}{{"提交", "Commit", "Git 提交页", "Git commit page", commitIcon}, {"日志", "Log", "Git 日志页", "Git log page", logIcon}} {
-				selected := w.gitView.tab == i
-				tab := ui.Button(c.Key(fmt.Sprintf("git-page:%d", i)), "").Label(w.tr(page.labelZh, page.labelEn)).Height(26).Padding(0, 11).
-					Border(0, p.line).TextColor(p.muted).Role(ui.RoleTab).Selected(selected).Radius(6).Background(ui.Transparent).Shrink(0)
-				if selected {
-					tab.Background(p.raised).TextColor(p.ink)
-					if !p.dark {
-						tab.Border(1, p.lineSoft)
-					}
-				} else if tab.Hovered() {
-					tab.Background(p.lineSoft).TextColor(p.ink)
+func (w *workbench) gitPageTabStrip(c *ui.Context, p palette, changes int) {
+	pages := []struct {
+		id                       int
+		zh, en, labelZh, labelEn string
+		icon                     *ui.SVG
+	}{
+		{0, "提交", "Commit", "Git 提交页", "Git commit page", commitIcon},
+		{1, "日志", "Log", "Git 日志页", "Git log page", logIcon},
+	}
+	if w.gitView.compareTarget != "" || w.gitView.tab == 2 {
+		pages = append(pages, struct {
+			id                       int
+			zh, en, labelZh, labelEn string
+			icon                     *ui.SVG
+		}{2, "比较", "Compare", "Git 比较页", "Git compare page", lucide("arrow-right-left")})
+	}
+	ui.Row(c.Key("git-pages-tabs")).Height(28).Padding(2).Gap(2).Radius(8).Background(p.soft).AlignItems(ui.Center).Shrink(0).
+		Role(ui.RoleTabList).Label(w.tr("Git 页面", "Git pages")).Children(func() {
+		for _, page := range pages {
+			page := page
+			selected := w.gitView.tab == page.id
+			tab := ui.Button(c.Key(fmt.Sprintf("git-page:%d", page.id)), "").Label(w.tr(page.labelZh, page.labelEn)).Height(24).Padding(0, 9).
+				Border(0, p.line).TextColor(p.muted).Role(ui.RoleTab).Selected(selected).Radius(6).Background(ui.Transparent).Shrink(0)
+			if selected {
+				tab.Background(p.raised).TextColor(p.ink)
+				if !p.dark {
+					tab.Border(1, p.lineSoft)
 				}
-				tab.Children(func() {
-					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-						iconTone := p.muted
+			} else if tab.Hovered() {
+				tab.Background(p.lineSoft).TextColor(p.ink)
+			}
+			tab.Children(func() {
+				ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+					iconTone := p.muted
+					if selected {
+						iconTone = p.accentInk
+					}
+					ui.Icon(c, page.icon).FontSize(12).TextColor(iconTone).Shrink(0)
+					ui.Text(c, w.tr(page.zh, page.en)).FontSize(11.5).FontWeight(500).NoWrap()
+					if page.id == 0 && changes > 0 {
+						badgeBg := p.lineSoft
 						if selected {
-							iconTone = p.accentInk
+							badgeBg = p.soft
 						}
-						ui.Icon(c, page.icon).FontSize(12.5).TextColor(iconTone).Shrink(0)
-						ui.Text(c, w.tr(page.zh, page.en)).FontSize(12).FontWeight(500).NoWrap()
-						if i == 0 && changes > 0 {
-							badgeBg := p.lineSoft
-							if selected {
-								badgeBg = p.soft
-							}
-							ui.Text(c, fmt.Sprint(changes)).FontSize(10.5).TextColor(p.muted).Padding(1, 6).Radius(8).Background(badgeBg).NoWrap()
-						}
-					})
+						ui.Text(c, fmt.Sprint(changes)).FontSize(10).TextColor(p.muted).Padding(1, 5).Radius(7).Background(badgeBg).NoWrap()
+					}
 				})
-				if tab.Clicked() {
-					w.gitView.tab = i
-					if i == 1 && !w.features.busy["git-log:"+w.selected] {
-						target := w.selected
-						if _, loaded := w.gitView.logLoaded[target]; !loaded {
-							w.loadGitLog(w.gitView.logQuery)
-						}
+			})
+			if tab.Clicked() {
+				w.gitView.tab = page.id
+				if page.id == 1 && !w.features.busy["git-log:"+w.selected] {
+					target := w.selected
+					if _, loaded := w.gitView.logLoaded[target]; !loaded {
+						w.loadGitLog(w.gitView.logQuery)
 					}
 				}
 			}
-		})
-		ui.Spacer(c)
-		w.prBadge(c, p, w.selected)
-		if w.gitView.tab != 1 { // the log toolbar has its own refresh
-			ui.Row(c).Height(30).AlignItems(ui.Center).Shrink(0).Children(func() { w.gitRefreshButton(c, p, w.features.busy["git:"+w.selected]) })
 		}
 	})
 }
 
-// gitBranchPill is the ⎇ branch selector with ahead/behind counts; its
-// popover switches, creates and merges branches.
+// gitBranchPill delegates to the shared IDEA branch popover anchored on the dock.
 func (w *workbench) gitBranchPill(c *ui.Context, p palette, state *api.GitState, locked, compact, narrow bool) {
-	target := w.selected
-	maxBranchW := float32(210)
-	if narrow {
-		maxBranchW = 104
-	} else if compact {
-		maxBranchW = 132
-	}
-	pill := ui.Button(c.Key("git-branch-pill"), "").Label(w.tr("分支：", "Branch: ")+state.Branch).Height(28).Padding(0, 9).Radius(8).
-		Background(p.raised).Border(1, p.line).TextColor(p.ink).Shrink(1).MinWidth(0).Expanded(w.gitView.branchOpen)
-	if pill.Hovered() {
-		pill.Background(p.soft)
-	}
-	pill.Tooltip(nonEmptyString(state.RemoteBranch, state.Branch))
-	pill.Children(func() {
-		ui.Row(c).Gap(5).AlignItems(ui.Center).MinWidth(0).Children(func() {
-			ui.Icon(c, branchIcon).FontSize(12).TextColor(p.accentInk).Shrink(0)
-			ui.Text(c, nonEmptyString(state.Branch, "HEAD")).Font("Menlo").FontSize(11).Bold().MaxWidth(maxBranchW).SingleLine().Ellipsis("…").Shrink(1).MinWidth(0)
-			if state.Ahead > 0 {
-				ui.Text(c, fmt.Sprintf("↑%d", state.Ahead)).Font("Menlo").FontSize(10).TextColor(p.success).NoWrap().Shrink(0)
-			}
-			if state.Behind > 0 {
-				ui.Text(c, fmt.Sprintf("↓%d", state.Behind)).Font("Menlo").FontSize(10).TextColor(p.warning).NoWrap().Shrink(0)
-			}
-			ui.Icon(c, chevronIcon).FontSize(10).TextColor(p.faint).Shrink(0)
-		})
-	})
-	if pill.Clicked() {
-		w.gitView.branchOpen = !w.gitView.branchOpen
-	}
-	ui.PopoverBase(c, pill, &w.gitView.branchOpen, func(panel ui.Element) {
-		panel.Width(320).Padding(8).Radius(12).Background(p.raised).Border(1, p.line)
-		ui.Column(c).Gap(8).FillWidth().Children(func() {
-			ui.TextInput(c.Key("branch-query"), &w.gitView.branchQuery).Label(w.tr("搜索分支", "Search branches")).Placeholder(w.tr("搜索分支…", "Search branches…")).FillWidth()
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.TextInput(c.Key("new-branch"), &w.gitView.newBranch).Label(w.tr("新分支名", "New branch name")).Placeholder(w.tr("+ 新建分支…", "+ New branch…")).Grow(1).MinWidth(0)
-				create := ui.Button(c.Key("create-branch"), w.tr("新建", "Create")).Label(w.tr("新建分支", "New branch")).Height(28)
-				if locked || strings.TrimSpace(w.gitView.newBranch) == "" {
-					create.Disabled(true)
-				}
-				if create.Clicked() {
-					w.gitCreateBranch(w.gitView.newBranch)
-				}
-			})
-			query := strings.ToLower(strings.TrimSpace(w.gitView.branchQuery))
-			match := func(name string) bool { return query == "" || strings.Contains(strings.ToLower(name), query) }
-			// Large repositories carry hundreds of branches. Drawing every
-			// one per frame made the popover lag; show the current one and
-			// the first matches, and let the search narrow the rest.
-			const limit = 40
-			ui.Scroll(c.Key("branch-list")).MaxHeight(300).FillWidth().Gap(1).Children(func() {
-				ui.Text(c, w.tr("本地分支", "Local branches")).FontSize(10.5).Bold().TextColor(p.faint).Padding(4, 6)
-				shown, hidden := 0, 0
-				if state.Branch != "" && match(state.Branch) {
-					w.branchRow(c, p, state.Branch, true, false, locked)
-				}
-				for _, branch := range state.Branches {
-					if branch == state.Branch || !match(branch) {
-						continue
-					}
-					if shown >= limit {
-						hidden++
-						continue
-					}
-					shown++
-					w.branchRow(c, p, branch, false, false, locked)
-				}
-				if len(state.RemoteBranches) > 0 {
-					ui.Text(c, w.tr("远程分支", "Remote branches")).FontSize(10.5).Bold().TextColor(p.faint).Padding(8, 6, 4)
-					remoteShown := 0
-					for _, branch := range state.RemoteBranches {
-						if !match(branch) {
-							continue
-						}
-						if remoteShown >= limit/2 {
-							hidden++
-							continue
-						}
-						remoteShown++
-						w.branchRow(c, p, branch, false, true, locked)
-					}
-				}
-				if hidden > 0 {
-					ui.Text(c, fmt.Sprintf(w.tr("还有 %d 个分支，输入名称筛选", "%d more branches; type to filter"), hidden)).FontSize(11).TextColor(p.faint).Padding(6, 6)
-				}
-			})
-			ui.Box(c).FillWidth().Height(1).Background(p.lineSoft)
-			// Merge into current, as before: a source branch and an explicit button.
-			branches := []string{}
-			for _, branch := range state.Branches {
-				if branch != state.Branch {
-					branches = append(branches, branch)
-				}
-			}
-			if w.features.gitBranches == nil {
-				w.features.gitBranches = map[string]string{}
-			}
-			branch := w.features.gitBranches[target]
-			if !slices.Contains(branches, branch) {
-				branch = ""
-			}
-			selection := branch
-			if selection == "" {
-				selection = w.tr("选择来源分支", "Choose source branch")
-			}
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Select(c.Key("git-branch:"+target), &selection, branches).Label(w.tr("合并来源分支", "Merge source branch")).Grow(1).MinWidth(0)
-				if slices.Contains(branches, selection) {
-					branch = selection
-				}
-				w.features.gitBranches[target] = branch
-				merge := ui.Button(c, w.tr("合并", "Merge")).Label(w.tr("自动合并到当前分支", "Merge into the current branch")).Height(28)
-				if locked || branch == "" {
-					merge.Disabled(true)
-				}
-				if merge.Clicked() {
-					w.gitView.branchOpen = false
-					w.mergeBranch()
-				}
-			})
-		})
-	})
-}
-
-func (w *workbench) branchRow(c *ui.Context, p palette, branch string, current, remote, locked bool) {
-	row := ui.Row(c.Key("branch:"+branch)).Height(28).Padding(0, 4, 0, 6).Gap(6).Radius(6).AlignItems(ui.Center)
-	if row.Hovered() {
-		row.Background(p.soft)
-	}
-	row.Children(func() {
-		icon, color := branchIcon, p.muted
-		if current {
-			icon, color = checkIcon, p.accentInk
-		} else if remote {
-			icon = cloudUpIcon
-		}
-		ui.Icon(c, icon).FontSize(11).TextColor(color)
-		text := ui.Text(c, branch).Font("Menlo").FontSize(11).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
-		if current {
-			text.Bold().TextColor(p.ink)
-		}
-		if current {
-			ui.Text(c, w.tr("当前", "current")).FontSize(10).TextColor(p.faint)
-			return
-		}
-		checkout := quietButton(c, p, "checkout", w.tr("签出", "Checkout")).Label(w.tr("签出 ", "Checkout ")+branch).Height(22).Padding(0, 6).FontSize(11)
-		if locked {
-			checkout.Disabled(true)
-		}
-		if checkout.Clicked() {
-			w.gitCheckout(branch)
-		}
-		if !remote {
-			merge := quietButton(c, p, "merge", w.tr("合并", "Merge")).Label(w.tr("合并 ", "Merge ")+branch+w.tr(" 到当前分支", " into current")).Height(22).Padding(0, 6).FontSize(11)
-			if locked {
-				merge.Disabled(true)
-			}
-			if merge.Clicked() {
-				if w.features.gitBranches == nil {
-					w.features.gitBranches = map[string]string{}
-				}
-				w.features.gitBranches[w.selected] = branch
-				w.gitView.branchOpen = false
-				w.mergeBranch()
-			}
-		}
-	})
+	w.ideaBranchTrigger(c, p, "dock", state.Branch, state, locked, compact, narrow, ui.AnchorBottomStart, ui.AnchorTopStart)
 }
 
 // stashPopButton lists the stashes to pop once there are any.
@@ -778,7 +639,99 @@ func (w *workbench) legacyGitView(c *ui.Context, p palette, state *api.GitState)
 
 // ------------------------------------------------------------ commit page
 
+func (w *workbench) gitCleanEmptyState(c *ui.Context, p palette, state *api.GitState, locked bool) {
+	syncLine := w.tr("工作区无未提交更改", "No uncommitted local changes")
+	if state.RemoteBranch != "" {
+		switch {
+		case state.Ahead > 0 && state.Behind > 0:
+			syncLine = fmt.Sprintf(w.tr("与 %s 存在分叉（↑%d / ↓%d）", "Diverged from %s (↑%d / ↓%d)"), state.RemoteBranch, state.Ahead, state.Behind)
+		case state.Ahead > 0:
+			syncLine = fmt.Sprintf(w.tr("领先 %s %d 个提交，可以推送", "%d commits ahead of %s"), state.RemoteBranch, state.Ahead)
+		case state.Behind > 0:
+			syncLine = fmt.Sprintf(w.tr("落后 %s %d 个提交，可以拉取更新", "%d commits behind %s"), state.RemoteBranch, state.Behind)
+		default:
+			syncLine = fmt.Sprintf(w.tr("与 %s 保持同步", "Up to date with %s"), state.RemoteBranch)
+		}
+	}
+
+	ui.Column(c.Key("git-clean-empty")).Grow(1).MinHeight(0).Justify(ui.Center).AlignItems(ui.Center).Padding(24, 16).Gap(14).Children(func() {
+		ui.Row(c).Size(44, 44).Radius(22).Justify(ui.Center).AlignItems(ui.Center).Background(p.success.Alpha(0.12)).Border(1, p.success.Alpha(0.28)).Children(func() {
+			ui.Icon(c, checkIcon).FontSize(20).TextColor(p.success)
+		})
+		ui.Column(c).Gap(4).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, w.tr("工作区干净", "Working tree clean")).FontSize(14).FontWeight(600).TextColor(p.ink)
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				if state.Branch != "" {
+					ui.Text(c, state.Branch).Font("Menlo").FontSize(11.5).TextColor(p.accentInk)
+					ui.Text(c, "·").FontSize(11).TextColor(p.faint)
+				}
+				ui.Text(c, syncLine).FontSize(11.5).TextColor(p.muted)
+			})
+		})
+		ui.Row(c).Gap(8).Wrap().Justify(ui.Center).AlignItems(ui.Center).Children(func() {
+			if state.Behind > 0 {
+				pullBtn := primaryAction(c, p, "clean-pull", fmt.Sprintf(w.tr("拉取更新 (↓%d)", "Pull (↓%d)"), state.Behind))
+				pullBtn.Disabled(locked)
+				if pullBtn.Clicked() {
+					w.gitRemote(actionGitPull)
+				}
+			}
+			if state.Ahead > 0 {
+				var pushBtn ui.Element
+				if state.Behind == 0 {
+					pushBtn = primaryAction(c, p, "clean-push", fmt.Sprintf(w.tr("推送提交 (↑%d)", "Push (↑%d)"), state.Ahead))
+				} else {
+					pushBtn = outlineButton(c, p, "clean-push", fmt.Sprintf(w.tr("推送提交 (↑%d)", "Push (↑%d)"), state.Ahead))
+				}
+				pushBtn.Disabled(locked)
+				if pushBtn.Clicked() {
+					w.gitView.pushConfirm = w.selected
+				}
+			}
+			if outlineButton(c, p, "clean-view-log", w.tr("查看提交日志", "View commit log")).Clicked() {
+				w.gitView.tab = 1
+				if _, loaded := w.gitView.logLoaded[w.selected]; !loaded {
+					w.loadGitLog(w.gitView.logQuery)
+				}
+			}
+			var compareCandidate string
+			for _, b := range state.Branches {
+				if b != "" && b != state.Branch {
+					compareCandidate = b
+					break
+				}
+			}
+			if compareCandidate != "" {
+				if outlineButton(c, p, "clean-compare", w.tr("与其他分支比较", "Compare branches")).Clicked() {
+					w.openBranchCompare(state.Branch, compareCandidate)
+				}
+			}
+			if len(state.Stashes) > 0 {
+				popBtn := outlineButton(c, p, "clean-stash-pop", fmt.Sprintf(w.tr("恢复储藏 (%d)", "Pop stash (%d)"), len(state.Stashes)))
+				popBtn.Disabled(locked)
+				if popBtn.Clicked() {
+					w.gitStashPop(state.Stashes[0].Ref)
+				}
+			}
+		})
+		if quietButton(c, p, "clean-amend", w.tr("修正上次提交 (Amend)", "Amend last commit")).Height(24).FontSize(11).TextColor(p.faint).Clicked() {
+			w.gitView.amend = true
+			if w.gitView.messages == nil {
+				w.gitView.messages = map[string]string{}
+			}
+			if strings.TrimSpace(w.gitView.messages[w.selected]) == "" && len(state.Commits) > 0 {
+				w.gitView.messages[w.selected] = state.Commits[0].Subject
+			}
+			w.gitView.messageFocus.Focus()
+		}
+	})
+}
+
 func (w *workbench) gitCommitPage(c *ui.Context, p palette, state *api.GitState, groups gitGroups, width float32, locked bool) {
+	if len(state.Files) == 0 && !w.gitView.amend {
+		w.gitCleanEmptyState(c, p, state, locked)
+		return
+	}
 	target := w.selected
 	if w.gitView.selected == nil {
 		w.gitView.selected = map[string]string{}
@@ -788,22 +741,23 @@ func (w *workbench) gitCommitPage(c *ui.Context, p palette, state *api.GitState,
 	}
 	unstaged := append(paths(groups.changes), paths(groups.untracked)...)
 	ui.Row(c.Key("changelist-toolbar")).Gap(6).Padding(2, 0).AlignItems(ui.Center).Shrink(0).Wrap().Children(func() {
-		stageAll := quietButton(c, p, "stage-all", w.tr("全选暂存", "Stage all")).Label(w.tr("暂存全部", "Stage all")).Height(26).Padding(0, 8).FontSize(11.5).NoWrap()
+		ui.Text(c, fmt.Sprintf(w.tr("变更文件 · %d", "Changes · %d"), len(state.Files))).FontSize(11).FontWeight(600).TextColor(p.muted).NoWrap()
+		ui.Spacer(c)
+		stageAll := quietButton(c, p, "stage-all", w.tr("全选暂存", "Stage all")).Label(w.tr("暂存全部", "Stage all")).Height(24).Padding(0, 7).FontSize(11).NoWrap()
 		if locked || len(unstaged) == 0 {
 			stageAll.Disabled(true)
 		}
 		if stageAll.Clicked() {
 			w.changeGit("git.stage", unstaged, "")
 		}
-		unstageAll := quietButton(c, p, "unstage-all", w.tr("取消全暂存", "Unstage all")).Label(w.tr("取消全部暂存", "Unstage all")).Height(26).Padding(0, 8).FontSize(11.5).NoWrap()
+		unstageAll := quietButton(c, p, "unstage-all", w.tr("取消全暂存", "Unstage all")).Label(w.tr("取消全部暂存", "Unstage all")).Height(24).Padding(0, 7).FontSize(11).NoWrap()
 		if locked || len(groups.staged) == 0 {
 			unstageAll.Disabled(true)
 		}
 		if unstageAll.Clicked() {
 			w.changeGit("git.unstage", paths(groups.staged), "")
 		}
-		ui.Spacer(c)
-		review := quietButton(c, p, "open-commit", w.tr("提交已暂存", "Commit staged")).Height(26).Padding(0, 8).FontSize(11.5).NoWrap()
+		review := quietButton(c, p, "open-commit", w.tr("提交已暂存", "Commit staged")).Height(24).Padding(0, 7).FontSize(11).NoWrap()
 		if locked || len(groups.staged) == 0 || state.Conflicts {
 			review.Disabled(true)
 		}

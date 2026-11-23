@@ -127,27 +127,6 @@ func RunWorker(ctx context.Context, jobDir string) error {
 		result.Error = fmt.Sprintf("prepare pi workspace: %v", err)
 		return err
 	}
-	capturePreRunCheckpoint(ctx, job, prepared.Path)
-	workspaceLock, err := workspace.LockDirectory(ctx, prepared.Path)
-	if err != nil {
-		result.Error = fmt.Sprintf("lock pi workspace: %v", err)
-		return err
-	}
-	defer workspace.Unlock(workspaceLock)
-	if stopped, err := fileExists(filepath.Join(absolute, "stop.json")); err != nil {
-		result.Error = err.Error()
-		return err
-	} else if stopped {
-		result.Status = "cancelled"
-		return context.Canceled
-	}
-
-	sessionsDir := filepath.Join(job.DataDir, "sessions")
-	if err := makePrivateDir(sessionsDir); err != nil {
-		result.Error = err.Error()
-		return err
-	}
-	sessionPath := filepath.Join(sessionsDir, job.Request.ThreadID+".jsonl")
 	journal, err := openJournal(filepath.Join(absolute, "events.jsonl"))
 	if err != nil {
 		result.Error = err.Error()
@@ -157,6 +136,46 @@ func RunWorker(ctx context.Context, jobDir string) error {
 		return err
 	}
 	defer journal.Close()
+	capturePreRunCheckpoint(ctx, job, prepared.Path)
+	waitedForLock := false
+	workspaceLock, err := workspace.LockDirectoryNotify(ctx, prepared.Path, func() {
+		waitedForLock = true
+		payload, _ := json.Marshal(map[string]any{
+			"type": "workspace_lock_wait",
+			"path": prepared.Path,
+		})
+		_ = journal.Append(provider.Event{Type: "workspace_lock_wait", Data: payload})
+	})
+	if err != nil {
+		result.Error = fmt.Sprintf("lock pi workspace: %v", err)
+		result.LastSequence = journal.sequence
+		return err
+	}
+	defer workspace.Unlock(workspaceLock)
+	if waitedForLock {
+		payload, _ := json.Marshal(map[string]any{
+			"type": "workspace_lock_acquired",
+			"path": prepared.Path,
+		})
+		_ = journal.Append(provider.Event{Type: "workspace_lock_acquired", Data: payload})
+	}
+	if stopped, err := fileExists(filepath.Join(absolute, "stop.json")); err != nil {
+		result.Error = err.Error()
+		result.LastSequence = journal.sequence
+		return err
+	} else if stopped {
+		result.Status = "cancelled"
+		result.LastSequence = journal.sequence
+		return context.Canceled
+	}
+
+	sessionsDir := filepath.Join(job.DataDir, "sessions")
+	if err := makePrivateDir(sessionsDir); err != nil {
+		result.Error = err.Error()
+		result.LastSequence = journal.sequence
+		return err
+	}
+	sessionPath := filepath.Join(sessionsDir, job.Request.ThreadID+".jsonl")
 	if job.Request.ProviderID != "" && job.Request.ProviderID != ProviderPI {
 		err = fmt.Errorf("unsupported provider %q", job.Request.ProviderID)
 	} else {

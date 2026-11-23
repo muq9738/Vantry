@@ -27,7 +27,7 @@ const (
 	DefaultRepo = "muq9738/Vantry"
 	// CurrentVersion is the version this build reports when the caller does
 	// not pass one.
-	CurrentVersion = "0.1.40"
+	CurrentVersion = "0.1.41"
 	// DefaultAPIBase is the GitHub REST API.
 	DefaultAPIBase = "https://api.github.com"
 

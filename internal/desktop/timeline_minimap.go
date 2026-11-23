@@ -22,6 +22,16 @@ func timelineMinimapGutter(chatW, horizontalPad float32) float32 {
 	return (chatW - content) / 2
 }
 
+// timelineMinimapLeft anchors the turn rail near the left edge of the chat
+// stage instead of hugging the reading column, keeping generous breathing room
+// beside wide tables and code blocks on medium/wide windows.
+func timelineMinimapLeft(gutter float32) float32 {
+	if gutter <= 44 {
+		return max(float32(4), (gutter-26)/2)
+	}
+	return min(float32(20), max(float32(10), gutter*0.18))
+}
+
 func userTurnIndexes(entries []conversationEntry) []int {
 	turns := make([]int, len(entries))
 	for i := range entries {
@@ -100,11 +110,11 @@ func (w *workbench) timelineMinimap(c *ui.Context, p palette, entries []conversa
 	current := minimapCurrent(turns, first, last)
 	hoverIndex := w.timelineNav.minimapHover - 1
 	seen := 0
-	left := max(float32(2), gutter-34)
-	// A quiet column of hairline ticks, one per user turn. The current turn
-	// is a longer ink tick; neighbours of the hovered tick grow a little so
-	// the pointer reads like a magnifier. Step arrows only appear on hover.
-	rail := ui.Column(c.Key("timeline-minimap")).Absolute().Left(left).Top(48).Bottom(24).Width(26).Justify(ui.Center).AlignItems(ui.End).Gap(2)
+	left := timelineMinimapLeft(gutter)
+	// A quiet column of hairline ticks, one per user turn, anchored near the
+	// left edge of the chat stage and extending rightward on hover/active so it
+	// never collides with tables or blocks in the centered reading column.
+	rail := ui.Column(c.Key("timeline-minimap")).Absolute().Left(left).Top(48).Bottom(24).Width(26).Justify(ui.Center).AlignItems(ui.Start).Gap(2)
 	rail.Label(w.tr3("对话轮次", "Conversation turns", "会話のターン"))
 	active := rail.Hovered() || rail.FocusWithin()
 	rail.Children(func() {
@@ -122,7 +132,7 @@ func (w *workbench) timelineMinimap(c *ui.Context, p palette, entries []conversa
 			}
 		}
 		step("minimap-prev", w.tr3("上一轮", "Previous turn", "前のターン"), upIcon, current <= 0, current-1)
-		ui.Column(c.Key("minimap-dots")).Gap(0).AlignItems(ui.End).Padding(2, 0).Children(func() {
+		ui.Column(c.Key("minimap-dots")).Gap(0).AlignItems(ui.Start).Padding(2, 0).Children(func() {
 			for i, row := range turns {
 				i, row := i, row
 				width := float32(8)
@@ -141,9 +151,9 @@ func (w *workbench) timelineMinimap(c *ui.Context, p palette, entries []conversa
 				}
 				entry := entries[row]
 				label := fmt.Sprintf(w.tr3("跳到第 %d 轮", "Jump to turn %d", "%d 番目のターンへ"), i+1)
-				// The hit target is a full-width 8px band; the visible tick sits at its right edge.
+				// The hit target is a full-width 8px band; the visible tick sits at its left edge.
 				tick := ui.Button(c.Key("minimap-dot:"+entry.id), "").Label(label).Width(26).Height(8).Padding(0).
-					Border(0, p.line).Background(ui.Transparent).Justify(ui.End).AlignItems(ui.Center)
+					Border(0, p.line).Background(ui.Transparent).Justify(ui.Start).AlignItems(ui.Center)
 				if tick.Hovered() {
 					seen = i + 1
 					color = p.ink

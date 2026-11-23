@@ -9,11 +9,13 @@ import (
 	"github.com/muq9738/Vantry/pkg/api"
 )
 
-func TestMCPPanelConfiguresCodemodeTrustProbeAndRemove(t *testing.T) {
+func TestMCPPanelCodexStyleTrustProbeToggleAndAddModal(t *testing.T) {
 	sharedScope := "user"
 	sharedExposure := "codemode"
+	sharedEnabled := true
 	sharedRemoved := false
 	hasGemini := false
+	trusted := false
 
 	buildCatalog := func(probed bool) *api.MCPCatalog {
 		servers := []api.MCPServerInfo{}
@@ -22,7 +24,8 @@ func TestMCPPanelConfiguresCodemodeTrustProbeAndRemove(t *testing.T) {
 				Name:      "shared",
 				Scope:     sharedScope,
 				Transport: "http",
-				Enabled:   true,
+				Endpoint:  "http://127.0.0.1:3425/mcp",
+				Enabled:   sharedEnabled,
 				Exposure:  sharedExposure,
 			}
 			if probed {
@@ -45,50 +48,47 @@ func TestMCPPanelConfiguresCodemodeTrustProbeAndRemove(t *testing.T) {
 			Workspace:       "/repo",
 			UserFile:        "/home/.pi/agent/mcp.json",
 			ProjectFile:     "/repo/.pi/mcp.json",
-			ProjectTrusted:  probed,
+			ProjectTrusted:  trusted,
 			CodemodeDefault: true,
 			Probed:          probed,
 			Servers:         servers,
 		}
 	}
 
-	trusted := false
 	w, service := v3Workbench(t, func(r api.WorkbenchRequest) (api.WorkbenchResponse, error) {
 		switch r.Action {
 		case "mcp.probe":
-			cat := buildCatalog(true)
-			cat.ProjectTrusted = trusted
-			return api.WorkbenchResponse{MCP: cat}, nil
+			return api.WorkbenchResponse{MCP: buildCatalog(true)}, nil
 		case "mcp.trust":
 			trusted = true
-			cat := buildCatalog(false)
-			cat.ProjectTrusted = trusted
-			return api.WorkbenchResponse{MCP: cat}, nil
+			return api.WorkbenchResponse{MCP: buildCatalog(false)}, nil
 		case "mcp.upsert":
 			if r.Name == "shared" {
-				sharedScope = "project-override"
-				sharedExposure = "deferred"
+				var raw map[string]any
+				_ = json.Unmarshal(r.Input, &raw)
+				if exp, ok := raw["exposure"].(string); ok {
+					sharedScope = "project-override"
+					sharedExposure = exp
+				}
+				if en, ok := raw["enabled"].(bool); ok {
+					sharedEnabled = en
+				}
 			} else if r.Name == "gemini-ego" {
 				hasGemini = true
 			}
-			cat := buildCatalog(false)
-			cat.ProjectTrusted = trusted
-			return api.WorkbenchResponse{MCP: cat}, nil
+			return api.WorkbenchResponse{MCP: buildCatalog(false)}, nil
 		case "mcp.remove":
 			if r.Name == "gemini-ego" {
 				hasGemini = false
 			} else if r.Name == "shared" {
 				sharedRemoved = true
 			}
-			cat := buildCatalog(false)
-			cat.ProjectTrusted = trusted
-			return api.WorkbenchResponse{MCP: cat}, nil
+			return api.WorkbenchResponse{MCP: buildCatalog(false)}, nil
 		default:
-			cat := buildCatalog(false)
-			cat.ProjectTrusted = trusted
-			return api.WorkbenchResponse{MCP: cat}, nil
+			return api.WorkbenchResponse{MCP: buildCatalog(false)}, nil
 		}
 	})
+
 	tt := ui.NewTester(w.view, 1440, 900)
 	mustClick(t, tt, "MCP")
 	tt.Frame()
@@ -98,43 +98,55 @@ func TestMCPPanelConfiguresCodemodeTrustProbeAndRemove(t *testing.T) {
 	if _, ok := service.find("mcp.probe"); ok {
 		t.Fatal("opening MCP must not probe servers eagerly")
 	}
-	if !tt.HasText("shared") || !tt.HasText("/repo/.pi/mcp.json") {
-		t.Fatalf("missing configuration view: %q", tt.Texts())
+	// Compact panel: no permanent inline JSON form or 4 exposure buttons cluttering rows.
+	if tt.HasText("服务 JSON 配置") || tt.HasText("deferred · shared") {
+		t.Fatalf("compact MCP view should hide form and exposure buttons by default: %v", tt.Texts())
+	}
+	if !tt.HasText("shared") || !tt.HasText("信任此项目") {
+		t.Fatalf("missing server or untrusted banner: %v", tt.Texts())
 	}
 
-	// Trust project button triggers mcp.trust {"trusted":true}
+	// Trust project collapses the trust banner once trusted.
 	mustClick(t, tt, "信任此项目")
 	tt.Frame()
 	trustReq, ok := service.find("mcp.trust")
 	if !ok || !strings.Contains(string(trustReq.Input), `"trusted":true`) {
 		t.Fatalf("expected mcp.trust true, got %+v", service.requests)
 	}
+	if tt.HasText("信任此项目") {
+		t.Fatalf("trusted project should hide trust banner: %v", tt.Texts())
+	}
 
-	// Probe triggers mcp.probe and renders live tool discovery
+	// Probe triggers mcp.probe and renders live tool discovery.
 	mustClick(t, tt, "检测连接")
 	tt.Frame()
 	if _, ok := service.find("mcp.probe"); !ok {
 		t.Fatal("clicking Probe must dispatch mcp.probe")
 	}
 	if !tt.HasText("已连接 · 2 工具") || !tt.HasText("magpie_search") {
-		t.Fatalf("missing probed live tools output: %q", tt.Texts())
+		t.Fatalf("missing probed live tools output: %v", tt.Texts())
 	}
 
-	// Inline exposure switch sends mcp.upsert with {"exposure":"deferred"}
-	mustClick(t, tt, "deferred · shared")
+	// Native toggle disables the server.
+	mustClick(t, tt, "切换 shared")
 	tt.Frame()
-	if expReq, ok := service.find("mcp.upsert"); !ok || expReq.Name != "shared" || !strings.Contains(string(expReq.Input), `"exposure":"deferred"`) {
-		t.Fatalf("inline exposure switch = %+v", service.requests)
+	if sharedEnabled {
+		t.Fatal("switch did not disable shared server")
 	}
 
-	// Adding a new server injects default exposure=codemode + description
-	mustClick(t, tt, "MCP 服务名")
-	tt.Type("gemini-ego")
-	mustClick(t, tt, "用途说明（Codemode 搜索提示）")
-	tt.Type("Gemini browser MCP")
-	mustClick(t, tt, "服务 JSON 配置")
-	tt.Type(`{"command":"node","args":["/tmp/gemini/server.mjs"]}`)
-	mustClick(t, tt, "保存到当前项目")
+	// Open "+ 添加" modal and add a stdio server via Quick Add (defaults to codemode).
+	mustClick(t, tt, "添加")
+	tt.Frame()
+	if !w.mcp.addOpen {
+		t.Fatal("clicking Add did not open modal")
+	}
+	w.mcp.scopeTarget = "project"
+	w.mcp.transport = 1 // stdio
+	w.mcp.name = "gemini-ego"
+	w.mcp.endpoint = `node "/tmp/gemini/server.mjs" --flag`
+	w.mcp.description = "Gemini browser MCP"
+	tt.Frame()
+	mustClick(t, tt, "保存")
 	tt.Frame()
 
 	var upsertReq *api.WorkbenchRequest
@@ -151,14 +163,20 @@ func TestMCPPanelConfiguresCodemodeTrustProbeAndRemove(t *testing.T) {
 	if err := json.Unmarshal(upsertReq.Input, &parsed); err != nil {
 		t.Fatalf("invalid submitted json: %v", err)
 	}
-	if parsed["exposure"] != "codemode" || parsed["description"] != "Gemini browser MCP" {
-		t.Fatalf("expected codemode default and description, got %+v", parsed)
+	if parsed["exposure"] != "codemode" || parsed["command"] != "node" || parsed["description"] != "Gemini browser MCP" {
+		t.Fatalf("expected codemode + split stdio command, got %+v", parsed)
 	}
+	if w.mcp.addOpen {
+		t.Fatal("add modal did not close after successful save")
+	}
+}
 
-	// Inline remove on project server triggers mcp.remove
-	mustClick(t, tt, "移除 · gemini-ego")
-	tt.Frame()
-	if rmReq, ok := service.find("mcp.remove"); !ok || rmReq.Name != "gemini-ego" {
-		t.Fatalf("expected mcp.remove for gemini-ego: %+v", service.requests)
+func TestBuildServerUpsertInputExtractsNameFromMCPServersSnippet(t *testing.T) {
+	name, raw, ok := buildServerUpsertInput("user", "", "", "codemode", `{"mcpServers":{"docs":{"url":"https://example.com/mcp"}}}`)
+	if !ok || name != "docs" {
+		t.Fatalf("got ok=%v name=%q", ok, name)
+	}
+	if !strings.Contains(string(raw), `"exposure":"codemode"`) || !strings.Contains(string(raw), `"scope":"user"`) {
+		t.Fatalf("unexpected payload: %s", raw)
 	}
 }

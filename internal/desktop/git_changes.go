@@ -33,24 +33,39 @@ type gitViewState struct {
 	prLoaded    map[string]bool
 
 	// JetBrains-style tool window state.
-	tab          int // 0 commit, 1 log
-	checked      map[string]map[string]bool
-	amend        bool
-	closed       map[string]bool
-	layout       int // -1 follows the width; else 0 unified, 1 split
-	layoutSet    bool
-	messageFocus ui.Handle
-	branchOpen   bool
-	newBranch    string
-	branchQuery  string
-	pushAfter    map[string]bool
-	logQuery     string
-	logs         map[string][]api.GitCommit
-	logLoaded    map[string]string
-	commit       map[string]string
-	details      map[string]*gitCommitDetail
-	detailFile   map[string]string
-	discard      map[string]string
+	tab                 int // 0 commit, 1 log, 2 compare
+	checked             map[string]map[string]bool
+	amend               bool
+	closed              map[string]bool
+	layout              int // -1 follows the width; else 0 unified, 1 split
+	layoutSet           bool
+	messageFocus        ui.Handle
+	branchOpen          bool
+	branchAnchor        string // "header", "footer", "dock"
+	branchExpanded      string // currently expanded branch row in IDEA popover
+	branchFolders       map[string]bool
+	recentBranches      map[string][]string
+	branchRenaming      string
+	branchRenameDraft   string
+	branchDeleteConfirm string
+	newBranch           string
+	branchQuery         string
+	pushAfter           map[string]bool
+	logQuery            string
+	logs                map[string][]api.GitCommit
+	logLoaded           map[string]string
+	commit              map[string]string
+	details             map[string]*gitCommitDetail
+	detailFile          map[string]string
+	discard             map[string]string
+
+	// Branch compare state (IDEA "Compare with Current").
+	compareBase    string
+	compareTarget  string
+	compareTab     int // 0 commits, 1 files
+	compareFile    string
+	compareResults map[string]*gitBranchCompare
+	compareErrs    map[string]string
 
 	// IDEA log page.
 	filter      gitLogFilter

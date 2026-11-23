@@ -36,6 +36,7 @@ func (w *workbench) foldOrchestration(event api.Event) bool {
 			}
 		}
 		w.tasks = append(w.tasks, *payload.Task)
+		w.maybeAutoOpenSubagentPanel(*payload.Task)
 		return true
 	}
 	if payload.Cohort != nil && payload.Cohort.ParentRunID != "" {
@@ -65,19 +66,85 @@ func (w *workbench) latestRun(threadID string) (api.Run, bool) {
 }
 
 func (w *workbench) delegateDraft(threadID string) bool {
+	comp := w.composerFor(threadID)
+	message := strings.TrimSpace(comp.outgoing())
+	if comp.pending != nil || message == "" {
+		return false
+	}
+	cmd, ok := w.buildDelegateCommand(threadID, message, false)
+	if !ok {
+		return false
+	}
+	if st := w.subagentPanelState(w.subagentPanelKey(threadID)); st != nil {
+		st.dismissed = false
+	}
+	pending := &submission{send: cmd, threadID: threadID, startedAt: time.Now()}
+	comp.pending, comp.draft = pending, ""
+	comp.mentions = nil
+	comp.feedback = notice{Text: w.tr("正在派出子代理…", "Delegating subagent…"), Level: noticeInfo}
+	w.saveState()
+	w.dispatchSend(threadID, pending)
+	return true
+}
+
+func (w *workbench) canDelegateThread(threadID string) bool {
+	parent, ok := w.latestRun(threadID)
+	return ok && parent.Status != api.RunCancelled && parent.Status != api.RunFailed && parent.Status != api.RunInterrupted
+}
+
+func (w *workbench) buildDelegateCommand(threadID, message string, useWorktree bool) (api.Command, bool) {
+	message = strings.TrimSpace(message)
+	if threadID == "" || message == "" {
+		return api.Command{}, false
+	}
 	parent, ok := w.latestRun(threadID)
 	if !ok || parent.Status == api.RunCancelled || parent.Status == api.RunFailed || parent.Status == api.RunInterrupted {
-		return false
+		return api.Command{}, false
 	}
 	policy := "auto"
 	if w.widgets.manualDelivery {
 		policy = "manual"
 	}
-	return w.submitTaskDraft(threadID, api.Command{
+	cmd := api.Command{
 		Version: api.ProtocolVersion, CommandID: newCommandID("delegate"), Kind: api.DelegateTask,
 		ThreadID: threadID, ParentRunID: parent.ID, ParentAttemptID: parent.AttemptID,
+		Message: message, Title: titleFromInstruction(message),
 		ResumePolicy: policy,
+	}
+	if useWorktree {
+		if th, ok := w.threadByID(threadID); ok && th.Workspace != nil {
+			repo := nonEmptyString(th.Workspace.Repository, th.Workspace.Path)
+			if repo != "" {
+				cmd.Workspace = &api.WorkspaceSpec{Kind: "worktree", Repository: repo, BaseRef: "HEAD"}
+			}
+		}
+	}
+	return cmd, true
+}
+
+// delegateMessage dispatches a delegated child subagent directly without
+// touching the parent composer's pending state or draft.
+func (w *workbench) delegateMessage(threadID, message string, useWorktree bool) bool {
+	cmd, ok := w.buildDelegateCommand(threadID, message, useWorktree)
+	if !ok {
+		return false
+	}
+	if st := w.subagentPanelState(w.subagentPanelKey(threadID)); st != nil {
+		st.dismissed = false
+	}
+	w.inFlightCommands[cmd.CommandID] = true
+	w.dispatch(cmd, func(receipt api.Receipt, err error) {
+		w.post(func() {
+			delete(w.inFlightCommands, cmd.CommandID)
+			if err != nil {
+				w.actionNotice = notice{Text: describe(w.tr("派出子代理失败", "Failed to delegate subagent"), err), Level: levelFor(err)}
+				return
+			}
+			w.actionNotice = notice{}
+			_ = receipt
+		})
 	})
+	return true
 }
 
 func (w *workbench) followUpDraft(task api.Task) bool {
@@ -294,6 +361,12 @@ func (w *workbench) subagentRelationshipsControl(c *ui.Context, p palette) {
 			}
 			if m.Item(label).Radio(w.subagentPanelShows(item.threadID)).Chosen() {
 				w.openSubagentPanel(item.threadID)
+			}
+		}
+		if w.canDelegateThread(rootID) {
+			m.Separator()
+			if m.Item(w.tr("+ 派出新子代理…", "+ New subagent…")).Chosen() {
+				w.openSubagentCreator(rootID)
 			}
 		}
 	}, ui.PopoverMenuButtonOptions{At: ui.AnchorBottomEnd, Self: ui.AnchorTopEnd})

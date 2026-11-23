@@ -40,7 +40,7 @@ type persistedState struct {
 	ThemeSet          bool                          `json:"themeSet"`
 	Dark              bool                          `json:"dark"`
 	ThemePreset string                        `json:"themePreset,omitempty"`
-	SendWithEnter     bool                          `json:"sendWithEnter"`
+	SendWithEnter     *bool                         `json:"sendWithEnter,omitempty"`
 	ActiveTurnDefault string                        `json:"activeTurnDefault,omitempty"`
 	ManualDelivery    bool                          `json:"manualDelivery"`
 	Locale            string                        `json:"locale,omitempty"` // "zh" (default), "en", or "ja"
@@ -98,7 +98,9 @@ func (w *workbench) restoreState() error {
 	w.widgets.themeSet = state.ThemeSet
 	w.widgets.dark = state.Dark
 	w.widgets.themePreset = normalizeThemePreset(state.ThemePreset)
-	w.widgets.sendWithEnter = state.SendWithEnter
+	if state.SendWithEnter != nil {
+		w.widgets.sendWithEnter = *state.SendWithEnter
+	}
 	w.widgets.steerMode = state.ActiveTurnDefault != "queue"
 	w.widgets.manualDelivery = state.ManualDelivery
 	w.widgets.locale = normalizeLocale(state.Locale)
@@ -220,6 +222,7 @@ func (w *workbench) saveState() {
 	if !w.widgets.steerMode {
 		activeDefault = "queue"
 	}
+	sendWithEnter := w.widgets.sendWithEnter
 	state := persistedState{
 		ActiveTurnDefault: activeDefault,
 		Version:           desktopStateVersion,
@@ -228,8 +231,8 @@ func (w *workbench) saveState() {
 		LocalOrder:        append([]string(nil), w.localOrder...),
 		ThemeSet:          w.widgets.themeSet,
 		Dark:              w.widgets.dark,
-		ThemePreset: normalizeThemePreset(w.widgets.themePreset),
-		SendWithEnter:     w.widgets.sendWithEnter,
+		ThemePreset:       normalizeThemePreset(w.widgets.themePreset),
+		SendWithEnter:     &sendWithEnter,
 		ManualDelivery:    w.widgets.manualDelivery,
 		Locale:            normalizeLocale(w.widgets.locale),
 		PreferredEditor:   strings.TrimSpace(w.widgets.preferredEditor),

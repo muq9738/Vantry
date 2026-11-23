@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -419,6 +420,19 @@ func (w *workbench) view(c *ui.Context) {
 	if !w.remoteDesktopFocused(c) && c.Shortcut(ui.Ctrl, ui.KeyT) {
 		w.toggleAllReasoning()
 	}
+	if !w.remoteDesktopFocused(c) && c.Shortcut(ui.Ctrl|ui.Shift, ui.KeyB) {
+		if ok, _ := w.toolAvailable("git"); ok {
+			width, _ := c.Size()
+			narrow := width < narrowWidth
+			if w.headerShowsBranchPill(narrow) {
+				w.toggleBranchPopover("header")
+			} else if w.features.panel == "git" {
+				w.toggleBranchPopover("dock")
+			} else {
+				w.toggleBranchPopover("footer")
+			}
+		}
+	}
 	w.widgets.sidebarFocus.OnShortcut(c, 0, ui.KeyEnter, func() {
 		w.widgets.mobileNav = false
 		w.widgets.composerFocus.Focus()
@@ -451,6 +465,7 @@ func (w *workbench) view(c *ui.Context) {
 	w.usageDialog(c, p)
 	w.rewindDialog(c, p)
 	w.forkDialog(c, p)
+	w.mcpAddDialog(c, p)
 	w.remoteDirectoryDialog(c, p)
 	w.environmentConnectionsDialog(c, p)
 	w.bindAskHotkeys(c)
@@ -1222,20 +1237,10 @@ func (w *workbench) composerKey(threadID string, k ui.TextKey) bool {
 	// Empty preedit can mean cancellation, with no following InputText. Keep
 	// the same short boundary guard, then allow an intentional later send.
 	comp.compositionEnding = false
-	// ⌘+Enter never sends: in either mode it breaks the line. The editor
-	// takes only a bare or Shift Enter itself, so the break is queued and
-	// composerBox inserts it where the live selection stands.
-	if k.Mods == ui.Super || k.Mods == ui.Super|ui.Shift {
+	newlineChord, sendChord, alternate := composerEnterBehavior(w.widgets.sendWithEnter, k.Mods, runtime.GOOS)
+	if newlineChord {
 		comp.newlinePending = true
 		return true
-	}
-	sendChord, alternate := false, false
-	if w.widgets.sendWithEnter {
-		sendChord = k.Mods == 0 || k.Mods == ui.Ctrl || k.Mods == ui.Ctrl|ui.Shift
-		alternate = k.Mods == ui.Ctrl|ui.Shift
-	} else {
-		sendChord = k.Mods == ui.Ctrl || k.Mods == ui.Ctrl|ui.Shift
-		alternate = k.Mods == ui.Ctrl|ui.Shift
 	}
 	if !sendChord {
 		return false
@@ -1252,6 +1257,70 @@ func (w *workbench) composerKey(threadID string, k ui.TextKey) bool {
 		w.send(threadID)
 	}
 	return true
+}
+
+// composerEnterBehavior resolves Enter+modifier chords across macOS and
+// Windows/Linux. In the default Enter-to-send mode, macOS uses ⌘+Enter (and
+// Shift+Enter) to insert a newline, while Windows/Linux maps Ctrl+Enter (and
+// Shift+Enter) to newline so both platforms share the same muscle memory.
+func composerEnterBehavior(sendWithEnter bool, mods ui.Modifiers, goos string) (newline, send, alternate bool) {
+	if goos == "darwin" {
+		if mods == ui.Super || mods == ui.Super|ui.Shift {
+			return true, false, false
+		}
+		if sendWithEnter {
+			send = mods == 0 || mods == ui.Ctrl || mods == ui.Ctrl|ui.Shift || mods == ui.Alt
+			alternate = mods == ui.Ctrl|ui.Shift || mods == ui.Alt
+			return false, send, alternate
+		}
+		send = mods == ui.Ctrl || mods == ui.Ctrl|ui.Shift
+		alternate = mods == ui.Ctrl|ui.Shift
+		return false, send, alternate
+	}
+	if sendWithEnter {
+		if mods == ui.Ctrl || mods == ui.Ctrl|ui.Shift || mods == ui.Super || mods == ui.Super|ui.Shift {
+			return true, false, false
+		}
+		send = mods == 0 || mods == ui.Alt || mods == ui.Alt|ui.Shift
+		alternate = mods == ui.Alt || mods == ui.Alt|ui.Shift
+		return false, send, alternate
+	}
+	if mods == ui.Super || mods == ui.Super|ui.Shift {
+		return true, false, false
+	}
+	send = mods == ui.Ctrl || mods == ui.Ctrl|ui.Shift
+	alternate = mods == ui.Ctrl|ui.Shift
+	return false, send, alternate
+}
+
+func platformPrimaryNewlineKey(goos string) string {
+	if goos == "darwin" {
+		return "⌘ Enter"
+	}
+	return "Ctrl Enter"
+}
+
+func (w *workbench) applyPendingComposerNewline(c *ui.Context, field ui.Element, comp *composer, threadID string, draft *string) {
+	if comp.newlinePending {
+		comp.newlinePending = false
+		anchor, caret := field.TextAnchorCaret()
+		runes := []rune(*draft)
+		a := min(max(0, min(anchor, caret)), len(runes))
+		z := min(max(0, max(anchor, caret)), len(runes))
+		*draft = string(runes[:a]) + "\n" + string(runes[z:])
+		comp.caretAfter = a + 1
+		comp.caretRestore = true
+		w.setDraft(threadID, *draft)
+		// The control was built before this edit. Request the frame that
+		// adopts the new buffer and restores its caret.
+		c.After(time.Millisecond)
+	} else if comp.caretRestore {
+		field.SetTextSelection(comp.caretAfter, comp.caretAfter)
+		comp.liveAnchor, comp.liveCaret = comp.caretAfter, comp.caretAfter
+		comp.caretRestore = false
+	} else {
+		comp.liveAnchor, comp.liveCaret = field.TextAnchorCaret()
+	}
 }
 
 func (w *workbench) composerLine(comp *composer, active bool, run api.Run) notice {
@@ -1343,6 +1412,7 @@ func (w *workbench) hasOpenOverlay(c *ui.Context) bool {
 		w.gitView.commitOpen ||
 		w.gitView.branchOpen ||
 		w.gitView.pathOpen ||
+		w.mcp.addOpen ||
 		w.visuals.expanded ||
 		len(w.visuals.lightbox) > 0 ||
 		w.widgets.modelPickerOpen ||

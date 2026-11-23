@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"encoding/json"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -275,5 +276,79 @@ func TestSubagentPanelRenders(t *testing.T) {
 		if err != nil || closeErr != nil {
 			t.Fatalf("render %s: %v, %v", spec.name, err, closeErr)
 		}
+	}
+}
+
+func TestSubagentSlashCommandAndAutoOpenTabs(t *testing.T) {
+	w, service := projectWorkbench()
+	w.selectThread("t1")
+
+	// Bare /subagent with no children opens the right-side creator.
+	w.setDraft("t1", "/subagent")
+	if !w.send("t1") {
+		t.Fatal("bare /subagent did not execute")
+	}
+	if !w.subagentPanelOpen() {
+		t.Fatal("bare /subagent did not open right-side panel")
+	}
+	tt := ui.NewTester(w.view, 1440, 900)
+	tt.Frame()
+	if !tt.HasText("派出新子代理") {
+		t.Fatalf("subagent creator missing: %v", tt.Texts())
+	}
+
+	// /subagent <task> dispatches DelegateTask directly.
+	w.closeSubagentPanel()
+	w.setDraft("t1", "/subagent 梳理权限边界")
+	if !w.send("t1") {
+		t.Fatal("/subagent <task> did not dispatch")
+	}
+	cmds := service.dispatched()
+	if len(cmds) != 1 || cmds[0].Kind != api.DelegateTask || cmds[0].Message != "梳理权限边界" {
+		t.Fatalf("dispatched = %+v", cmds)
+	}
+
+	// A new running task event auto-opens the right-side panel silently.
+	c1 := thread("child-1", "梳理权限边界", time.Minute)
+	c1.ParentThreadID = "t1"
+	c2 := thread("child-2", "核对渲染回归", 2*time.Minute)
+	c2.ParentThreadID = "t1"
+	w.mergeThread(c1)
+	w.mergeThread(c2)
+	w.mergeRun(run("rc1", "child-1", api.RunRunning, "梳理权限边界", "检查中", time.Minute))
+	w.mergeRun(run("rc2", "child-2", api.RunCompleted, "核对渲染回归", "已完成", 2*time.Minute))
+	taskBytes, _ := json.Marshal(map[string]any{
+		"task": api.Task{
+			ID: "task-auto-1", ParentThreadID: "t1", ParentRunID: "r1",
+			ChildThreadID: "child-1", Title: "梳理权限边界", Status: api.RunRunning, Generation: 1,
+		},
+	})
+	w.foldOrchestration(api.Event{Type: "task.created", Data: taskBytes})
+	if !w.subagentPanelShows("child-1") {
+		t.Fatalf("expected new live task to auto-open subagent panel for child-1")
+	}
+
+	// Horizontal tab strip lets user switch directly to child-2.
+	w.tasks = append(w.tasks, api.Task{
+		ID: "task-auto-2", ParentThreadID: "t1", ParentRunID: "r1",
+		ChildThreadID: "child-2", Title: "核对渲染回归", Status: api.RunCompleted, Generation: 1,
+	})
+	tt.Frame()
+	mustClick(t, tt, "核对渲染回归")
+	if !w.subagentPanelShows("child-2") {
+		t.Fatalf("clicking subagent tab did not switch to child-2")
+	}
+
+	// Manual dismissal prevents unsolicited auto-reopen for another task.
+	w.closeSubagentPanel()
+	task3Bytes, _ := json.Marshal(map[string]any{
+		"task": api.Task{
+			ID: "task-auto-3", ParentThreadID: "t1", ParentRunID: "r1",
+			ChildThreadID: "child-1", Title: "再次派发", Status: api.RunRunning, Generation: 2,
+		},
+	})
+	w.foldOrchestration(api.Event{Type: "task.created", Data: task3Bytes})
+	if w.subagentPanelOpen() {
+		t.Fatal("dismissed subagent panel should stay closed until user opens or dispatches again")
 	}
 }

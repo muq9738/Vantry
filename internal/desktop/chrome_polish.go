@@ -1,6 +1,8 @@
 package desktop
 
 import (
+	"runtime"
+
 	"github.com/egoist/mygo/ui"
 	"github.com/muq9738/Vantry/pkg/api"
 )
@@ -133,6 +135,7 @@ func (w *workbench) breadcrumb(c *ui.Context, p palette, title string, narrow bo
 			name := w.workspaceLabel()
 			projectBadge(c, name, 16)
 			ui.Text(c, name).FontSize(13).TextColor(p.muted).MaxWidth(160).SingleLine().Ellipsis("…").Shrink(0)
+			w.headerBranchPill(c, p, narrow)
 			ui.Text(c, "/").FontSize(13).TextColor(p.faint)
 		} else if !narrow && w.hasConversation(w.selected) {
 			ui.Text(c, w.tr3("无项目", "No project", "プロジェクトなし")).FontSize(13).TextColor(p.faint).Shrink(0)
@@ -175,9 +178,16 @@ func (w *workbench) shortcutGroups() []struct {
 	title   string
 	entries []shortcutEntry
 } {
+	newlinePrimary := platformPrimaryNewlineKey(runtime.GOOS)
 	send, newline, alternate := "Ctrl Enter", "Enter", "Ctrl ⇧ Enter"
 	if w.widgets.sendWithEnter {
-		send, newline, alternate = "Enter", "⇧ Enter", "Ctrl ⇧ Enter"
+		send = "Enter"
+		newline = newlinePrimary + " / ⇧ Enter"
+		if runtime.GOOS == "darwin" {
+			alternate = "Ctrl ⇧ Enter / ⌥ Enter"
+		} else {
+			alternate = "Alt Enter"
+		}
 	}
 	t := w.tr
 	return []struct {
@@ -205,7 +215,6 @@ func (w *workbench) shortcutGroups() []struct {
 		{t("输入与发送", "Composer"), []shortcutEntry{
 			{send, t("发送消息", "Send")},
 			{newline, t("换行", "New line")},
-			{"⌘ Enter", t("换行（任意模式）", "New line (either mode)")},
 			{alternate, t("运行中：在排队与调整本轮之间临时切换", "While running: switch queue / steer once")},
 			{"@", t("引用工作区文件；↑ ↓ 选择，Enter / Tab 插入", "Mention a file; ↑ ↓ to pick, Enter / Tab to insert")},
 			{"/", t("调用技能；↑ ↓ 选择，Enter / Tab 插入", "Run a skill; ↑ ↓ to pick, Enter / Tab to insert")},

@@ -17,8 +17,9 @@ import (
 type RunPhase string
 
 const (
-	PhaseStarting        RunPhase = "starting"
-	PhaseThinking        RunPhase = "thinking"
+	PhaseStarting         RunPhase = "starting"
+	PhaseWaitingWorkspace RunPhase = "waiting_workspace"
+	PhaseThinking         RunPhase = "thinking"
 	PhaseStreaming       RunPhase = "streaming"
 	PhaseExecutingTool   RunPhase = "executing_tool"
 	PhaseWaitingApproval RunPhase = "waiting_approval"
@@ -191,9 +192,19 @@ func (t *PhaseTracker) Apply(event provider.Event) PhaseSnapshot {
 	}
 
 	switch kind {
+	case "workspace_lock_wait":
+		if t.basePhase == PhaseStarting || t.basePhase == PhaseWaitingWorkspace {
+			t.basePhase = PhaseWaitingWorkspace
+		}
+
+	case "workspace_lock_acquired":
+		if t.basePhase == PhaseWaitingWorkspace {
+			t.basePhase = PhaseStarting
+		}
+
 	case "session", "agent_start", "turn_start":
 		t.transientFailed = false
-		if t.basePhase == PhaseStarting {
+		if t.basePhase == PhaseStarting || t.basePhase == PhaseWaitingWorkspace {
 			t.basePhase = PhaseThinking
 		}
 

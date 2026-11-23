@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"time"
 
@@ -177,12 +178,17 @@ func (w *workbench) settingsGeneral(c *ui.Context, p palette) {
 					w.setLocale(next)
 				}
 			})
-			settingsRow(c, p, "settings-row-send", false, w.tr("发送快捷键", "Send shortcut"), w.tr("运行中按住 ⌘ / Ctrl 可在排队与调整本轮之间临时切换。", "While running, hold ⌘ / Ctrl to switch between queue and steer once."), func() {
+			newlineKey := platformPrimaryNewlineKey(runtime.GOOS)
+			sendDesc := fmt.Sprintf(
+				w.tr("默认 Enter 发送，%s / Shift+Enter 换行；运行中按住 ⌘ / Ctrl 点发送可临时切换排队与追加。", "Default: Enter sends, %s or Shift+Enter breaks line. Hold ⌘/Ctrl when clicking Send to switch queue vs steer."),
+				newlineKey,
+			)
+			settingsRow(c, p, "settings-row-send", false, w.tr("发送快捷键", "Send shortcut"), sendDesc, func() {
 				mode := 0
 				if w.widgets.sendWithEnter {
 					mode = 1
 				}
-				ui.Segmented(c.Key("settings-send"), &mode, w.tr("⌘ Enter 发送", "⌘ Enter sends"), w.tr("Enter 发送", "Enter sends")).Label(w.tr("发送快捷键", "Send shortcut"))
+				ui.Segmented(c.Key("settings-send"), &mode, w.tr("Ctrl Enter 发送", "Ctrl Enter sends"), w.tr("Enter 发送", "Enter sends")).Label(w.tr("发送快捷键", "Send shortcut"))
 				w.widgets.sendWithEnter = mode == 1
 			})
 		})

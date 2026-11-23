@@ -203,4 +203,12 @@ func TestMinimapCurrentAndGutter(t *testing.T) {
 	if timelineMinimapGutter(640, 16) >= timelineMinimapMinGutter {
 		t.Fatal("narrow chat should hide the minimap")
 	}
+	wideGutter := timelineMinimapGutter(1040, 28) // 140px
+	wideLeft := timelineMinimapLeft(wideGutter)
+	if wideLeft < 10 || wideLeft > 24 {
+		t.Fatalf("wide minimap should anchor near left margin (10..24px), got %.1f for gutter %.1f", wideLeft, wideGutter)
+	}
+	if wideGutter-(wideLeft+26) < 80 {
+		t.Fatalf("wide minimap still hugs the reading column: left=%.1f gutter=%.1f", wideLeft, wideGutter)
+	}
 }

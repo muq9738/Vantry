@@ -310,19 +310,19 @@ func (w *workbench) afterRequest(request api.ProviderRequest) {
 func inputStatusLabel(input api.Input) string {
 	switch input.Status {
 	case "queued":
-		return "持久排队中"
+		return "排队中"
 	case "pending":
-		return "等待 Pi 接收"
+		return "正在追加…"
 	case "started":
 		return "已开始"
 	case "delivered":
-		return "Pi 已接收 · 不代表模型已消费"
+		return "已追加到本轮"
 	case "unknown":
 		return "交付状态未知 · 不会自动重发"
 	case "cancelled":
 		return "已取消"
 	case "failed":
-		return "投递失败"
+		return "发送失败"
 	default:
 		return input.Status
 	}

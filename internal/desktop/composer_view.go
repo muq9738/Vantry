@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -75,11 +76,12 @@ func (w *workbench) composerBox(c *ui.Context, p palette, home bool) {
 			field := ui.TextAreaBase(c.Key("draft:"+target), &draft).Lines(minLines, maxLines).FillWidth().Padding(10, 12, 6).FontSize(14).LineHeight(1.5)
 			field.Placeholder(placeholder).Label(w.tr("消息输入框", "Message")).Bind(&w.widgets.composerFocus)
 			field.TrackLines(&comp.chipLines).TrackScroll(&comp.chipScroll)
+			newlineKey := platformPrimaryNewlineKey(runtime.GOOS)
 			description := w.tr("输入消息；Enter 换行，Ctrl + Enter 发送", "Type a message; Enter for a new line, Ctrl + Enter to send")
 			if w.widgets.sendWithEnter {
-				description = w.tr("输入消息；Enter 发送，Shift + Enter 换行", "Type a message; Enter to send, Shift + Enter for a new line")
+				description = fmt.Sprintf(w.tr("输入消息；Enter 发送，%s / Shift + Enter 换行", "Type a message; Enter to send, %s or Shift + Enter for a new line"), newlineKey)
 			}
-			description += w.tr("；⌘ + Enter 总是换行；/ 调用技能，@ 引用文件", "; ⌘ + Enter always breaks a line; / runs a skill, @ mentions a file")
+			description += w.tr("；/ 调用技能，@ 引用文件", "; / runs a skill, @ mentions a file")
 			if active {
 				if w.canSteer(run, active) && w.widgets.steerMode {
 					description += w.tr("；运行中默认调整当前任务", "; while running it steers the current turn")
@@ -120,29 +122,9 @@ func (w *workbench) composerBox(c *ui.Context, p palette, home bool) {
 			}
 			field.OnPaste(func(pasted string) bool { return w.handleComposerPaste(target, pasted) })
 			field.OnTextKey(func(k ui.TextKey) bool { return w.composerKey(target, k) })
-			// Cmd+Enter queued a line break between frames, where the field's
-			// selection is unreachable: insert it here, restore the caret on the
-			// next build once the longer text is in the buffer.
-			if comp.newlinePending {
-				comp.newlinePending = false
-				anchor, caret := field.TextAnchorCaret()
-				runes := []rune(draft)
-				a := min(max(0, min(anchor, caret)), len(runes))
-				z := min(max(0, max(anchor, caret)), len(runes))
-				draft = string(runes[:a]) + "\n" + string(runes[z:])
-				comp.caretAfter = a + 1
-				comp.caretRestore = true
-				w.setDraft(target, draft)
-				// The control was built before this edit. Request the frame that
-				// adopts the new buffer and restores its caret.
-				c.After(time.Millisecond)
-			} else if comp.caretRestore {
-				field.SetTextSelection(comp.caretAfter, comp.caretAfter)
-				comp.liveAnchor, comp.liveCaret = comp.caretAfter, comp.caretAfter
-				comp.caretRestore = false
-			} else {
-				comp.liveAnchor, comp.liveCaret = field.TextAnchorCaret()
-			}
+			// Cmd/Ctrl+Enter queued a line break between frames, where the
+			// field's selection is unreachable: insert it here and restore caret.
+			w.applyPendingComposerNewline(c, field, comp, target, &draft)
 		})
 		footer := ui.Row(c.Key("composer-footer")).FillWidth().MinWidth(0).Padding(2, 6, 4, 6).Gap(6).AlignItems(ui.Center)
 		w.widgets.composerFooterW = footer.Bounds().W

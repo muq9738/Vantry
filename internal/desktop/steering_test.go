@@ -57,7 +57,7 @@ func TestSteerEntryFreezesCommandAndQueueRemainsIndependent(t *testing.T) {
 		t.Fatal("input.updated event was not handled")
 	}
 	tt.Frame()
-	if !tt.HasText("Pi 已接收") {
+	if !tt.HasText("已追加到本轮") {
 		t.Fatalf("delivery projection missing: %q", tt.Texts())
 	}
 	if len(f.dispatched()) != 2 {
@@ -111,7 +111,7 @@ func TestSteeringSnapshotAndUnknownNeverAutomaticallyRetry(t *testing.T) {
 				t.Fatal("snapshot created or retried a command")
 			}
 			if status == api.SteeringUnknown {
-				if _, ok := tt.Access("重试原调整"); ok || !strings.Contains(steeringStatusText(message), "不会自动重试或新建指令") {
+				if _, ok := tt.Access("重试"); ok || !strings.Contains(steeringStatusText(message), "不会自动重发") {
 					t.Fatal("unknown state offered an unsafe retry")
 				}
 			}
