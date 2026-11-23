@@ -18,7 +18,7 @@ pub struct PiConfig {
     pub settings: Map<String, Value>,
     pub models: Map<String, Value>,
 }
-fn object(path: &Path) -> Result<Map<String, Value>> {
+pub(crate) fn object(path: &Path) -> Result<Map<String, Value>> {
     match fs::File::open(path) {
         Ok(file) => Ok(
             serde_json::from_reader(file).with_context(|| format!("read {}", path.display()))?

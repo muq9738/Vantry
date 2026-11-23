@@ -34,8 +34,13 @@ pub fn deliver_control(dir: &Path, control: &ControlResponse) -> Result<()> {
     let controls = dir.join("controls");
     let path = controls.join(format!("{}.json", base64url_encode(control.id.as_bytes())));
     if path.try_exists()? {
+        let stored: serde_json::Value = disk::read(&path)?;
+        let mut expected = control.clone();
+        if stored["valueConsumed"] == true && control.kind == "response" {
+            expected.value.clear();
+        }
         ensure!(
-            disk::read::<ControlResponse>(&path)? == *control,
+            serde_json::from_value::<ControlResponse>(stored)? == expected,
             "control ID conflicts with persisted intent"
         );
         return Ok(());

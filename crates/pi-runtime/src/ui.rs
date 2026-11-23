@@ -39,13 +39,13 @@ impl WorkerUi {
     pub(crate) fn approval_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
-    async fn ask(
+    pub(crate) async fn ask(
         &self,
+        id: String,
         mut data: Value,
         opts: DialogOptions,
         options: Option<Vec<String>>,
     ) -> Option<ControlResponse> {
-        let id = Uuid::new_v4().to_string();
         data["type"] = json!("extension_ui_request");
         data["id"] = json!(id);
         if let Some(d) = opts.timeout {
@@ -116,6 +116,7 @@ impl WorkerUi {
 impl ExtensionUi for WorkerUi {
     async fn confirm(&self, title: &str, message: &str, opts: DialogOptions) -> bool {
         self.ask(
+            Uuid::new_v4().to_string(),
             json!({"method":"confirm","title":title,"message":message}),
             opts,
             None,
@@ -125,6 +126,7 @@ impl ExtensionUi for WorkerUi {
     }
     async fn select(&self, title: &str, options: &[String], opts: DialogOptions) -> Option<String> {
         self.ask(
+            Uuid::new_v4().to_string(),
             json!({"method":"select","title":title,"options":options}),
             opts,
             Some(options.to_vec()),
@@ -138,7 +140,7 @@ impl ExtensionUi for WorkerUi {
         placeholder: Option<&str>,
         opts: DialogOptions,
     ) -> Option<String> {
-        self.ask(json!({"method":"input","title":title,"placeholder":placeholder,"prefill":opts.prefill}), opts, None).await.map(|c| c.value)
+        self.ask(Uuid::new_v4().to_string(),json!({"method":"input","title":title,"placeholder":placeholder,"prefill":opts.prefill}), opts, None).await.map(|c| c.value)
     }
     async fn editor(
         &self,
@@ -147,6 +149,7 @@ impl ExtensionUi for WorkerUi {
         opts: DialogOptions,
     ) -> Option<String> {
         self.ask(
+            Uuid::new_v4().to_string(),
             json!({"method":"editor","title":title,"prefill":prefill}),
             opts,
             None,
