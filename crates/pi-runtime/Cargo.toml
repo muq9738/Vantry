@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures.workspace = true
 pi-agent.workspace = true
@@ -23,3 +24,6 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 vantry-protocol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

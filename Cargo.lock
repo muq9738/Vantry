@@ -6015,17 +6015,27 @@ name = "vantry-connectivity"
 version = "0.1.42"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "url",
+ "uuid",
  "vantry-protocol",
 ]
 
@@ -6035,10 +6045,17 @@ version = "0.1.42"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "chrono",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -6052,6 +6069,7 @@ name = "vantry-desktop"
 version = "0.1.42"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "env_logger",
  "nsh-base",
@@ -6061,7 +6079,9 @@ dependencies = [
  "nsh-platform-windows",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "uuid",
  "vantry-client",
  "vantry-protocol",
 ]
@@ -6072,6 +6092,7 @@ version = "0.1.42"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "pi-agent",
@@ -6079,6 +6100,7 @@ dependencies = [
  "pi-coding-agent",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -6093,12 +6115,15 @@ name = "vantry-platform"
 version = "0.1.42"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
  "vantry-protocol",
 ]
 
@@ -6153,9 +6178,14 @@ name = "vantry-updater"
 version = "0.1.42"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "vantry-protocol",
 ]
 
