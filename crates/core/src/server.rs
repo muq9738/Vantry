@@ -18,6 +18,7 @@ use std::{
     fs, io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::PathBuf,
+    sync::Arc,
 };
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -25,15 +26,52 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use vantry_protocol::*;
+
+/// Optional service-layer handler mounted onto the Core Unix socket for
+/// workbench actions, orchestration queries, and extra capabilities.
+#[async_trait::async_trait]
+pub trait ServiceExtension: Send + Sync + 'static {
+    async fn workbench(&self, request: WorkbenchRequest) -> Result<WorkbenchResponse>;
+
+    async fn extra_route(
+        &self,
+        _method: &str,
+        _path: &str,
+        _query: Option<&str>,
+        _body: Bytes,
+    ) -> Option<Result<serde_json::Value>> {
+        None
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 pub struct Server {
     listener: UnixListener,
     path: PathBuf,
     identity: (u64, u64),
     core: Core,
+    extension: Option<Arc<dyn ServiceExtension>>,
 }
 impl Server {
     pub async fn bind(core: Core) -> Result<Self> {
+        Self::bind_inner(core, None).await
+    }
+
+    pub async fn bind_with_extension(
+        core: Core,
+        extension: Arc<dyn ServiceExtension>,
+    ) -> Result<Self> {
+        Self::bind_inner(core, Some(extension)).await
+    }
+
+    async fn bind_inner(
+        core: Core,
+        extension: Option<Arc<dyn ServiceExtension>>,
+    ) -> Result<Self> {
         let path = core.directory().join("core.sock");
         if fs::metadata(core.directory())?.mode() & 0o077 != 0 {
             return Err(invalid("Core socket requires a private data directory"));
@@ -61,6 +99,7 @@ impl Server {
             path,
             identity: (info.dev(), info.ino()),
             core,
+            extension,
         };
         fs::set_permissions(&server.path, fs::Permissions::from_mode(0o600))?;
         Ok(server)
@@ -76,11 +115,13 @@ impl Server {
                 conn=self.listener.accept()=>{
                     let (conn,_)=conn?;
                     let core=self.core.clone();
+                    let extension=self.extension.clone();
                     let done=closing.clone();
                     conns.spawn(async move {
                         let service=service_fn(move|req|{
                             let core=core.clone();
-                            async move { Ok::<_,Infallible>(route(core,req).await.unwrap_or_else(error_response)) }
+                            let extension=extension.clone();
+                            async move { Ok::<_,Infallible>(route(core,extension,req).await.unwrap_or_else(error_response)) }
                         });
                         let connection=http1::Builder::new().serve_connection(TokioIo::new(conn),service);
                         tokio::pin!(connection);
@@ -132,27 +173,57 @@ fn error_response(e: Error) -> Response<Body> {
     };
     response(status, api_error(e))
 }
-async fn route(core: Core, req: Request<Incoming>) -> Result<Response<Body>> {
-    let path = req.uri().path();
-    let method = match path {
-        "/v1/commands" | "/v1/admin/shutdown-if-idle" => "POST",
-        "/v1/health" | "/v1/status" | "/v1/capabilities" | "/v1/state" | "/v1/snapshot"
-        | "/v1/events" => "GET",
-        _ => return Err(Error::Api(ErrorCode::NotFound, "unknown endpoint".into())),
+async fn route(
+    core: Core,
+    extension: Option<Arc<dyn ServiceExtension>>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>> {
+    let path = req.uri().path().to_owned();
+    let query = req.uri().query().map(str::to_owned);
+    let method_str = req.method().as_str().to_owned();
+    let expected_method = match path.as_str() {
+        "/v1/commands" | "/v1/admin/shutdown-if-idle" | "/v1/workbench" => Some("POST"),
+        "/v1/health"
+        | "/v1/status"
+        | "/v1/capabilities"
+        | "/v1/state"
+        | "/v1/snapshot"
+        | "/v1/threads/summaries"
+        | "/v1/threads/detail"
+        | "/v1/events" => Some("GET"),
+        _ => None,
     };
-    if req.method().as_str() != method {
-        let mut res = response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            api_error(invalid("method not allowed")),
-        );
-        res.headers_mut().insert("allow", method.parse().unwrap());
-        return Ok(res);
+    if let Some(method) = expected_method {
+        if method_str != method {
+            let mut res = response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                api_error(invalid("method not allowed")),
+            );
+            res.headers_mut().insert("allow", method.parse().unwrap());
+            return Ok(res);
+        }
+        if !matches!(path.as_str(), "/v1/events" | "/v1/threads/detail") && query.is_some() {
+            return Err(invalid("unexpected query parameter"));
+        }
+    } else if let Some(ext) = extension {
+        let body = Limited::new(req.into_body(), 16 << 20)
+            .collect()
+            .await
+            .map_err(|_| invalid("invalid or oversized request body"))?
+            .to_bytes();
+        if let Some(result) = ext
+            .extra_route(&method_str, &path, query.as_deref(), body)
+            .await
+        {
+            return Ok(response(StatusCode::OK, result?));
+        }
+        return Err(Error::Api(ErrorCode::NotFound, "unknown endpoint".into()));
+    } else {
+        return Err(Error::Api(ErrorCode::NotFound, "unknown endpoint".into()));
     }
-    if path != "/v1/events" && req.uri().query().is_some() {
-        return Err(invalid("unexpected query parameter"));
-    }
+
     let ok = StatusCode::OK;
-    Ok(match path {
+    Ok(match path.as_str() {
         "/v1/health" => response(
             ok,
             Health {
@@ -160,8 +231,46 @@ async fn route(core: Core, req: Request<Incoming>) -> Result<Response<Body>> {
                 state: core.status()?.state,
             },
         ),
-        "/v1/capabilities" | "/v1/status" => response(ok, core.status()?),
+        "/v1/capabilities" | "/v1/status" => {
+            let mut status = core.status()?;
+            if let Some(ext) = &extension {
+                let extra = ext.capabilities();
+                if !extra.is_empty() {
+                    let caps = status.capabilities.get_or_insert_with(Vec::new);
+                    for cap in extra {
+                        if !caps.contains(&cap) {
+                            caps.push(cap);
+                        }
+                    }
+                }
+            }
+            response(ok, status)
+        }
         "/v1/snapshot" | "/v1/state" => response(ok, core.snapshot()?),
+        "/v1/threads/summaries" => response(ok, build_thread_summaries(&core.snapshot()?)),
+        "/v1/threads/detail" => {
+            let (thread_id, limit_runs) = parse_thread_detail_query(query.as_deref())?;
+            response(
+                ok,
+                build_thread_detail(&core.snapshot()?, &thread_id, limit_runs)?,
+            )
+        }
+        "/v1/workbench" => {
+            let Some(ext) = extension else {
+                return Err(Error::Api(
+                    ErrorCode::NotReady,
+                    "workbench service is not mounted on this Core".into(),
+                ));
+            };
+            let body = Limited::new(req.into_body(), 16 << 20)
+                .collect()
+                .await
+                .map_err(|_| invalid("invalid or oversized workbench body"))?
+                .to_bytes();
+            let request: WorkbenchRequest =
+                serde_json::from_slice(&body).map_err(|e| invalid(&e.to_string()))?;
+            response(ok, ext.workbench(request).await?)
+        }
         "/v1/commands" => {
             let body = Limited::new(req.into_body(), 1 << 20)
                 .collect()
@@ -187,9 +296,8 @@ async fn route(core: Core, req: Request<Incoming>) -> Result<Response<Body>> {
             response(ok, json!({"state":"draining"}))
         }
         _ => {
-            let after = req
-                .uri()
-                .query()
+            let after = query
+                .as_deref()
                 .and_then(|q| q.strip_prefix("after="))
                 .and_then(|s| s.parse::<i64>().ok())
                 .ok_or_else(|| invalid("events requires one integer after cursor"))?;
@@ -197,6 +305,177 @@ async fn route(core: Core, req: Request<Incoming>) -> Result<Response<Body>> {
         }
     })
 }
+
+fn build_thread_summaries(snapshot: &Snapshot) -> ThreadSummaries {
+    let runs = snapshot.runs.as_deref().unwrap_or(&[]);
+    let inputs = &snapshot.inputs;
+    let requests = &snapshot.requests;
+    let threads = snapshot
+        .threads
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|thread| {
+            let mut run_count = 0i64;
+            let mut active_runs = 0i64;
+            let mut latest_run_id = String::new();
+            let mut latest_status = None;
+            let mut updated_at = thread.created_at.clone();
+            for run in runs.iter().filter(|r| r.thread_id == thread.id) {
+                run_count += 1;
+                if matches!(
+                    run.status,
+                    RunStatus::Queued | RunStatus::Running | RunStatus::Waiting
+                ) {
+                    active_runs += 1;
+                }
+                latest_run_id = run.id.clone();
+                latest_status = Some(run.status);
+                if !run.updated_at.is_empty() && run.updated_at > updated_at {
+                    updated_at = run.updated_at.clone();
+                }
+            }
+            let pending_inputs = inputs
+                .iter()
+                .filter(|i| {
+                    i.thread_id == thread.id
+                        && matches!(i.status.as_str(), "queued" | "pending" | "")
+                })
+                .count() as i64;
+            let pending_requests = requests
+                .iter()
+                .filter(|r| {
+                    r.thread_id == thread.id
+                        && matches!(r.status.as_str(), "pending" | "responding" | "")
+                })
+                .count() as i64;
+            ThreadSummary {
+                project_path: thread.project_path.clone(),
+                id: thread.id.clone(),
+                title: thread.title.clone(),
+                provider_id: thread.provider_id.clone(),
+                model: thread.model.clone(),
+                workspace: thread.workspace.clone(),
+                parent_thread_id: thread.parent_thread_id.clone(),
+                parent_task_id: thread.parent_task_id.clone(),
+                created_by_thread_id: thread.created_by_thread_id.clone(),
+                pinned: thread.pinned,
+                archived: thread.archived,
+                snoozed_until: thread.snoozed_until.clone(),
+                approval_policy: thread.approval_policy.clone(),
+                created_at: thread.created_at.clone(),
+                updated_at,
+                run_count,
+                active_runs,
+                pending_inputs,
+                pending_requests,
+                latest_run_id,
+                latest_status,
+            }
+        })
+        .collect();
+    ThreadSummaries {
+        sequence: snapshot.sequence,
+        threads: Some(threads),
+    }
+}
+
+fn parse_thread_detail_query(query: Option<&str>) -> Result<(String, i64)> {
+    let mut thread_id = String::new();
+    let mut limit_runs = 0i64;
+    if let Some(q) = query {
+        for pair in q.split('&').filter(|s| !s.is_empty()) {
+            let Some((k, v)) = pair.split_once('=') else {
+                return Err(invalid("invalid thread detail query"));
+            };
+            match k {
+                "threadId" | "thread" => thread_id = v.to_owned(),
+                "limitRuns" | "limit" => {
+                    limit_runs = v
+                        .parse::<i64>()
+                        .map_err(|_| invalid("invalid limitRuns query parameter"))?;
+                    if limit_runs < 0 {
+                        return Err(invalid("limitRuns cannot be negative"));
+                    }
+                }
+                _ => return Err(invalid("unexpected query parameter")),
+            }
+        }
+    }
+    if thread_id.is_empty() {
+        return Err(invalid("threadId is required"));
+    }
+    Ok((thread_id, limit_runs))
+}
+
+fn build_thread_detail(
+    snapshot: &Snapshot,
+    thread_id: &str,
+    limit_runs: i64,
+) -> Result<ThreadDetail> {
+    let thread = snapshot
+        .threads
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|t| t.id == thread_id)
+        .cloned()
+        .ok_or_else(|| Error::Api(ErrorCode::NotFound, format!("thread {thread_id} not found")))?;
+    let all_runs: Vec<Run> = snapshot
+        .runs
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|r| r.thread_id == thread_id)
+        .cloned()
+        .collect();
+    let run_count = all_runs.len() as i64;
+    let (runs, truncated_runs) = if limit_runs > 0 && all_runs.len() > limit_runs as usize {
+        let start = all_runs.len() - limit_runs as usize;
+        (all_runs[start..].to_vec(), true)
+    } else {
+        (all_runs, false)
+    };
+    let tasks = snapshot
+        .tasks
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|t| t.parent_thread_id == thread_id || t.child_thread_id == thread_id)
+        .cloned()
+        .collect();
+    let inputs = snapshot
+        .inputs
+        .iter()
+        .filter(|i| i.thread_id == thread_id)
+        .cloned()
+        .collect();
+    let tools = snapshot
+        .tools
+        .iter()
+        .filter(|t| t.thread_id == thread_id)
+        .cloned()
+        .collect();
+    let requests = snapshot
+        .requests
+        .iter()
+        .filter(|r| r.thread_id == thread_id)
+        .cloned()
+        .collect();
+    Ok(ThreadDetail {
+        project_updates: snapshot.project_updates.clone(),
+        sequence: snapshot.sequence,
+        thread,
+        runs: Some(runs),
+        tasks: Some(tasks),
+        inputs: Some(inputs),
+        tools: Some(tools),
+        requests: Some(requests),
+        run_count,
+        truncated_runs,
+    })
+}
+
 fn events(core: Core, after: i64) -> Result<Response<Body>> {
     let changed = core.0.changed.subscribe();
     let page = VecDeque::from(core.events_after(after, 128)?);

@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -20,6 +23,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 vantry-client.workspace = true
 vantry-connectivity.workspace = true
 vantry-core.workspace = true

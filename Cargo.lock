@@ -6167,6 +6167,7 @@ name = "vantry-desktop"
 version = "0.1.42"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "env_logger",
@@ -6264,6 +6265,9 @@ name = "vantry-service"
 version = "0.1.42"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
  "chrono",
  "clap",
  "serde",
@@ -6273,6 +6277,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vantry-client",
  "vantry-connectivity",
  "vantry-core",

@@ -127,6 +127,45 @@ impl CoreClient {
         )
         .await
     }
+    pub async fn workbench(&self, request: &WorkbenchRequest) -> Result<WorkbenchResponse> {
+        self.json(
+            Method::POST,
+            "/v1/workbench",
+            serde_json::to_vec(request).map_err(anyhow::Error::from)?,
+        )
+        .await
+    }
+    pub async fn thread_summaries(&self) -> Result<ThreadSummaries> {
+        self.json(Method::GET, "/v1/threads/summaries", vec![])
+            .await
+    }
+    pub async fn thread_detail(&self, thread_id: &str, limit_runs: i64) -> Result<ThreadDetail> {
+        let path = if limit_runs > 0 {
+            format!("/v1/threads/detail?threadId={thread_id}&limitRuns={limit_runs}")
+        } else {
+            format!("/v1/threads/detail?threadId={thread_id}")
+        };
+        self.json(Method::GET, &path, vec![]).await
+    }
+    pub async fn shutdown_if_idle(&self) -> Result<serde_json::Value> {
+        self.json(Method::POST, "/v1/admin/shutdown-if-idle", vec![])
+            .await
+    }
+    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.json(Method::GET, path, vec![]).await
+    }
+    pub async fn post_json<Req: serde::Serialize, Res: DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &Req,
+    ) -> Result<Res> {
+        self.json(
+            Method::POST,
+            path,
+            serde_json::to_vec(request).map_err(anyhow::Error::from)?,
+        )
+        .await
+    }
     pub async fn subscribe(&self, since: i64) -> Result<EventStream> {
         let (body, driver) = self
             .request(Method::GET, &format!("/v1/events?after={since}"), vec![])
