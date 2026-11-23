@@ -816,6 +816,8 @@ func TestInterListThreadsFiltersAndPagination(t *testing.T) {
 	other := interThread(t, c, "elsewhere", "auto", "default", &api.WorkspaceSpec{Kind: "directory", Path: t.TempDir()})
 	parent := mustSend(t, c, "parent", caller, "parent")
 	child := dispatchOrFail(t, c, delegateCommand("child", parent.RunID, "", "child", resumeManual))
+	// Ensure a strictly newer wall-clock tick on Windows before updating `other`.
+	time.Sleep(20 * time.Millisecond)
 	until := time.Now().Add(time.Hour)
 	dispatchOrFail(t, c, api.Command{Version: 1, Kind: api.UpdateThread, CommandID: "snooze", ThreadID: other, SnoozedUntil: &until})
 	first, err := c.ListThreads(context.Background(), api.ThreadListQuery{CallerThreadID: caller})
