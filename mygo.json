@@ -1,0 +1,30 @@
+{
+  "name": "Vantry",
+  "slug": "vantry",
+  "identifier": "io.github.muq9738.vantry",
+  "version": "0.1.40",
+  "main": "./cmd/vantry",
+  "icon": "resources/icon.png",
+  "out": "dist",
+  "resourcesExclude": ["remote-access/**"],
+  "resources": [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/licenses"
+  ],
+  "macos": {
+    "minimumSystemVersion": "13.0",
+    "signingIdentity": "-",
+    "infoPlist": {
+      "LSApplicationCategoryType": "public.app-category.developer-tools",
+      "CFBundleDevelopmentRegion": "zh-Hans",
+      "CFBundleLocalizations": ["zh-Hans", "en", "ja"],
+      "NSLocalNetworkUsageDescription": "Vantry 需要发现并直连局域网中的电脑，以访问你的项目和会话。",
+      "NSScreenCaptureUsageDescription": "Vantry 仅在你开启本机桌面共享且经你确认授权时采集屏幕，并通过局域网直连或你配置的自建中继加密传输。",
+      "NSBonjourServices": ["_vantry._tcp"]
+    }
+  },
+  "linux": {
+    "webview": false
+  }
+}

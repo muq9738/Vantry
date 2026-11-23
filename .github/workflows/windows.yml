@@ -1,0 +1,87 @@
+name: Windows Build and Smoke
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'scripts/build_remote_helper.py'
+      - 'scripts/verify_windows_package.py'
+      - 'go.mod'
+      - 'go.sum'
+      - 'mygo.json'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'scripts/build_remote_helper.py'
+      - 'scripts/verify_windows_package.py'
+      - 'go.mod'
+      - 'go.sum'
+      - 'mygo.json'
+      - '.github/workflows/windows.yml'
+
+jobs:
+  windows-amd64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure private Go module access (optional)
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -n "${PRIVATE_REPO_TOKEN:-}" ]; then
+            git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+            echo "GOPRIVATE=github.com/muq9738/*" >> "$GITHUB_ENV"
+          fi
+
+      - name: Go vet and Windows unit tests
+        shell: bash
+        run: |
+          go vet ./internal/core/... ./internal/app/... ./internal/hostfs/... ./internal/hostprocess/... ./internal/adapters/preview/... ./cmd/vantry/...
+          go test -count=1 ./internal/core/... ./internal/hostfs/... ./internal/hostprocess/... ./internal/adapters/preview/... ./cmd/vantry/...
+
+      - name: Build Windows remote-desktop helper
+        shell: bash
+        run: python scripts/build_remote_helper.py --platform windows/amd64
+
+      - name: Package Windows desktop app
+        shell: bash
+        env:
+          GOMAXPROCS: '2'
+        run: go tool mygo build --platform windows/amd64
+
+      - name: Verify Windows package and Core/SQLite smoke test
+        shell: bash
+        run: python scripts/verify_windows_package.py --package dist/windows-amd64 --require-helper
+
+      - name: Upload Windows package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vantry-windows-amd64
+          path: dist/windows-amd64/

@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; frame-src 'self' data: blob:; connect-src 'self';">
+<link rel="stylesheet" href="/assets/katex.min.css">
+<style>
+:root { color-scheme: light dark; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+}
+html[data-theme="dark"] { color: #f4f4f5; }
+html[data-theme="light"] { color: #18181b; }
+#snap-root {
+  display: inline-block;
+  padding: 12px 14px;
+  min-width: 120px;
+  max-width: 740px;
+}
+#snap-root svg {
+  display: block;
+  max-width: 712px;
+  height: auto;
+}
+#snap-root iframe {
+  width: 712px;
+  height: 390px;
+  border: 0;
+  display: block;
+}
+</style>
+</head>
+<body>
+<div id="snap-root"></div>
+<script src="/assets/mermaid.min.js"></script>
+<script src="/assets/katex.min.js"></script>
+<script>
+(function () {
+  "use strict";
+  const params = new URLSearchParams(window.location.search);
+  const id = params.get("id") || "";
+  const token = params.get("token") || "";
+  const root = document.getElementById("snap-root");
+  let seq = 0;
+
+  function report(evt) {
+    if (!id || !token) return;
+    fetch("/bridge?id=" + encodeURIComponent(id) + "&token=" + encodeURIComponent(token), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(evt)
+    }).catch(function () {});
+  }
+
+  window.__vantrySnapshot = async function (payload) {
+    const dark = !!(payload && payload.dark);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    const kind = String((payload && payload.kind) || "").toLowerCase();
+    const source = String((payload && payload.source) || "");
+    root.innerHTML = "";
+    try {
+      if (kind === "mermaid") {
+        window.mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          suppressErrorRendering: true,
+          theme: dark ? "dark" : "default"
+        });
+        const res = await window.mermaid.render("snap-mmd-" + (++seq), source);
+        root.innerHTML = res.svg;
+      } else if (kind === "svg") {
+        root.innerHTML = source;
+      } else if (kind === "html") {
+        const frame = document.createElement("iframe");
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.setAttribute("referrerpolicy", "no-referrer");
+        frame.srcdoc = source;
+        root.appendChild(frame);
+      } else if (kind === "math") {
+        window.katex.render(source, root, { displayMode: true, throwOnError: false });
+      }
+      if (document.fonts && document.fonts.ready) {
+        await document.fonts.ready;
+      }
+      await new Promise(function (resolve) { requestAnimationFrame(function () { requestAnimationFrame(resolve); }); });
+      const rect = root.getBoundingClientRect();
+      report({ type: "ready", width: Math.ceil(rect.width), height: Math.ceil(rect.height) });
+      return { width: Math.ceil(rect.width), height: Math.ceil(rect.height) };
+    } catch (err) {
+      report({ type: "error", message: err && err.message ? err.message : String(err) });
+      return { error: err && err.message ? err.message : String(err) };
+    }
+  };
+
+  report({ type: "loaded" });
+})();
+</script>
+</body>
+</html>
