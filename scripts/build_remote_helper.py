@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a matching native RTC helper into platform-specific MyGo resources.
+"""Build a matching native RTC helper into platform-specific Rust packaging resources.
 
 macOS builds Swift locally. Windows builds with MSVC/CMake on Windows, or takes
 an explicitly provided Windows CI artifact when packaging from another OS.
@@ -28,8 +28,12 @@ if not target:
 goos, goarch = target.split('/')
 if args.plugin_root:
     plugin = args.plugin_root.resolve()
+elif os.environ.get('VANTRY_REMOTE_PLUGIN_ROOT'):
+    plugin = Path(os.environ['VANTRY_REMOTE_PLUGIN_ROOT']).expanduser().resolve()
+elif args.helper_file:
+    plugin = None
 else:
-    plugin = Path(subprocess.check_output(['go', 'list', '-m', '-f', '{{.Dir}}', 'github.com/muq9738/vantry-plugin-remote-desktop'], cwd=project, text=True).strip())
+    raise SystemExit('Specify --plugin-root (or VANTRY_REMOTE_PLUGIN_ROOT) or --helper-file')
 name = 'vantry-remote-helper.exe' if goos == 'windows' else 'vantry-remote-helper'
 output = project / 'resources' / f'{goos}-{goarch}' / 'remote-desktop' / name
 output.parent.mkdir(parents=True, exist_ok=True)

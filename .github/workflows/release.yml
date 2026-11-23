@@ -1,8 +1,7 @@
 name: Release
 
 env:
-  PYTHONUTF8: '1'
-  PYTHONIOENCODING: utf-8
+  CARGO_TERM_COLOR: always
 
 on:
   push:
@@ -11,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build and publish (e.g. v0.1.41)'
+        description: 'Release tag to build and publish (e.g. v0.2.0)'
         required: true
         type: string
 
@@ -24,46 +23,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+      - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
 
-      - name: Configure private Go module access (optional)
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - name: Build release workspace
+        run: cargo build --workspace --release --locked
+
+      - name: Package macOS desktop, service and relay bundles
         run: |
-          if [ -n "${PRIVATE_REPO_TOKEN:-}" ]; then
-            git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-            echo "GOPRIVATE=github.com/muq9738/*" >> "$GITHUB_ENV"
-          fi
+          cargo run --locked -p xtask -- package desktop --profile release --target darwin-arm64 --out-dir dist/desktop
+          cargo run --locked -p xtask -- package service --profile release --target darwin-arm64 --out-dir dist/service
+          cargo run --locked -p xtask -- package relay --profile release --target darwin-arm64 --out-dir dist/relay
+          ls -lh dist/desktop dist/service dist/relay
 
-      - name: Go vet
-        run: go vet ./...
-
-      - name: Build macOS remote-desktop helper
-        run: python3 scripts/build_remote_helper.py --platform darwin/arm64
-
-      - name: Package macOS desktop app
-        run: go tool mygo build -platform darwin/arm64 -skip-dmg
-
-      - name: Create macOS ZIP archive
-        run: |
-          VERSION=$(python3 -c 'import json; print(json.load(open("mygo.json"))["version"])')
-          ARCHIVE="dist/vantry-${VERSION}-darwin-arm64.zip"
-          codesign --verify --deep --strict dist/darwin-arm64/Vantry.app
-          ditto -c -k --sequesterRsrc --keepParent dist/darwin-arm64/Vantry.app "$ARCHIVE"
-          ls -lh "$ARCHIVE"
-
-      - name: Upload macOS release artifact
+      - name: Upload macOS release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-darwin-arm64
-          path: dist/vantry-*-darwin-arm64.zip
+          path: |
+            dist/desktop/vantry-*-darwin-arm64.zip
+            dist/service/vantry-service-*-darwin-arm64.zip
+            dist/relay/vantry-relay-*-darwin-arm64.zip
+            dist/*/*.json
+          if-no-files-found: error
+
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build service and relay release binaries
+        run: cargo build --release --locked -p vantry-service -p vantry-relay
+
+      - name: Package Linux service and relay bundles
+        run: |
+          cargo run --locked -p xtask -- package service --profile release --target linux-x86_64 --out-dir dist/service
+          cargo run --locked -p xtask -- package relay --profile release --target linux-x86_64 --out-dir dist/relay
+          ls -lh dist/service dist/relay
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: |
+            dist/service/vantry-service-*-linux-x86_64.tar.gz
+            dist/relay/vantry-relay-*-linux-x86_64.tar.gz
+            dist/*/*.json
           if-no-files-found: error
 
   windows-amd64:
@@ -71,75 +80,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+      - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Configure private Go module access (optional)
+      - name: Build release workspace
         shell: bash
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        run: |
-          if [ -n "${PRIVATE_REPO_TOKEN:-}" ]; then
-            git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-            echo "GOPRIVATE=github.com/muq9738/*" >> "$GITHUB_ENV"
-          fi
+        run: cargo build --workspace --release --locked
 
-      - name: Build Windows remote-desktop helper
-        shell: bash
-        run: python scripts/build_remote_helper.py --platform windows/amd64
-
-      - name: Package Windows desktop app
-        shell: bash
-        env:
-          GOMAXPROCS: '2'
-        run: go tool mygo build --platform windows/amd64
-
-      - name: Verify Windows package and Core/SQLite smoke test
-        shell: bash
-        run: python scripts/verify_windows_package.py --package dist/windows-amd64 --require-helper
-
-      - name: Create portable Windows ZIP archive
+      - name: Package Windows desktop and service bundles
         shell: bash
         run: |
-          python - <<'PY'
-          import json, zipfile
-          from pathlib import Path
-
-          version = json.loads(Path("mygo.json").read_text(encoding="utf-8"))["version"]
-          src = Path("dist/windows-amd64")
-          out = Path(f"dist/vantry-{version}-windows-amd64.zip")
-          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-              for path in sorted(src.rglob("*")):
-                  if path.is_dir():
-                      continue
-                  if path.parent == src and path.suffix.lower() == ".exe" and path.name.lower() != "vantry.exe":
-                      continue
-                  zf.write(path, path.relative_to(src))
-          print(f"Created {out} ({out.stat().st_size} bytes)")
-          PY
+          cargo run --locked -p xtask -- package desktop --profile release --target windows-x86_64 --out-dir dist/desktop
+          cargo run --locked -p xtask -- package service --profile release --target windows-x86_64 --out-dir dist/service
+          ls -lh dist/desktop dist/service
 
       - name: Upload Windows release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-windows-amd64
           path: |
-            dist/vantry-*-windows-amd64.zip
-            dist/vantry-setup-*-amd64.exe
-            dist/windows-amd64/vantry-setup-*-amd64.exe
+            dist/desktop/vantry-*-windows-x86_64.zip
+            dist/service/vantry-service-*-windows-x86_64.zip
+            dist/*/*.json
           if-no-files-found: error
 
   publish-release:
-    needs: [darwin-arm64, windows-amd64]
+    needs: [darwin-arm64, linux-x86_64, windows-amd64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -159,37 +124,10 @@ jobs:
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           mkdir -p staging
-          find release-assets -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.dmg' \) -exec mv {} staging/ \;
-          (cd staging && sha256sum * > SHA256SUMS.txt)
-          cat staging/SHA256SUMS.txt
-
-          python3 - "$VERSION" <<'PY'
-          import sys
-          from pathlib import Path
-
-          version = sys.argv[1]
-          checksums = Path("staging/SHA256SUMS.txt").read_text(encoding="utf-8").strip()
-          notes = f"""Vantry {version} desktop release.
-
-          ### Highlights
-          - Fix external Pi upgrade button visibility when already on the latest version
-          - Anchor conversation turn minimap cleanly on the left margin across wide windows
-          - Default multi-tool work groups to collapsed with live inline step preview and bounded expanded scrolling
-          - Standardize composer shortcuts across macOS and Windows (Enter sends, Cmd+Enter / Ctrl+Enter and Shift+Enter insert newlines) and preserve default across state restore
-          - Redesign active-turn follow-up (steer) bubbles and fix ghost steer entries leaking into legacy queue UI
-          - Surface workspace directory lock waiting state with the holding thread title instead of appearing hung
-          - Enhance right-side subagent panel with live tab switcher, quick launch, and slash command entry
-          - Simplify MCP panel to align with external Pi (`mcp.json` + default `codemode`) and Codex/T3 Code interactions
-          - Redesign Git workflow with an IDEA-style branch popover (search, recent/local/remote folder tree, branch submenus for checkout/update/merge/rebase/compare/rename/delete), branch compare view, and streamlined Git drawer
-
-          ### SHA-256 Checksums
-          ```
-          {checksums}
-          ```
-          """
-          cleaned = "\n".join(line[10:] if line.startswith("          ") else line for line in notes.splitlines()) + "\n"
-          Path("release-notes.md").write_text(cleaned, encoding="utf-8")
-          PY
+          find release-assets -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.delta' \) -exec mv {} staging/ \;
+          cat > release-notes.md <<EOF
+          Vantry ${VERSION} full-Rust release (NSH native desktop, Rust Core, embedded Pi worker, standalone relay).
+          EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" staging/* --clobber

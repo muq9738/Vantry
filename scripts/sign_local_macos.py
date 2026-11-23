@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Sign a Vantry .app with an existing local code-signing identity and zip it.
 
-Build first with MyGo's ad-hoc signer, then run this script. It reuses the
-identity already in Keychain; it never generates certificates, exports private
-keys, changes trust settings, or publishes anything. Only the .app, a public
-certificate (when supplied), and installation notes go into the distribution.
+Build first with `cargo run --locked -p xtask -- package desktop`, then run this
+script. It reuses the identity already in Keychain; it never generates
+certificates, exports private keys, changes trust settings, or publishes
+anything. Only the .app, a public certificate (when supplied), and installation
+notes go into the distribution.
 """
 import argparse
 import os
@@ -73,6 +74,9 @@ def main():
             containers.append(path)
     for path in sorted(native, key=lambda p: len(p.parts), reverse=True):
         run(["codesign", "--force", "--sign", args.identity, "--timestamp=none", "--preserve-metadata=entitlements", str(path)])
+    service_bin = app / "Contents/MacOS/vantry-service"
+    if service_bin.is_file():
+        run(["codesign", "--force", "--sign", args.identity, "--timestamp=none", "--preserve-metadata=entitlements", str(service_bin)])
     for path in sorted(containers, key=lambda p: len(p.parts), reverse=True):
         if any(path in binary.parents for binary in native):
             run(["codesign", "--force", "--sign", args.identity, "--timestamp=none", "--preserve-metadata=entitlements", str(path)])

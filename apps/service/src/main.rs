@@ -117,12 +117,16 @@ impl WorkspaceArgs {
 struct CoreArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    #[arg(long)]
+    socket: Option<PathBuf>,
     #[arg(long,value_parser=["pi","controlled"])]
     provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
     #[arg(long,default_value="80ms",value_parser=parse_duration)]
     controlled_delay: Duration,
+    #[arg(long)]
+    pi_executable: Option<PathBuf>,
     #[arg(long)]
     magpie_settings: Option<PathBuf>,
     #[arg(long)]
@@ -268,7 +272,10 @@ async fn serve(args: CoreArgs) -> Result<()> {
 }
 async fn ensure_core(args: CoreArgs, raw: &[OsString]) -> Result<()> {
     let data = data_dir(args.data_dir.as_deref())?;
-    let client = CoreClient::from_data_dir(&data);
+    let client = match args.socket.as_deref() {
+        Some(socket) => CoreClient::new(socket),
+        None => CoreClient::from_data_dir(&data),
+    };
     let ready = async || {
         tokio::time::timeout(Duration::from_secs(1), client.health())
             .await

@@ -412,11 +412,11 @@ async fn execute(
     for (filename, source) in [
         (
             "vantry_tools.ts",
-            include_str!("../../../internal/adapters/provider/pi/vantry_tools.ts"),
+            include_str!("../extensions/vantry_tools.ts"),
         ),
         (
             "approval.ts",
-            include_str!("../../../internal/adapters/provider/pi/approval.ts"),
+            include_str!("../extensions/approval.ts"),
         ),
     ] {
         let path = dir.join(filename);
