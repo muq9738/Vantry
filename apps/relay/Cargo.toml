@@ -16,8 +16,12 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vantry-connectivity.workspace = true
 vantry-platform.workspace = true
 vantry-protocol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
