@@ -268,6 +268,15 @@ func runRPC(ctx context.Context, job jobRequest, jobDir string, stdin io.WriteCl
 		now := time.Now()
 		lastActivity = now
 		if record.Type == "response" {
+			sendPrompt := func() error {
+				phase = "prompt"
+				deadline = time.Now().Add(rpcTimeout)
+				prompt, err := framedPromptCommand(job)
+				if err != nil {
+					return err
+				}
+				return queueWrite(prompt, nil)
+			}
 			switch record.ID {
 			case "vantry:state":
 				if phase != "get_state" || record.Command != "get_state" {
@@ -276,30 +285,44 @@ func runRPC(ctx context.Context, job jobRequest, jobDir string, stdin io.WriteCl
 				if !record.Success {
 					return fmt.Errorf("Pi get_state rejected: %s", record.Error)
 				}
+				var stateData struct {
+					SteeringMode string `json:"steeringMode"`
+					Model        struct {
+						Provider string `json:"provider"`
+						ID       string `json:"id"`
+					} `json:"model"`
+				}
+				stateDecoded := json.Unmarshal(record.Data, &stateData) == nil
 				if job.ExpectedModel != "" {
-					var execution struct {
-						Model struct {
-							Provider string `json:"provider"`
-							ID       string `json:"id"`
-						} `json:"model"`
-					}
-					if json.Unmarshal(record.Data, &execution) != nil || execution.Model.Provider == "" || execution.Model.ID == "" {
+					if !stateDecoded || stateData.Model.Provider == "" || stateData.Model.ID == "" {
 						return errors.New("Pi 未确认所选模型，未发送消息；请重新载入 Magpie 模型配置")
 					}
-					if execution.Model.Provider+"/"+execution.Model.ID != job.ExpectedModel {
+					if stateData.Model.Provider+"/"+stateData.Model.ID != job.ExpectedModel {
 						return errors.New("Pi 实际模型与 Magpie 选择不一致，未发送消息；请检查并应用 Magpie 的 Pi 配置")
 					}
 				}
 				if requiresApprovalExtension(job) && !approvalReady {
 					return errors.New("Pi approval extension did not initialize")
 				}
-				phase = "prompt"
-				deadline = time.Now().Add(rpcTimeout)
-				prompt, err := framedPromptCommand(job)
-				if err != nil {
-					return err
+				if stateDecoded && stateData.SteeringMode == "one-at-a-time" {
+					// Batch queued steers into one turn so rapid user follow-ups
+					// are seen together instead of fragmenting execution turn-by-turn.
+					phase = "steering_mode"
+					deadline = time.Now().Add(rpcTimeout)
+					sentRPC["vantry:steering-mode"] = true
+					return queueWrite(map[string]any{
+						"id":   "vantry:steering-mode",
+						"type": "set_steering_mode",
+						"mode": "all",
+					}, nil)
 				}
-				return queueWrite(prompt, nil)
+				return sendPrompt()
+			case "vantry:steering-mode":
+				if phase != "steering_mode" {
+					return nil
+				}
+				// Proceed to prompt even if an older Pi rejects set_steering_mode.
+				return sendPrompt()
 			case "vantry:prompt":
 				if phase != "prompt" || record.Command != "prompt" {
 					return errors.New("unexpected Pi prompt response")
@@ -458,6 +481,9 @@ func runRPC(ctx context.Context, job jobRequest, jobDir string, stdin io.WriteCl
 				}
 				if phase == "get_state" {
 					return state, fmt.Errorf("Pi RPC startup handshake (get_state) timed out after %s; check user extension initialization", rpcStartupTimeout)
+				}
+				if phase == "steering_mode" {
+					return state, fmt.Errorf("Pi RPC steering mode setup timed out after %s", rpcTimeout)
 				}
 				return state, fmt.Errorf("Pi RPC prompt acceptance timed out after %s", rpcTimeout)
 			}

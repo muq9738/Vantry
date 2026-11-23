@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/muq9738/Vantry/pkg/provider"
 )
@@ -102,7 +104,12 @@ func readControls(jobDir string) ([]provider.Control, error) {
 	if err != nil {
 		return nil, err
 	}
-	var controls []provider.Control
+	type orderedControl struct {
+		control provider.Control
+		modTime time.Time
+		name    string
+	}
+	var ordered []orderedControl
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -115,7 +122,25 @@ func readControls(jobDir string) ([]provider.Control, error) {
 		if err != nil || name != entry.Name() {
 			return nil, errors.New("invalid persisted control identity")
 		}
-		controls = append(controls, control)
+		var modTime time.Time
+		if info, infoErr := entry.Info(); infoErr == nil {
+			modTime = info.ModTime()
+		}
+		ordered = append(ordered, orderedControl{
+			control: control,
+			modTime: modTime,
+			name:    entry.Name(),
+		})
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if !ordered[i].modTime.Equal(ordered[j].modTime) {
+			return ordered[i].modTime.Before(ordered[j].modTime)
+		}
+		return ordered[i].name < ordered[j].name
+	})
+	controls := make([]provider.Control, len(ordered))
+	for i, item := range ordered {
+		controls[i] = item.control
 	}
 	return controls, nil
 }

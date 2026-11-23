@@ -241,6 +241,7 @@ type workbench struct {
 	subagentWidth     float32
 	ssh               sshHubState
 	termTab           terminalTabState
+	terminalTasks     terminalTaskState
 	plugs             pluginCenterState
 	mcp               mcpPanelState
 	rd                remoteDesktopState

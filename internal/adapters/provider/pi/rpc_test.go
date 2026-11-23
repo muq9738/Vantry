@@ -2,6 +2,7 @@ package pi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -68,10 +69,16 @@ func fakeRPCMain() {
 				// Extension startup can legitimately exceed the command timeout.
 				time.Sleep(rpcTimeout + time.Second)
 			}
-			response(command.ID, command.Type, config.Mode != "reject-state", map[string]any{"isStreaming": false})
+			statePayload := map[string]any{"isStreaming": false}
+			if config.Mode == "steering-mode-all" || config.Mode == "steering-mode-reject" {
+				statePayload["steeringMode"] = "one-at-a-time"
+			}
+			response(command.ID, command.Type, config.Mode != "reject-state", statePayload)
 			if config.Mode == "backpressure" {
 				emit(map[string]any{"type": "notification", "text": strings.Repeat("startup", 100000)})
 			}
+		case "set_steering_mode":
+			response(command.ID, command.Type, config.Mode != "steering-mode-reject", nil)
 		case "prompt":
 			if config.Mode == "reject-prompt" {
 				response(command.ID, command.Type, false, nil)
@@ -118,7 +125,7 @@ func fakeRPCMain() {
 				emit(map[string]any{"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "bash", "args": map[string]string{"command": "sleep 99"}})
 			case "stall-stream":
 				// Stay silent with no active tool so stream-idle watchdog fires.
-			case "normal", "slow-start", "settled-before-accept", "chat":
+			case "normal", "slow-start", "settled-before-accept", "chat", "steering-mode-all", "steering-mode-reject":
 				settle()
 			case "settle-control":
 				// Give Core time to persist a control but never accept it.
@@ -580,4 +587,70 @@ func waitFor(t *testing.T, check func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func TestPiRPCSteeringModeBatchingAndControlOrdering(t *testing.T) {
+	for _, mode := range []string{"steering-mode-all", "steering-mode-reject"} {
+		t.Run(mode, func(t *testing.T) {
+			p, request, cfg := newRPCProvider(t, mode)
+			if err := p.RunEvents(context.Background(), request, func(provider.Event) error { return nil }); err != nil {
+				t.Fatalf("RunEvents(%s): %v", mode, err)
+			}
+			raw, err := os.ReadFile(cfg.Commands)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var types []string
+			var steerMode string
+			for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte{'\n'}) {
+				var cmd struct {
+					Type string `json:"type"`
+					Mode string `json:"mode"`
+				}
+				if err := json.Unmarshal(line, &cmd); err != nil {
+					t.Fatalf("decode command %s: %v", line, err)
+				}
+				types = append(types, cmd.Type)
+				if cmd.Type == "set_steering_mode" {
+					steerMode = cmd.Mode
+				}
+			}
+			if len(types) < 3 || types[0] != "get_state" || types[1] != "set_steering_mode" || types[2] != "prompt" || steerMode != "all" {
+				t.Fatalf("unexpected handshake sequence=%v mode=%q", types, steerMode)
+			}
+		})
+	}
+
+	t.Run("readControls-chronological-order", func(t *testing.T) {
+		jobDir := t.TempDir()
+		controlsDir := filepath.Join(jobDir, "controls")
+		if err := os.MkdirAll(controlsDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Second control ID sorts lexicographically BEFORE first control ID in base64;
+		// chronological ModTime ordering must preserve user-sent order.
+		first := provider.Control{ID: "zzz_first", Kind: "steer", Message: "first"}
+		second := provider.Control{ID: "aaa_second", Kind: "steer", Message: "second"}
+		for idx, ctrl := range []provider.Control{first, second} {
+			name, err := controlName(ctrl.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(controlsDir, name)
+			if err := writeJSONFile(path, ctrl); err != nil {
+				t.Fatal(err)
+			}
+			ts := time.Now().Add(time.Duration(idx) * 2 * time.Second)
+			if err := os.Chtimes(path, ts, ts); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := readControls(jobDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 || got[0].ID != "zzz_first" || got[1].ID != "aaa_second" {
+			t.Fatalf("readControls order = %+v, want [zzz_first aaa_second]", got)
+		}
+	})
 }

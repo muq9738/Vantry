@@ -595,27 +595,32 @@ External MCP (codemode default): check <mcp_servers>, discover schemas via descr
 }
 
 func mainWorkerInstructions(job jobRequest, refs workerInstructionPaths) string {
-	ecosystemNote := "User extensions and MCP are disabled unless enabled; Vantry provides native orchestration/secret tools and optional approval gating."
+	ecosystemNote := "User extensions/MCP off unless enabled."
 	if effectiveUserExtensions(job) || effectiveUserMCP(job) {
 		ecosystemNote = fmt.Sprintf(
-			"User Pi compatibility: extensions=%t, mcp=%t (codemode default); Vantry provides native orchestration/secret tools and optional approval gating.",
+			"User Pi: extensions=%t, mcp=%t (codemode default).",
 			effectiveUserExtensions(job), effectiveUserMCP(job),
 		)
 	}
-	return fmt.Sprintf(`You are executing inside Vantry's durable Pi session worker. %s%s
+	return fmt.Sprintf(`Vantry durable Pi worker. %s%s
+
+Execution:
+- Finish tasks end-to-end and verify in this turn; inspect local code/state first and never stop after narrating a next step you can run now.
+- On a mid-run steer, answer concisely and immediately continue completing the active goal unless told to stop.
+- Interactive TTY (login/2FA/SSH/wizards): call vantry_terminal_run directly (built-in PTY; resumes on exit) instead of osascript, .command wrappers, or /usr/bin/script.
+- Secrets: call vantry_request_secret directly (0600 file; unavailable in scripts).
 
 Workspace & delegation:
-- Ordinary coding tasks need no Vantry orchestration tools. Work directly in this workspace.
+- Ordinary coding tasks need no Vantry orchestration tools.
 %s
-- Read %s before delegating, showing a `+"```dispatch"+` card, managing peer threads, or targeting another machine (remote environmentId, low-frequency tools, thread links, CLI fallback).
+- Read %s before delegating, showing a `+"```dispatch"+` card, managing peer threads, or targeting another machine.
 - On orchestration/model error, quote it and stop. Never fall back to native subagents, scripted workflows, other CLIs, or another model. Run a scripted workflow only when the user asks for one.
-- Secrets: call vantry_request_secret directly (0600 file; scripts cannot invoke it).
 
 Tools & codemode:
-- For ordinary multi-file read / grep / find / ls, call native tools directly in parallel—do NOT wrap routine file reads or greps in codemode.
-- Web/HTTP: inspect status, headers, and charset (e.g. GBK/GB18030) via short curl/python3 bash scripts and extract only needed text—never dump raw HTML.
-- Use codemode only to filter large JSON/lists (e.g. list_projects, large API/MCP payloads), batch multi-subtask orchestration (Promise.allSettled), or call codemode MCP/Vantry tools; filter/trim inside the script before text().
-- Vantry context: thread=%s`,
+- Call native read/grep/find/ls directly in parallel—do NOT wrap routine reads/greps in codemode.
+- Web/HTTP: inspect status/headers/charset (e.g. GBK/GB18030) via short curl/python3 scripts; never dump raw HTML.
+- Use codemode only for large JSON/lists (list_projects, large API/MCP payloads), batch Promise.allSettled, or codemode MCP/Vantry tools; trim before text().
+- Context: thread=%s`,
 		ecosystemNote, mcpCodemodeGuidance(job), nativeSubagentPolicy(job), refs.orchestration, job.Request.ThreadID,
 	)
 }

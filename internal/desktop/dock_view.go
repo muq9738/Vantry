@@ -117,7 +117,7 @@ func (w *workbench) openDock(id string) {
 	}
 	switch id {
 	case "terminal":
-		if w.termTab.active != terminalHostsTab && len(w.sshSessions()) == 0 {
+		if w.termTab.active != terminalHostsTab && len(w.sshSessions()) == 0 && len(w.terminalTaskSessions()) == 0 {
 			w.openTerminal()
 		}
 	case "git":

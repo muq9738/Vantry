@@ -2,7 +2,7 @@
   "name": "Vantry",
   "slug": "vantry",
   "identifier": "io.github.muq9738.vantry",
-  "version": "0.1.41",
+  "version": "0.1.42",
   "main": "./cmd/vantry",
   "icon": "resources/icon.png",
   "out": "dist",

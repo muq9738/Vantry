@@ -153,6 +153,10 @@ func (w *workbench) requestListView(c *ui.Context, p palette, runID string) {
 			continue
 		}
 		request := request
+		if termPayload, isTermRun := parseTerminalRunRequest(request); isTermRun {
+			w.terminalTaskRequestCard(c, p, request, termPayload, w.controlBusy("request:"+request.ID))
+			continue
+		}
 		// The approval card is the turn's live state while it waits: a warm
 		// amber surface and border, a clear headline, the command in a code
 		// well, and Deny / Allow once on the right.

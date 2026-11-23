@@ -167,7 +167,7 @@ func TestPiRPCExplicitBuiltinsSurviveDisabledUserExtensions(t *testing.T) {
 		}
 		return false
 	}
-	if !ready || !contains("codemode") || !contains("tool_search") || !contains("vantry_request_secret") || contains("vantry_delegate_task") || contains("vantry_thread_read") {
+	if !ready || !contains("codemode") || !contains("tool_search") || !contains("vantry_request_secret") || !contains("vantry_terminal_run") || contains("vantry_delegate_task") || contains("vantry_thread_read") {
 		t.Fatalf("built-in/discovery loadout did not survive --no-extensions: ready=%v active=%v stderr=%s", ready, active, stderr.String())
 	}
 }

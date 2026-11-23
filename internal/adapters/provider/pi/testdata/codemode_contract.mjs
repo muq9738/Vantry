@@ -78,13 +78,14 @@ try {
   session.subscribe(event => { if (event.type.startsWith("tool_execution")) events.push(event); });
   const initial = session.getActiveToolNames();
   const vantry = session.getAllTools().filter(t => t.name.startsWith("vantry_"));
-  assert.equal(vantry.length, 17);
-  assert.deepEqual(initial.filter(n => n.startsWith("vantry_")), ["vantry_request_secret"]);
+  assert.equal(vantry.length, 18);
+  assert.deepEqual(initial.filter(n => n.startsWith("vantry_")).sort(), ["vantry_request_secret", "vantry_terminal_run"]);
   assert.ok(!initial.includes("vantry_delegate_task"));
   assert.ok(!initial.includes("vantry_thread_read"));
   assert.ok(session.getCallableToolNames().includes("vantry_delegate_task"));
   assert.ok(session.getCallableToolNames().includes("vantry_thread_read"));
   assert.ok(!session.getCallableToolNames().includes("vantry_request_secret"));
+  assert.ok(!session.getCallableToolNames().includes("vantry_terminal_run"));
   for (const info of vantry) assert.ok(session.getToolDefinition(info.name).outputSchema);
   const readDeclared = session.agent.state.tools.find(t => t.name === "read");
   assert.ok(readDeclared && !readDeclared.description.includes("Codemode:"), "read description must not advertise Codemode suffix");
@@ -123,6 +124,19 @@ try {
   assert.deepEqual(starts.map(e => e.toolName).sort(), ["vantry_thread_list", "vantry_thread_read"]);
   assert.ok(starts.every(e => e.toolCallId.startsWith("batch/")));
   const searchTool = session.agent.state.tools.find(t => t.name === "tool_search");
+  const beforeNoiseSearch = [...session.getActiveToolNames()];
+  const noiseDecision = await session.agent.beforeToolCall({
+    toolCall: { id: "discover-noise", name: "tool_search" },
+    args: { query: "Vantry cmd interactive terminal PTY launch local command tty" },
+  });
+  assert.equal(noiseDecision?.block, true, "Irrelevant terminal tool_search must be blocked before mutating active tools");
+  assert.match(String(noiseDecision?.reason ?? ""), /vantry_terminal_run/i);
+  assert.deepEqual(session.getActiveToolNames(), beforeNoiseSearch, "Blocked tool_search must not bust prompt cache by mutating active tools");
+  const validSearchDecision = await session.agent.beforeToolCall({
+    toolCall: { id: "discover", name: "tool_search" },
+    args: { query: "vantry_thread_read", limit: 1 },
+  });
+  assert.notEqual(validSearchDecision?.block, true, "Real deferred tool query must not be blocked");
   const discovered = await searchTool.execute("discover", { query: "vantry_thread_read", limit: 1 }, undefined, undefined);
   assert.ok(!discovered.isError);
   assert.ok(session.getActiveToolNames().includes("vantry_thread_read"));
@@ -147,6 +161,8 @@ try {
   assert.equal(confirms, 2, "The bridge must not add a separate approval rule for native child tools");
   const secret = await execute("secret", 'await tools.vantry_request_secret({prompt:"not allowed from scripts"})');
   assert.ok(secret.isError);
+  const termScript = await execute("term-script", 'await tools.vantry_terminal_run({command:"echo nope"})');
+  assert.ok(termScript.isError);
   assert.equal(confirms, 2);
   const beforeInvalid = requests.length;
   const invalid = await execute("invalid", 'await tools.vantry_thread_read({environmentId:"studio"})');
@@ -315,7 +331,7 @@ try {
   }
   await fs.writeFile(path.join(root, "native-events.jsonl"), events.map(e => JSON.stringify(e)).join("\n") + "\n");
   process.stdout.write(JSON.stringify({
-    status: "passed", registeredVantryTools: vantry.length, declaredVantryTools: 1,
+    status: "passed", registeredVantryTools: vantry.length, declaredVantryTools: 2,
     toolDeclarationBytes: { baseline: baselineBytes, compact: compactBytes },
     unfilteredFixtureBytes: Buffer.byteLength(JSON.stringify(list)) + Buffer.byteLength(JSON.stringify(read)),
     filteredResultBytes: Buffer.byteLength(resultText(batch)), approvals: confirms,

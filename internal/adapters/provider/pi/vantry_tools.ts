@@ -18,6 +18,9 @@ const ENV_ATTEMPT_ID = "VANTRY_ATTEMPT_ID";
 const ENV_THREAD_ID = "VANTRY_THREAD_ID";
 const ENV_PARENT_TASK_ID = "VANTRY_PARENT_TASK_ID";
 const ENV_DIRECT_ORCHESTRATION = "VANTRY_DIRECT_ORCHESTRATION";
+const ENV_INTERACTION_MODE = "VANTRY_INTERACTION_MODE";
+const VANTRY_TERMINAL_REQUEST_KIND = "vantry_terminal_run";
+const MODEL_ONLY_UI_TOOLS = new Set(["vantry_request_secret", "vantry_terminal_run"]);
 
 const DIRECT_RETRIEVAL_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const DEFAULT_CODEMODE_MAX_OUTPUT_TOKENS = 10_000;
@@ -740,6 +743,24 @@ const requestSecretSchema = Type.Object({
   ),
 });
 type RequestSecretInput = Static<typeof requestSecretSchema>;
+
+const terminalRunSchema = Type.Object({
+  command: Type.String({
+    description:
+      "Shell command to run interactively inside Vantry's built-in Terminal (real PTY in the workspace directory). Use for login, 2FA/OTP, SSH prompts, sudo, or interactive TTY setup wizards.",
+  }),
+  title: Type.Optional(
+    Type.String({
+      description: "Short human-readable label for the interactive terminal tab (e.g. 'Steam Guard 设置')",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description: "Optional working directory (relative to workspace or absolute; defaults to workspace root)",
+    }),
+  ),
+});
+type TerminalRunInput = Static<typeof terminalRunSchema>;
 
 function serializeThreadLaunchSpec(spec: CreateThreadsItemInput, baseCwd?: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -1474,6 +1495,311 @@ export class ToolLoopGuard {
   }
 }
 
+const TOOL_SEARCH_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "in",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "that",
+  "the",
+  "this",
+  "to",
+  "with",
+]);
+
+const TOOL_SEARCH_GENERIC_TERMS = new Set([
+  "vantry",
+  "tool",
+  "local",
+  "command",
+  "cmd",
+  "run",
+  "exec",
+  "execute",
+  "open",
+  "launch",
+  "start",
+  "panel",
+  "ui",
+  "native",
+  "interactive",
+  "user",
+  "input",
+  "output",
+  "call",
+  "use",
+  "get",
+  "set",
+  "help",
+  "file",
+  "system",
+  "app",
+  "session",
+  "work",
+  "workspace",
+  "current",
+  "mode",
+  "client",
+  "host",
+  "window",
+  "tab",
+  "action",
+  "do",
+  "make",
+  "new",
+  "manage",
+  "control",
+  "direct",
+  "directly",
+]);
+
+function stemSearchTerm(term: string): string {
+  if (term.length > 4 && term.endsWith("ies")) return `${term.slice(0, -3)}y`;
+  if (term.length > 4 && /(ches|shes|sses|xes|zes)$/.test(term)) return term.slice(0, -2);
+  if (term.length > 3 && term.endsWith("s") && !term.endsWith("ss")) return term.slice(0, -1);
+  return term;
+}
+
+function tokenizeSearchText(text: string): string[] {
+  const normalized = text
+    .normalize("NFC")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{M}\p{N}]+/gu, " ");
+  return normalized
+    .split(/\s+/)
+    .filter((word) => word.length > 0 && !TOOL_SEARCH_STOP_WORDS.has(word))
+    .map((word) => (/^[a-z0-9]+$/.test(word) ? stemSearchTerm(word) : word));
+}
+
+function normalizeSearchToolName(name: string): string {
+  return name.trim().toLowerCase().replace(/[^a-z0-9_$]/g, "_");
+}
+
+function collectSchemaSearchTerms(schema: unknown, out: string[], depth = 0): void {
+  if (!isRecord(schema) || depth > 5) return;
+  if (typeof schema.description === "string") out.push(schema.description);
+  if (isRecord(schema.properties)) {
+    for (const [key, prop] of Object.entries(schema.properties)) {
+      out.push(key);
+      collectSchemaSearchTerms(prop, out, depth + 1);
+    }
+  }
+  if (schema.items !== undefined) collectSchemaSearchTerms(schema.items, out, depth + 1);
+}
+
+export interface SearchableToolSummary {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+  exposure?: string;
+}
+
+export interface ToolSearchGuardDecision {
+  allow: boolean;
+  reason?: string;
+}
+
+/**
+ * Prevents Pi's BM25 tool_search from activating unrelated deferred vantry_*
+ * tools (and busting the prompt KV cache) when a query only overlaps generic
+ * boilerplate/brand terms like "vantry", "local", "launch", or "input".
+ */
+export function evaluateToolSearchGuard(
+  query: string,
+  allTools: ReadonlyArray<SearchableToolSummary>,
+  activeToolNames: ReadonlyArray<string>,
+): ToolSearchGuardDecision {
+  const trimmed = query.trim();
+  if (!trimmed || allTools.length === 0) {
+    return { allow: true };
+  }
+  const activeSet = new Set(activeToolNames);
+  const inactiveSearchable = allTools.filter(
+    (t) => (t.exposure === "deferred" || t.exposure === "codemode") && !activeSet.has(t.name),
+  );
+  if (inactiveSearchable.length === 0) {
+    return {
+      allow: false,
+      reason: "All searchable tools are already loaded; no deferred tools remain to load.",
+    };
+  }
+
+  const exactQuery = normalizeSearchToolName(trimmed);
+  for (const tool of inactiveSearchable) {
+    const normalized = normalizeSearchToolName(tool.name);
+    if (normalized === exactQuery || normalized.endsWith(`__${exactQuery}`)) {
+      return { allow: true };
+    }
+  }
+
+  const queryTerms = [...new Set(tokenizeSearchText(trimmed))];
+  if (queryTerms.length === 0) {
+    return { allow: true };
+  }
+  const specificTerms = queryTerms.filter((term) => !TOOL_SEARCH_GENERIC_TERMS.has(term));
+
+  const toolTermsOf = (tool: SearchableToolSummary): Set<string> => {
+    const parts: string[] = [tool.name, tool.description ?? ""];
+    collectSchemaSearchTerms(tool.parameters, parts);
+    return new Set(tokenizeSearchText(parts.join(" ")));
+  };
+
+  if (specificTerms.length > 0) {
+    for (const tool of inactiveSearchable) {
+      const terms = toolTermsOf(tool);
+      if (specificTerms.some((term) => terms.has(term))) {
+        return { allow: true };
+      }
+    }
+    const activeMatches = allTools
+      .filter((t) => activeSet.has(t.name) && t.name !== "tool_search")
+      .filter((t) => {
+        const terms = toolTermsOf(t);
+        return specificTerms.some((term) => terms.has(term));
+      })
+      .map((t) => t.name);
+    if (activeMatches.length > 0) {
+      return {
+        allow: false,
+        reason: `No inactive deferred tools match [${specificTerms.join(", ")}]. Already-loaded tools matching your query: ${activeMatches.join(", ")}. Call them directly instead of tool_search.`,
+      };
+    }
+    return {
+      allow: false,
+      reason: `No deferred tools match [${specificTerms.join(", ")}]. Deferred tools only cover Vantry orchestration (delegate/thread/task/environment) and configured MCP servers; use your already-loaded tools directly (bash, vantry_terminal_run, vantry_request_secret, read/grep/find/edit/write).`,
+    };
+  }
+
+  return {
+    allow: false,
+    reason: `Query ${JSON.stringify(trimmed)} contains only generic terms and would load unrelated orchestration tools. Search by a specific capability or tool name (e.g. "delegate", "thread_read", "environment", or an MCP tool name), or use already-loaded tools directly (bash, vantry_terminal_run, vantry_request_secret).`,
+  };
+}
+
+export interface ContinuityGuardInput {
+  assistantText: string;
+  lastUserText: string;
+  sawMidRunUserMessage: boolean;
+  toolCallsInAttempt: number;
+  toolCallsSinceLastUser: number;
+}
+
+export interface ContinuityGuardDecision {
+  shouldContinue: boolean;
+  reason?: "steer_dropped_execution" | "dangling_next_step";
+  instruction?: string;
+}
+
+const USER_STOP_INTENT_RE =
+  /(?:^(?:停|停止|先停|别做|先别|算了|不用做|不用了|取消|暂停|只回答|先回答|stop|cancel|abort|pause|never\s*mind|don't\s+(?:do|run|change)|just\s+(?:answer|explain))\b|(?:停下|别继续|先别做|不要执行|暂停执行|停止执行|stop\s+here|don't\s+continue))/i;
+
+const ASSISTANT_USER_HANDOFF_RE =
+  /(?:[?？]\s*$|请确认|确认后|请回复|回复[「“"']|告诉我|请先|请你|需要你|你来|请选择|是否要|要不要|是否继续|你确定|麻烦你|切到.{0,12}窗口|完成后再|please confirm|let me know|would you like|do you want|confirm if|should i proceed|tell me when)/i;
+
+const DANGLING_NEXT_STEP_RE =
+  /(?:(?:^|[。！!\n])\s*(?:接下来|下一步|随后|紧接着|下面|现在)(?:我|我会|我将|我来|只做|继续|直接|先|再|去|开始|着手|补|改|跑|测|验证|执行|打通|开启|重启|启动)|(?:^|[。！!\n])\s*(?:后续|接下来)(?:应|应该|需要|将|会)(?:让程序|直接|改用|改为|自动|接入|补齐|完善)|(?:^|[.!\n])\s*(?:next,?\s+i(?:'ll| will)|i(?:'ll| will)\s+(?:now|next|proceed to|continue to|go ahead and)|let me\s+(?:now|next|proceed to))\b)/i;
+
+const CONDITIONAL_USER_GATE_RE =
+  /(?:完成后|确认后|等你|你确认|如果|若|once you|after you|when you|if you)/i;
+
+const STEER_CORRECTION_ACK_RE =
+  /(?:是我选错|我误用|我理解错|说错了|搞错了|正确做法是|应该直接|不用走|不走|跳过|绕过|改为|接下来|下一步|my mistake|wrong approach|wrong path|instead|skip|bypass)/i;
+
+const ALREADY_COMPLETED_RE =
+  /(?:全部完成|已完成全部|已经全部完成|均已通过|all done|everything is complete)/i;
+
+/**
+ * Detects high-confidence premature stops before agent settlement:
+ * 1) A mid-run steer redirected the agent, it acknowledged/corrected course with
+ *    text only (0 tools), and tried to settle without executing the fix.
+ * 2) The final reply ends by narrating a concrete next action the agent itself
+ *    will take ("接下来只做...", "I'll now...") without calling any tool or
+ *    waiting on user input.
+ */
+export function evaluateContinuityGuard(input: ContinuityGuardInput): ContinuityGuardDecision {
+  const text = input.assistantText.trim();
+  if (!text) {
+    return { shouldContinue: false };
+  }
+  if (USER_STOP_INTENT_RE.test(input.lastUserText.trim())) {
+    return { shouldContinue: false };
+  }
+  if (/```(?:ask|dispatch)\b/.test(text)) {
+    return { shouldContinue: false };
+  }
+
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const tail = paragraphs.length > 0 ? paragraphs[paragraphs.length - 1] : text;
+  if (ASSISTANT_USER_HANDOFF_RE.test(tail)) {
+    return { shouldContinue: false };
+  }
+
+  const danglingMatch = DANGLING_NEXT_STEP_RE.exec(tail);
+  if (danglingMatch) {
+    const lineStart = tail.lastIndexOf("\n", danglingMatch.index);
+    const sentencePrefix = tail.slice(lineStart + 1, danglingMatch.index);
+    if (!CONDITIONAL_USER_GATE_RE.test(sentencePrefix)) {
+      return {
+        shouldContinue: true,
+        reason: "dangling_next_step",
+        instruction:
+          "Your previous message ended by stating a next step you intend to take instead of executing it. Execute that step now and verify the result before finishing; only stop if genuinely blocked on user input, approval, or an unrecoverable error.",
+      };
+    }
+  }
+
+  if (
+    input.sawMidRunUserMessage &&
+    input.toolCallsInAttempt > 0 &&
+    input.toolCallsSinceLastUser === 0 &&
+    STEER_CORRECTION_ACK_RE.test(text) &&
+    !ALREADY_COMPLETED_RE.test(tail)
+  ) {
+    return {
+      shouldContinue: true,
+      reason: "steer_dropped_execution",
+      instruction:
+        "You answered the user's mid-run steering message without resuming execution. Do not stop after explaining or apologizing: immediately carry out the corrected next step and verify the outcome. Only stop if genuinely blocked waiting on user input, approval, or an explicit stop instruction.",
+    };
+  }
+
+  return { shouldContinue: false };
+}
+
+function extractMessagePlainText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const chunks: string[] = [];
+  for (const part of content) {
+    if (isRecord(part) && part.type === "text" && typeof part.text === "string") {
+      chunks.push(part.text);
+    }
+  }
+  return chunks.join("\n");
+}
+
+function messageHasToolCall(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.some((part) => isRecord(part) && part.type === "toolCall");
+}
+
 export default function vantryToolsExtension(pi: ExtensionAPI) {
   const isDelegatedChild = Boolean(readEnv(ENV_PARENT_TASK_ID));
   const directOrchestration = !isDelegatedChild && isTruthyEnv(ENV_DIRECT_ORCHESTRATION);
@@ -1482,13 +1808,97 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
     : new Set<string>();
   const loopGuard = new ToolLoopGuard();
 
+  let toolCallsInAttempt = 0;
+  let toolCallsSinceLastUser = 0;
+  let sawFirstUserMessage = false;
+  let sawMidRunUserMessage = false;
+  let lastUserText = "";
+  let continuityNudgeCount = 0;
+
   if (typeof pi.on === "function") {
+    pi.on("agent_start", () => {
+      toolCallsInAttempt = 0;
+      toolCallsSinceLastUser = 0;
+      sawFirstUserMessage = false;
+      sawMidRunUserMessage = false;
+      lastUserText = "";
+      continuityNudgeCount = 0;
+    });
+
+    pi.on("message_end", (event) => {
+      const msg = (event as { message?: unknown }).message;
+      if (!isRecord(msg) || msg.role !== "user") return;
+      if (sawFirstUserMessage) {
+        sawMidRunUserMessage = true;
+      }
+      sawFirstUserMessage = true;
+      toolCallsSinceLastUser = 0;
+      lastUserText = extractMessagePlainText(msg.content);
+    });
+
+    pi.on("tool_execution_start", (event) => {
+      if ((event as { parentToolCallId?: unknown }).parentToolCallId) return;
+      toolCallsInAttempt += 1;
+      toolCallsSinceLastUser += 1;
+    });
+
     pi.on("before_agent_start", (event) => {
       const opts = event.systemPromptOptions;
       if (opts.selectedTools.includes("codemode") || opts.toolGuidelines.codemode) {
         opts.toolGuidelines.codemode = [...VANTRY_CODEMODE_GUIDELINES];
         opts.toolSnippets.codemode = VANTRY_CODEMODE_SNIPPET;
       }
+    });
+
+    pi.on("tool_call", (event) => {
+      if (event.toolName !== "tool_search") return;
+      if (typeof pi.getAllTools !== "function" || typeof pi.getActiveTools !== "function") return;
+      const query = isRecord(event.input) && typeof event.input.query === "string" ? event.input.query : "";
+      if (!query.trim()) return;
+      const decision = evaluateToolSearchGuard(query, pi.getAllTools(), pi.getActiveTools());
+      if (!decision.allow) {
+        return { block: true, reason: decision.reason };
+      }
+    });
+
+    pi.on("agent_before_settle", (event) => {
+      if (continuityNudgeCount >= 1) return;
+      if (readEnv(ENV_INTERACTION_MODE)?.toLowerCase() === "plan") return;
+      if (event.outcome !== "completed" || !event.context?.canContinue) return;
+      const messages = Array.isArray(event.context.contextMessages) ? event.context.contextMessages : [];
+      let lastAssistant: Record<string, unknown> | undefined;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const candidate = messages[i];
+        if (isRecord(candidate) && candidate.role === "assistant") {
+          lastAssistant = candidate;
+          break;
+        }
+      }
+      if (!lastAssistant) return;
+      const stopReason = typeof lastAssistant.stopReason === "string" ? lastAssistant.stopReason : "stop";
+      if (stopReason !== "stop" || messageHasToolCall(lastAssistant.content)) return;
+      const assistantText = extractMessagePlainText(lastAssistant.content);
+      const decision = evaluateContinuityGuard({
+        assistantText,
+        lastUserText,
+        sawMidRunUserMessage,
+        toolCallsInAttempt,
+        toolCallsSinceLastUser,
+      });
+      if (!decision.shouldContinue || !decision.instruction) return;
+      continuityNudgeCount += 1;
+      return {
+        entries: [
+          ...event.entries,
+          {
+            type: "custom_message" as const,
+            customType: "vantry_continuity_guard",
+            content: decision.instruction,
+            display: false,
+          },
+        ],
+        continue: true,
+      };
     });
 
     pi.on("tool_result", async (event) => {
@@ -1625,11 +2035,11 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
   const registerTool: ExtensionAPI["registerTool"] = (tool) => {
     pi.registerTool({
       ...tool,
-      exposure: tool.name === "vantry_request_secret" ? "model-only" : directTools.has(tool.name) ? "direct" : "deferred",
+      exposure: MODEL_ONLY_UI_TOOLS.has(tool.name) ? "model-only" : directTools.has(tool.name) ? "direct" : "deferred",
       namespace: {
         name: "vantry",
-        description: "Durable Vantry tasks, project sessions and linked execution environments",
-        instructions: "Discover low-frequency session tools with tool_search or codemode searchTools/describeTool. Keep environmentId on remote requests; do not substitute local thread IDs. Async child work wakes its parent automatically; never poll it. Secrets require the directly declared vantry_request_secret dialog, which scripts cannot call.",
+        description: "Delegated child tasks, peer threads, and remote machines",
+        instructions: "Orchestration tools for delegation, peer threads, and paired environments. Keep environmentId on remote requests. Async child tasks wake the parent automatically.",
       },
       outputSchema: Type.Record(Type.String(), Type.Unknown()),
     });
@@ -2539,6 +2949,74 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
 
       const result = { secretFilePath, usageHint };
       return toolJsonResult(result);
+    },
+  });
+
+  registerTool({
+    name: "vantry_terminal_run",
+    label: "Vantry Interactive Terminal",
+    description:
+      "Run an interactive shell command inside Vantry's built-in Terminal (real PTY in the workspace directory) so the user can complete login, 2FA/OTP, SSH prompts, sudo, or TTY wizards directly beside the chat. Resumes automatically when the command exits without exposing terminal secrets to chat or logs.",
+    promptSnippet: "Run an interactive TTY command in Vantry's built-in Terminal and resume on exit",
+    promptGuidelines: [
+      "Use vantry_terminal_run for interactive TTY commands (login, 2FA, SSH, setup wizards) instead of osascript, .command wrappers, or /usr/bin/script.",
+    ],
+    parameters: terminalRunSchema,
+    async execute(_toolCallId, params: TerminalRunInput, signal, _onUpdate, ctx) {
+      const command = params.command?.trim();
+      if (!command) {
+        throw new Error("vantry_terminal_run requires a non-empty command");
+      }
+      if (!ctx.hasUI) {
+        throw new Error("Vantry interactive terminal UI is unavailable");
+      }
+      const baseCwd = ctx.cwd ? path.resolve(ctx.cwd) : process.cwd();
+      const rawCwd = params.cwd?.trim();
+      const resolvedCwd = rawCwd ? (path.isAbsolute(rawCwd) ? path.resolve(rawCwd) : path.resolve(baseCwd, rawCwd)) : baseCwd;
+      const label = params.title?.trim() || command.split(/\r?\n/, 1)[0].slice(0, 60);
+      const payload = JSON.stringify({
+        kind: VANTRY_TERMINAL_REQUEST_KIND,
+        version: 1,
+        title: label,
+        command,
+        cwd: resolvedCwd,
+      });
+      const activeSignal = signal ?? ctx.signal;
+      const rawResponse = activeSignal
+        ? await ctx.ui.editor(`交互终端 · ${label}`, payload, { signal: activeSignal })
+        : await ctx.ui.editor(`交互终端 · ${label}`, payload);
+
+      if (rawResponse === undefined) {
+        return toolJsonResult({
+          status: "cancelled",
+          title: label,
+          command,
+          cwd: resolvedCwd,
+        });
+      }
+      const trimmed = rawResponse.trim();
+      if (trimmed.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (isRecord(parsed)) {
+            return toolJsonResult({
+              status: typeof parsed.status === "string" ? parsed.status : "exited",
+              ...(typeof parsed.exitCode === "number" ? { exitCode: parsed.exitCode } : {}),
+              title: label,
+              cwd: typeof parsed.cwd === "string" && parsed.cwd ? parsed.cwd : resolvedCwd,
+              ...(typeof parsed.note === "string" && parsed.note ? { note: parsed.note } : {}),
+            });
+          }
+        } catch {
+          // Fall back to plain-text completion result below.
+        }
+      }
+      return toolJsonResult({
+        status: "completed",
+        title: label,
+        cwd: resolvedCwd,
+        ...(trimmed ? { note: trimmed } : {}),
+      });
     },
   });
 }

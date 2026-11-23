@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/muq9738/Vantry/pkg/api"
@@ -412,6 +413,8 @@ func (c *Core) applyProviderProjection(t *txn, eff effect, event provider.Event)
 			return c.applyControlResult(t, run, eff.attemptID, event)
 		}
 		return c.applyToolEvent(t, run, eff.attemptID, event)
+	case "message_start":
+		return c.applyAssistantMessageBoundary(t, eff, event)
 	}
 	if event.Type == "thinking_delta" {
 		return appendRunReasoning(t, eff, event)
@@ -420,6 +423,45 @@ func (c *Core) applyProviderProjection(t *txn, eff effect, event provider.Event)
 		return nil
 	}
 	return appendRunOutput(t, eff, event.Delta)
+}
+
+// applyAssistantMessageBoundary separates consecutive assistant messages inside
+// one run (for example after a mid-run steer or continuity nudge) when no tool
+// call already anchors a timeline split at the current output offset.
+func (c *Core) applyAssistantMessageBoundary(t *txn, eff effect, event provider.Event) error {
+	if len(event.Data) == 0 {
+		return nil
+	}
+	var payload struct {
+		Message struct {
+			Role string `json:"role"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(event.Data, &payload) != nil || payload.Message.Role != "assistant" {
+		return nil
+	}
+	run, err := loadRun(t, eff.runID)
+	if err != nil {
+		return wrapInternal("read run", err)
+	}
+	if strings.TrimSpace(run.Output) == "" || strings.HasSuffix(run.Output, "\n\n") {
+		return nil
+	}
+	var toolsAtEnd int
+	if err := t.queryRow(
+		`SELECT COUNT(1) FROM tool_calls WHERE run_id = ? AND output_offset = ?`,
+		eff.runID, len(run.Output),
+	).Scan(&toolsAtEnd); err != nil {
+		return wrapInternal("check tool boundary", err)
+	}
+	if toolsAtEnd > 0 {
+		return nil
+	}
+	sep := "\n\n"
+	if strings.HasSuffix(run.Output, "\n") {
+		sep = "\n"
+	}
+	return appendRunOutput(t, eff, sep)
 }
 
 func attemptCursor(t *txn, attemptID string) (int64, error) {

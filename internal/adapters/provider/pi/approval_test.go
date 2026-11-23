@@ -259,6 +259,36 @@ for (const vantryTool of ["vantry_delegate_task", "vantry_task_status", "vantry_
   assert.equal(res, undefined, vantryTool + " must never be blocked by approval.ts");
 }
 
+// vantry_terminal_run executes shell commands and MUST be gated by approval.ts in ask/plan/auto-accept-edits.
+process.env.VANTRY_APPROVAL_POLICY = "auto-accept-edits";
+process.env.VANTRY_INTERACTION_MODE = "default";
+{
+  let selectOpts = null;
+  const denied = await handler(
+    { toolName: "vantry_terminal_run", input: { command: "steamguard setup" } },
+    {
+      hasUI: true,
+      ui: {
+        select: async (_title, options) => { selectOpts = options; return "拒绝"; },
+        confirm: async () => false,
+      },
+    },
+  );
+  assert.equal(denied?.block, true, "vantry_terminal_run must require approval in auto-accept-edits");
+  assert.ok(Array.isArray(selectOpts) && selectOpts.includes("本会话允许 terminal:steamguard"), "expected terminal scope grant, got " + JSON.stringify(selectOpts));
+}
+process.env.VANTRY_APPROVAL_POLICY = "auto";
+process.env.VANTRY_INTERACTION_MODE = "plan";
+{
+  let prompts = 0;
+  const deniedPlan = await handler(
+    { toolName: "vantry_terminal_run", input: { command: "ls -la" } },
+    { hasUI: true, ui: { confirm: async () => { prompts++; return false; } } },
+  );
+  assert.equal(deniedPlan?.block, true, "vantry_terminal_run must require confirmation in plan mode");
+  assert.equal(prompts, 1);
+}
+
 console.log("granular-approval-ok");
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

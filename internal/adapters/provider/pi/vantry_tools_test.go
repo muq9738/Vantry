@@ -1076,7 +1076,7 @@ if (jitiMod?.createJiti) {
   const mod = await jiti.import(process.argv[2]);
   const minimalRegistered = [];
   mod.default({ registerTool: (tool) => minimalRegistered.push(tool.name) });
-  assert.equal(minimalRegistered.length, 17);
+  assert.equal(minimalRegistered.length, 18);
 
   // Verify Pure Pi default vs Project Coordinator vs Child exposure gating.
   const collectExposure = (envPatch) => {
@@ -1103,7 +1103,92 @@ if (jitiMod?.createJiti) {
     [],
   );
   assert.equal(pureDefault.find((t) => t.name === "vantry_request_secret")?.exposure, "model-only");
+  assert.equal(pureDefault.find((t) => t.name === "vantry_terminal_run")?.exposure, "model-only");
   assert.equal(pureDefault.filter((t) => t.exposure === "deferred").length, 16);
+
+  // Unit tests for evaluateToolSearchGuard (prevents KV cache bust on irrelevant queries).
+  const activeDefaults = ["read", "bash", "edit", "write", "codemode", "tool_search", "vantry_request_secret", "vantry_terminal_run"];
+  const allForSearch = [
+    ...pureDefault,
+    { name: "bash", description: "Execute bash commands", exposure: "direct" },
+    { name: "mcp__magpie__magpie-search__web_search", description: "Search the web via Exa", exposure: "codemode" },
+  ];
+  const blockedTerminal = mod.evaluateToolSearchGuard(
+    "Vantry cmd interactive terminal PTY launch local command tty interactive user input",
+    allForSearch,
+    activeDefaults,
+  );
+  assert.equal(blockedTerminal.allow, false);
+  assert.match(blockedTerminal.reason, /vantry_terminal_run/);
+
+  const blockedGeneric = mod.evaluateToolSearchGuard("vantry local command ui", allForSearch, activeDefaults);
+  assert.equal(blockedGeneric.allow, false);
+
+  assert.equal(mod.evaluateToolSearchGuard("vantry_thread_read", allForSearch, activeDefaults).allow, true);
+  assert.equal(mod.evaluateToolSearchGuard("vantry_environment_list linked target environment list", allForSearch, activeDefaults).allow, true);
+  assert.equal(mod.evaluateToolSearchGuard("web_search exa", allForSearch, activeDefaults).allow, true);
+
+  // Unit tests for evaluateContinuityGuard (catches steer-dropped execution and dangling next steps).
+  const steerDropped = mod.evaluateContinuityGuard({
+    assistantText: "对，就在你的 Mac 上执行，不需要 qmt。刚才我误用了 buff-steam enroll。\n\n接下来只做 Mac 本地的 Steam 会话续登，不查 BUFF、不走 qmt。",
+    lastUserText: "不是本地执行吗",
+    sawMidRunUserMessage: true,
+    toolCallsInAttempt: 8,
+    toolCallsSinceLastUser: 0,
+  });
+  assert.equal(steerDropped.shouldContinue, true);
+
+  const danglingDeferred = mod.evaluateContinuityGuard({
+    assistantText: "刚才那轮登录超时了，会话还没保存。\n\n后续应让程序直接用 Mac 托管的令牌完成验证码这一步。",
+    lastUserText: "我真的服了",
+    sawMidRunUserMessage: false,
+    toolCallsInAttempt: 3,
+    toolCallsSinceLastUser: 3,
+  });
+  assert.equal(danglingDeferred.shouldContinue, true);
+  assert.equal(danglingDeferred.reason, "dangling_next_step");
+
+  const steerCorrectionOnly = mod.evaluateContinuityGuard({
+    assistantText: "是我选错入口，应该跳过 BUFF 直接续登本地会话。",
+    lastUserText: "为什么要 qmt 啊",
+    sawMidRunUserMessage: true,
+    toolCallsInAttempt: 5,
+    toolCallsSinceLastUser: 0,
+  });
+  assert.equal(steerCorrectionOnly.shouldContinue, true);
+  assert.equal(steerCorrectionOnly.reason, "steer_dropped_execution");
+
+  // Legitimate user handoffs, questions, and stop commands must NOT trigger continuation.
+  assert.equal(
+    mod.evaluateContinuityGuard({
+      assistantText: "完成后告诉我「绑好了」。我会先核对文件权限，再做只读验证。",
+      lastUserText: "帮我启动设置",
+      sawMidRunUserMessage: false,
+      toolCallsInAttempt: 4,
+      toolCallsSinceLastUser: 4,
+    }).shouldContinue,
+    false,
+  );
+  assert.equal(
+    mod.evaluateContinuityGuard({
+      assistantText: "已停止，接下来不再执行任何修改。",
+      lastUserText: "停下别做了",
+      sawMidRunUserMessage: true,
+      toolCallsInAttempt: 4,
+      toolCallsSinceLastUser: 0,
+    }).shouldContinue,
+    false,
+  );
+  assert.equal(
+    mod.evaluateContinuityGuard({
+      assistantText: "接下来要做哪一步？\n\x60\x60\x60ask\n选择方案\n* 方案 A | 推荐\n- 方案 B | 备选\n\x60\x60\x60",
+      lastUserText: "看下方案",
+      sawMidRunUserMessage: false,
+      toolCallsInAttempt: 1,
+      toolCallsSinceLastUser: 1,
+    }).shouldContinue,
+    false,
+  );
 
   const coordinatorTools = collectExposure({ VANTRY_DIRECT_ORCHESTRATION: "1", VANTRY_PARENT_TASK_ID: undefined });
   assert.deepEqual(
@@ -1208,6 +1293,89 @@ const directTools = [...toolsExt.tools.entries()]
   .map(([name]) => name).sort();
 assert.deepEqual(directTools, []);
 assert.equal(toolsExt.tools.get("vantry_request_secret")?.definition.exposure, "model-only");
+assert.equal(toolsExt.tools.get("vantry_terminal_run")?.definition.exposure, "model-only");
+
+// Verify vantry_terminal_run uses structured editor UI request and never leaks secrets.
+const termDef = toolsExt.tools.get("vantry_terminal_run").definition;
+let capturedTermEditor = null;
+const termExited = await termDef.execute(
+  "term-call-1",
+  { command: "steamguard setup", title: "Steam Guard 设置", cwd: "." },
+  undefined,
+  undefined,
+  {
+    hasUI: true,
+    cwd: process.cwd(),
+    ui: {
+      editor: async (title, prefill) => {
+        capturedTermEditor = { title, prefill };
+        return JSON.stringify({ status: "exited", exitCode: 0, cwd: process.cwd() });
+      },
+    },
+  },
+);
+assert.ok(capturedTermEditor && capturedTermEditor.title.includes("Steam Guard 设置"));
+const parsedPrefill = JSON.parse(capturedTermEditor.prefill);
+assert.equal(parsedPrefill.kind, "vantry_terminal_run");
+assert.equal(parsedPrefill.command, "steamguard setup");
+assert.equal(parsedPrefill.cwd, process.cwd());
+const parsedTermOut = JSON.parse(termExited.content[0].text);
+assert.equal(parsedTermOut.status, "exited");
+assert.equal(parsedTermOut.exitCode, 0);
+
+const termCancelled = await termDef.execute(
+  "term-call-2",
+  { command: "steamguard setup" },
+  undefined,
+  undefined,
+  {
+    hasUI: true,
+    cwd: process.cwd(),
+    ui: { editor: async () => undefined },
+  },
+);
+assert.equal(JSON.parse(termCancelled.content[0].text).status, "cancelled");
+
+// Verify agent_before_settle continuity guard nudges at most ONCE per attempt.
+const runHook = async (name, ev) => {
+  let out;
+  for (const h of toolsExt.handlers.get(name) ?? []) {
+    const res = await h(ev, { hasUI: true });
+    if (res !== undefined) out = res;
+  }
+  return out;
+};
+const prevMode = process.env.VANTRY_INTERACTION_MODE;
+process.env.VANTRY_INTERACTION_MODE = "default";
+try {
+  await runHook("agent_start", {});
+  await runHook("message_end", { message: { role: "user", content: "那你做掉啊" } });
+  await runHook("tool_execution_start", { toolName: "bash", toolCallId: "b1" });
+  await runHook("message_end", { message: { role: "user", content: "不是本地执行吗" } });
+  const settleEvent = {
+    type: "agent_before_settle",
+    outcome: "completed",
+    entries: [],
+    continue: false,
+    context: {
+      canContinue: true,
+      contextMessages: [
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "接下来只做 Mac 本地的 Steam 会话续登，不走 qmt。" }] },
+      ],
+    },
+  };
+  const firstNudge = await runHook("agent_before_settle", settleEvent);
+  assert.equal(firstNudge?.continue, true);
+  assert.equal(firstNudge?.entries?.length, 1);
+  assert.equal(firstNudge?.entries?.[0]?.customType, "vantry_continuity_guard");
+  assert.equal(firstNudge?.entries?.[0]?.display, false);
+  const secondNudge = await runHook("agent_before_settle", settleEvent);
+  assert.equal(secondNudge, undefined, "Continuity guard must nudge at most once per attempt");
+} finally {
+  if (prevMode === undefined) delete process.env.VANTRY_INTERACTION_MODE;
+  else process.env.VANTRY_INTERACTION_MODE = prevMode;
+}
+
 assert.equal(await toolsGuard({ toolName: "read", input: { path: "README.md" } }, { hasUI: false }), undefined);
 
 // Verify tool_result handler preserves images, skips read/vantry_*, and keeps JSON valid on vantry_* loop hints.

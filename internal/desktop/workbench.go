@@ -305,6 +305,7 @@ func (w *workbench) afterRequest(request api.ProviderRequest) {
 	if request.Status != "pending" {
 		delete(w.controls, "request:"+request.ID)
 	}
+	w.maybeAutoLaunchTerminalTask(request)
 }
 
 func inputStatusLabel(input api.Input) string {

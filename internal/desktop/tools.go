@@ -413,6 +413,7 @@ func (w *workbench) closeTerminals() {
 	for _, term := range w.features.terminals {
 		_ = term.Close()
 	}
+	w.closeTerminalTasks()
 	w.closeSSHTerminals()
 	w.disconnectRemoteDesktop()
 }

@@ -63,3 +63,41 @@ func TestReplyPartsKeepReasoningAndToolPlacement(t *testing.T) {
 		t.Fatalf("output and reasoning events = %d, want 4", deltas)
 	}
 }
+
+func TestAssistantMessageBoundarySeparatesSteerRepliesWithoutBreakingToolSplits(t *testing.T) {
+	p := newWorkbenchProvider(t)
+	p.recover = true
+	c := openTestCore(t, p)
+	threadID := mustCreateThread(t, c, "create-boundary")
+	sent := mustSend(t, c, "send-boundary", threadID, "start")
+	waitRunStatus(t, c, sent.RunID, api.RunRunning)
+
+	assistantStart := map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}}
+	userStart := map[string]any{"type": "message_start", "message": map[string]any{"role": "user"}}
+
+	// Turn 1: text + tool -> Turn 2: text (tool already splits these; no extra \n\n).
+	p.add("message_start", assistantStart)
+	p.add("text_delta", "先查状态。")
+	p.add("tool_execution_start", map[string]any{"toolCallId": "c1", "toolName": "read", "args": map[string]any{"path": "a.go"}})
+	p.add("tool_execution_end", map[string]any{"toolCallId": "c1", "toolName": "read", "result": "ok"})
+	p.add("message_start", assistantStart)
+	p.add("text_delta", "查完了。")
+	// Mid-run steer with NO tool call between assistant replies -> must insert \n\n.
+	p.add("message_start", userStart)
+	p.add("message_start", assistantStart)
+	p.add("text_delta", "对，直接本地执行。")
+	p.finish()
+	waitRunStatus(t, c, sent.RunID, api.RunCompleted)
+
+	snap := snapshotOf(t, c)
+	var run api.Run
+	for _, r := range snap.Runs {
+		if r.ID == sent.RunID {
+			run = r
+		}
+	}
+	want := "先查状态。查完了。\n\n对，直接本地执行。"
+	if run.Output != want {
+		t.Fatalf("run.Output = %q, want %q", run.Output, want)
+	}
+}

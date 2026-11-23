@@ -39,13 +39,25 @@ func (w *workbench) projectTerminal() *terminal.Terminal {
 // session, and the terminal itself.
 func (w *workbench) terminalDock(c *ui.Context, p palette) {
 	active := w.termTab.active
-	if active != "" && active != terminalHostsTab && w.ssh.sessions[active] == nil {
-		active, w.termTab.active = "", ""
+	if active != "" && active != terminalHostsTab {
+		if strings.HasPrefix(active, terminalTaskTabPrefix) {
+			if w.terminalTaskForTab(active) == nil {
+				active, w.termTab.active = "", ""
+			}
+		} else if w.ssh.sessions[active] == nil {
+			active, w.termTab.active = "", ""
+		}
 	}
 	w.terminalTabStrip(c, p)
 	switch {
 	case active == terminalHostsTab:
 		w.sshHub(c, p)
+	case strings.HasPrefix(active, terminalTaskTabPrefix):
+		if session := w.terminalTaskForTab(active); session != nil {
+			w.terminalTaskPane(c, p, session)
+		} else {
+			w.terminalEmptyState(c, p)
+		}
 	case active != "":
 		w.sshTerminalPane(c, p, w.ssh.sessions[active])
 	case w.projectTerminal() == nil:
@@ -74,6 +86,9 @@ func (w *workbench) terminalTabStrip(c *ui.Context, p palette) {
 			w.terminalHostsTabButton(c, p)
 			if w.projectTerminal() != nil {
 				w.terminalTab(c, p, "", w.tr("本机", "Local"), true, p.success)
+			}
+			for _, session := range w.terminalTaskSessions() {
+				w.terminalTab(c, p, session.tabKey(), session.tabLabel(), !session.exited, w.terminalTaskDotColor(p, session))
 			}
 			for _, session := range w.sshSessions() {
 				session.refresh()
@@ -149,6 +164,8 @@ func (w *workbench) terminalTab(c *ui.Context, p palette, target, name string, l
 						_ = term.Close()
 						delete(w.features.terminals, w.selected)
 					}
+				} else if strings.HasPrefix(target, terminalTaskTabPrefix) {
+					w.closeTerminalTaskTab(strings.TrimPrefix(target, terminalTaskTabPrefix))
 				} else {
 					w.closeSSHTerminal(target)
 				}

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 const FILE_EDIT_TOOLS = new Set(["write", "edit"]);
-const SHELL_TOOLS = new Set(["bash", "powershell"]);
+const SHELL_TOOLS = new Set(["bash", "powershell", "vantry_terminal_run"]);
 
 type NormalizedApprovalPolicy = "auto" | "auto-accept-edits" | "ask";
 
@@ -494,6 +494,9 @@ function extractScopeKey(toolName: string, input: unknown): string | null {
   if (!chosen) {
     return null;
   }
+  if (toolName === "vantry_terminal_run") {
+    return `terminal:${chosen}`;
+  }
   return `bash:${chosen}`;
 }
 
@@ -575,8 +578,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    // Native Vantry orchestration and secret tools never pass through bash approval.
-    if (event.toolName.startsWith("vantry_")) {
+    // Native Vantry orchestration and secret tools never pass through bash approval,
+    // but vantry_terminal_run executes shell commands and shares shell gating.
+    if (event.toolName.startsWith("vantry_") && !SHELL_TOOLS.has(event.toolName)) {
       return;
     }
 
@@ -594,10 +598,13 @@ export default function (pi: ExtensionAPI) {
 
     if (SHELL_TOOLS.has(event.toolName)) {
       const command = extractShellCommand(event.input);
-      if (policy === "ask") {
+      if (event.toolName === "vantry_terminal_run" && planMode) {
+        requiresConfirm = true;
+        promptTitle = "当前处于 Plan 规划模式，允许在交互终端执行命令？";
+      } else if (policy === "ask") {
         requiresConfirm = true;
       } else if (policy === "auto-accept-edits") {
-        if (!isReadOnlyShellCommand(command)) {
+        if (event.toolName === "vantry_terminal_run" || !isReadOnlyShellCommand(command)) {
           requiresConfirm = true;
           if (planMode && isDestructiveShellCommand(command)) {
             promptTitle = `当前处于 Plan 规划模式，允许执行可能修改环境的 ${event.toolName} 命令？`;
