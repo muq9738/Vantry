@@ -12,12 +12,17 @@
 //!   ([`state::persist`]), all without I/O;
 //! - [`theme`]: Stardust tokens and palette;
 //! - `controller`: the signals, the connection loop, persistence, intents;
-//! - `views`: sidebar, header, timeline, composer, dock, settings, remote
-//!   desktop, dialogs, approval modal.
+//! - `views`: sidebar, header, timeline, composer, dock, settings, plugin
+//!   panels, remote desktop, dialogs, approval modal;
+//! - [`service`]: the `vantry-service` / `vantry-relay` binaries (0.1.42
+//!   service modes forwarded, `ensure-core`), and `autostart`, which starts
+//!   the local Core when the window opens and it does not answer.
 
+mod autostart;
 pub mod bridge;
 pub mod cli;
 mod controller;
+pub mod service;
 pub mod state;
 pub mod theme;
 mod views;
@@ -60,6 +65,16 @@ pub fn App() -> impl IntoElement {
     let sidebar_open = computed(|| controller::ui().with(|u| u.sidebar_open));
     let dock_open = computed(|| controller::ui().with(|u| u.dock_open));
     let main = computed(|| controller::ui().with(|u| u.view.clone()));
+    // Escape stops the shown run (or closes the model picker); dialogs and
+    // inputs still see it.
+    on_key_with(
+        "escape",
+        KeyOptions {
+            pass_through: true,
+            ..KeyOptions::default()
+        },
+        |_| controller::escape(),
+    );
     view()
         .flex_1()
         .flex_row()
@@ -78,7 +93,7 @@ pub fn App() -> impl IntoElement {
                         .child(views::composer::composer())
                         .into_element(),
                     MainView::RemoteDesktop => views::remote_desktop::remote_desktop().into_element(),
-                    MainView::Plugin(id) => plugin_panel(id).into_element(),
+                    MainView::Plugin(id) => views::plugin_panel::plugin_panel(id).into_element(),
                 })),
         )
         .child(when(move || dock_open.get(), views::dock::dock))
@@ -88,25 +103,16 @@ pub fn App() -> impl IntoElement {
         .child(views::dialogs::confirm_dialog())
 }
 
-/// A plugin's panel slot: its process-protocol UI lands here (Wave 3).
-fn plugin_panel(id: String) -> impl IntoElement {
-    view()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .child(
-            text(format!("插件面板 · {id}"))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(16.0))
-                .text_color(theme::PALETTE.ink),
-        )
-        .child(
-            text("插件的原生面板由 Core 插件宿主渲染，接入后在此显示。")
-                .text_size(px(12.5))
-                .text_color(theme::PALETTE.muted),
-        )
-        .child(views::ghost_button("返回对话", || {
-            controller::show_view(MainView::Conversation)
-        }))
+/// The desktop links NSH, the protocol and the client only: never the Core
+/// or the Pi engine (the architecture's red line).
+#[cfg(test)]
+mod manifest_guard {
+    #[test]
+    fn the_manifest_names_no_core_or_pi_crate() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        for forbidden in ["vantry-core", "vantry-pi-runtime", "pi-coding-agent"] {
+            assert!(!manifest.contains(forbidden), "apps/desktop must not depend on {forbidden}");
+        }
+        assert!(manifest.contains("vantry-client") && manifest.contains("vantry-protocol"));
+    }
 }

@@ -6,22 +6,37 @@
 //! - [`LocalWorkbench`] works on the local workspace directory (files read
 //!   directly, `git` and the shell as child processes that never outlive
 //!   their call);
+//! - [`CoreWorkbench`] asks the Core (`POST /v1/workbench`) for models,
+//!   Pi, MCP, plugins, remote access, the remote desktop, updates, usage,
+//!   environments and projects, and works on the local directory for files,
+//!   Git and the terminal; a Core without the workbench (or an action)
+//!   falls back to [`LocalWorkbench`], so the window never goes blank;
 //! - [`MockWorkbench`] is an in-memory workspace for `--mock` and tests.
+//!
+//! [`WorkbenchBridge::workbench`] is the generic action call; [`actions`]
+//! builds its requests and reads its outputs.
 //!
 //! Types the protocol already has (`GitState`, `ModelCatalog`,
 //! `PluginInfo`, `MCPCatalog`, `AppUpdateInfo`, `SSHHostInfo`,
 //! `EnvironmentInfo`, `Attachment`) are the protocol's.
 
+pub mod actions;
+mod core_bench;
 mod local;
 mod mock;
 
 use std::path::{Component, Path, PathBuf};
 
+pub use core_bench::CoreWorkbench;
 pub use local::LocalWorkbench;
 pub use mock::MockWorkbench;
 use vantry_protocol::{
-    AppUpdateInfo, Attachment, EnvironmentInfo, GitState, MCPCatalog, ModelCatalog, PluginInfo,
-    SSHHostInfo,
+    AppUpdateInfo, Attachment, EnvironmentInfo, GitState, MCPCatalog, ModelCatalog,
+    PiRuntimeStatus, PluginInfo, SSHHostInfo, WorkbenchRequest, WorkbenchResponse,
+};
+
+use self::actions::{
+    EnvironmentEntry, ProjectEntry, RdStatus, RemoteStatus, SandboxInfo, UsageSummary,
 };
 
 use super::{BridgeError, BridgeFuture, ErrorCode};
@@ -74,6 +89,103 @@ pub struct SettingsData {
     /// Paired machines (remote environments).
     pub peers: Vec<EnvironmentInfo>,
     pub ssh_hosts: Vec<SSHHostInfo>,
+    /// The built-in Pi runtime (`pi.status`).
+    pub pi: Option<PiRuntimeStatus>,
+    pub sandbox: Option<SandboxInfo>,
+    pub usage: Option<UsageSummary>,
+    /// Remote access and pairing (`remote.status`).
+    pub remote: Option<RemoteStatus>,
+    /// The remote desktop (`rd.status`).
+    pub rd: Option<RdStatus>,
+    pub environments: Vec<EnvironmentEntry>,
+    pub projects: Vec<ProjectEntry>,
+    /// Sections the Core did not serve, and why (shown as a quiet note;
+    /// what the desktop could read itself is shown instead).
+    pub degraded: Vec<(String, String)>,
+}
+
+impl SettingsData {
+    /// Folds an action's response into what is shown (catalogs the Core
+    /// returns with its answer replace the old ones).
+    pub fn absorb(&mut self, action: &str, response: &WorkbenchResponse) {
+        use actions::names;
+        if let Some(mcp) = &response.mcp {
+            self.mcp = mcp.clone();
+        }
+        if let Some(catalog) = &response.catalog {
+            self.models = catalog.clone();
+        }
+        if let Some(update) = &response.update {
+            self.update = update.clone();
+        }
+        if let Some(pi) = &response.pi_runtime {
+            self.pi = Some(pi.clone());
+        }
+        if action.starts_with("plugins.") && action != names::PLUGINS_RUN && action != names::PLUGINS_PANEL {
+            self.plugins = response.plugins.clone();
+        }
+        if !response.ssh_hosts.is_empty() {
+            self.ssh_hosts = response.ssh_hosts.clone();
+        }
+        match action {
+            names::SANDBOX_GET | names::SANDBOX_SET => {
+                if let Ok(info) = actions::read_output::<SandboxInfo>(response) {
+                    self.sandbox = Some(info);
+                }
+            }
+            names::USAGE_SUMMARY => {
+                if let Ok(usage) = actions::read_output::<UsageSummary>(response) {
+                    self.usage = Some(usage);
+                }
+            }
+            names::REMOTE_STATUS
+            | names::REMOTE_PAIR_CREATE
+            | names::REMOTE_PAIR_REDEEM
+            | names::REMOTE_PEERS_LIST
+            | names::REMOTE_PEERS_REVOKE => {
+                if let Ok(status) = RemoteStatus::read(response) {
+                    // The paired machines are the remote desktop's peers.
+                    self.peers = status
+                        .peers()
+                        .iter()
+                        .map(|p| EnvironmentInfo {
+                            id: p.id.clone(),
+                            name: if p.name.is_empty() { p.id.clone() } else { p.name.clone() },
+                            ..EnvironmentInfo::default()
+                        })
+                        .collect();
+                    self.remote = Some(status);
+                }
+            }
+            names::RD_STATUS | names::RD_SESSION_START | names::RD_SESSION_STOP => {
+                if let Ok(status) = RdStatus::read(response) {
+                    self.rd = Some(status);
+                }
+            }
+            names::ENVIRONMENTS_LIST | names::ENVIRONMENTS_UPSERT | names::ENVIRONMENTS_REMOVE => {
+                if let Ok(list) = EnvironmentEntry::read_list(response) {
+                    self.environments = list;
+                }
+            }
+            names::PROJECTS_LIST | names::PROJECTS_ADD | names::PROJECTS_REMOVE => {
+                if let Ok(list) = ProjectEntry::read_list(response) {
+                    self.projects = list;
+                }
+            }
+            _ => {}
+        }
+        self.degraded.retain(|(section, _)| section != action);
+    }
+}
+
+/// What a file search found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchHit {
+    /// Relative to the workspace root.
+    pub path: String,
+    /// The matching line (empty for a name match).
+    pub line: String,
+    pub line_number: usize,
 }
 
 /// The workspace and the machine, for the dock and settings.
@@ -107,7 +219,38 @@ pub trait WorkbenchBridge: Send + Sync + 'static {
     fn settings(&self) -> BridgeFuture<SettingsData>;
     /// Makes file `path` an attachment for the next message.
     fn attach(&self, path: PathBuf) -> BridgeFuture<Attachment>;
+    /// A Core workbench action (`POST /v1/workbench`); [`actions`] builds
+    /// the requests. Without a Core that serves it: `not_ready`.
+    fn workbench(&self, request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
+        let action = request.action;
+        Box::pin(async move {
+            Err(BridgeError::new(
+                ErrorCode::NotReady,
+                format!("「{action}」需要连接支持工作台扩展的 Core"),
+            ))
+        })
+    }
+    /// Switches the workspace to branch `branch`.
+    fn git_checkout(&self, branch: String) -> BridgeFuture<()> {
+        let _ = branch;
+        Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "此工作区不支持切换分支")) })
+    }
+    /// Throws away the unstaged changes of `paths` (untracked files are
+    /// removed).
+    fn git_discard(&self, paths: Vec<String>) -> BridgeFuture<()> {
+        let _ = paths;
+        Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "此工作区不支持撤销改动")) })
+    }
+    /// Files whose path contains `query`, then lines that do (at most
+    /// [`MAX_SEARCH_HITS`]).
+    fn search_files(&self, query: String) -> BridgeFuture<Vec<SearchHit>> {
+        let _ = query;
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
+
+/// The most hits a search returns.
+pub const MAX_SEARCH_HITS: usize = 80;
 
 /// `path` (relative, `/`-separated) under `root`, refusing anything that
 /// leaves it (absolute paths, `..`).

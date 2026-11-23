@@ -10,6 +10,7 @@ use vantry_protocol::Attachment;
 
 use super::{ghost_button, link_button, pill, primary_button};
 use crate::{
+    bridge::workbench::actions::{split_thinking, thinking_label},
     controller,
     state::{
         APPROVAL_POLICIES, InteractionMode, NoticeLevel, PrimaryAction, QueueItem, QueueItemKind,
@@ -108,7 +109,18 @@ pub(crate) fn composer() -> impl IntoElement {
                                 .line_height(LineHeight::Multiple(1.5))
                                 .text_color(PALETTE.ink),
                         )
-                        .child(toolbar(status, plan, running, running_action)),
+                        .child(toolbar(status, plan, running, running_action))
+                        .child(when(
+                            move || running.get(),
+                            move || {
+                                text(move || match running_action.get() {
+                                    RunningAction::Steer => "运行中 · 发送的内容会作为纠偏追加给当前任务；Esc 停止",
+                                    RunningAction::Queue => "运行中 · 发送的内容会排队，当前任务结束后依次发送；Esc 停止",
+                                })
+                                .text_size(px(11.0))
+                                .text_color(PALETTE.faint)
+                            },
+                        )),
                 )
                 .child(model_picker()),
         )
@@ -122,6 +134,14 @@ fn toolbar(
 ) -> impl IntoElement {
     let policy = computed(|| controller::state().with(|s| s.current_policy()));
     let model = computed(|| controller::state().with(|s| s.current_model()));
+    // The thinking level, when the catalog offers levels.
+    let thinking = computed(move || {
+        let (levels, models) = controller::ui().with(|u| u.thinking_catalog());
+        if levels.is_empty() {
+            return None;
+        }
+        Some(thinking_label(split_thinking(&model.get(), &models).1))
+    });
     view()
         .flex_row()
         .items_center()
@@ -188,6 +208,25 @@ fn toolbar(
                 ),
         )
         .child(when(
+            move || thinking.with(Option::is_some),
+            move || {
+                nsh_base::button()
+                    .accessibility_label("思考档位")
+                    .on_press(controller::cycle_thinking)
+                    .px_3()
+                    .py_1()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(PALETTE.line)
+                    .active(|s| s.opacity(0.7))
+                    .child(
+                        text(move || format!("思考 · {}", thinking.get().unwrap_or_default()))
+                            .text_size(px(12.0))
+                            .text_color(PALETTE.muted),
+                    )
+            },
+        ))
+        .child(when(
             move || status.with(|s| s.retry.is_some()),
             move || {
                 view()
@@ -218,7 +257,7 @@ fn toolbar(
                     .border_1()
                     .border_color(PALETTE.line)
                     .active(|s| s.opacity(0.7))
-                    .child(text("■ 停止").text_size(px(12.0)).text_color(PALETTE.ink))
+                    .child(text("■ 停止 · Esc").text_size(px(12.0)).text_color(PALETTE.ink))
             },
         ))
         .child(

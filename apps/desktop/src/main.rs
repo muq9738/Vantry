@@ -11,7 +11,10 @@ use nsh_platform_linux as platform;
 use nsh_platform_macos as platform;
 #[cfg(target_os = "windows")]
 use nsh_platform_windows as platform;
-use vantry_desktop::cli::{self, Invocation};
+use vantry_desktop::{
+    cli::{self, Invocation},
+    service,
+};
 
 /// The process's exit: the command line's own, or the window's.
 enum Exit<T> {
@@ -36,9 +39,26 @@ fn main() -> impl Termination {
             print!("{text}");
             Exit::Code(ExitCode::SUCCESS)
         }
-        Ok(Invocation::Service { mode }) => {
-            eprintln!("vantry: {mode} 模式由 vantry-service 提供；请运行 vantry-service {mode} …");
-            Exit::Code(ExitCode::from(2))
+        Ok(Invocation::Service { mode, args }) => {
+            // The 0.1.42 entry points: the service binary runs them, with
+            // the same arguments and exit code.
+            let locator = service::Locator::from_env();
+            match service::forward_command(&mode, &args, &locator) {
+                Ok(command) => match service::exec_or_wait(&command) {
+                    Ok(code) => Exit::Code(ExitCode::from(service::exit_byte(code))),
+                    Err(error) => {
+                        eprintln!(
+                            "vantry: 无法启动 {}：{error}",
+                            command.program.display()
+                        );
+                        Exit::Code(ExitCode::from(126))
+                    }
+                },
+                Err(why) => {
+                    eprintln!("vantry: {why}");
+                    Exit::Code(ExitCode::from(127))
+                }
+            }
         }
         Err(err) => {
             eprintln!("vantry: {err}");

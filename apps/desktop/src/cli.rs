@@ -4,7 +4,8 @@
 //! a mode (`desktop` when left out), flags follow Go's `flag` package
 //! (`-data-dir x`, `--data-dir=x`, `-attach-only=true` all work). Modes
 //! other than `desktop` belong to `vantry-service` (`core`, `ctl`,
-//! `provider-worker`, …); the desktop names that instead of guessing.
+//! `provider-worker`, …): the desktop forwards them to that binary
+//! unchanged ([`crate::service`]).
 
 use std::path::{Path, PathBuf};
 
@@ -21,8 +22,9 @@ pub enum Invocation {
     Desktop(Box<LaunchConfig>),
     /// Print this text and exit 0.
     Help(String),
-    /// A mode `vantry-service` runs.
-    Service { mode: String },
+    /// A mode `vantry-service` (or `vantry-relay`) runs: forwarded with the
+    /// arguments after the mode, as typed.
+    Service { mode: String, args: Vec<String> },
 }
 
 /// Modes the service binary owns.
@@ -238,6 +240,7 @@ pub fn parse(
         other if SERVICE_MODES.contains(&other) => {
             return Ok(Invocation::Service {
                 mode: other.to_owned(),
+                args: rest.to_vec(),
             });
         }
         other => {
@@ -448,7 +451,7 @@ pub fn usage() -> String {
     let flags = command.render_help().to_string();
     format!(
         "用法：vantry [desktop] [选项]\n\
-         \u{20}     vantry core|ctl|provider-worker|relay|rd-relay|apply-update …（由 vantry-service 提供）\n\n{flags}"
+         \u{20}     vantry core|ctl|provider-worker|relay|rd-relay|apply-update …（转交 vantry-service / vantry-relay 执行）\n\n{flags}"
     )
 }
 
@@ -669,8 +672,11 @@ mod tests {
         }
         for mode in ["core", "ctl", "provider-worker", "relay", "apply-update"] {
             assert_eq!(
-                parse(&args(&[mode, "-x"]), &env).unwrap(),
-                Invocation::Service { mode: mode.into() }
+                parse(&args(&[mode, "-x", "--data-dir=/d", "status"]), &env).unwrap(),
+                Invocation::Service {
+                    mode: mode.into(),
+                    args: args(&["-x", "--data-dir=/d", "status"]),
+                }
             );
         }
     }

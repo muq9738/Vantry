@@ -27,6 +27,43 @@ impl Risk {
     }
 }
 
+/// What kind of answer a request wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    /// A tool approval: allow once / for the session / deny.
+    Approval,
+    /// A choice among the request's options.
+    Choice,
+    /// Free text (or a longer text in an editor).
+    Text,
+    /// A secret (`vantry_request_secret`, passwords, keys): typed masked,
+    /// never shown again or kept by the desktop.
+    Secret,
+    /// An interactive terminal's prompt (`vantry_terminal_run`).
+    Terminal,
+}
+
+impl RequestKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RequestKind::Approval => "工具审批",
+            RequestKind::Choice => "需要选择",
+            RequestKind::Text => "需要输入",
+            RequestKind::Secret => "私密输入",
+            RequestKind::Terminal => "交互终端",
+        }
+    }
+}
+
+/// The tool whose input requests are secrets.
+pub const SECRET_TOOL: &str = "vantry_request_secret";
+
+/// Words of a prompt that asks for a secret.
+const SECRET_WORDS: &[&str] = &[
+    "密码", "口令", "密钥", "秘钥", "令牌", "验证码", "password", "passphrase", "secret",
+    "api key", "api_key", "apikey", "token", "otp",
+];
+
 /// What the modal shows for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalView {
@@ -46,6 +83,7 @@ pub struct ApprovalView {
     pub allow_session: Option<String>,
     pub deny: Option<String>,
     pub risk: Risk,
+    pub kind: RequestKind,
     /// pending | responding | failed …
     pub status: String,
     pub error: String,
@@ -69,6 +107,33 @@ const MAX_BODY_CHARS: usize = 1200;
 
 /// The modal's view of `request`.
 pub fn approval_view(request: &PendingRequest) -> ApprovalView {
+    approval_view_with(request, false)
+}
+
+/// The kind of `request`; `secret_tool` when its run is inside
+/// [`SECRET_TOOL`].
+pub fn request_kind(request: &PendingRequest, secret_tool: bool) -> RequestKind {
+    let (allow_once, _, deny) = approval_options(request);
+    if request.method == "confirm" || (allow_once.is_some() && deny.is_some()) {
+        return RequestKind::Approval;
+    }
+    match request.method.as_str() {
+        "select" => RequestKind::Choice,
+        "editor" if request.title.trim_start().starts_with("交互终端") => RequestKind::Terminal,
+        "input" => {
+            let text = format!("{}\n{}", request.title, request.message).to_lowercase();
+            if secret_tool || SECRET_WORDS.iter().any(|w| text.contains(w)) {
+                RequestKind::Secret
+            } else {
+                RequestKind::Text
+            }
+        }
+        _ => RequestKind::Text,
+    }
+}
+
+/// [`approval_view`], knowing whether the run is inside [`SECRET_TOOL`].
+pub fn approval_view_with(request: &PendingRequest, secret_tool: bool) -> ApprovalView {
     let (headline, body) = split_title(request);
     let body = truncate_chars(&body, MAX_BODY_CHARS);
     let (allow_once, allow_session, deny) = approval_options(request);
@@ -81,11 +146,17 @@ pub fn approval_view(request: &PendingRequest) -> ApprovalView {
         headline,
         body,
         options: request.options.clone(),
-        prefill: request.prefill.clone(),
+        // A secret is never prefilled.
+        prefill: if request_kind(request, secret_tool) == RequestKind::Secret {
+            String::new()
+        } else {
+            request.prefill.clone()
+        },
         allow_once,
         allow_session,
         deny,
         risk,
+        kind: request_kind(request, secret_tool),
         status: request.status.clone(),
         error: request.error.clone(),
     }

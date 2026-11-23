@@ -5,7 +5,7 @@
 
 use nsh_core::prelude::*;
 
-use super::{dot, ghost_button, link_button, pill, run_status_color, status_color, status_label};
+use super::{badge, dot, ghost_button, link_button, pill, run_status_color, status_color, status_label};
 use crate::{
     controller,
     state::{
@@ -50,6 +50,7 @@ pub(crate) fn header() -> impl IntoElement {
     let connection_color = move || match connection.get() {
         Connection::Live => PALETTE.success,
         Connection::Connecting => PALETTE.faint,
+        Connection::Starting { .. } => PALETTE.accent,
         Connection::Reconnecting { .. } | Connection::Resyncing { .. } => PALETTE.warning,
     };
     let connection_text = move || {
@@ -65,10 +66,12 @@ pub(crate) fn header() -> impl IntoElement {
             Connection::Reconnecting { reason, .. } | Connection::Resyncing { reason, .. } => {
                 reason.clone()
             }
+            Connection::Starting { detail } => detail.clone(),
             _ => s.endpoint_label.clone(),
         })
     };
     let dock = computed(|| controller::ui().with(|u| u.dock_open.then_some(u.dock_tab)));
+    let remote = computed(|| controller::ui().with(|u| u.remote_target.clone()));
     let tasks_open = signal(false);
     let thread_id = move || selected.get_untracked().unwrap_or_default();
 
@@ -236,6 +239,10 @@ pub(crate) fn header() -> impl IntoElement {
                 .border_1()
                 .border_color(PALETTE.line)
                 .tooltip(text(connection_reason).text_size(px(12.0)))
+                .child(badge(
+                    move || if remote.with(Option::is_some) { "远端" } else { "本机" },
+                    move || if remote.with(Option::is_some) { PALETTE.accent } else { PALETTE.muted },
+                ))
                 .child(dot(connection_color))
                 .child(
                     text(connection_text)

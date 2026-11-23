@@ -12,6 +12,7 @@ pub(crate) mod dialogs;
 pub(crate) mod dock;
 pub(crate) mod header;
 pub(crate) mod markdown;
+pub(crate) mod plugin_panel;
 pub(crate) mod remote_desktop;
 pub(crate) mod settings;
 pub(crate) mod sidebar;

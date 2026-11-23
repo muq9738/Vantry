@@ -26,7 +26,7 @@ pub use client::ClientBridge;
 pub use mock::MockBridge;
 pub use vantry_protocol as protocol;
 use vantry_protocol::{Command, CoreEvent, Health, Receipt, Snapshot};
-pub use workbench::{LocalWorkbench, MockWorkbench, WorkbenchBridge};
+pub use workbench::{CoreWorkbench, LocalWorkbench, MockWorkbench, WorkbenchBridge};
 
 /// A bridge call's future: `Send`, so it runs on the runtime's threads.
 pub type BridgeFuture<T> = Pin<Box<dyn Future<Output = Result<T, BridgeError>> + Send + 'static>>;

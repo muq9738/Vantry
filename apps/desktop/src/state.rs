@@ -26,6 +26,8 @@ pub mod workbench;
 mod tests;
 #[cfg(test)]
 mod wave2_tests;
+#[cfg(test)]
+mod wave4_tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -41,7 +43,10 @@ use vantry_protocol::{
 
 pub use self::{
     actions::{QueueItem, QueueItemKind},
-    approval::{ApprovalDecision, ApprovalView, DecisionError, Risk, approval_view},
+    approval::{
+        ApprovalDecision, ApprovalView, DecisionError, RequestKind, Risk, approval_view,
+        approval_view_with,
+    },
     timeline::{RunParts, TimelineIndex, TimelineItem, ToolStatus},
 };
 use crate::bridge::{BridgeError, events, new_command_id};
@@ -140,6 +145,8 @@ pub fn policy_label(policy: &str) -> String {
 pub enum Connection {
     /// Loading the first snapshot.
     Connecting,
+    /// The local Core did not answer: `vantry-service ensure-core` runs.
+    Starting { detail: String },
     /// Snapshot loaded, events streaming.
     Live,
     /// The stream broke; resubscribing after the last applied event.
@@ -152,6 +159,7 @@ impl Connection {
     pub fn label(&self) -> &'static str {
         match self {
             Connection::Connecting => "连接中",
+            Connection::Starting { .. } => "正在启动本地 Core…",
             Connection::Live => "已连接",
             Connection::Reconnecting { .. } => "重连中",
             Connection::Resyncing { .. } => "重新同步",
@@ -569,7 +577,16 @@ impl AppState {
             .iter()
             .find(|r| Some(r.thread_id.as_str()) == selected)
             .or_else(|| queue.first())
-            .map(|r| approval_view(r))
+            .map(|r| approval_view_with(r, self.inside_secret_tool(&r.run_id)))
+    }
+
+    /// Whether run `run_id` is inside the secret-input tool now.
+    pub fn inside_secret_tool(&self, run_id: &str) -> bool {
+        self.tools.iter().any(|t| {
+            t.run_id == run_id
+                && t.name == approval::SECRET_TOOL
+                && !matches!(t.status.as_str(), "completed" | "failed" | "error" | "cancelled")
+        })
     }
 
     fn pending_by_key(&self, key: &str) -> Option<&PendingCommand> {
@@ -1565,8 +1582,31 @@ impl AppState {
         self.connection = Connection::Connecting;
     }
 
+    /// The local Core is being started (`vantry-service ensure-core`).
+    pub fn starting_core(&mut self, detail: impl Into<String>) {
+        self.connection = Connection::Starting {
+            detail: detail.into(),
+        };
+        self.notice = Some(Notice::new(NoticeLevel::Info, "正在启动本地 Core…"));
+    }
+
+    /// Starting the local Core failed: say why; the connection keeps
+    /// retrying (the user may start it by hand).
+    pub fn on_core_start_failed(&mut self, reason: &str) {
+        self.connection = Connection::Connecting;
+        self.notice = Some(Notice::new(
+            NoticeLevel::Error,
+            format!("无法启动本地 Core：{reason}"),
+        ));
+    }
+
     /// The snapshot is in and the subscription runs.
     pub fn on_live(&mut self) {
+        if matches!(self.connection, Connection::Starting { .. }) {
+            self.connection = Connection::Live;
+            self.notice = Some(Notice::new(NoticeLevel::Info, "本地 Core 已启动。"));
+            return;
+        }
         let was_recovering = !matches!(self.connection, Connection::Live | Connection::Connecting);
         self.connection = Connection::Live;
         if was_recovering
@@ -1589,10 +1629,13 @@ impl AppState {
             attempt,
             reason: error.to_string(),
         };
-        self.notice = Some(Notice::new(
-            NoticeLevel::Warn,
-            format!("无法读取 Core 快照（{}），正在重试…", error.message),
-        ));
+        // An error the user must act on (the Core could not start) stays.
+        if self.notice.as_ref().is_none_or(|n| n.level != NoticeLevel::Error) {
+            self.notice = Some(Notice::new(
+                NoticeLevel::Warn,
+                format!("无法读取 Core 快照（{}），正在重试…", error.message),
+            ));
+        }
         Recovery::Resync {
             delay: reconnect_delay(attempt),
         }

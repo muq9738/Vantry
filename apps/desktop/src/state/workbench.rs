@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use vantry_protocol::{GitFile, GitState};
 
 use super::markdown::MarkdownDoc;
-use crate::bridge::workbench::{DirEntry, FileContent, PrSummary};
+use crate::bridge::workbench::{DirEntry, FileContent, PrSummary, SearchHit};
 
 /// A tab of the dock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,6 +79,53 @@ pub struct FilesState {
     pub selected: Option<String>,
     pub preview: Option<FileContent>,
     pub error: Option<String>,
+    pub search: FileSearch,
+}
+
+/// The file panel's search (names first, then lines).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileSearch {
+    pub query: String,
+    /// Bumped per query: an older answer is dropped.
+    pub generation: u64,
+    pub loading: bool,
+    pub results: Vec<SearchHit>,
+    pub error: Option<String>,
+}
+
+impl FileSearch {
+    /// A new query; its generation (the answer must carry it back).
+    pub fn set_query(&mut self, query: &str) -> u64 {
+        self.query = query.to_owned();
+        self.generation += 1;
+        self.error = None;
+        if query.trim().is_empty() {
+            self.loading = false;
+            self.results.clear();
+        } else {
+            self.loading = true;
+        }
+        self.generation
+    }
+
+    pub fn on_results(&mut self, generation: u64, result: Result<Vec<SearchHit>, String>) {
+        if generation != self.generation {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok(results) => self.results = results,
+            Err(error) => {
+                self.results.clear();
+                self.error = Some(error);
+            }
+        }
+    }
+
+    /// Whether the tree gives way to the results.
+    pub fn active(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
 }
 
 /// A visible row of the tree.
@@ -211,6 +258,11 @@ pub struct GitPanel {
     pub busy: bool,
     pub error: Option<String>,
     pub last_commit: Option<String>,
+    /// A path whose unstaged changes wait for the discard confirmation
+    /// (`""` = every unstaged change).
+    pub confirm_discard: Option<String>,
+    /// The branch list is open.
+    pub branch_menu: bool,
 }
 
 impl GitPanel {
@@ -324,9 +376,37 @@ impl GitPanel {
         (!self.busy && !message.is_empty() && self.staged_count() > 0).then(|| message.to_owned())
     }
 
+    /// The local branches other than the current one.
+    pub fn other_branches(&self) -> Vec<String> {
+        let Some(status) = &self.status else {
+            return Vec::new();
+        };
+        status
+            .branches
+            .iter()
+            .flatten()
+            .filter(|b| **b != status.branch)
+            .cloned()
+            .collect()
+    }
+
+    /// The paths a discard of `target` (a path, or `""` for every unstaged
+    /// change) throws away.
+    pub fn discard_paths(&self, target: &str) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .changes()
+            .into_iter()
+            .filter(|c| !c.staged && (target.is_empty() || c.path == target))
+            .map(|c| c.path)
+            .collect();
+        paths.dedup();
+        paths
+    }
+
     /// A stage / unstage / commit ended; the status reloads.
     pub fn on_done(&mut self, result: Result<Option<String>, String>) -> Load {
         self.busy = false;
+        self.branch_menu = false;
         match result {
             Ok(Some(commit)) => {
                 self.last_commit = Some(commit);

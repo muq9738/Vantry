@@ -12,14 +12,17 @@
 use std::{cell::RefCell, path::PathBuf, sync::Arc, time::Duration};
 
 use nsh_core::prelude::*;
-use vantry_protocol::{Command, CoreEvent};
+use vantry_protocol::{Command, CoreEvent, WorkbenchRequest};
 
 use crate::{
+    autostart,
     bridge::{
-        self, BridgeError, CoreBridge, Endpoint, ErrorCode, LocalWorkbench, MockWorkbench,
-        WorkbenchBridge,
+        self, BridgeError, CoreBridge, CoreWorkbench, Endpoint, ErrorCode, LocalWorkbench,
+        MockWorkbench, WorkbenchBridge,
+        workbench::actions::{self, names},
     },
     cli::LaunchConfig,
+    service,
     state::{
         AppState, ApprovalDecision, DecisionError, Notice, NoticeLevel, Recovery, RunningAction,
         persist,
@@ -82,13 +85,17 @@ fn workbench() -> Option<Arc<dyn WorkbenchBridge>> {
 pub(crate) fn start(config: &LaunchConfig) {
     let core = bridge::connect(&config.endpoint);
     let mock = config.endpoint == Endpoint::Mock;
-    let workbench: Arc<dyn WorkbenchBridge> = if mock {
-        Arc::new(MockWorkbench::demo())
-    } else {
-        Arc::new(LocalWorkbench::new(
-            config.workspace_root(),
+    let local = LocalWorkbench::new(config.workspace_root(), config.model.clone());
+    let workbench: Arc<dyn WorkbenchBridge> = match &config.endpoint {
+        Endpoint::Mock => Arc::new(MockWorkbench::demo()),
+        // Settings, plugins, remote access … from the Core; files, Git and
+        // the terminal on this machine's workspace.
+        Endpoint::Local { socket } => Arc::new(CoreWorkbench::new(
+            socket.clone(),
+            local,
             config.model.clone(),
-        ))
+        )),
+        Endpoint::Ssh { .. } | Endpoint::Peer { .. } => Arc::new(local),
     };
     let state_path = config.state_path();
     global::<Bridges>().set(Bridges {
@@ -150,7 +157,40 @@ pub(crate) fn start(config: &LaunchConfig) {
             schedule_save(file);
         });
     }
-    spawn(run_connection(core));
+    if service::should_autostart(config) {
+        let command = service::ensure_core_command(config, &service::Locator::from_env());
+        spawn(boot_then_connect(core, command));
+    } else {
+        spawn(run_connection(core));
+    }
+}
+
+/// Starts the local Core when it does not answer, then connects.
+async fn boot_then_connect(
+    core: Arc<dyn CoreBridge>,
+    command: Result<service::ServiceCommand, service::NotFound>,
+) {
+    let down = matches!(
+        call(core.health()).await,
+        Err(BridgeError { code: ErrorCode::Unavailable, .. })
+    );
+    if down {
+        let detail = match &command {
+            Ok(command) => format!("{} ensure-core", command.program.display()),
+            Err(_) => "未找到 vantry-service".to_owned(),
+        };
+        state().update(move |s| s.starting_core(detail));
+        let result = background(autostart::ensure_core(core.clone(), command, || {})).await;
+        let failure = match result {
+            Ok(Ok(_)) => None,
+            Ok(Err(reason)) => Some(reason),
+            Err(join) => Some(join.to_string()),
+        };
+        if let Some(reason) = failure {
+            state().update(move |s| s.on_core_start_failed(&reason));
+        }
+    }
+    run_connection(core).await;
 }
 
 // ---------------------------------------------------------------- persistence
@@ -225,6 +265,7 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
                         s.on_live();
                     });
                     need_snapshot = false;
+                    catalogs_after_connect();
                 }
                 Err(error) => {
                     let mut recovery = None;
@@ -282,6 +323,20 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
             Some(Recovery::Resubscribe { delay, .. }) => timer(delay).await,
             None => {}
         }
+    }
+}
+
+/// Once the Core answers: the catalogs load (the composer's thinking
+/// switch needs them), and ones read while it was down load again.
+fn catalogs_after_connect() {
+    let stale = ui().with_untracked(|u| match &u.catalogs {
+        crate::state::ui::Catalogs::NotLoaded | crate::state::ui::Catalogs::Failed(_) => true,
+        crate::state::ui::Catalogs::Loaded(data) => !data.degraded.is_empty() && !bridges(|b| b.mock),
+        crate::state::ui::Catalogs::Loading => false,
+    });
+    if stale {
+        ui().update(|u| u.catalogs = crate::state::ui::Catalogs::NotLoaded);
+        load_catalogs(false);
     }
 }
 
@@ -693,42 +748,402 @@ pub(crate) fn toggle_extensions() {
     ui().update(|u| u.extensions_enabled = !u.extensions_enabled);
 }
 
-pub(crate) fn toggle_mcp(name: String) {
-    ui().update(move |u| u.toggle_mcp(&name));
-}
-
 pub(crate) fn show_view(view: MainView) {
+    let remote = view == MainView::RemoteDesktop;
     ui().update(move |u| u.view = view);
+    if remote {
+        refresh_rd_status();
+    }
 }
 
 pub(crate) fn open_plugin(id: String, page: String) {
-    ui().update(move |u| u.open_plugin(&id, &page));
+    let mut load = false;
+    ui().update(|u| load = u.open_plugin(&id, &page));
+    if load {
+        load_plugin_panel();
+    } else if ui().with_untracked(|u| u.view == MainView::RemoteDesktop) {
+        refresh_rd_status();
+    }
+}
+
+// ------------------------------------------------------------- settings ops
+
+/// Runs workbench action `request` as settings operation `key`: its
+/// buttons wait, its answer updates the shown catalogs, `done` (or the
+/// Core's message) is the feedback line.
+pub(crate) fn settings_op(key: impl Into<String>, request: WorkbenchRequest, done: &'static str) {
+    let key = key.into();
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let mut go = false;
+    ui().update(|u| go = u.begin_op(&key));
+    if !go {
+        return;
+    }
+    let action = request.action.clone();
+    spawn(async move {
+        let result = call(workbench.workbench(request)).await.map_err(|e| e.message);
+        ui().update(move |u| u.end_op(&key, &action, result, done));
+    });
+}
+
+pub(crate) fn dismiss_feedback() {
+    ui().update(|u| u.forms.feedback = None);
+}
+
+pub(crate) fn mcp_set_enabled(name: String, enabled: bool) {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let key = format!("mcp:{name}");
+    let mut go = false;
+    // The switch moves at once; a refusal moves it back.
+    let mut flipped = false;
+    ui().update(|u| {
+        go = u.begin_op(&key);
+        if go && u.mcp_enabled(&name, true) != enabled {
+            u.toggle_mcp(&name);
+            flipped = true;
+        }
+    });
+    if !go {
+        return;
+    }
+    let request = actions::mcp_set_enabled(&name, enabled);
+    spawn(async move {
+        let result = call(workbench.workbench(request)).await.map_err(|e| e.message);
+        let failed = result.is_err();
+        ui().update(move |u| {
+            if failed && flipped {
+                u.toggle_mcp(&name);
+            }
+            u.end_op(
+                &key,
+                names::MCP_UPSERT,
+                result,
+                if enabled { "已启用 MCP 服务器" } else { "已停用 MCP 服务器" },
+            );
+        });
+    });
+}
+
+pub(crate) fn mcp_probe(name: String) {
+    settings_op(format!("mcp.probe:{name}"), actions::mcp_named(names::MCP_PROBE, &name), "探活完成");
+}
+
+pub(crate) fn mcp_remove(name: String) {
+    settings_op(format!("mcp:{name}"), actions::mcp_named(names::MCP_REMOVE, &name), "已删除 MCP 服务器");
+}
+
+pub(crate) fn mcp_trust() {
+    settings_op("mcp.trust", actions::request(names::MCP_TRUST), "已信任项目 MCP 配置");
+}
+
+/// Opens (or closes) the add-server form.
+pub(crate) fn mcp_draft_toggle() {
+    ui().update(|u| {
+        u.forms.mcp_draft = match u.forms.mcp_draft {
+            Some(_) => None,
+            None => Some(actions::McpServerSpec {
+                transport: "stdio".into(),
+                enabled: true,
+                scope: "user".into(),
+                ..Default::default()
+            }),
+        }
+    });
+}
+
+pub(crate) fn mcp_draft_update(f: impl FnOnce(&mut actions::McpServerSpec) + 'static) {
+    ui().update(move |u| {
+        if let Some(draft) = u.forms.mcp_draft.as_mut() {
+            f(draft);
+        }
+    });
+}
+
+pub(crate) fn mcp_draft_save() {
+    let Some(draft) = ui().with_untracked(|u| u.forms.mcp_draft.clone()) else {
+        return;
+    };
+    if let Some(problem) = draft.problem() {
+        ui().update(move |u| {
+            u.forms.feedback = Some(crate::state::ui::Feedback { ok: false, text: problem.to_owned() })
+        });
+        return;
+    }
+    ui().update(|u| u.forms.mcp_draft = None);
+    settings_op("mcp.add", actions::mcp_upsert(&draft), "已保存 MCP 服务器");
+}
+
+pub(crate) fn plugin_set_enabled(id: String, enabled: bool) {
+    settings_op(
+        format!("plugin:{id}"),
+        actions::plugin_toggle(&id, enabled),
+        if enabled { "已启用插件" } else { "已停用插件" },
+    );
+}
+
+pub(crate) fn sandbox_set(mode: String) {
+    settings_op("sandbox", actions::sandbox_set(&mode), "已切换沙盒模式");
+}
+
+pub(crate) fn pair_create() {
+    settings_op("pair.create", actions::request(names::REMOTE_PAIR_CREATE), "已生成一次性配对码");
+}
+
+pub(crate) fn set_pair_field(code: bool, text: &str) {
+    let text = text.to_owned();
+    ui().update(move |u| {
+        let field = if code { &mut u.forms.pair_code } else { &mut u.forms.pair_name };
+        if *field != text {
+            *field = text;
+        }
+    });
+}
+
+pub(crate) fn pair_redeem() {
+    let (code, name) = ui().with_untracked(|u| (u.forms.pair_code.clone(), u.forms.pair_name.clone()));
+    if code.trim().is_empty() {
+        ui().update(|u| {
+            u.forms.feedback = Some(crate::state::ui::Feedback { ok: false, text: "请输入配对码或连接链接".into() })
+        });
+        return;
+    }
+    // The code is single use: it leaves the form as it is sent.
+    ui().update(|u| u.forms.pair_code.clear());
+    settings_op("pair.redeem", actions::pair_redeem(&code, &name), "配对成功");
+}
+
+pub(crate) fn ask_revoke(id: Option<String>) {
+    ui().update(move |u| u.forms.confirm_revoke = id);
+}
+
+pub(crate) fn peer_revoke(id: String) {
+    ui().update(|u| u.forms.confirm_revoke = None);
+    settings_op(format!("revoke:{id}"), actions::peer_revoke(&id), "已撤销配对");
+}
+
+pub(crate) fn environment_remove(id: String) {
+    settings_op(format!("env:{id}"), actions::named(names::ENVIRONMENTS_REMOVE, &id), "已移除环境");
+}
+
+pub(crate) fn project_remove(id: String) {
+    settings_op(format!("project:{id}"), actions::named(names::PROJECTS_REMOVE, &id), "已移除项目");
+}
+
+/// Picks a folder and adds it as a project.
+pub(crate) fn project_add() {
+    spawn(async move {
+        let picked = pick_paths(
+            nsh_core::file_dialog::OpenDialog::folders().title("添加项目目录"),
+        )
+        .await;
+        match picked {
+            Ok(Some(paths)) => {
+                for path in paths {
+                    settings_op(
+                        "project.add",
+                        actions::project_add(&path.to_string_lossy()),
+                        "已添加项目",
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn(format!("无法打开文件夹选择器：{error}")),
+        }
+    });
+}
+
+pub(crate) fn update_op(action: &'static str) {
+    let done = match action {
+        names::UPDATE_CHECK => "检查完成",
+        names::UPDATE_DOWNLOAD => "更新已下载",
+        _ => "正在安装更新",
+    };
+    settings_op("update", actions::request(action), done);
+}
+
+pub(crate) fn usage_refresh() {
+    settings_op("usage", actions::request(names::USAGE_SUMMARY), "");
+}
+
+pub(crate) fn set_pi_field(field: u8, text: &str) {
+    let text = text.to_owned();
+    ui().update(move |u| match field {
+        0 => u.forms.pi_provider = text,
+        1 => u.forms.pi_key = crate::state::ui::Secret::new(text),
+        _ => u.forms.pi_model = text,
+    });
+}
+
+/// Saves the Pi quick setup; the key leaves the desktop's memory as it is
+/// sent.
+pub(crate) fn pi_setup_save() {
+    let mut request = None;
+    ui().update(|u| {
+        let forms = &mut u.forms;
+        if forms.pi_provider.trim().is_empty() || forms.pi_key.is_empty() {
+            forms.feedback = Some(crate::state::ui::Feedback {
+                ok: false,
+                text: "请填写 Provider 与 API Key".into(),
+            });
+            return;
+        }
+        request = Some(actions::pi_setup_save(&forms.pi_provider, forms.pi_key.expose(), &forms.pi_model));
+        forms.pi_key.clear();
+    });
+    if let Some(request) = request {
+        settings_op("pi.setup", request, "Pi 配置已保存");
+    }
+}
+
+// ------------------------------------------------------------- plugin panel
+
+fn load_plugin_panel() {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let Some((id, page)) = ui().with_untracked(|u| {
+        u.plugin_panel.as_ref().map(|p| (p.plugin_id.clone(), p.page.clone()))
+    }) else {
+        return;
+    };
+    spawn(async move {
+        let result = call(workbench.workbench(actions::plugin_panel(&id, &page)))
+            .await
+            .map(|r| r.output)
+            .map_err(|e| e.message);
+        ui().update(move |u| {
+            if let Some(panel) = u.plugin_panel.as_mut().filter(|p| p.plugin_id == id && p.page == page) {
+                panel.on_loaded(result);
+            }
+        });
+    });
+}
+
+pub(crate) fn reload_plugin_panel() {
+    ui().update(|u| {
+        if let Some(panel) = u.plugin_panel.as_mut() {
+            panel.loading = true;
+            panel.error = None;
+        }
+    });
+    load_plugin_panel();
+}
+
+pub(crate) fn set_panel_value(key: String, value: &str) {
+    if ui().with_untracked(|u| {
+        u.plugin_panel.as_ref().is_some_and(|p| p.values.get(&key).map(String::as_str) == Some(value))
+    }) {
+        return;
+    }
+    let value = value.to_owned();
+    ui().update(move |u| {
+        if let Some(panel) = u.plugin_panel.as_mut() {
+            panel.values.insert(key, value);
+        }
+    });
+}
+
+/// Runs the shown panel's action `action_id` (`plugins.run`).
+pub(crate) fn run_panel_action(action_id: String) {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let mut run = None;
+    ui().update(|u| {
+        if let Some(panel) = u.plugin_panel.as_mut()
+            && let Some(input) = panel.begin_run(&action_id)
+        {
+            run = Some(actions::plugin_run(&panel.plugin_id, &panel.page, input));
+        }
+    });
+    let Some(request) = run else {
+        return;
+    };
+    let id = request.plugin_id.clone();
+    spawn(async move {
+        let result = call(workbench.workbench(request)).await.map(|r| r.output).map_err(|e| e.message);
+        ui().update(move |u| {
+            if let Some(panel) = u.plugin_panel.as_mut().filter(|p| p.plugin_id == id) {
+                panel.on_ran(&action_id, result);
+            }
+        });
+    });
 }
 
 // ---------------------------------------------------------- remote desktop
 
-/// Connects the remote desktop view to `peer`. The media stream is Wave 3:
-/// the demo shows a connected canvas, a real peer reports that it is not
-/// wired yet.
+/// Connects the remote desktop view to `peer` (`rd.session.start` with
+/// the toolbar's resolution, quality, control and clipboard).
 pub(crate) fn remote_connect(peer: String) {
-    let mut start = false;
-    ui().update(|u| start = u.remote.connect(&peer));
-    if !start {
+    let Some(workbench) = workbench() else {
         return;
-    }
-    let mock = bridges(|b| b.mock);
-    set_timeout(Duration::from_millis(600), move || {
-        let result = if mock {
-            Ok(())
-        } else {
-            Err("远程桌面媒体流将在 Wave 3 接入".to_owned())
-        };
-        ui().update(move |u| u.remote.on_result(&peer, result));
+    };
+    let mut start = None;
+    ui().update(|u| {
+        if u.remote.connect(&peer) {
+            start = Some(u.remote.session_options(&peer));
+        }
+    });
+    let Some(options) = start else {
+        return;
+    };
+    spawn(async move {
+        let result = call(workbench.workbench(actions::rd_session_start(&options))).await;
+        ui().update(move |u| match result {
+            Ok(response) => {
+                let status = actions::RdStatus::read(&response).unwrap_or_default();
+                let outcome = if status.session_error.is_empty() {
+                    Ok(())
+                } else {
+                    Err(status.session_error.clone())
+                };
+                u.remote.on_result(&peer, outcome);
+                u.remote.status = Some(status);
+            }
+            Err(error) => u.remote.on_result(&peer, Err(error.message)),
+        });
     });
 }
 
+/// Ends the session (`rd.session.stop`); the view returns to the picker
+/// whatever the Core answers.
 pub(crate) fn remote_disconnect() {
+    let peer = ui().with_untracked(|u| u.remote.peer().map(str::to_owned));
     ui().update(|u| u.remote.disconnect());
+    let (Some(peer), Some(workbench)) = (peer, workbench()) else {
+        return;
+    };
+    spawn(async move {
+        if let Ok(response) = call(workbench.workbench(actions::rd_session_stop(&peer))).await
+            && let Ok(status) = actions::RdStatus::read(&response)
+        {
+            ui().update(move |u| u.remote.status = Some(status));
+        }
+    });
+}
+
+/// Leaves the remote desktop for the conversation, ending its session.
+pub(crate) fn remote_exit() {
+    remote_disconnect();
+    show_view(MainView::Conversation);
+}
+
+/// Reads `rd.status` (permissions, sharing, a session the Core still runs).
+pub(crate) fn refresh_rd_status() {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    spawn(async move {
+        if let Ok(response) = call(workbench.workbench(actions::request(names::RD_STATUS))).await
+            && let Ok(status) = actions::RdStatus::read(&response)
+        {
+            ui().update(move |u| u.remote.on_status(status));
+        }
+    });
 }
 
 pub(crate) fn remote_update(f: impl FnOnce(&mut crate::state::ui::RemoteDesktopState) + 'static) {
@@ -1007,13 +1422,123 @@ pub(crate) fn reveal_workspace() {
     });
 }
 
-/// The plugin panel's settings toggle (a plugin's `disabled` flag is the
-/// Core's; here it is the local switch shown until the Core's API lands).
-pub(crate) fn plugin_notice(name: String) {
-    state().update(move |s| {
-        s.notice = Some(Notice::new(
-            NoticeLevel::Info,
-            format!("插件「{name}」的安装与启停由 Core 插件宿主管理（Wave 3 接入）。"),
-        ))
+// ------------------------------------------------------------ git extras
+
+/// Switches the workspace's branch.
+pub(crate) fn git_checkout(branch: String) {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let mut go = false;
+    bench().update(|b| go = b.git.begin());
+    if !go {
+        return;
+    }
+    spawn(async move {
+        let result = call(workbench.git_checkout(branch)).await.map(|()| None).map_err(|e| e.message);
+        let mut next = None;
+        bench().update(|b| next = Some(b.git.on_done(result)));
+        let mut loads: Vec<Load> = next.into_iter().collect();
+        // The tree may differ on the other branch.
+        bench().update(|b| loads.extend(b.files.refresh()));
+        run_loads(loads);
     });
+}
+
+/// Asks before throwing away `path`'s unstaged changes.
+pub(crate) fn ask_discard(path: Option<String>) {
+    bench().update(move |b| b.git.confirm_discard = path);
+}
+
+pub(crate) fn git_discard(paths: Vec<String>) {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let mut go = false;
+    bench().update(|b| {
+        b.git.confirm_discard = None;
+        go = b.git.begin();
+    });
+    if !go {
+        return;
+    }
+    spawn(async move {
+        let result = call(workbench.git_discard(paths)).await.map(|()| None).map_err(|e| e.message);
+        let mut next = None;
+        bench().update(|b| next = Some(b.git.on_done(result)));
+        run_loads(next.into_iter().collect());
+    });
+}
+
+pub(crate) fn toggle_branch_menu() {
+    bench().update(|b| b.git.branch_menu = !b.git.branch_menu);
+}
+
+// ------------------------------------------------------------- file search
+
+/// Searches the workspace (names, then lines) shortly after typing stops.
+pub(crate) fn set_file_search(text: &str) {
+    if bench().with_untracked(|b| b.files.search.query == text) {
+        return;
+    }
+    let text = text.to_owned();
+    let mut generation = 0;
+    bench().update(|b| generation = b.files.search.set_query(&text));
+    if text.trim().is_empty() {
+        return;
+    }
+    set_timeout(Duration::from_millis(220), move || {
+        if bench().with_untracked(|b| b.files.search.generation) != generation {
+            return;
+        }
+        let Some(workbench) = workbench() else {
+            return;
+        };
+        let query = text.clone();
+        spawn(async move {
+            let result = call(workbench.search_files(query)).await.map_err(|e| e.message);
+            bench().update(move |b| b.files.search.on_results(generation, result));
+        });
+    });
+}
+
+/// Opens a search hit in the preview.
+pub(crate) fn open_search_hit(path: String) {
+    select_file(path);
+}
+
+// ----------------------------------------------------------------- composer
+
+/// Cycles the thinking level of the shown model (`model:level`).
+pub(crate) fn cycle_thinking() {
+    let (levels, models) = ui().with_untracked(|u| u.thinking_catalog());
+    if levels.is_empty() {
+        load_catalogs(false);
+        return;
+    }
+    let current = state().with_untracked(|s| s.current_model());
+    let (base, level) = actions::split_thinking(&current, &models);
+    if base.is_empty() {
+        return;
+    }
+    let next = actions::with_thinking(base, &actions::next_thinking(level, &levels));
+    intent(move |s| s.set_model(&next));
+}
+
+/// Escape in the window: closes the model picker, else stops the shown
+/// thread's run (when nothing modal is open).
+pub(crate) fn escape() {
+    let (picker, modal_ui) = ui().with_untracked(|u| {
+        (u.model_picker, u.settings.is_some() || u.rename.is_some() || u.confirm.is_some())
+    });
+    if picker {
+        toggle_model_picker();
+        return;
+    }
+    if modal_ui || state().with_untracked(|s| s.modal_request().is_some()) {
+        return;
+    }
+    if state().with_untracked(|s| s.composer_status().can_stop) {
+        stop();
+    }
 }

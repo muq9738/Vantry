@@ -10,11 +10,15 @@ use std::{
 };
 
 use tokio::{io::AsyncReadExt, process::Command, sync::oneshot};
-use vantry_protocol::{AppUpdateInfo, Attachment, GitState, MCPCatalog, ModelCatalog, ModelInfo};
+use vantry_protocol::{
+    AppUpdateInfo, Attachment, GitState, MCPCatalog, ModelCatalog, ModelInfo, WorkbenchRequest,
+    WorkbenchResponse,
+};
 
 use super::{
-    DirEntry, FileContent, PrSummary, SettingsData, TerminalSink, WorkbenchBridge, mime_of,
-    parse_git_status, preview_of, resolve_in, sort_entries,
+    DirEntry, FileContent, MAX_SEARCH_HITS, PrSummary, SearchHit, SettingsData, TerminalSink,
+    WorkbenchBridge, actions::names, mime_of, parse_git_status, preview_of, resolve_in,
+    sort_entries,
 };
 use crate::bridge::{BridgeError, BridgeFuture, ErrorCode};
 
@@ -305,40 +309,88 @@ impl WorkbenchBridge for LocalWorkbench {
     fn settings(&self) -> BridgeFuture<SettingsData> {
         let model = self.model.clone();
         Box::pin(async move {
-            let models = model
-                .iter()
-                .map(|id| ModelInfo {
-                    id: id.clone(),
-                    provider: id.split('/').next().unwrap_or_default().to_owned(),
-                    name: id.clone(),
-                    ..ModelInfo::default()
-                })
-                .collect::<Vec<_>>();
-            let ssh_hosts = match std::env::var_os("HOME") {
-                Some(home) => tokio::fs::read_to_string(PathBuf::from(home).join(".ssh/config"))
-                    .await
-                    .map(|text| parse_ssh_hosts(&text))
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
+            let ssh_hosts = local_ssh_hosts().await;
             Ok(SettingsData {
-                models: ModelCatalog {
-                    default: model.clone().unwrap_or_default(),
-                    models: Some(models),
-                    ..ModelCatalog::default()
-                },
+                models: local_catalog(model.as_deref()),
                 mcp: MCPCatalog {
                     notice: "MCP 服务器由 Core 读取并管理；连接 Core 后在此显示。".into(),
                     servers: Some(Vec::new()),
                     ..MCPCatalog::default()
                 },
-                update: AppUpdateInfo {
-                    current_version: env!("CARGO_PKG_VERSION").into(),
-                    ..AppUpdateInfo::default()
-                },
+                update: local_update(),
                 ssh_hosts,
                 ..SettingsData::default()
             })
+        })
+    }
+
+    /// What the desktop answers without a Core: the command line's model,
+    /// the SSH config's hosts, this build's version; nothing else.
+    fn workbench(&self, request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
+        let model = self.model.clone();
+        Box::pin(async move {
+            let mut response = WorkbenchResponse::default();
+            match request.action.as_str() {
+                names::MODELS => response.catalog = Some(local_catalog(model.as_deref())),
+                names::SSH_HOSTS => response.ssh_hosts = local_ssh_hosts().await,
+                names::UPDATE_STATUS => response.update = Some(local_update()),
+                action => {
+                    return Err(BridgeError::new(
+                        ErrorCode::NotReady,
+                        format!("「{action}」需要连接支持工作台扩展的 Core"),
+                    ));
+                }
+            }
+            Ok(response)
+        })
+    }
+
+    fn git_checkout(&self, branch: String) -> BridgeFuture<()> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            let branch = branch.trim().to_owned();
+            if branch.is_empty() || branch.starts_with('-') {
+                return Err(BridgeError::new(ErrorCode::InvalidCommand, "分支名无效"));
+            }
+            run_git(&root, &["checkout".into(), "-q".into(), branch]).await.map(|_| ())
+        })
+    }
+
+    fn git_discard(&self, paths: Vec<String>) -> BridgeFuture<()> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            if paths.is_empty() {
+                return Ok(());
+            }
+            let status = run_git(
+                &root,
+                &dashdash(vec!["status".into(), "--porcelain=v1".into()], paths.clone()),
+            )
+            .await?;
+            let untracked: Vec<String> = parse_git_status(&status)
+                .files
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| f.index == "?")
+                .map(|f| f.path)
+                .collect();
+            let tracked: Vec<String> = paths.into_iter().filter(|p| !untracked.contains(p)).collect();
+            if !tracked.is_empty() {
+                run_git(&root, &dashdash(vec!["checkout".into()], tracked)).await?;
+            }
+            if !untracked.is_empty() {
+                run_git(&root, &dashdash(vec!["clean".into(), "-f".into(), "-q".into()], untracked)).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn search_files(&self, query: String) -> BridgeFuture<Vec<SearchHit>> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || search_tree(&root, &query))
+                .await
+                .map_err(|e| BridgeError::new(ErrorCode::Internal, e.to_string()))
         })
     }
 
@@ -363,6 +415,109 @@ impl WorkbenchBridge for LocalWorkbench {
             })
         })
     }
+}
+
+/// The command line's model as the catalog.
+fn local_catalog(model: Option<&str>) -> ModelCatalog {
+    ModelCatalog {
+        default: model.unwrap_or_default().to_owned(),
+        models: Some(
+            model
+                .iter()
+                .map(|id| ModelInfo {
+                    id: (*id).to_owned(),
+                    provider: id.split('/').next().unwrap_or_default().to_owned(),
+                    name: (*id).to_owned(),
+                    ..ModelInfo::default()
+                })
+                .collect(),
+        ),
+        ..ModelCatalog::default()
+    }
+}
+
+fn local_update() -> AppUpdateInfo {
+    AppUpdateInfo {
+        current_version: env!("CARGO_PKG_VERSION").into(),
+        ..AppUpdateInfo::default()
+    }
+}
+
+async fn local_ssh_hosts() -> Vec<vantry_protocol::SSHHostInfo> {
+    match std::env::var_os("HOME") {
+        Some(home) => tokio::fs::read_to_string(PathBuf::from(home).join(".ssh/config"))
+            .await
+            .map(|text| parse_ssh_hosts(&text))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Folders a search skips.
+const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "target", ".agent", "dist", "build"];
+/// The most files a search looks at, and the largest it reads.
+const MAX_SEARCH_FILES: usize = 4000;
+const MAX_SEARCH_BYTES: u64 = 512 << 10;
+
+/// Paths containing `query` (case-insensitive), then matching lines.
+pub(crate) fn search_tree(root: &std::path::Path, query: &str) -> Vec<SearchHit> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let Ok(reader) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = reader.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                if !SKIPPED_DIRS.contains(&name.as_str()) {
+                    stack.push((entry.path(), path));
+                }
+            } else if kind.is_file() && files.len() < MAX_SEARCH_FILES {
+                files.push((entry.path(), path));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut hits: Vec<SearchHit> = files
+        .iter()
+        .filter(|(_, path)| path.to_lowercase().contains(&needle))
+        .take(MAX_SEARCH_HITS)
+        .map(|(_, path)| SearchHit { path: path.clone(), ..SearchHit::default() })
+        .collect();
+    for (file, path) in &files {
+        if hits.len() >= MAX_SEARCH_HITS {
+            break;
+        }
+        if std::fs::metadata(file).map_or(true, |m| m.len() > MAX_SEARCH_BYTES) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(file) else { continue };
+        if super::looks_binary(&bytes) {
+            continue;
+        }
+        for (n, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+            if line.to_lowercase().contains(&needle) {
+                hits.push(SearchHit {
+                    path: path.clone(),
+                    line: line.trim().chars().take(200).collect(),
+                    line_number: n + 1,
+                });
+                if hits.len() >= MAX_SEARCH_HITS {
+                    break;
+                }
+            }
+        }
+    }
+    hits
 }
 
 /// The platform's shell running `command`.
@@ -513,6 +668,76 @@ mod tests {
             .unwrap();
         assert_eq!(code, -1);
         assert!(bench.running.lock().unwrap().is_empty());
+        drop(bench);
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn search_finds_names_then_lines_and_skips_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/x")).unwrap();
+        std::fs::write(dir.path().join("src/greet.rs"), "fn hello() {}\n// Greeting here\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "say hello\n").unwrap();
+        std::fs::write(dir.path().join("node_modules/x/greet.js"), "greet").unwrap();
+        std::fs::write(dir.path().join("blob.bin"), b"greet\0\0").unwrap();
+        let hits = search_tree(dir.path(), "GREET");
+        assert_eq!(hits[0].path, "src/greet.rs");
+        assert_eq!(hits[0].line_number, 0, "a name match first");
+        assert!(hits.iter().any(|h| h.line_number == 2 && h.line.contains("Greeting")));
+        assert!(hits.iter().all(|h| !h.path.starts_with("node_modules") && h.path != "blob.bin"));
+        assert!(search_tree(dir.path(), "  ").is_empty());
+        dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_a_core_only_local_actions_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let bench = LocalWorkbench::new(dir.path().to_path_buf(), Some("openai/gpt".into()));
+        let models = bench.workbench(super::super::actions::request(names::MODELS)).await.unwrap();
+        assert_eq!(models.catalog.unwrap().default, "openai/gpt");
+        let update = bench.workbench(super::super::actions::request(names::UPDATE_STATUS)).await.unwrap();
+        assert_eq!(update.update.unwrap().current_version, env!("CARGO_PKG_VERSION"));
+        let err = bench.workbench(super::super::actions::request(names::PLUGINS_LIST)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotReady);
+        dir.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_checkout_and_discard_work_on_a_real_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.invalid"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "feat"]);
+        let bench = LocalWorkbench::new(root.clone(), None);
+        bench.git_checkout("feat".into()).await.unwrap();
+        assert_eq!(bench.git_status().await.unwrap().branch, "feat");
+        assert!(bench.git_checkout("--orphan".into()).await.is_err());
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("new.txt"), "fresh\n").unwrap();
+        bench.git_discard(vec!["a.txt".into(), "new.txt".into()]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+        assert!(!root.join("new.txt").exists());
+        assert!(bench.git_status().await.unwrap().files.unwrap().is_empty());
         drop(bench);
         dir.close().unwrap();
     }

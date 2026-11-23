@@ -1,15 +1,16 @@
-//! The remote desktop view's shell: the connection state, a toolbar
-//! (peer, connect / disconnect, resolution, fit, input control, clipboard),
-//! and the canvas container where Wave 3's media stream will draw frames.
-//! Until then the demo shows a placeholder picture and a real peer reports
-//! that the stream is not wired.
+//! The remote desktop view: the session's state from the Core
+//! (`rd.status`, `rd.session.start` / `rd.session.stop`), a control bar
+//! (resolution, quality, fit, keyboard and pointer control, clipboard,
+//! disconnect, back to the conversation), missing permissions, and the
+//! canvas the media stream draws into. Paired hosts come from the remote
+//! access settings; a failed start shows why and offers a retry.
 
 use nsh_core::prelude::*;
 
 use super::{caption, dot, ghost_button, link_button, pill, primary_button};
 use crate::{
     controller,
-    state::ui::{Catalogs, MainView, RemoteLink, Resolution},
+    state::ui::{Catalogs, Quality, RemoteLink, Resolution},
     theme::PALETTE,
 };
 
@@ -62,6 +63,12 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                         .text_size(px(12.5))
                         .text_color(PALETTE.ink),
                 )
+                .child(
+                    text(move || remote.with(|r| r.detail()))
+                        .number_of_lines(1u32)
+                        .text_size(px(11.5))
+                        .text_color(PALETTE.muted),
+                )
                 .child(view().flex_1())
                 .children(Resolution::ALL.map(|res| {
                     pill(
@@ -70,6 +77,15 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                         move || controller::remote_update(move |r| r.resolution = res),
                     )
                 }))
+                .child(view().w(px(6.0)))
+                .children(Quality::ALL.map(|q| {
+                    pill(
+                        q.label(),
+                        move || remote.with(|r| r.quality == q),
+                        move || controller::remote_update(move |r| r.quality = q),
+                    )
+                }))
+                .child(view().w(px(6.0)))
                 .child(pill(
                     "适应窗口",
                     move || remote.with(|r| r.fit),
@@ -90,9 +106,34 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                     move || remote.with(|r| r.clipboard),
                     || controller::remote_update(|r| r.clipboard = !r.clipboard),
                 ))
-                .child(when(connected, || ghost_button("断开", controller::remote_disconnect)))
-                .child(link_button("返回对话", || controller::show_view(MainView::Conversation))),
+                .child(when(move || connected() || busy(), || ghost_button("断开", controller::remote_disconnect)))
+                .child(link_button("退出远程桌面", controller::remote_exit)),
         )
+        .child(when(
+            move || remote.with(|r| r.status.as_ref().is_some_and(|s| !s.missing_permissions().is_empty())),
+            move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_5()
+                    .py_1p5()
+                    .bg(PALETTE.approval)
+                    .child(dot(PALETTE.warning))
+                    .child(
+                        text(move || {
+                            remote.with(|r| {
+                                let missing = r.status.as_ref().map(|s| s.missing_permissions().join("、")).unwrap_or_default();
+                                format!("共享端缺少权限：{missing}。在系统设置 › 隐私与安全性中授权后重新连接。")
+                            })
+                        })
+                        .flex_1()
+                        .text_size(px(12.0))
+                        .text_color(PALETTE.ink),
+                    )
+                    .child(link_button("重新检查", controller::refresh_rd_status))
+            },
+        ))
         .child(
             view()
                 .flex_1()
@@ -126,8 +167,10 @@ fn canvas_view(remote: Memo<crate::state::ui::RemoteDesktopState>) -> impl IntoE
             text(move || {
                 remote.with(|r| {
                     format!(
-                        "演示画面 · {} · {}{}",
+                        "{} · {} · {} · {}{}",
+                        r.peer().unwrap_or("远程主机"),
                         r.resolution.label(),
+                        r.quality.label(),
                         if r.fit { "适应窗口" } else { "1:1" },
                         if r.control { " · 键鼠已接管" } else { "" }
                     )
@@ -157,9 +200,35 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
         )
         .child(caption("选择一台已配对的主机"))
         .child(when(
+            move || controller::ui().with(|u| matches!(u.remote.link, RemoteLink::Failed { .. })),
+            || {
+                view()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(8.0))
+                    .bg(PALETTE.approval)
+                    .child(
+                        text(|| controller::ui().with(|u| u.remote.status_label()))
+                            .select_text()
+                            .text_size(px(12.0))
+                            .text_color(PALETTE.danger),
+                    )
+                    .child(link_button("重试", || {
+                        let peer = controller::ui().with_untracked(|u| match &u.remote.link {
+                            RemoteLink::Failed { peer, .. } => Some(peer.clone()),
+                            _ => None,
+                        });
+                        if let Some(peer) = peer {
+                            controller::remote_connect(peer);
+                        }
+                    }))
+            },
+        ))
+        .child(when(
             move || peers.with(Vec::is_empty),
             || {
-                text("还没有已配对的主机。可在 设置 › 远端与配对 中查看。")
+                text("还没有已配对的主机。在 设置 › 远端互联与配对 中兑换配对码即可添加。")
                     .text_size(px(12.0))
                     .text_color(PALETTE.faint)
             },

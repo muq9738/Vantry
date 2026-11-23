@@ -3,13 +3,18 @@
 //! Each answer sends `request.respond` with the request's id; the modal
 //! stays until the Core's `request.updated` settles the request. Escape
 //! puts it aside ("稍后处理"); the timeline keeps its card.
+//!
+//! Three kinds of request: a tool approval (allow once / for the session /
+//! deny), a secret (typed masked, never prefilled, cleared once sent and
+//! never logged), and an interactive terminal or text prompt (a monospace
+//! editor for the terminal, a field or editor otherwise).
 
 use nsh_core::{LineHeight, prelude::*};
 
 use super::{ghost_button, primary_button};
 use crate::{
     controller,
-    state::{ApprovalDecision, ApprovalView, Risk},
+    state::{ApprovalDecision, ApprovalView, RequestKind, Risk},
     theme::{PALETTE, metrics},
 };
 
@@ -98,7 +103,10 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                         if busy.get() {
                                             "正在提交响应…".to_owned()
                                         } else {
-                                            "需要你的确认".to_owned()
+                                            match current.with(|v| v.as_ref().map(|v| v.kind)) {
+                                                Some(RequestKind::Approval) | None => "需要你的确认".to_owned(),
+                                                Some(kind) => kind.label().to_owned(),
+                                            }
                                         }
                                     })
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -259,6 +267,58 @@ fn answers(
             )
             .into_element();
     }
+    if request.kind == RequestKind::Secret {
+        let (cancel, submit) = (answer.clone(), answer);
+        return view_column()
+            .child(
+                nsh_base::input()
+                    .masked(true)
+                    .value(move || value.get())
+                    .on_change(move |text: &str| value.set(text.to_owned()))
+                    .on_submit(move |_: &str| {
+                        let secret = value.get_untracked();
+                        if !secret.is_empty() {
+                            value.set(String::new());
+                            controller::respond(request.request_id.clone(), ApprovalDecision::Submit(secret));
+                        }
+                    })
+                    .placeholder("输入后按回车提交")
+                    .auto_focus(true)
+                    .auto_correct(false)
+                    .auto_capitalize(AutoCapitalize::None)
+                    .min_h(px(34.0))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.0))
+                    .bg(PALETTE.card)
+                    .border_1()
+                    .border_color(PALETTE.line)
+                    .text_size(px(13.0))
+                    .text_color(PALETTE.ink),
+            )
+            .child(
+                text("私密内容以掩码输入，只交给本次请求的一次性文件；桌面不显示、不保存、不写日志。")
+                    .text_size(px(11.5))
+                    .text_color(PALETTE.muted),
+            )
+            .child(
+                nsh_base_row()
+                    .child(view_spacer())
+                    .child(
+                        ghost_button("取消请求", move || cancel(ApprovalDecision::Cancel))
+                            .disabled(move || busy.get()),
+                    )
+                    .child(
+                        primary_button("提交", move || {
+                            let secret = value.get_untracked();
+                            value.set(String::new());
+                            submit(ApprovalDecision::Submit(secret))
+                        })
+                        .disabled(move || busy.get() || value.with(String::is_empty)),
+                    ),
+            )
+            .into_element();
+    }
     match request.method.as_str() {
         "select" => {
             let cancel = answer.clone();
@@ -288,20 +348,25 @@ fn answers(
         _ => {
             // input / editor: text, then submit or cancel.
             let multiline = request.method == "editor";
+            let terminal = request.kind == RequestKind::Terminal;
             let (cancel, submit) = (answer.clone(), answer);
+            let field = nsh_base::input();
+            // A terminal's prompt reads as one.
+            let field = if terminal { field.font_family("Menlo") } else { field };
             view_column()
                 .child(
-                    nsh_base::input()
+                    field
                         .multiline(multiline)
                         .value(move || value.get())
                         .on_change(move |text: &str| value.set(text.to_owned()))
-                        .placeholder("输入回复")
+                        .placeholder(if terminal { "输入要发送给终端的内容" } else { "输入回复" })
                         .auto_focus(true)
+                        .auto_correct(!terminal)
                         .min_h(px(if multiline { 96.0 } else { 34.0 }))
                         .px_3()
                         .py_2()
                         .rounded(px(8.0))
-                        .bg(PALETTE.card)
+                        .bg(if terminal { PALETTE.code } else { PALETTE.card })
                         .border_1()
                         .border_color(PALETTE.line)
                         .text_size(px(13.0))
@@ -315,7 +380,7 @@ fn answers(
                                 .disabled(move || busy.get()),
                         )
                         .child(
-                            primary_button("提交响应", move || {
+                            primary_button(if terminal { "发送到终端" } else { "提交响应" }, move || {
                                 submit(ApprovalDecision::Submit(value.get_untracked()))
                             })
                             .disabled(move || busy.get()),

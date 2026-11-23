@@ -8,10 +8,11 @@ use nsh_core::{LineHeight, prelude::*};
 
 use super::{badge, caption, ghost_button, link_button, markdown, pill, primary_button};
 use crate::{
+    bridge::workbench::SearchHit,
     controller,
     state::{
         ui::Catalogs,
-        workbench::{Change, DockTab, PreviewContent, TreeRow},
+        workbench::{Change, DockTab, FileSearch, PreviewContent, TreeRow},
     },
     theme::PALETTE,
 };
@@ -64,6 +65,8 @@ fn files_panel() -> impl IntoElement {
     let preview = computed(|| controller::bench().with(|b| b.files.preview.clone()));
     let error = computed(|| controller::bench().with(|b| b.files.error.clone()));
     let root = computed(|| controller::bench().with(|b| b.root.clone()));
+    let search = computed(|| controller::bench().with(|b| b.files.search.clone()));
+    let searching = move || search.with(|s| s.active());
     view()
         .flex_1()
         .flex_col()
@@ -85,6 +88,37 @@ fn files_panel() -> impl IntoElement {
                 .child(link_button("刷新", controller::refresh_files))
                 .child(link_button("在访达中显示", controller::reveal_workspace)),
         )
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .mx_3()
+                .mb_1()
+                .px_2()
+                .py_0p5()
+                .rounded(px(7.0))
+                .bg(PALETTE.card)
+                .border_1()
+                .border_color(PALETTE.line)
+                .child(text("⌕").text_size(px(12.0)).text_color(PALETTE.faint))
+                .child(
+                    nsh_base::input()
+                        .value(move || search.with(|s| s.query.clone()))
+                        .on_change(|t: &str| controller::set_file_search(t))
+                        .placeholder("搜索文件名或内容")
+                        .placeholder_color(move || color(PALETTE.faint))
+                        .auto_correct(false)
+                        .auto_capitalize(AutoCapitalize::None)
+                        .flex_1()
+                        .text_size(px(12.0))
+                        .text_color(PALETTE.ink),
+                )
+                .child(when(
+                    move || search.with(|s| s.active()),
+                    || link_button("✕", || controller::set_file_search("")).accessibility_label("清除搜索"),
+                )),
+        )
         .child(when(
             move || error.with(Option::is_some),
             move || {
@@ -94,15 +128,16 @@ fn files_panel() -> impl IntoElement {
                     .text_color(PALETTE.danger)
             },
         ))
-        .child(
+        .child(when(searching, move || search_results(search, selected, preview)))
+        .child(when(move || !searching(), move || {
             scroll().flex_1().max_h(move || {
                 px(if preview.with(Option::is_some) { 260.0 } else { 10_000.0 })
             }).child(view().flex_col().px_1().pb_2().child(each(
                 move || rows.get(),
                 |r: &TreeRow| r.entry.path.clone(),
                 move |row, _| tree_row(row, selected),
-            ))),
-        )
+            )))
+        }))
         .child(when(
             move || preview.with(Option::is_some),
             move || {
@@ -137,6 +172,78 @@ fn files_panel() -> impl IntoElement {
                     })))
             },
         ))
+}
+
+/// What the search found: file names, then matching lines.
+fn search_results(
+    search: Memo<FileSearch>,
+    selected: Memo<Option<String>>,
+    preview: Memo<Option<crate::bridge::workbench::FileContent>>,
+) -> impl IntoElement {
+    let hits = computed(move || search.with(|s| s.results.clone().into_iter().enumerate().collect::<Vec<_>>()));
+    scroll()
+        .flex_1()
+        .max_h(move || px(if preview.with(Option::is_some) { 260.0 } else { 10_000.0 }))
+        .child(
+            view()
+                .flex_col()
+                .px_1()
+                .pb_2()
+                .child(
+                    caption(move || {
+                        search.with(|s| {
+                            if s.loading {
+                                "搜索中…".to_owned()
+                            } else if let Some(error) = &s.error {
+                                format!("搜索失败：{error}")
+                            } else if s.results.is_empty() {
+                                "没有匹配的文件或内容。".to_owned()
+                            } else {
+                                format!("{} 条结果", s.results.len())
+                            }
+                        })
+                    })
+                    .px_2()
+                    .py_1(),
+                )
+                .child(each(
+                    move || hits.get(),
+                    |(n, _): &(usize, SearchHit)| *n,
+                    move |hit, _| {
+                        let path = move || hit.with_untracked(|(_, h)| h.path.clone());
+                        let on = move || selected.with(|s| s.as_deref() == Some(hit.with(|(_, h)| h.path.clone()).as_str()));
+                        nsh_base::button()
+                            .on_press(move || controller::open_search_hit(path()))
+                            .flex_col()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(6.0))
+                            .bg(move || if on() { PALETTE.card } else { AdaptiveColor::TRANSPARENT })
+                            .hover(|s| s.bg(PALETTE.soft))
+                            .child(
+                                text(move || {
+                                    hit.with(|(_, h)| {
+                                        if h.line_number > 0 { format!("{}:{}", h.path, h.line_number) } else { h.path.clone() }
+                                    })
+                                })
+                                .number_of_lines(1u32)
+                                .font_family(MONO)
+                                .text_size(px(11.5))
+                                .text_color(PALETTE.ink),
+                            )
+                            .child(when(
+                                move || hit.with(|(_, h)| !h.line.is_empty()),
+                                move || {
+                                    text(move || hit.with(|(_, h)| h.line.clone()))
+                                        .number_of_lines(1u32)
+                                        .font_family(MONO)
+                                        .text_size(px(11.0))
+                                        .text_color(PALETTE.muted)
+                                },
+                            ))
+                    },
+                )),
+        )
 }
 
 fn tree_row(row: ReadSignal<TreeRow>, selected: Memo<Option<String>>) -> impl IntoElement {
@@ -218,6 +325,9 @@ fn git_panel() -> impl IntoElement {
     let error = computed(|| controller::bench().with(|b| b.git.error.clone()));
     let last_commit = computed(|| controller::bench().with(|b| b.git.last_commit.clone()));
     let pr = computed(|| controller::bench().with(|b| b.git.pr.clone()));
+    let branch_menu = computed(|| controller::bench().with(|b| b.git.branch_menu));
+    let branches = computed(|| controller::bench().with(|b| b.git.other_branches()));
+    let confirm_discard = computed(|| controller::bench().with(|b| b.git.confirm_discard.clone()));
     let branch_line = move || {
         status.with(|s| match s {
             Some(s) => {
@@ -250,15 +360,94 @@ fn git_panel() -> impl IntoElement {
                     .items_center()
                     .gap_2()
                     .child(
-                        text(branch_line)
+                        nsh_base::button()
+                            .accessibility_label("切换分支")
+                            .on_press(controller::toggle_branch_menu)
                             .flex_1()
-                            .number_of_lines(1u32)
-                            .font_family(MONO)
-                            .text_size(px(12.0))
-                            .text_color(PALETTE.ink),
+                            .px_1()
+                            .rounded(px(6.0))
+                            .hover(|s| s.bg(PALETTE.soft))
+                            .child(
+                                text(move || format!("{branch_line_text} ▾", branch_line_text = branch_line()))
+                                    .number_of_lines(1u32)
+                                    .font_family(MONO)
+                                    .text_size(px(12.0))
+                                    .text_color(PALETTE.ink),
+                            ),
                     )
                     .child(link_button("刷新", controller::refresh_git).disabled(move || busy.get())),
             )
+            .child(when(
+                move || branch_menu.get(),
+                move || {
+                    view()
+                        .flex_col()
+                        .gap_0p5()
+                        .p_1()
+                        .rounded(px(8.0))
+                        .bg(PALETTE.card)
+                        .border_1()
+                        .border_color(PALETTE.line)
+                        .child(caption("切换到分支").px_2())
+                        .child(when(
+                            move || branches.with(Vec::is_empty),
+                            || text("没有其他本地分支。").px_2().text_size(px(11.5)).text_color(PALETTE.faint),
+                        ))
+                        .child(each(
+                            move || branches.get(),
+                            |b: &String| b.clone(),
+                            move |branch, _| {
+                                nsh_base::button()
+                                    .on_press(move || controller::git_checkout(branch.get_untracked()))
+                                    .disabled(move || busy.get())
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(6.0))
+                                    .hover(|s| s.bg(PALETTE.soft))
+                                    .child(
+                                        text(move || branch.get())
+                                            .font_family(MONO)
+                                            .text_size(px(12.0))
+                                            .text_color(PALETTE.ink),
+                                    )
+                            },
+                        ))
+                },
+            ))
+            .child(when(
+                move || confirm_discard.with(Option::is_some),
+                move || {
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .p_2()
+                        .rounded(px(8.0))
+                        .bg(PALETTE.approval)
+                        .border_1()
+                        .border_color(PALETTE.approval_border)
+                        .child(
+                            text(move || {
+                                confirm_discard.with(|c| match c.as_deref() {
+                                    Some("") | None => "撤销全部未暂存改动？未跟踪文件将被删除，无法恢复。".to_owned(),
+                                    Some(path) => format!("撤销 {path} 的未暂存改动？无法恢复。"),
+                                })
+                            })
+                            .flex_1()
+                            .text_size(px(11.5))
+                            .text_color(PALETTE.ink),
+                        )
+                        .child(link_button("取消", || controller::ask_discard(None)))
+                        .child(
+                            link_button("撤销", move || {
+                                let target = confirm_discard.get_untracked().unwrap_or_default();
+                                let paths = controller::bench().with_untracked(|b| b.git.discard_paths(&target));
+                                controller::git_discard(paths);
+                            })
+                            .disabled(move || busy.get()),
+                        )
+                },
+            ))
             .child(when(
                 move || error.with(Option::is_some),
                 move || {
@@ -401,6 +590,10 @@ fn change_group(
                         .flex_row()
                         .items_center()
                         .child(caption(move || format!("{label} · {}", rows.with(Vec::len))).flex_1())
+                        .child(when(!staged, move || {
+                            link_button("全部撤销", || controller::ask_discard(Some(String::new())))
+                                .disabled(move || busy.get())
+                        }))
                         .child(
                             link_button(if staged { "全部取消暂存" } else { "全部暂存" }, move || {
                                 let paths = rows.with_untracked(|r| r.iter().map(|c| c.path.clone()).collect());
@@ -451,6 +644,11 @@ fn change_group(
                                             .text_color(PALETTE.ink),
                                     ),
                             )
+                            .child(when(!staged, move || {
+                                link_button("↺", move || controller::ask_discard(Some(path())))
+                                    .accessibility_label("撤销改动")
+                                    .disabled(move || busy.get())
+                            }))
                             .child(
                                 link_button(if staged { "−" } else { "+" }, move || {
                                     controller::stage(vec![path()], staged)
@@ -696,8 +894,24 @@ fn plugins_panel() -> impl IntoElement {
                                         })
                                         .collect::<Vec<_>>()
                                 }))
-                                .child(link_button("管理", move || {
-                                    controller::plugin_notice(plugin.with_untracked(|p| p.name.clone()))
+                                .child(when(
+                                    move || plugin.with(|p| p.navigation.is_empty() && !p.disabled),
+                                    move || {
+                                        link_button("打开面板", move || {
+                                            controller::open_plugin(plugin.with_untracked(|p| p.id.clone()), "main".into())
+                                        })
+                                    },
+                                ))
+                                .child(view().flex_1())
+                                .child(link_button(
+                                    move || if plugin.with(|p| p.disabled) { "启用" } else { "停用" },
+                                    move || {
+                                        let (id, disabled) = plugin.with_untracked(|p| (p.id.clone(), p.disabled));
+                                        controller::plugin_set_enabled(id, disabled);
+                                    },
+                                ))
+                                .child(link_button("设置", || {
+                                    controller::open_settings(crate::state::ui::SettingsPage::Plugins)
                                 })),
                         )
                 },
