@@ -146,7 +146,7 @@ def smoke_core(exe_path, env):
                 if not any(item.get('title') == 'Windows 冒烟测试' for item in items):
                     raise AssertionError(f'ctl threads 未找到刚创建的线程: {threads}')
 
-                db_path = data_dir / 'core.db'
+                db_path = data_dir / 'state.sqlite'
                 if not db_path.is_file():
                     raise AssertionError(f'未生成 SQLite 数据库文件: {db_path}')
             finally:
