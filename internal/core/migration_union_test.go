@@ -308,6 +308,7 @@ func TestLocalV4UpgradeKeepsHistoryAndUnifiesInputs(t *testing.T) {
 
 	capture := &funcProvider{}
 	c := openCoreAt(t, database.path, capture)
+	defer c.Close()
 
 	// Nothing the branch recorded may be lost.
 	snapshot := snapshotOf(t, c)
@@ -430,6 +431,7 @@ func TestMacBookV3UpgradeAddsWorkbenchState(t *testing.T) {
 
 	recorder := newRecordingProvider()
 	c := openCoreAt(t, database.path, recorder)
+	defer c.Close()
 
 	snapshot := snapshotOf(t, c)
 	thread, ok := findThreadByID(snapshot, threadID)

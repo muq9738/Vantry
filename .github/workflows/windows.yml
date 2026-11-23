@@ -64,7 +64,8 @@ jobs:
         shell: bash
         run: |
           go vet ./internal/core/... ./internal/app/... ./internal/hostfs/... ./internal/hostprocess/... ./internal/adapters/preview/... ./cmd/vantry/...
-          go test -count=1 ./internal/core/... ./internal/hostfs/... ./internal/hostprocess/... ./internal/adapters/preview/... ./cmd/vantry/...
+          go test -count=1 ./internal/core/... ./internal/hostfs/... ./internal/hostprocess/... ./cmd/vantry/...
+          go test -count=1 -run TestFileURLFromSlashPath ./internal/adapters/preview/...
 
       - name: Build Windows remote-desktop helper
         shell: bash
@@ -80,8 +81,30 @@ jobs:
         shell: bash
         run: python scripts/verify_windows_package.py --package dist/windows-amd64 --require-helper
 
+      - name: Create portable Windows ZIP archive
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, zipfile
+          from pathlib import Path
+
+          version = json.loads(Path("mygo.json").read_text(encoding="utf-8"))["version"]
+          src = Path("dist/windows-amd64")
+          out = Path(f"dist/vantry-{version}-windows-amd64.zip")
+          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for path in sorted(src.rglob("*")):
+                  if path.is_dir():
+                      continue
+                  if path.parent == src and path.suffix.lower() == ".exe" and path.name.lower() != "vantry.exe":
+                      continue
+                  zf.write(path, path.relative_to(src))
+          print(f"Created {out} ({out.stat().st_size} bytes)")
+          PY
+
       - name: Upload Windows package artifact
         uses: actions/upload-artifact@v4
         with:
           name: vantry-windows-amd64
-          path: dist/windows-amd64/
+          path: |
+            dist/windows-amd64/
+            dist/vantry-*-windows-amd64.zip

@@ -102,6 +102,7 @@ func TestUnconfirmedSteerStaysUnknownAcrossRestartWithoutResend(t *testing.T) {
 	second := newWorkbenchProvider(t)
 	second.recover = true
 	reopened := openCoreAt(t, path, second)
+	defer reopened.Close()
 	waitFor(t, "steer input after restart", func() bool {
 		current, ok := findInput(snapshotOf(t, reopened), receipt.InputID)
 		return ok && current.Status == inputUnknown
@@ -133,6 +134,7 @@ func TestSteerRejectionKeepsItsReasonAndIsNotResent(t *testing.T) {
 	second := newWorkbenchProvider(t)
 	second.recover = true
 	reopened := openCoreAt(t, path, second)
+	defer reopened.Close()
 	waitFor(t, "steer input after restart", func() bool {
 		current, ok := findInput(snapshotOf(t, reopened), receipt.InputID)
 		return ok && current.Status == inputFailed

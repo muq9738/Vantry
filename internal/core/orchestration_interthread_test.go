@@ -513,7 +513,15 @@ func TestInterDelegateIsolationRoleModelAndIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := lifecycleThread(t, c, detail.ChildThreadID)
-	if child.Workspace == nil || child.Workspace.Kind != "worktree" || child.Workspace.Repository != repository || child.Workspace.BaseRef != "HEAD" || child.Model != "other:max" || child.ApprovalPolicy != "ask" || child.InteractionMode != "plan" {
+	repoMatches := child.Workspace != nil && child.Workspace.Repository == repository
+	if !repoMatches && child.Workspace != nil {
+		if a, errA := os.Stat(child.Workspace.Repository); errA == nil {
+			if b, errB := os.Stat(repository); errB == nil {
+				repoMatches = os.SameFile(a, b)
+			}
+		}
+	}
+	if child.Workspace == nil || child.Workspace.Kind != "worktree" || !repoMatches || child.Workspace.BaseRef != "HEAD" || child.Model != "other:max" || child.ApprovalPolicy != "ask" || child.InteractionMode != "plan" {
 		t.Fatalf("child configuration: %+v", child)
 	}
 	if run := latestAttempt(t, c, detail.ChildRunID); run.Input != "[Role: implementation]\n\nimplement" {
