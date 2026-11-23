@@ -1,2 +1,14 @@
-//! Platform abstractions: workspaces, Git/PR, attachments, previews, PTY, plugin host,
-//! OS process ownership, file locks, permissions, and SSH configuration.
+//! Host-side services used by the Vantry core and its workers.
+pub mod environments;
+pub mod git;
+pub mod hostfs;
+pub mod hostplatform;
+pub mod hostprocess;
+pub mod plugins;
+pub mod projects;
+#[cfg(unix)]
+pub mod pty;
+pub mod sshconfig;
+#[cfg(test)]
+mod tests;
+pub mod workspace;
