@@ -11,14 +11,14 @@ use super::markdown::MarkdownDoc;
 use crate::bridge::workbench::{DirEntry, FileContent, PrSummary, SearchHit};
 
 /// A tab of the dock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum DockTab {
     #[default]
     Files,
     Git,
     Terminal,
-    Preview,
     Plugins,
+    Mcp,
 }
 
 impl DockTab {
@@ -26,8 +26,8 @@ impl DockTab {
         DockTab::Files,
         DockTab::Git,
         DockTab::Terminal,
-        DockTab::Preview,
         DockTab::Plugins,
+        DockTab::Mcp,
     ];
 
     pub fn label(self) -> &'static str {
@@ -35,7 +35,7 @@ impl DockTab {
             DockTab::Files => "文件",
             DockTab::Git => "Git",
             DockTab::Terminal => "终端",
-            DockTab::Preview => "预览",
+            DockTab::Mcp => "MCP",
             DockTab::Plugins => "插件",
         }
     }
@@ -45,7 +45,7 @@ impl DockTab {
             DockTab::Files => "files",
             DockTab::Git => "git",
             DockTab::Terminal => "terminal",
-            DockTab::Preview => "preview",
+            DockTab::Mcp => "mcp",
             DockTab::Plugins => "plugins",
         }
     }
@@ -76,7 +76,11 @@ pub struct FilesState {
     /// Loaded folders' entries ("" is the root).
     pub children: BTreeMap<String, Vec<DirEntry>>,
     pub loading: BTreeSet<String>,
+    /// Monotonic counter bumped whenever the visible tree rows may change.
+    pub tree_revision: u64,
     pub selected: Option<String>,
+    pub show_tree: bool,
+    pub source_paths: BTreeSet<String>,
     pub preview: Option<FileContent>,
     pub error: Option<String>,
     pub search: FileSearch,
@@ -186,6 +190,7 @@ impl FilesState {
 
     /// Opens or closes folder `path`, loading it the first time.
     pub fn toggle_dir(&mut self, path: &str) -> Option<Load> {
+        self.tree_revision += 1;
         if self.expanded.remove(path) {
             return None;
         }
@@ -199,6 +204,7 @@ impl FilesState {
 
     pub fn on_dir(&mut self, path: &str, result: Result<Vec<DirEntry>, String>) {
         self.loading.remove(path);
+        self.tree_revision += 1;
         match result {
             Ok(entries) => {
                 self.children.insert(path.to_owned(), entries);
@@ -244,14 +250,45 @@ pub struct Change {
     pub staged: bool,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum GitPage { #[default] Commit, Log, Compare }
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum GitDialog { Expanded, Changes }
+
 /// The Git / PR panel.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GitPanel {
+    pub page: GitPage,
+    pub changes_patch: Option<Result<String,String>>,
+    pub changes_split: bool,
+    pub dialog: Option<GitDialog>,
+    pub compare: String,
+    pub compare_reverse: bool,
+    pub log_branch: String,
+    pub log_path: String,
+    pub log_author: String,
+    pub log_date: String,
+    pub compare_files: bool,
+    pub query: String,
+    pub commits: Vec<crate::bridge::workbench::history::CommitRow>,
+    pub revision: Option<crate::bridge::workbench::history::Revision>,
+    pub revision_files: Vec<String>,
+    pub revision_path: String,
+    pub revision_diff: String,
+    /// Monotonic counter bumped whenever `revision_diff` changes.
+    pub revision_diff_version: u64,
+    pub history_request: u64,
+    pub side_by_side: bool,
+    pub hunk: usize,
     pub status: Option<GitState>,
+    /// Monotonic counter bumped whenever `status` changes.
+    pub status_version: u64,
     pub loading: bool,
     /// The change whose diff shows.
     pub selected: Option<(String, bool)>,
     pub diff: String,
+    /// Monotonic counter bumped whenever `diff` changes.
+    pub diff_version: u64,
     pub commit_message: String,
     pub pr: Option<PrSummary>,
     /// A stage / unstage / commit is running.
@@ -311,6 +348,7 @@ impl GitPanel {
 
     pub fn on_status(&mut self, result: Result<GitState, String>) -> Option<Load> {
         self.loading = false;
+        self.status_version += 1;
         match result {
             Ok(state) => {
                 self.status = Some(state);
@@ -328,6 +366,7 @@ impl GitPanel {
                     Some(_) => {
                         self.selected = None;
                         self.diff.clear();
+                        self.diff_version += 1;
                         None
                     }
                     None => None,
@@ -341,8 +380,10 @@ impl GitPanel {
     }
 
     pub fn select(&mut self, path: &str, staged: bool) -> Load {
+        self.hunk = 0;
         self.selected = Some((path.to_owned(), staged));
         self.diff.clear();
+        self.diff_version += 1;
         Load::Diff {
             path: Some(path.to_owned()),
             staged,
@@ -355,7 +396,10 @@ impl GitPanel {
             return;
         }
         match result {
-            Ok(diff) => self.diff = diff,
+            Ok(diff) => {
+                self.diff = diff;
+                self.diff_version += 1;
+            }
             Err(error) => self.error = Some(error),
         }
     }
@@ -388,6 +432,14 @@ impl GitPanel {
             .filter(|b| **b != status.branch)
             .cloned()
             .collect()
+    }
+
+    /// The remote branches known to Git.
+    pub fn remote_branches(&self) -> Vec<String> {
+        self.status
+            .as_ref()
+            .map(|s| s.remote_branches.clone())
+            .unwrap_or_default()
     }
 
     /// The paths a discard of `target` (a path, or `""` for every unstaged
@@ -441,6 +493,10 @@ pub struct TerminalSession {
     pub history: Vec<String>,
     /// Where ↑ / ↓ is in the history.
     pub history_at: Option<usize>,
+    /// Associated `vantry_terminal_run` request ID when launched for a tool task.
+    pub request_id: Option<String>,
+    /// Working directory reported back to the worker when the tool task exits.
+    pub task_cwd: String,
 }
 
 /// The terminal panel.
@@ -465,6 +521,36 @@ impl TerminalState {
             last_exit: None,
             history: Vec::new(),
             history_at: None,
+            request_id: None,
+            task_cwd: String::new(),
+        });
+        self.active = self.sessions.len() - 1;
+        id
+    }
+
+    /// Opens or activates a dedicated terminal tab for a `vantry_terminal_run` request.
+    pub fn open_task(&mut self, request_id: &str, title: &str, cwd: &str) -> String {
+        let id = format!("task-{request_id}");
+        if let Some(pos) = self.sessions.iter().position(|s| s.id == id) {
+            self.active = pos;
+            return id;
+        }
+        let label = if title.trim().is_empty() {
+            "交互终端".to_owned()
+        } else {
+            title.trim().to_owned()
+        };
+        self.sessions.push(TerminalSession {
+            id: id.clone(),
+            title: label,
+            output: String::new(),
+            input: String::new(),
+            running: false,
+            last_exit: None,
+            history: Vec::new(),
+            history_at: None,
+            request_id: Some(request_id.to_owned()),
+            task_cwd: cwd.to_owned(),
         });
         self.active = self.sessions.len() - 1;
         id
@@ -662,6 +748,8 @@ impl PreviewState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkbenchState {
     pub root: String,
+    pub project_generation: u64,
+    commit_drafts: BTreeMap<String, String>,
     pub files: FilesState,
     pub git: GitPanel,
     pub terminal: TerminalState,
@@ -669,6 +757,43 @@ pub struct WorkbenchState {
 }
 
 impl WorkbenchState {
+    pub fn select_project(&mut self, root: String) {
+        if self.root == root {
+            return;
+        }
+        if !self.git.commit_message.is_empty() {
+            self.commit_drafts.insert(
+                self.root.clone(),
+                std::mem::take(&mut self.git.commit_message),
+            );
+        }
+        let next_tree = self.files.tree_revision.wrapping_add(1);
+        let next_status = self.git.status_version.wrapping_add(1);
+        let next_diff = self.git.diff_version.wrapping_add(1);
+        let next_rev_diff = self.git.revision_diff_version.wrapping_add(1);
+        self.files = FilesState {
+            tree_revision: next_tree,
+            ..Default::default()
+        };
+        self.git = GitPanel {
+            commit_message: self.commit_drafts.remove(&root).unwrap_or_default(),
+            changes_split: true,
+            status_version: next_status,
+            diff_version: next_diff,
+            revision_diff_version: next_rev_diff,
+            ..Default::default()
+        };
+        self.preview = PreviewState::default();
+        self.root = root;
+        self.project_generation = self.project_generation.wrapping_add(1);
+    }
+
+    pub fn apply_project_result(&mut self, generation: u64, apply: impl FnOnce(&mut Self)) {
+        if self.project_generation == generation {
+            apply(self);
+        }
+    }
+
     /// What showing `tab` needs loaded first.
     pub fn on_tab(&mut self, tab: DockTab) -> Vec<Load> {
         match tab {
@@ -700,6 +825,23 @@ impl WorkbenchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_checkouts_keeps_commit_drafts_and_rejects_late_results() {
+        let mut state = WorkbenchState::default();
+        state.select_project("/work/one".into());
+        let first = state.project_generation;
+        state.git.commit_message = "第一次修改".into();
+        state.select_project("/work/two".into());
+        state.select_project("/work/one".into());
+        assert_eq!(state.git.commit_message, "第一次修改");
+        state.apply_project_result(first, |b| b.files.error = Some("late".into()));
+        assert!(state.files.error.is_none());
+        let current = state.project_generation;
+        state.select_project("/work/one".into());
+        state.apply_project_result(current, |b| b.files.error = Some("current".into()));
+        assert_eq!(state.files.error.as_deref(), Some("current"));
+    }
 
     fn entry(path: &str, is_dir: bool) -> DirEntry {
         DirEntry {

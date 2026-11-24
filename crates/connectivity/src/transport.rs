@@ -50,13 +50,6 @@ impl Tasks {
             tokio::select! {biased;_=stop.cancelled()=>{},_=future=>{}}
         });
     }
-    pub fn owned(&self, future: impl Future<Output = ()> + Send + 'static) {
-        let guard = self.active.subscribe();
-        tokio::spawn(async move {
-            let _guard = guard;
-            future.await;
-        });
-    }
     pub async fn close(&self) {
         self.stop.cancel();
         self.active.closed().await;

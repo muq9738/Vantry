@@ -22,6 +22,15 @@ pub struct Provider {
     pub model: String,
     pub magpie: Option<PathBuf>,
     pub delay: Duration,
+    pub federator: Option<std::sync::Arc<crate::federation::Federator>>,
+}
+impl Provider {
+    fn is_remote(request: &ProviderRequest) -> bool {
+        request
+            .workspace
+            .as_ref()
+            .is_some_and(|w| !w.environment_id.trim().is_empty())
+    }
 }
 fn failed(e: impl std::fmt::Display) -> ProviderError {
     ProviderError::Failed(e.to_string())
@@ -56,8 +65,8 @@ impl Provider {
         } else {
             &request.model
         };
-        let expected_model = if controlled {
-            String::new()
+        let (expected_model, thinking_level) = if controlled {
+            (String::new(), String::new())
         } else {
             let selection = self
                 .magpie
@@ -71,8 +80,16 @@ impl Provider {
             )
             .await?;
             ensure!(!model.selected_model.is_empty(), "no Pi model configured");
-            request.model.clone_from(&model.selected_model);
-            model.selected_model
+            let level = model
+                .thinking_level
+                .map(|l| l.as_str().to_owned())
+                .unwrap_or_default();
+            if level.is_empty() {
+                request.model.clone_from(&model.selected_model);
+            } else {
+                request.model = format!("{}:{level}", model.selected_model);
+            }
+            (model.selected_model, level)
         };
         request.workspace = Some(match request.workspace.take() {
             Some(spec) => workspace::prepare(&self.data, &request.thread_id, spec)?,
@@ -84,6 +101,39 @@ impl Provider {
                 ..Default::default()
             },
         });
+        // Capture a Git-native pre-run checkpoint matching Go v0.1.42.
+        if !controlled
+            && std::env::var("VANTRY_AUTO_CHECKPOINT").as_deref() != Ok("0")
+            && request.interaction_mode != "plan"
+            && !request.run_id.is_empty()
+            && let Some(ws_path) = request.workspace.as_ref().map(|w| w.path.clone())
+            && let Ok(repo) = vantry_platform::git::Repository::discover(Path::new(&ws_path))
+        {
+            let run_id = request.run_id.clone();
+            let summary: String = request
+                .message
+                .replace(['\0', '\r', '\n'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect();
+            let label = if summary.is_empty() {
+                format!("Before turn: {run_id}")
+            } else {
+                format!("Before turn: {summary}")
+            };
+            let repo_root = repo.root().to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = crate::workbench_git::capture_checkpoint(
+                    &repo_root,
+                    &format!("run-{run_id}"),
+                    &label,
+                );
+            })
+            .await;
+        }
         let exe = std::env::current_exe()?;
         let pi_settings = crate::settings::document(&self.data.join("pi-runtime.json"))
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -94,6 +144,7 @@ impl Provider {
             socket_path: self.data.join("core.sock"),
             default_model: self.model.clone(),
             expected_model,
+            thinking_level,
             executable: exe.clone(),
             interaction_mode: request.interaction_mode.clone(),
             request,
@@ -177,6 +228,13 @@ impl DurableProvider for Provider {
         mode: StartMode,
         emit: Emit,
     ) -> ProviderResult {
+        if Self::is_remote(&request) {
+            let federator = self
+                .federator
+                .as_ref()
+                .ok_or_else(|| failed("federated execution is not enabled on this Core"))?;
+            return federator.run(&request, emit).await;
+        }
         let dir = self.directory(&request).map_err(failed)?;
         let after = request.after_sequence;
         if mode == StartMode::Submit {
@@ -254,6 +312,9 @@ impl DurableProvider for Provider {
         }
     }
     async fn recoverable(&self, request: &ProviderRequest) -> bool {
+        if Self::is_remote(request) {
+            return self.federator.is_some();
+        }
         let Ok(dir) = self.directory(request) else {
             return false;
         };
@@ -271,6 +332,13 @@ impl DurableProvider for Provider {
             || !dir.join("worker.json").exists())
     }
     async fn stop(&self, request: &ProviderRequest) -> ProviderResult {
+        if Self::is_remote(request) {
+            let federator = self
+                .federator
+                .as_ref()
+                .ok_or_else(|| failed("federated execution is not enabled on this Core"))?;
+            return federator.stop(request).await;
+        }
         let dir = self.directory(request).map_err(failed)?;
         if !dir.join("request.json").try_exists().map_err(failed)? {
             // Cancellation can commit before the submission task publishes request.json.
@@ -292,6 +360,13 @@ impl DurableProvider for Provider {
         request: &ProviderRequest,
         control: &ControlResponse,
     ) -> ProviderResult {
+        if Self::is_remote(request) {
+            let federator = self
+                .federator
+                .as_ref()
+                .ok_or_else(|| failed("federated execution is not enabled on this Core"))?;
+            return federator.control(request, control).await;
+        }
         vantry_pi_runtime::deliver_control(&self.directory(request).map_err(failed)?, control)
             .map_err(failed)
     }

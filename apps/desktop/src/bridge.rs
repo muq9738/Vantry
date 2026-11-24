@@ -9,8 +9,7 @@
 //! - [`ClientBridge`]: protocol v1 through the real `vantry_client::CoreClient`
 //!   on the Core's Unix socket (`<data dir>/core.sock`);
 //! - [`MockBridge`]: an in-memory Core for `--mock` runs and tests;
-//! - [`RemoteBridge`]: the `--remote` / `--peer` route, until the remote
-//!   transport lands (it reports `not_ready`, the window still opens).
+//! - [`RemoteBridge`]: the paired Core reached through `peer-proxy`.
 //!
 //! Every wire type is `vantry_protocol`'s; this module only adds the
 //! desktop's error classification ([`BridgeError::outcome_unknown`]) and the
@@ -242,11 +241,6 @@ pub enum Endpoint {
     Local { socket: std::path::PathBuf },
     /// The in-memory demo Core.
     Mock,
-    /// A Core over SSH (`--remote`).
-    Ssh {
-        host: String,
-        remote_socket: Option<String>,
-    },
     /// A paired peer (`--peer`), `mode` auto | direct | relay.
     Peer { id: String, mode: String },
 }
@@ -254,7 +248,7 @@ pub enum Endpoint {
 impl Endpoint {
     /// Whether the Core runs on another machine.
     pub fn is_remote(&self) -> bool {
-        matches!(self, Endpoint::Ssh { .. } | Endpoint::Peer { .. })
+        matches!(self, Endpoint::Peer { .. })
     }
 }
 
@@ -263,8 +257,8 @@ pub fn connect(endpoint: &Endpoint) -> Arc<dyn CoreBridge> {
     match endpoint {
         Endpoint::Local { socket } => Arc::new(ClientBridge::new(socket.clone())),
         Endpoint::Mock => Arc::new(MockBridge::demo()),
-        Endpoint::Ssh { .. } | Endpoint::Peer { .. } => {
-            Arc::new(RemoteBridge::new(endpoint.clone()))
+        Endpoint::Peer { .. } => {
+            Arc::new(RemoteBridge::new(endpoint.clone(), None))
         }
     }
 }
@@ -287,14 +281,14 @@ impl Drop for TunnelHandle {
     }
 }
 
-/// Real remote Core bridge for `--remote` (OpenSSH StreamLocal forward) and
-/// `--peer` (`vantry-service peer-proxy` mTLS/Relay tunnel).
+/// Remote Core bridge for a paired host via the authenticated peer proxy.
 ///
 /// The tunnel child is started lazily on first contact, automatically
 /// restarted if it exits, and cleanly terminated when the bridge drops.
 #[derive(Clone)]
 pub struct RemoteBridge {
     endpoint: Endpoint,
+    data_dir: Option<std::path::PathBuf>,
     tunnel: Arc<TunnelHandle>,
 }
 
@@ -308,7 +302,7 @@ impl std::fmt::Debug for RemoteBridge {
 }
 
 impl RemoteBridge {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(endpoint: Endpoint, data_dir: Option<std::path::PathBuf>) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "vantry-remote-{}",
             uuid::Uuid::new_v4().simple()
@@ -316,6 +310,7 @@ impl RemoteBridge {
         let socket = dir.join("core.sock");
         RemoteBridge {
             endpoint,
+            data_dir,
             tunnel: Arc::new(TunnelHandle {
                 dir,
                 socket,
@@ -345,9 +340,6 @@ impl RemoteBridge {
             }
         }
 
-        std::fs::create_dir_all(&self.tunnel.dir)
-            .map_err(|e| BridgeError::unavailable(format!("无法创建远程转发目录：{e}")))?;
-
         let mut needs_spawn = false;
         {
             let guard = self.tunnel.child.lock().unwrap();
@@ -358,64 +350,6 @@ impl RemoteBridge {
 
         if needs_spawn {
             let child = match &self.endpoint {
-                Endpoint::Ssh {
-                    host,
-                    remote_socket,
-                } => {
-                    if host.is_empty()
-                        || host.starts_with('-')
-                        || host.chars().any(|c| c.is_control() || c.is_whitespace())
-                    {
-                        return Err(BridgeError::new(
-                            ErrorCode::InvalidCommand,
-                            format!("无效的 SSH 主机：{host}"),
-                        ));
-                    }
-                    let remote = remote_socket
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("/tmp/vantry-core.sock");
-                    if remote.contains([':', '\n', '\r', '\0']) {
-                        return Err(BridgeError::new(
-                            ErrorCode::InvalidCommand,
-                            format!("无效的远程 socket 路径：{remote}"),
-                        ));
-                    }
-                    let _ = std::fs::remove_file(&socket);
-                    let spec = format!("{}:{remote}", socket.display());
-                    std::process::Command::new("ssh")
-                        .args([
-                            "-N",
-                            "-T",
-                            "-S",
-                            "none",
-                            "-o",
-                            "BatchMode=yes",
-                            "-o",
-                            "StrictHostKeyChecking=yes",
-                            "-o",
-                            "ExitOnForwardFailure=yes",
-                            "-o",
-                            "StreamLocalBindUnlink=yes",
-                            "-o",
-                            "ConnectTimeout=8",
-                            "-o",
-                            "ServerAliveInterval=15",
-                            "-o",
-                            "ServerAliveCountMax=3",
-                            "-L",
-                            &spec,
-                            "--",
-                            host,
-                        ])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .map_err(|e| {
-                            BridgeError::unavailable(format!("无法启动 ssh 转发进程：{e}"))
-                        })?
-                }
                 Endpoint::Peer { id, mode } => {
                     let locator = crate::service::Locator::from_env();
                     let exe = locator.find("vantry-service").ok_or_else(|| {
@@ -425,9 +359,12 @@ impl RemoteBridge {
                         )
                     })?;
                     let _ = std::fs::remove_file(&socket);
-                    std::process::Command::new(exe)
-                        .args([
-                            "peer-proxy",
+                    let mut command = std::process::Command::new(exe);
+                    command.arg("peer-proxy");
+                    if let Some(dir) = &self.data_dir {
+                        command.arg("--data-dir").arg(dir);
+                    }
+                    command.args([
                             "--peer",
                             id,
                             "--mode",
@@ -485,13 +422,6 @@ impl RemoteBridge {
 impl CoreBridge for RemoteBridge {
     fn label(&self) -> String {
         match &self.endpoint {
-            Endpoint::Ssh {
-                host,
-                remote_socket,
-            } => match remote_socket {
-                Some(socket) => format!("SSH · {host}:{socket}"),
-                None => format!("SSH · {host}"),
-            },
             Endpoint::Peer { id, mode } => format!("配对主机 · {id}（{mode}）"),
             Endpoint::Local { socket } => socket.display().to_string(),
             Endpoint::Mock => "演示 Core".to_owned(),
@@ -645,19 +575,6 @@ mod tests {
 
     #[tokio::test]
     async fn remote_endpoints_validate_and_label_tunnels() {
-        let bridge = connect(&Endpoint::Ssh {
-            host: "build-box".into(),
-            remote_socket: Some("/run/vantry/core.sock".into()),
-        });
-        assert_eq!(bridge.label(), "SSH · build-box:/run/vantry/core.sock");
-
-        let bad = connect(&Endpoint::Ssh {
-            host: "-oProxyCommand=bad".into(),
-            remote_socket: Some("/run/vantry/core.sock".into()),
-        });
-        let err = bad.snapshot().await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidCommand);
-
         let peer = connect(&Endpoint::Peer {
             id: "peer-7".into(),
             mode: "relay".into(),

@@ -346,7 +346,42 @@ fn read(s: &Snapshot, q: ThreadReadQuery) -> Result<Value> {
         earlier_position: earlier
     }))
 }
-fn details(s: &Snapshot, t: &Task) -> Result<TaskDetail> {
+fn format_env_thread_link(env_id: &str, link: &str) -> String {
+    if env_id.is_empty() || link.contains("environmentId=") {
+        return link.to_owned();
+    }
+    if let Some(pos) = link.rfind("](vantry-thread://") {
+        let prefix = &link[..pos];
+        let rest = &link[pos + 2..];
+        if let Some(end) = rest.rfind(')') {
+            let url = &rest[..end];
+            let sep = if url.contains('?') { '&' } else { '?' };
+            return format!("{prefix}]({url}{sep}environmentId={env_id})");
+        }
+    }
+    link.to_owned()
+}
+
+fn decorate_remote_links(val: &mut Value, env_id: &str) {
+    match val {
+        Value::Object(map) => {
+            if let Some(Value::String(s)) = map.get_mut("link") {
+                *s = format_env_thread_link(env_id, s);
+            }
+            for (_, v) in map.iter_mut() {
+                decorate_remote_links(v, env_id);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                decorate_remote_links(v, env_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn details(w: &Workbench, s: &Snapshot, t: &Task) -> Result<TaskDetail> {
     let child = thread(s, &t.child_thread_id)?;
     let requests: Vec<_> = s
         .requests
@@ -355,6 +390,36 @@ fn details(s: &Snapshot, t: &Task) -> Result<TaskDetail> {
             r.thread_id == child.id && matches!(r.status.as_str(), "pending" | "responding")
         })
         .collect();
+    let child_attempt_id = s
+        .runs
+        .iter()
+        .flatten()
+        .find(|r| r.id == t.child_run_id)
+        .map(|r| r.attempt_id.clone())
+        .unwrap_or_default();
+    let remote = (!child_attempt_id.is_empty())
+        .then(|| w.federator.get_task(&child_attempt_id))
+        .flatten()
+        .or_else(|| w.federator.find_by_local_thread(&t.child_thread_id));
+    let environment_id = remote
+        .as_ref()
+        .map(|h| h.environment_id.clone())
+        .or_else(|| {
+            child
+                .workspace
+                .as_ref()
+                .map(|ws| ws.environment_id.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
+    let remote_thread_id = remote
+        .as_ref()
+        .map(|h| h.remote_thread_id.clone())
+        .unwrap_or_default();
+    let remote_run_id = remote
+        .as_ref()
+        .map(|h| h.remote_run_id.clone())
+        .unwrap_or_default();
     Ok(TaskDetail {
         task_id: t.id.clone(),
         title: t.title.clone(),
@@ -362,13 +427,10 @@ fn details(s: &Snapshot, t: &Task) -> Result<TaskDetail> {
         parent_thread_id: t.parent_thread_id.clone(),
         child_thread_id: t.child_thread_id.clone(),
         child_run_id: t.child_run_id.clone(),
-        child_attempt_id: s
-            .runs
-            .iter()
-            .flatten()
-            .find(|r| r.id == t.child_run_id)
-            .map(|r| r.attempt_id.clone())
-            .unwrap_or_default(),
+        child_attempt_id,
+        environment_id,
+        remote_thread_id,
+        remote_run_id,
         link: link(child),
         model: child.model.clone(),
         status: t.status,
@@ -637,65 +699,28 @@ async fn forward_remote_orchestration(
 ) -> Result<Value> {
     if let Some(obj) = payload.as_object_mut() {
         obj.remove("environmentId");
+        // Caller thread/run IDs belong to the local Core, not the remote peer.
+        obj.remove("callerThreadId");
+        obj.remove("callerRunId");
         if let Some(spec) = obj.get_mut("spec").and_then(Value::as_object_mut) {
             spec.remove("environmentId");
         }
     }
-    let cfg = w.identity.snapshot();
-    let stop = tokio_util::sync::CancellationToken::new();
-    if let Some(peer) = cfg
-        .peers
-        .iter()
-        .find(|p| p.id == env_id || p.pair.name == env_id)
-    {
-        let conn = vantry_connectivity::peer::PeerConnection::connect(
-            &peer.pair,
-            Some(&cfg),
-            vantry_connectivity::peer::Route::Auto,
-            stop,
-        )
+    let target = crate::federation::resolve_target(w.core.directory(), &w.identity, env_id).await?;
+    let mut result = target
+        .post_json(&format!("/v1/orchestration/{path}"), payload)
         .await?;
-        return conn
-            .post_json(&format!("/v1/orchestration/{path}"), payload)
-            .await;
+    decorate_remote_links(&mut result, env_id);
+    if let Some(obj) = result.as_object_mut()
+        && matches!(path, "threads/launch" | "threads/send" | "threads/wait")
+    {
+        obj.entry("environmentId").or_insert_with(|| json!(env_id));
     }
-    let catalog = vantry_platform::environments::Catalog::open(w.core.directory())?;
-    let envs = catalog.load()?;
-    if let Some(env) = envs.iter().find(|e| e.id == env_id || e.name == env_id) {
-        if let Some(peer) = cfg
-            .peers
-            .iter()
-            .find(|p| p.id == env.id || p.pair.name == env.name || p.id == env.host)
-        {
-            let conn = vantry_connectivity::peer::PeerConnection::connect(
-                &peer.pair,
-                Some(&cfg),
-                vantry_connectivity::peer::Route::Auto,
-                stop,
-            )
-            .await?;
-            return conn
-                .post_json(&format!("/v1/orchestration/{path}"), payload)
-                .await;
-        }
-        if !env.host.is_empty() {
-            let remote_sock = std::path::PathBuf::from(env.socket());
-            let forward = vantry_connectivity::ssh::SshForward::connect(
-                &env.host,
-                &remote_sock,
-                stop.clone(),
-            )
-            .await?;
-            let client = vantry_client::CoreClient::new(forward.socket());
-            let result: Value = client
-                .post_json(&format!("/v1/orchestration/{path}"), &payload)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let _ = forward.close().await;
-            return Ok(result);
-        }
-    }
-    bail!("unknown execution environment: {env_id}");
+    Ok(result)
+}
+
+fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if !a.trim().is_empty() { a } else { b }
 }
 
 pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
@@ -711,7 +736,8 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
         })
         .unwrap_or("")
         .to_owned();
-    if !env_id.is_empty() && env_id != "local" && env_id != w.environment {
+    let is_remote = !env_id.is_empty() && env_id != "local" && env_id != w.environment;
+    if is_remote && !matches!(path, "delegate" | "tasks/status" | "task-status" | "tasks/cancel" | "task-cancel") {
         return forward_remote_orchestration(w, &env_id, path, payload).await;
     }
     let core = &w.core;
@@ -859,22 +885,108 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 q.caller_thread_id.is_empty() || q.caller_thread_id == parent.thread_id,
                 "caller does not own parent run"
             );
-            let mut ws = q.workspace.or(parent.workspace.clone());
-            if q.isolation == "worktree" {
-                let spec = ws.context("workspace required")?;
-                let root = if spec.repository.is_empty() {
-                    spec.path
-                } else {
-                    spec.repository
-                };
-                let repo = vantry_platform::git::Repository::discover(std::path::Path::new(&root))?;
-                ws = Some(WorkspaceSpec {
-                    kind: "worktree".into(),
-                    repository: repo.root().display().to_string(),
-                    base_ref: "HEAD".into(),
-                    ..Default::default()
-                });
-            }
+            let caller = thread(&s, &parent.thread_id)?;
+            let mut provider_id = q.provider_id.clone();
+            let mut model = q.model.clone();
+            let mut approval_policy = q.approval_policy.clone();
+            let mut interaction_mode = q.interaction_mode.clone();
+            let ws = if is_remote {
+                let target =
+                    crate::federation::resolve_target(w.core.directory(), &w.identity, &env_id)
+                        .await?;
+                let info = target.environment_info().await?;
+                if approval_policy.is_empty() {
+                    approval_policy.clone_from(&caller.approval_policy);
+                }
+                if interaction_mode.is_empty() {
+                    interaction_mode.clone_from(&caller.interaction_mode);
+                }
+                ensure!(
+                    rank(&approval_policy) <= rank(&caller.approval_policy)
+                        && (caller.interaction_mode != "plan" || interaction_mode == "plan"),
+                    "远端会话的权限或交互模式高于发起会话"
+                );
+                provider_id = first_non_empty(&provider_id, &info.provider_id).to_owned();
+                let resolved_model = first_non_empty(&model, &info.default_model).to_owned();
+                if model.is_empty()
+                    && !caller.model.is_empty()
+                    && !resolved_model.is_empty()
+                    && caller.model != resolved_model
+                {
+                    return Err(Error::Api(
+                        ErrorCode::Conflict,
+                        "目标环境的默认模型与父会话不同；请查看目标能力并显式选择 model".into(),
+                    )
+                    .into());
+                }
+                if resolved_model.is_empty() && provider_id != "controlled" {
+                    return Err(Error::Api(
+                        ErrorCode::NotReady,
+                        "目标环境未配置默认模型，请显式选择目标模型".into(),
+                    )
+                    .into());
+                }
+                model = resolved_model;
+                let mut spec = q
+                    .workspace
+                    .or(info.workspace)
+                    .ok_or_else(|| anyhow::anyhow!("远端任务需要目标环境的工作区，请显式指定目标路径"))?;
+                if !spec.environment_id.is_empty() && spec.environment_id != env_id {
+                    return Err(Error::Api(
+                        ErrorCode::Conflict,
+                        "工作区不属于目标环境".into(),
+                    )
+                    .into());
+                }
+                if spec.kind.is_empty() {
+                    spec.kind = if spec.repository.is_empty() {
+                        "directory"
+                    } else {
+                        "worktree"
+                    }
+                    .into();
+                }
+                ensure!(
+                    matches!(spec.kind.as_str(), "directory" | "worktree"),
+                    "远端任务仅支持 directory 或 worktree 工作区"
+                );
+                ensure!(
+                    (spec.path.is_empty() || std::path::Path::new(&spec.path).is_absolute())
+                        && (spec.repository.is_empty()
+                            || std::path::Path::new(&spec.repository).is_absolute()),
+                    "远端工作区必须是目标机器上的绝对路径"
+                );
+                if q.isolation == "worktree" {
+                    spec.kind = "worktree".into();
+                    spec.repository = first_non_empty(&spec.repository, &spec.path).to_owned();
+                    spec.path.clear();
+                    spec.branch.clear();
+                    if spec.base_ref.is_empty() {
+                        spec.base_ref = "HEAD".into();
+                    }
+                }
+                spec.environment_id = env_id.clone();
+                Some(spec)
+            } else {
+                let mut ws = q.workspace.or(parent.workspace.clone());
+                if q.isolation == "worktree" {
+                    let spec = ws.context("workspace required")?;
+                    let root = if spec.repository.is_empty() {
+                        spec.path
+                    } else {
+                        spec.repository
+                    };
+                    let repo =
+                        vantry_platform::git::Repository::discover(std::path::Path::new(&root))?;
+                    ws = Some(WorkspaceSpec {
+                        kind: "worktree".into(),
+                        repository: repo.root().display().to_string(),
+                        base_ref: "HEAD".into(),
+                        ..Default::default()
+                    });
+                }
+                ws
+            };
             let r = core.dispatch(&Command {
                 parent_run_id: q.parent_run_id,
                 parent_attempt_id: q.parent_attempt_id,
@@ -885,10 +997,10 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 } else {
                     format!("[Role: {}]\n\n{}", q.role, q.task)
                 },
-                model: q.model,
-                provider_id: q.provider_id,
-                approval_policy: q.approval_policy,
-                interaction_mode: q.interaction_mode,
+                model,
+                provider_id,
+                approval_policy,
+                interaction_mode,
                 resume_policy: if q.mode == "wait" && q.resume_policy.is_empty() {
                     "manual".into()
                 } else {
@@ -921,6 +1033,7 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 .await?;
                 let s = core.snapshot()?;
                 let mut d = details(
+                    w,
                     &s,
                     s.tasks
                         .iter()
@@ -931,7 +1044,7 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 d.wait_timed_out = waited.timed_out;
                 return Ok(json!(d));
             }
-            Ok(json!(details(&initial, task)?))
+            Ok(json!(details(w, &initial, task)?))
         }
         "tasks/status" | "task-status" => {
             let q: TaskStatusQuery = serde_json::from_value(payload)?;
@@ -967,7 +1080,7 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 .iter()
                 .flatten()
                 .filter(selected)
-                .map(|t| details(&latest, t))
+                .map(|t| details(w, &latest, t))
                 .collect::<Result<_>>()?;
             if tasks.is_empty() && !q.task_id.is_empty() {
                 return Err(missing("task").into());

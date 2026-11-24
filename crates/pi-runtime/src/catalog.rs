@@ -65,6 +65,56 @@ fn key(provider: &str, id: &str) -> String {
     )
 }
 
+/// Split an optional `:thinking_level` suffix (e.g. `openai/o3:high`) from a model spec.
+pub fn split_model_thinking(spec: &str) -> (&str, Option<pi_ai::ThinkingLevel>) {
+    if let Some((base, suffix)) = spec.rsplit_once(':')
+        && !base.is_empty()
+        && let Ok(level) = suffix.parse::<pi_ai::ThinkingLevel>()
+    {
+        return (base, Some(level));
+    }
+    (spec, None)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub file_path: String,
+    pub source: String,
+    pub command: String,
+}
+
+/// Discover skills actually visible to embedded Pi for `(agent_dir, cwd)`.
+pub fn discover_skills(agent_dir: &Path, cwd: &Path) -> Vec<SkillInfo> {
+    use pi_coding_agent::resources::skills::{LoadSkillsOptions, load_skills};
+    let loaded = load_skills(&LoadSkillsOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+    let mut skills: Vec<SkillInfo> = loaded
+        .skills
+        .into_iter()
+        .filter(|s| !s.disable_model_invocation)
+        .map(|s| {
+            let source = format!("{:?}", s.source_info.scope).to_ascii_lowercase();
+            let command = format!("skill:{}", s.name);
+            SkillInfo {
+                name: s.name,
+                description: s.description,
+                file_path: s.file_path.display().to_string(),
+                source,
+                command,
+            }
+        })
+        .collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedModelCatalog {

@@ -10,6 +10,7 @@ pub(crate) mod approval_modal;
 pub(crate) mod composer;
 pub(crate) mod dialogs;
 pub(crate) mod dock;
+pub(crate) mod git;
 pub(crate) mod header;
 pub(crate) mod markdown;
 pub(crate) mod plugin_panel;
@@ -17,19 +18,166 @@ pub(crate) mod remote_desktop;
 pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod timeline;
+pub(crate) mod visuals;
 
 use nsh_core::prelude::*;
 use vantry_protocol::RunStatus;
 
-use crate::{state::ThreadStatus, theme::PALETTE};
+use crate::{
+    icons::{Icon, icon},
+    state::ThreadStatus,
+    theme::palette,
+};
+
+/// Keep the same native editor mounted as a draft becomes its first conversation.
+pub(crate) fn conversation(sheet: Memo<bool>) -> impl IntoElement {
+    let colors = palette();
+    let home = computed(move || {
+        !sheet.get() && crate::controller::state().with(|s| !s.has_conversation())
+    });
+    let project = computed(|| crate::controller::state().with(|s| s.current_project_key()));
+    view()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .flex_col()
+        .child(when(move || home.get(), move || view().flex_1().min_h_0()))
+        .child(when(
+            move || home.get(),
+            move || {
+                view()
+                    .items_center()
+                    .flex_col()
+                    .gap_2()
+                    .px_6()
+                    .pb(px(22.0))
+                    .child(
+                        text(move || {
+                            project.with(|key| {
+                                if key.is_empty() {
+                                    "今天想构建什么？".to_owned()
+                                } else {
+                                    format!(
+                                        "想在 {} 构建什么？",
+                                        crate::state::sidebar::project_name(key)
+                                    )
+                                }
+                            })
+                        })
+                        .text_size(px(24.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.ink),
+                    )
+                    .child(dynamic(move || {
+                        if project.with(String::is_empty) {
+                            text("一个问题、一段代码，或一个待完成的想法。")
+                                .text_size(px(13.0))
+                                .text_color(colors.muted)
+                                .into_element()
+                        } else {
+                            link_button("或不关联项目直接开始", || {
+                                crate::controller::state().update(|s| s.new_thread.workspace = None)
+                            })
+                            .into_element()
+                        }
+                    }))
+            },
+        ))
+        .child(when(move || sheet.get(), dock::dock))
+        .child(when(
+            move || !home.get() && !sheet.get(),
+            timeline::timeline,
+        ))
+        .child(composer::composer())
+        .child(when(
+            move || home.get(),
+            || view().flex_1().min_h_0().mb_8(),
+        ))
+}
+
+/// A crisp 28×28 icon-only toolbar button with subtle hover fill and tooltip,
+/// matching Stardust `v0.1.42`.
+pub(crate) fn icon_button(
+    glyph: Icon,
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let colors = palette();
+    nsh_base::button()
+        .accessibility_label(crate::tr(label))
+        .on_press(on_press)
+        .w(px(28.0))
+        .h(px(28.0))
+        .items_center()
+        .justify_center()
+        .rounded(px(7.0))
+        .hover(|s| s.bg(colors.soft))
+        .active(|s| s.opacity(0.65))
+        .disabled_style(|s| s.opacity(0.35))
+        .child(icon(glyph, 15.0, colors.muted))
+}
+
+/// A compact 24×24 subtle icon button (message action bars, inline controls).
+pub(crate) fn small_icon_button(
+    glyph: Icon,
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let colors = palette();
+    nsh_base::button()
+        .accessibility_label(label)
+        .on_press(on_press)
+        .w(px(24.0))
+        .h(px(24.0))
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .hover(|s| s.bg(colors.soft))
+        .active(|s| s.opacity(0.6))
+        .disabled_style(|s| s.opacity(0.35))
+        .child(icon(glyph, 13.5, colors.muted))
+}
+
+/// An icon-only segmented pill (header dock switches, compact toggles).
+pub(crate) fn icon_pill(
+    glyph: Icon,
+    label: &'static str,
+    on: impl Fn() -> bool + Clone + 'static,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let colors = palette();
+    let (a, b, c) = (on.clone(), on.clone(), on);
+    nsh_base::button()
+        .accessibility_label(crate::tr(label))
+        .selected(a)
+        .on_press(on_press)
+        .w(px(28.0))
+        .h(px(24.0))
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .bg(move || {
+            if b() {
+                colors.card
+            } else {
+                AdaptiveColor::TRANSPARENT
+            }
+        })
+        .hover(|s| s.bg(colors.card))
+        .active(|s| s.opacity(0.7))
+        .child(icon(glyph, 14.0, move || {
+            if c() { colors.accent } else { colors.muted }
+        }))
+}
 
 /// The dot color of a thread's status.
 pub(crate) fn status_color(status: ThreadStatus) -> AdaptiveColor {
+    let colors = palette();
     match status {
-        ThreadStatus::Idle => PALETTE.faint,
-        ThreadStatus::Running => PALETTE.accent,
-        ThreadStatus::NeedsApproval => PALETTE.warning,
-        ThreadStatus::Failed => PALETTE.danger,
+        ThreadStatus::Idle => colors.faint,
+        ThreadStatus::Running => colors.accent,
+        ThreadStatus::NeedsApproval => colors.warning,
+        ThreadStatus::Failed => colors.danger,
     }
 }
 
@@ -45,11 +193,12 @@ pub(crate) fn status_label(status: ThreadStatus) -> &'static str {
 
 /// A task status's badge color.
 pub(crate) fn run_status_color(status: RunStatus) -> AdaptiveColor {
+    let colors = palette();
     match status {
-        RunStatus::Completed => PALETTE.success,
-        RunStatus::Failed | RunStatus::Interrupted => PALETTE.danger,
-        RunStatus::Running | RunStatus::Waiting | RunStatus::Queued => PALETTE.accent,
-        RunStatus::Cancelled | RunStatus::Unspecified => PALETTE.faint,
+        RunStatus::Completed => colors.success,
+        RunStatus::Failed | RunStatus::Interrupted => colors.danger,
+        RunStatus::Running | RunStatus::Waiting | RunStatus::Queued => colors.accent,
+        RunStatus::Cancelled | RunStatus::Unspecified => colors.faint,
     }
 }
 
@@ -68,6 +217,7 @@ pub(crate) fn ghost_button(
     label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let colors = palette();
     nsh_base::button()
         .on_press(on_press)
         .flex_row()
@@ -76,11 +226,11 @@ pub(crate) fn ghost_button(
         .py_1()
         .rounded(px(8.0))
         .border_1()
-        .border_color(PALETTE.line)
-        .hover(|s| s.bg(PALETTE.soft))
+        .border_color(colors.line)
+        .hover(|s| s.bg(colors.soft))
         .active(|s| s.opacity(0.7))
         .disabled_style(|s| s.opacity(0.45))
-        .child(text(label).text_size(px(12.5)).text_color(PALETTE.ink))
+        .child(text(label).text_size(px(12.5)).text_color(colors.ink))
 }
 
 /// The ember primary button.
@@ -88,6 +238,7 @@ pub(crate) fn primary_button(
     label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let colors = palette();
     nsh_base::button()
         .on_press(on_press)
         .flex_row()
@@ -95,14 +246,14 @@ pub(crate) fn primary_button(
         .px_4()
         .py_1()
         .rounded(px(8.0))
-        .bg(PALETTE.accent)
+        .bg(colors.accent)
         .active(|s| s.opacity(0.75))
         .disabled_style(|s| s.opacity(0.4))
         .child(
             text(label)
                 .text_size(px(12.5))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(PALETTE.on_accent),
+                .text_color(colors.on_accent),
         )
 }
 
@@ -111,15 +262,16 @@ pub(crate) fn link_button(
     label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let colors = palette();
     nsh_base::button()
         .on_press(on_press)
         .px_1p5()
         .py_0p5()
         .rounded(px(6.0))
-        .hover(|s| s.bg(PALETTE.soft))
+        .hover(|s| s.bg(colors.soft))
         .active(|s| s.opacity(0.6))
         .disabled_style(|s| s.opacity(0.35))
-        .child(text(label).text_size(px(11.5)).text_color(PALETTE.muted))
+        .child(text(label).text_size(px(11.5)).text_color(colors.muted))
 }
 
 /// A pill that shows whether it is on (tabs, segmented switches, filters).
@@ -128,6 +280,7 @@ pub(crate) fn pill(
     on: impl Fn() -> bool + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let colors = palette();
     let (a, b, c, d) = (on.clone(), on.clone(), on.clone(), on);
     nsh_base::button()
         .selected(a)
@@ -137,7 +290,7 @@ pub(crate) fn pill(
         .rounded_full()
         .bg(move || {
             if b() {
-                PALETTE.card
+                colors.card
             } else {
                 AdaptiveColor::TRANSPARENT
             }
@@ -145,19 +298,58 @@ pub(crate) fn pill(
         .border_1()
         .border_color(move || {
             if c() {
-                PALETTE.line
+                colors.line
             } else {
                 AdaptiveColor::TRANSPARENT
             }
         })
         .active(|s| s.opacity(0.7))
-        .child(text(label).text_size(px(11.5)).text_color(move || {
-            if d() {
-                PALETTE.ink
+        .child(
+            text(label).text_size(px(11.5)).text_color(
+                move || {
+                    if d() { colors.ink } else { colors.muted }
+                },
+            ),
+        )
+}
+
+pub(crate) fn segments() -> nsh_base::ToggleGroupElement {
+    nsh_base::toggle_group()
+        .flex_row()
+        .items_center()
+        .p_0p5()
+        .rounded(px(8.0))
+        .bg(palette().soft)
+}
+
+pub(crate) fn segment(
+    label: &'static str,
+    selected: impl Fn() -> bool + Copy + 'static,
+    select: impl Fn() + 'static,
+) -> nsh_base::ToggleElement {
+    let colors = palette();
+    nsh_base::toggle()
+        .accessibility_label(label)
+        .pressed(selected)
+        .on_change(move |_: &bool| select())
+        .h(px(26.0))
+        .px_3()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .bg(move || {
+            if selected() {
+                colors.card
             } else {
-                PALETTE.muted
+                AdaptiveColor::TRANSPARENT
             }
-        }))
+        })
+        .child(
+            text(label)
+                .text_size(px(12.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || if selected() { colors.ink } else { colors.muted }),
+        )
 }
 
 /// A small rounded badge.
@@ -165,28 +357,33 @@ pub(crate) fn badge(
     label: impl IntoReactive<SharedString>,
     color: impl IntoReactive<AdaptiveColor>,
 ) -> View {
+    let colors = palette();
     view()
         .px_1p5()
         .rounded(px(5.0))
-        .bg(PALETTE.soft)
+        .bg(colors.soft)
         .child(text(label).text_size(px(10.0)).text_color(color))
 }
 
 /// A section's small caption.
 pub(crate) fn caption(label: impl IntoReactive<SharedString>) -> Text {
+    let colors = palette();
     text(label)
         .text_size(px(11.0))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(PALETTE.faint)
+        .text_color(colors.faint)
 }
 
 /// An on/off switch row: label, hint, its state.
 pub(crate) fn switch_row(
-    label: impl IntoReactive<SharedString>,
+    label: impl Into<SharedString>,
     hint: impl IntoReactive<SharedString>,
     on: impl Fn() -> bool + Clone + 'static,
     toggle: impl Fn() + 'static,
 ) -> View {
+    let colors = palette();
+    let label = label.into();
+    let switch_label = label.clone();
     let (a, b, c) = (on.clone(), on.clone(), on);
     view()
         .flex_row()
@@ -197,11 +394,12 @@ pub(crate) fn switch_row(
             view()
                 .flex_1()
                 .flex_col()
-                .child(text(label).text_size(px(13.0)).text_color(PALETTE.ink))
-                .child(text(hint).text_size(px(11.5)).text_color(PALETTE.muted)),
+                .child(text(label).text_size(px(13.0)).text_color(colors.ink))
+                .child(text(hint).text_size(px(11.5)).text_color(colors.muted)),
         )
         .child(
             nsh_base::button()
+                .accessibility_label(switch_label)
                 .selected(a)
                 .on_press(toggle)
                 .w(px(38.0))
@@ -210,9 +408,15 @@ pub(crate) fn switch_row(
                 .rounded_full()
                 .flex_row()
                 .justify_start()
-                .bg(move || if b() { PALETTE.accent } else { PALETTE.line })
+                .bg(move || if b() { colors.accent } else { colors.line })
                 .active(|s| s.opacity(0.75))
                 .child(when(c, || view().w(px(16.0))))
-                .child(view().w(px(18.0)).h(px(18.0)).rounded_full().bg(PALETTE.card)),
+                .child(
+                    view()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded_full()
+                        .bg(colors.card),
+                ),
         )
 }

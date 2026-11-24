@@ -12,22 +12,24 @@ use crate::{
     bridge::workbench::actions::{PanelAction, PanelField, PanelWidget},
     controller,
     state::{markdown::MarkdownDoc, ui::MainView},
-    theme::{PALETTE, metrics},
+    theme::{metrics, palette},
 };
 
 const MONO: &str = "Menlo";
 
 fn tone_color(tone: &str) -> AdaptiveColor {
+    let colors = palette();
     match tone {
-        "success" | "ok" => PALETTE.success,
-        "warning" | "warn" => PALETTE.warning,
-        "danger" | "error" => PALETTE.danger,
-        "info" | "accent" => PALETTE.accent,
-        _ => PALETTE.muted,
+        "success" | "ok" => colors.success,
+        "warning" | "warn" => colors.warning,
+        "danger" | "error" => colors.danger,
+        "info" | "accent" => colors.accent,
+        _ => colors.muted,
     }
 }
 
 pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
+    let colors = palette();
     let panel = computed(|| controller::ui().with(|u| u.plugin_panel.clone()));
     let view_memo = computed(move || panel.with(|p| p.as_ref().and_then(|p| p.view.clone())));
     let loading = computed(move || panel.with(|p| p.as_ref().is_some_and(|p| p.loading)));
@@ -41,7 +43,7 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
     view()
         .flex_1()
         .flex_col()
-        .bg(PALETTE.canvas)
+        .bg(colors.canvas)
         .child(
             view()
                 .flex_row()
@@ -50,12 +52,12 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
                 .px_5()
                 .py_2()
                 .border_b_1()
-                .border_b_color(PALETTE.line_soft)
+                .border_b_color(colors.line_soft)
                 .child(
                     text(move || title.get())
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_size(px(15.0))
-                        .text_color(PALETTE.ink),
+                        .text_color(colors.ink),
                 )
                 .child(when(
                     move || view_memo.with(|v| v.as_ref().is_some_and(|v| !v.badge.is_empty())),
@@ -93,13 +95,13 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
                                         .gap_2()
                                         .p_4()
                                         .rounded(px(metrics::CARD_RADIUS))
-                                        .bg(PALETTE.approval)
+                                        .bg(colors.approval)
                                         .border_1()
-                                        .border_color(PALETTE.approval_border)
-                                        .child(text("插件面板加载失败").font_weight(FontWeight::SEMIBOLD).text_size(px(13.0)).text_color(PALETTE.danger))
-                                        .child(text(move || error.get().unwrap_or_default()).select_text().text_size(px(12.0)).text_color(PALETTE.ink))
+                                        .border_color(colors.approval_border)
+                                        .child(text("插件面板加载失败").font_weight(FontWeight::SEMIBOLD).text_size(px(13.0)).text_color(colors.danger))
+                                        .child(text(move || error.get().unwrap_or_default()).select_text().text_size(px(12.0)).text_color(colors.ink))
                                         .child(view().flex_row().gap_2().child(ghost_button("重试", controller::reload_plugin_panel)).child(ghost_button("打开插件设置", || {
-                                            controller::open_settings(crate::state::ui::SettingsPage::Plugins)
+                                            controller::select_dock_tab(crate::state::workbench::DockTab::Plugins)
                                         })))
                                 },
                             ))
@@ -111,7 +113,7 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
                                         .font_family(MONO)
                                         .text_size(px(12.0))
                                         .line_height(LineHeight::Multiple(1.5))
-                                        .text_color(PALETTE.ink)
+                                        .text_color(colors.ink)
                                 },
                             ))
                             .child(dynamic(move || match view_memo.get() {
@@ -135,17 +137,17 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
                                         .gap_1()
                                         .p_3()
                                         .rounded(px(10.0))
-                                        .bg(PALETTE.code)
+                                        .bg(colors.code)
                                         .child(caption("输出"))
                                         .child(each(
                                             move || log.get().into_iter().enumerate().rev().collect::<Vec<_>>(),
                                             |(n, _): &(usize, crate::state::ui::PanelLog)| *n,
-                                            |line, _| {
+                                            move |line, _| {
                                                 text(move || line.with(|(_, l)| l.text.clone()))
                                                     .select_text()
                                                     .font_family(MONO)
                                                     .text_size(px(11.5))
-                                                    .text_color(move || if line.with(|(_, l)| l.ok) { PALETTE.ink } else { PALETTE.danger })
+                                                    .text_color(move || if line.with(|(_, l)| l.ok) { colors.ink } else { colors.danger })
                                             },
                                         ))
                                 },
@@ -157,6 +159,7 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
 
 /// One widget (recursively for groups).
 fn render(widget: PanelWidget) -> AnyElement {
+    let colors = palette();
     let heading = (!widget.title.is_empty()).then(|| caption(widget.title.clone()));
     let body: AnyElement = match widget.kind.as_str() {
         "markdown" => super::markdown::static_document(&MarkdownDoc::parse(&widget.text)).into_element(),
@@ -170,16 +173,16 @@ fn render(widget: PanelWidget) -> AnyElement {
                 .gap_1()
                 .p_3()
                 .rounded(px(metrics::CARD_RADIUS))
-                .bg(PALETTE.card)
+                .bg(colors.card)
                 .border_1()
-                .border_color(PALETTE.line);
+                .border_color(colors.line);
             for entry in widget.entries {
                 card = card.child(
                     view()
                         .flex_row()
                         .gap_3()
-                        .child(text(entry.key).w(px(140.0)).text_size(px(12.0)).text_color(PALETTE.muted))
-                        .child(text(entry.value).flex_1().select_text().text_size(px(12.5)).text_color(PALETTE.ink)),
+                        .child(text(entry.key).w(px(140.0)).text_size(px(12.0)).text_color(colors.muted))
+                        .child(text(entry.value).flex_1().select_text().text_size(px(12.5)).text_color(colors.ink)),
                 );
             }
             card.into_element()
@@ -191,8 +194,8 @@ fn render(widget: PanelWidget) -> AnyElement {
                     view()
                         .flex_row()
                         .gap_2()
-                        .child(text("•").text_size(px(12.5)).text_color(PALETTE.faint))
-                        .child(text(item).flex_1().select_text().text_size(px(12.5)).text_color(PALETTE.ink)),
+                        .child(text("•").text_size(px(12.5)).text_color(colors.faint))
+                        .child(text(item).flex_1().select_text().text_size(px(12.5)).text_color(colors.ink)),
                 );
             }
             list.into_element()
@@ -200,14 +203,14 @@ fn render(widget: PanelWidget) -> AnyElement {
         "code" => scroll()
             .horizontal()
             .rounded(px(8.0))
-            .bg(PALETTE.code)
+            .bg(colors.code)
             .child(
                 text(widget.text.clone())
                     .select_text()
                     .font_family(MONO)
                     .text_size(px(11.5))
                     .line_height(LineHeight::Multiple(1.45))
-                    .text_color(PALETTE.ink)
+                    .text_color(colors.ink)
                     .px_3()
                     .py_2(),
             )
@@ -219,9 +222,9 @@ fn render(widget: PanelWidget) -> AnyElement {
                 .p_3()
                 .rounded(px(metrics::CARD_RADIUS))
                 .border_1()
-                .border_color(PALETTE.line);
+                .border_color(colors.line);
             if !widget.text.is_empty() {
-                group = group.child(text(widget.text.clone()).text_size(px(12.0)).text_color(PALETTE.muted));
+                group = group.child(text(widget.text.clone()).text_size(px(12.0)).text_color(colors.muted));
             }
             for child in widget.children {
                 group = group.child(render(child));
@@ -249,7 +252,7 @@ fn render(widget: PanelWidget) -> AnyElement {
             .select_text()
             .text_size(px(12.5))
             .line_height(LineHeight::Multiple(1.5))
-            .text_color(if widget.tone.is_empty() { PALETTE.ink } else { tone_color(&widget.tone) })
+            .text_color(if widget.tone.is_empty() { colors.ink } else { tone_color(&widget.tone) })
             .into_element(),
     };
     let extra = (!widget.actions.is_empty() && widget.kind != "actions").then(|| actions_row(widget.actions));
@@ -263,6 +266,7 @@ fn render(widget: PanelWidget) -> AnyElement {
 }
 
 fn form_field(f: PanelField) -> impl IntoElement {
+    let colors = palette();
     let key = f.key.clone();
     let read_key = f.key.clone();
     let value = move || {
@@ -284,17 +288,17 @@ fn form_field(f: PanelField) -> impl IntoElement {
                 .value(value)
                 .on_change(move |t: &str| controller::set_panel_value(key.clone(), t))
                 .placeholder(f.placeholder.clone())
-                .placeholder_color(move || color(PALETTE.faint))
+                .placeholder_color(move || color(colors.faint))
                 .auto_correct(false)
                 .px_2()
                 .py_1()
                 .min_h(px(if f.kind == "multiline" { 72.0 } else { 28.0 }))
                 .rounded(px(7.0))
-                .bg(PALETTE.card)
+                .bg(colors.card)
                 .border_1()
-                .border_color(PALETTE.line)
+                .border_color(colors.line)
                 .text_size(px(12.5))
-                .text_color(PALETTE.ink),
+                .text_color(colors.ink),
         )
 }
 

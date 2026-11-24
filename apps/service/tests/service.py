@@ -162,7 +162,7 @@ def exercise(root):
         assert broker('threads/send',targetThreadId=thread,message='second',clientRequestId='second')['sequence']>0
         assert ctl('thread-wait','--thread',thread)['status']=='completed'
         for action in ['models','mcp.list','sandbox.get','projects.list','environments.list',
-                       'ssh.hosts','plugins.list','usage.summary','environment.info','remote.status','rd.status','update.status']:
+                       'plugins.list','usage.summary','environment.info','remote.status','rd.status','update.status']:
             response = wb(action)
             assert isinstance(response,dict), action
         usage=json.loads(wb('usage.summary')['output'])
@@ -184,7 +184,9 @@ for line in sys.stdin:
         wb('mcp.remove',name='fixture',input={'scope':'project'}); mcp_source.unlink()
         project=json.loads(wb('projects.add',workspace=str(work))['output'])['projects'][0]
         assert json.loads(wb('projects.remove',name=project['id'])['output'])['projects']==[]
-        entries=json.loads(wb('environments.upsert',input={'id':'lab','name':'fixture','kind':'ssh','host':'fixture'})['output'])['environments']
+        api('workbench', {'action':'ssh.hosts'}, False)
+        api('workbench', {'action':'environments.upsert','input':{'id':'old','name':'legacy','kind':'ssh','host':'fixture'}}, False)
+        entries=json.loads(wb('environments.upsert',input={'id':'lab','name':'fixture','kind':'remote','host':'fixture'})['output'])['environments']
         assert any(e['id']=='lab' for e in entries)
         assert not any(e['id']=='lab' for e in json.loads(wb('environments.remove',name='lab')['output'])['environments'])
         archive=root/'panel.zip'

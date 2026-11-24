@@ -6,10 +6,11 @@ use super::{ghost_button, primary_button};
 use crate::{
     controller,
     state::ui::Confirm,
-    theme::{PALETTE, metrics},
+    theme::{metrics, palette},
 };
 
 fn frame(body: impl IntoElement, on_cancel: impl Fn() + 'static) -> impl IntoElement {
+    let colors = palette();
     nsh_base::dialog()
         .animation(ModalAnimation::Fade)
         .on_cancel(on_cancel)
@@ -18,7 +19,7 @@ fn frame(body: impl IntoElement, on_cancel: impl Fn() + 'static) -> impl IntoEle
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .bg(PALETTE.scrim)
+                .bg(colors.scrim)
                 .p_6()
                 .child(
                     view()
@@ -28,9 +29,9 @@ fn frame(body: impl IntoElement, on_cancel: impl Fn() + 'static) -> impl IntoEle
                         .gap_3()
                         .p_5()
                         .rounded(px(14.0))
-                        .bg(PALETTE.card)
+                        .bg(colors.card)
                         .border_1()
-                        .border_color(PALETTE.line)
+                        .border_color(colors.line)
                         .shadow_xl()
                         .child(body),
                 ),
@@ -38,6 +39,7 @@ fn frame(body: impl IntoElement, on_cancel: impl Fn() + 'static) -> impl IntoEle
 }
 
 pub(crate) fn rename_dialog() -> impl IntoElement {
+    let colors = palette();
     let open = computed(|| controller::ui().with(|u| u.rename.is_some()));
     dynamic(move || {
         open.get().then(|| {
@@ -52,7 +54,7 @@ pub(crate) fn rename_dialog() -> impl IntoElement {
                         text("重命名会话")
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(15.0))
-                            .text_color(PALETTE.ink),
+                            .text_color(colors.ink),
                     )
                     .child(
                         view()
@@ -60,7 +62,7 @@ pub(crate) fn rename_dialog() -> impl IntoElement {
                             .py_2()
                             .rounded(px(8.0))
                             .border_1()
-                            .border_color(PALETTE.line)
+                            .border_color(colors.line)
                             .child(
                                 nsh_base::input()
                                     .value(move || value.get())
@@ -68,7 +70,7 @@ pub(crate) fn rename_dialog() -> impl IntoElement {
                                     .on_submit(|_: &str| controller::finish_rename(true))
                                     .auto_focus(true)
                                     .text_size(px(13.5))
-                                    .text_color(PALETTE.ink),
+                                    .text_color(colors.ink),
                             ),
                     )
                     .child(
@@ -90,6 +92,7 @@ pub(crate) fn rename_dialog() -> impl IntoElement {
 }
 
 pub(crate) fn confirm_dialog() -> impl IntoElement {
+    let colors = palette();
     let asked = computed(|| controller::ui().with(|u| u.confirm.clone()));
     dynamic(move || {
         asked.get().map(|confirm| {
@@ -113,9 +116,9 @@ pub(crate) fn confirm_dialog() -> impl IntoElement {
                         text(headline)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(15.0))
-                            .text_color(PALETTE.ink),
+                            .text_color(colors.ink),
                     )
-                    .child(text(detail).text_size(px(13.0)).text_color(PALETTE.muted))
+                    .child(text(detail).text_size(px(13.0)).text_color(colors.muted))
                     .child(
                         view()
                             .flex_row()

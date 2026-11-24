@@ -57,7 +57,6 @@ pub mod names {
     pub const PROJECTS_LIST: &str = "projects.list";
     pub const PROJECTS_ADD: &str = "projects.add";
     pub const PROJECTS_REMOVE: &str = "projects.remove";
-    pub const SSH_HOSTS: &str = "ssh.hosts";
     pub const ATTACHMENT_IMPORT: &str = "attachment.import";
     pub const ATTACHMENT_READ: &str = "attachment.read";
 }
@@ -142,7 +141,21 @@ pub struct SandboxInfo {
     pub mode: String,
     pub supported: bool,
     /// Set by `VANTRY_SANDBOX` (the setting cannot change it).
+    #[serde(default, deserialize_with = "read_env_override")]
     pub env_override: bool,
+}
+
+fn read_env_override<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Override {
+        Flag(bool),
+        Mode(String),
+    }
+    Ok(match Override::deserialize(d)? {
+        Override::Flag(v) => v,
+        Override::Mode(s) => !s.is_empty(),
+    })
 }
 
 /// The sandbox modes the settings offer: wire value, label, hint.
@@ -448,6 +461,7 @@ pub struct PanelWidget {
     pub kind: String,
     pub key: String,
     pub title: String,
+    #[serde(alias="markdown",alias="code",alias="label")]
     pub text: String,
     /// default | info | success | warning | danger
     pub tone: String,
@@ -485,11 +499,14 @@ impl PanelView {
             return None;
         }
         let value: Value = serde_json::from_str(text).ok()?;
-        // A wrapper `{ "panel": {…} }` is accepted too.
-        let value = match value.get("panel") {
+        // v0.1.42's plugin host returns the versioned vantryPanel envelope.
+        let value = if let Some(panel) = value.get("vantryPanel") {
+            if panel.get("version").and_then(Value::as_i64) != Some(1) {return None;}
+            panel.clone()
+        } else { match value.get("panel") {
             Some(panel) if panel.is_object() => panel.clone(),
             _ => value,
-        };
+        }};
         if value.get("widgets").is_none() && value.get("actions").is_none() {
             return None;
         }
@@ -682,11 +699,21 @@ pub fn pi_setup_save(provider: &str, api_key: &str, model: &str) -> WorkbenchReq
     let mut r = request(names::PI_SETUP_SAVE);
     r.name = provider.trim().to_owned();
     r.model = model.trim().to_owned();
-    r.input = Some(json!({
-        "provider": provider.trim(),
-        "apiKey": api_key,
-        "model": model.trim(),
-    }));
+    let id = model
+        .trim()
+        .strip_prefix(&format!("{}/", provider.trim()))
+        .unwrap_or(model.trim());
+    let setup = vantry_protocol::PiSetupRequest {
+        provider_id: provider.trim().into(),
+        api_key: api_key.into(),
+        models: (!id.is_empty())
+            .then(|| id.to_owned())
+            .into_iter()
+            .collect(),
+        set_default: !id.is_empty(),
+        ..Default::default()
+    };
+    r.input = Some(serde_json::to_value(setup).expect("Pi setup request serializes"));
     r
 }
 
@@ -698,10 +725,9 @@ pub fn pi_setup_save(provider: &str, api_key: &str, model: &str) -> WorkbenchReq
 pub struct EnvironmentEntry {
     pub id: String,
     pub name: String,
-    /// ssh | peer | local
+    /// Saved local or paired environment.
     pub kind: String,
     pub host: String,
-    pub remote_socket: String,
     pub peer_id: String,
 }
 
@@ -713,15 +739,14 @@ impl EnvironmentEntry {
         struct List {
             environments: Option<Vec<EnvironmentEntry>>,
         }
-        Ok(read_output::<List>(response)?.environments.unwrap_or_default())
+        Ok(read_output::<List>(response)?.environments.unwrap_or_default().into_iter()
+            .filter(|entry| matches!(entry.kind.as_str(), "local" | "peer" | "remote")).collect())
     }
 
     /// Where it connects to, as one line.
     pub fn target(&self) -> String {
         match self.kind.as_str() {
-            "ssh" if !self.remote_socket.is_empty() => format!("SSH · {}:{}", self.host, self.remote_socket),
-            "ssh" => format!("SSH · {}", self.host),
-            "peer" => format!("配对主机 · {}", if self.peer_id.is_empty() { &self.id } else { &self.peer_id }),
+            "peer" | "remote" => format!("配对主机 · {}", if self.peer_id.is_empty() { &self.id } else { &self.peer_id }),
             _ => "本机".to_owned(),
         }
     }
@@ -905,7 +930,7 @@ mod tests {
         assert_eq!(rd.missing_permissions(), ["辅助功能（键鼠控制）"]);
 
         let envs = EnvironmentEntry::read_list(&output(r#"{"environments":[{"id":"e1","name":"构建机","kind":"ssh","host":"build"}]}"#)).unwrap();
-        assert_eq!(envs[0].target(), "SSH · build");
+        assert!(envs.is_empty());
         assert!(EnvironmentEntry::read_list(&output("{}")).unwrap().is_empty());
         let projects = ProjectEntry::read_list(&output(r#"{"projects":[{"id":"a","name":"app","path":"/code/app"}]}"#)).unwrap();
         assert_eq!(projects[0].path, "/code/app");
@@ -933,6 +958,8 @@ mod tests {
         let actions: Vec<String> = panel.all_actions().into_iter().map(|a| a.id).collect();
         assert_eq!(actions, ["export", "refresh"]);
         assert_eq!(panel.all_fields()[0].value, "7");
+        let native=PanelView::parse(r#"{"vantryPanel":{"version":1,"widgets":[{"kind":"badge","label":"Ready"}]}}"#).unwrap();
+        assert_eq!(native.widgets[0].text,"Ready");
         let wrapped = PanelView::parse(r#"{"panel":{"widgets":[]}}"#).unwrap();
         assert!(wrapped.widgets.is_empty());
 

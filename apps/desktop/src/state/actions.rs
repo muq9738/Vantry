@@ -294,7 +294,7 @@ impl AppState {
         if self.queue_edit.is_some() {
             self.end_queue_edit();
         }
-        self.selected = Some(input.thread_id.clone());
+        self.select_thread(Some(input.thread_id.clone()));
         let key = self.draft_key();
         let saved = self.drafts.remove(&key).unwrap_or_default();
         self.drafts.insert(
@@ -303,6 +303,7 @@ impl AppState {
                 text: input.message.clone(),
                 mode: saved.mode,
                 attachments: input.attachments.clone(),
+                ..Default::default()
             },
         );
         self.queue_edit = Some(QueueEdit {
@@ -323,7 +324,7 @@ impl AppState {
     pub(super) fn save_queue_edit(&mut self) -> Option<Command> {
         let edit = self.queue_edit.clone()?;
         let draft = self.drafts.get(&edit.thread_id).cloned().unwrap_or_default();
-        let text = draft.text.trim().to_owned();
+        let text = draft.outgoing().trim().to_owned();
         let Some(input) = self.queued_input(&edit.input_id) else {
             self.end_queue_edit();
             self.notice = Some(Notice::new(
@@ -433,9 +434,22 @@ impl AppState {
 
     /// Adds `attachment` to the shown draft (once).
     pub fn add_attachment(&mut self, attachment: Attachment) {
-        let key = self.draft_key();
+        self.add_attachment_to(self.draft_key(), attachment, None);
+    }
+
+    pub fn add_attachment_to(
+        &mut self,
+        key: String,
+        attachment: Attachment,
+        path: Option<std::path::PathBuf>,
+    ) {
         let draft = self.drafts.entry(key).or_default();
         if !draft.attachments.iter().any(|a| a.id == attachment.id) {
+            if let Some(path) = path
+                && attachment.mime.starts_with("image/")
+            {
+                draft.image_paths.insert(attachment.id.clone(), path);
+            }
             draft.attachments.push(attachment);
         }
     }
@@ -444,6 +458,8 @@ impl AppState {
         let key = self.draft_key();
         if let Some(draft) = self.drafts.get_mut(&key) {
             draft.attachments.retain(|a| a.id != id);
+            draft.image_paths.remove(id);
+            draft.remove_attachment_mention(id);
         }
     }
 }

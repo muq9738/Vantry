@@ -44,7 +44,6 @@ const SECTIONS: &[&str] = &[
     names::USAGE_SUMMARY,
     names::ENVIRONMENTS_LIST,
     names::PROJECTS_LIST,
-    names::SSH_HOSTS,
 ];
 
 /// The Core's workbench, with the local workspace beside it.
@@ -53,6 +52,9 @@ pub struct CoreWorkbench {
     socket: PathBuf,
     local: LocalWorkbench,
     model: Option<String>,
+    /// Route file & Git operations through Core's `/v1/workbench` (used for remote Cores).
+    core_fs: bool,
+    workspace_override: Option<String>,
 }
 
 impl CoreWorkbench {
@@ -63,7 +65,34 @@ impl CoreWorkbench {
             socket,
             local,
             model,
+            core_fs: false,
+            workspace_override: None,
         }
+    }
+
+    /// A Core workbench that routes file & Git calls through the Core's `/v1/workbench`
+    /// for a checkout reached through a paired Core.
+    pub fn for_core_workspace(
+        socket: PathBuf,
+        workspace: String,
+        local: LocalWorkbench,
+        model: Option<String>,
+    ) -> Self {
+        CoreWorkbench {
+            socket,
+            local,
+            model,
+            core_fs: true,
+            workspace_override: Some(workspace),
+        }
+    }
+
+    fn ws_request(&self, action: &str) -> WorkbenchRequest {
+        let mut req = actions::request(action);
+        if let Some(ws) = &self.workspace_override {
+            req.workspace = ws.clone();
+        }
+        req
     }
 
     /// One action on the Core, without fallbacks.
@@ -107,35 +136,121 @@ impl WorkbenchBridge for CoreWorkbench {
     }
 
     fn root(&self) -> String {
-        self.local.root()
+        self.workspace_override
+            .clone()
+            .unwrap_or_else(|| self.local.root())
     }
 
     fn list_dir(&self, path: String) -> BridgeFuture<Vec<DirEntry>> {
-        self.local.list_dir(path)
+        if !self.core_fs {
+            return self.local.list_dir(path);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("files.list");
+        if !path.is_empty() {
+            req.paths = vec![path];
+        }
+        Box::pin(async move {
+            let res = Self::ask(socket, req).await?;
+            let val: serde_json::Value = serde_json::from_str(&res.output)
+                .map_err(|e| BridgeError::unavailable(format!("无效目录列表：{e}")))?;
+            let mut out = Vec::new();
+            for e in val["entries"].as_array().into_iter().flatten() {
+                out.push(DirEntry {
+                    name: e["name"].as_str().unwrap_or("").to_owned(),
+                    path: e["path"].as_str().unwrap_or("").to_owned(),
+                    is_dir: e["isDir"].as_bool().unwrap_or(false),
+                    size: e["size"].as_u64().unwrap_or(0),
+                });
+            }
+            Ok(out)
+        })
     }
 
     fn read_file(&self, path: String) -> BridgeFuture<FileContent> {
-        self.local.read_file(path)
+        if !self.core_fs {
+            return self.local.read_file(path);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("files.read");
+        req.paths = vec![path.clone()];
+        Box::pin(async move {
+            let res = Self::ask(socket, req).await?;
+            Ok(FileContent {
+                path,
+                text: res.output,
+                truncated: false,
+                binary: false,
+            })
+        })
     }
 
     fn git_status(&self) -> BridgeFuture<GitState> {
-        self.local.git_status()
+        if !self.core_fs {
+            return self.local.git_status();
+        }
+        let socket = self.socket.clone();
+        let req = self.ws_request("git.status");
+        Box::pin(async move {
+            let res = Self::ask(socket, req).await?;
+            res.git
+                .ok_or_else(|| BridgeError::unavailable("远端 Core 未返回 Git 状态"))
+        })
     }
 
     fn git_diff(&self, path: Option<String>, staged: bool) -> BridgeFuture<String> {
-        self.local.git_diff(path, staged)
+        if !self.core_fs {
+            return self.local.git_diff(path, staged);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("git.diff");
+        if let Some(p) = path {
+            req.paths = vec![p];
+        }
+        req.input = Some(serde_json::json!({"staged": staged}));
+        Box::pin(async move {
+            let res = Self::ask(socket, req).await?;
+            Ok(res.output)
+        })
     }
 
     fn git_stage(&self, paths: Vec<String>) -> BridgeFuture<()> {
-        self.local.git_stage(paths)
+        if !self.core_fs {
+            return self.local.git_stage(paths);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("git.stage");
+        req.paths = paths;
+        Box::pin(async move {
+            Self::ask(socket, req).await?;
+            Ok(())
+        })
     }
 
     fn git_unstage(&self, paths: Vec<String>) -> BridgeFuture<()> {
-        self.local.git_unstage(paths)
+        if !self.core_fs {
+            return self.local.git_unstage(paths);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("git.unstage");
+        req.paths = paths;
+        Box::pin(async move {
+            Self::ask(socket, req).await?;
+            Ok(())
+        })
     }
 
     fn git_commit(&self, message: String) -> BridgeFuture<String> {
-        self.local.git_commit(message)
+        if !self.core_fs {
+            return self.local.git_commit(message);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("git.commit");
+        req.message = message;
+        Box::pin(async move {
+            let res = Self::ask(socket, req).await?;
+            Ok(res.output)
+        })
     }
 
     fn pr_summary(&self) -> BridgeFuture<PrSummary> {
@@ -159,15 +274,52 @@ impl WorkbenchBridge for CoreWorkbench {
     }
 
     fn git_checkout(&self, branch: String) -> BridgeFuture<()> {
-        self.local.git_checkout(branch)
+        if !self.core_fs {
+            return self.local.git_checkout(branch);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("git.checkout");
+        req.branch = branch;
+        Box::pin(async move {
+            Self::ask(socket, req).await?;
+            Ok(())
+        })
     }
 
     fn git_discard(&self, paths: Vec<String>) -> BridgeFuture<()> {
-        self.local.git_discard(paths)
+        if !self.core_fs {
+            return self.local.git_discard(paths);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("git.discard");
+        req.paths = paths;
+        Box::pin(async move {
+            Self::ask(socket, req).await?;
+            Ok(())
+        })
     }
 
     fn search_files(&self, query: String) -> BridgeFuture<Vec<SearchHit>> {
-        self.local.search_files(query)
+        if !self.core_fs {
+            return self.local.search_files(query);
+        }
+        let socket = self.socket.clone();
+        let mut req = self.ws_request("files.search");
+        req.message = query;
+        Box::pin(async move {
+            let res = Self::ask(socket, req).await?;
+            let val: serde_json::Value = serde_json::from_str(&res.output)
+                .map_err(|e| BridgeError::unavailable(format!("无效搜索结果：{e}")))?;
+            let mut hits = Vec::new();
+            for item in val["results"].as_array().into_iter().flatten() {
+                hits.push(SearchHit {
+                    path: item["path"].as_str().unwrap_or("").to_owned(),
+                    line_number: 1,
+                    line: item["name"].as_str().unwrap_or("").to_owned(),
+                });
+            }
+            Ok(hits)
+        })
     }
 
     /// Every section at once; each one the Core does not serve keeps what

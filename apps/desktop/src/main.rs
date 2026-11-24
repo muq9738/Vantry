@@ -65,7 +65,7 @@ fn main() -> impl Termination {
             Exit::Code(ExitCode::from(2))
         }
         Ok(Invocation::Desktop(config)) => {
-            // `--remote` / `--peer` open the window on that environment; its
+            // `--peer` opens the window on that environment; its
             // transport reports what is not wired yet (bridge::RemoteBridge).
             vantry_desktop::set_launch_config(*config);
             Exit::Window(platform::run_app(

@@ -14,8 +14,11 @@
 //! `desktop-state.json` keeps.
 
 mod actions;
+mod draft;
+pub use draft::{Draft, DraftMention};
 pub mod approval;
 pub mod markdown;
+pub mod language;
 pub mod persist;
 pub mod sidebar;
 pub mod timeline;
@@ -37,7 +40,7 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use vantry_protocol::{
-    Attachment, Command, CommandKind, CoreEvent, Input, PendingRequest, Receipt, Run, RunStatus,
+    Command, CommandKind, CoreEvent, Input, PendingRequest, Receipt, Run, RunStatus,
     RunTelemetry, Snapshot, Task, Thread, ToolCall, WorkspaceSpec,
 };
 
@@ -89,21 +92,6 @@ pub enum RunningAction {
     Steer,
     /// Queue it after the run (`message.queue`).
     Queue,
-}
-
-/// One thread's unsent input.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Draft {
-    pub text: String,
-    pub mode: InteractionMode,
-    /// Files picked for the next message (their content is the Core's).
-    pub attachments: Vec<Attachment>,
-}
-
-impl Draft {
-    fn is_blank(&self) -> bool {
-        self.text.trim().is_empty() && self.attachments.is_empty()
-    }
 }
 
 /// How new threads start (the composer's model and permission choices
@@ -204,7 +192,7 @@ impl Notice {
 pub enum Purpose {
     /// Creates the thread a draft's first message goes to; the message
     /// follows once it is accepted.
-    CreateThread { then_send: Box<Command>, draft: Draft },
+    CreateThread { draft_key: String, then_send: Box<Command>, draft: Draft },
     /// A message (send, queue or steer) from the draft of `draft_key`.
     Message { draft_key: String, draft: Draft },
     /// Stops a run.
@@ -341,6 +329,11 @@ pub struct AppState {
     pub selected: Option<String>,
     /// Drafts by thread id ([`NEW_THREAD`] for the new one).
     pub drafts: BTreeMap<String, Draft>,
+    /// Unsent sessions in the v0.1.42 sidebar, separate from Core thread ids.
+    pub local_order: Vec<String>,
+    pub attachment_imports: BTreeSet<String>,
+    pub local_selected: Option<String>,
+    local_serial: u64,
     pub running_action: RunningAction,
     pub new_thread: NewThreadConfig,
     pub queue_edit: Option<QueueEdit>,
@@ -351,6 +344,8 @@ pub struct AppState {
     /// Requests the user put aside ("稍后处理"): the modal skips them, the
     /// timeline keeps showing them.
     pub deferred: BTreeSet<String>,
+    /// Results delivered in the background since this window connected.
+    pub unread: BTreeSet<String>,
     /// Who the desktop talks to ("本机 Core").
     pub endpoint_label: String,
     /// The workspace the header names.
@@ -374,6 +369,10 @@ impl Default for AppState {
             timeline: TimelineIndex::default(),
             selected: None,
             drafts: BTreeMap::new(),
+            local_order: Vec::new(),
+            attachment_imports: BTreeSet::new(),
+            local_selected: None,
+            local_serial: 0,
             running_action: RunningAction::default(),
             new_thread: NewThreadConfig {
                 provider_id: "pi".to_owned(),
@@ -385,6 +384,7 @@ impl Default for AppState {
             notice: None,
             pending: Vec::new(),
             deferred: BTreeSet::new(),
+            unread: BTreeSet::new(),
             endpoint_label: String::new(),
             workspace_label: String::new(),
             sidebar_revision: 0,
@@ -447,7 +447,8 @@ impl AppState {
     pub fn draft_key(&self) -> String {
         self.selected
             .clone()
-            .unwrap_or_else(|| NEW_THREAD.to_owned())
+            .or_else(|| self.local_selected.clone())
+            .unwrap_or_default()
     }
 
     /// The shown thread's draft.
@@ -464,6 +465,37 @@ impl AppState {
 
     pub fn selected_thread(&self) -> Option<&Thread> {
         self.selected.as_deref().and_then(|id| self.thread(id))
+    }
+
+    pub fn has_conversation(&self) -> bool {
+        self.selected
+            .as_deref()
+            .is_some_and(|id| !self.timeline.run_order(id).is_empty())
+            || self
+                .pending_by_key(&format!("submit:{}", self.draft_key()))
+                .is_some()
+    }
+
+    pub fn current_workspace(&self) -> Option<&WorkspaceSpec> {
+        match self.selected_thread() {
+            Some(thread) => thread.workspace.as_ref(),
+            None => self.new_thread.workspace.as_ref(),
+        }
+    }
+
+    /// The checkout whose files are actually on this machine. A repository groups
+    /// worktrees in the sidebar, but file and Git operations use the worktree itself.
+    pub fn checkout_path(&self) -> Option<&str> {
+        let workspace = self.current_workspace();
+        if workspace.is_some_and(|w| !w.environment_id.is_empty()) {
+            return None;
+        }
+        workspace
+            .into_iter()
+            .flat_map(|w| [w.path.as_str(), w.repository.as_str()])
+            .chain(self.selected_thread().map(|t| t.project_path.as_str()))
+            .map(str::trim)
+            .find(|s| !s.is_empty())
     }
 
     /// Threads not archived, pinned first, newest first.
@@ -635,7 +667,10 @@ impl AppState {
         let has_content = !draft.text.trim().is_empty()
             || (!editing && !draft.attachments.is_empty() && primary == PrimaryAction::Send);
         ComposerStatus {
-            can_submit: has_content && (editing || pending.is_none()) && self.snapshot_loaded,
+            can_submit: has_content
+                && (editing || pending.is_none())
+                && self.snapshot_loaded
+                && !self.attachment_imports.contains(&self.draft_key()),
             primary,
             can_stop: active.is_some_and(|run| !self.in_flight(&format!("stop:{}", run.id))),
             sending: !editing && pending.is_some_and(|p| p.in_flight),
@@ -657,6 +692,7 @@ impl AppState {
     /// The approval policy the composer shows.
     pub fn current_policy(&self) -> String {
         match self.selected_thread() {
+            Some(thread) if thread.approval_policy.is_empty() => "auto".to_owned(),
             Some(thread) => thread.approval_policy.clone(),
             None => self.new_thread.approval_policy.clone(),
         }
@@ -727,12 +763,19 @@ impl AppState {
             self.selected = None;
         }
         if self.selected.is_none()
+            && self.local_selected.is_none()
             && self
                 .drafts
                 .get(NEW_THREAD)
-                .is_none_or(|d| d.text.is_empty())
+                .is_none_or(|d| d.is_blank() && d.mode == InteractionMode::Default)
         {
             self.selected = self.visible_threads().first().map(|t| t.id.clone());
+        }
+        if self.selected.is_none()
+            && self.local_selected.is_none()
+            && self.pending_by_key("submit:").is_none()
+        {
+            self.new_thread();
         }
         if let Some(edit) = &self.queue_edit
             && !self
@@ -905,6 +948,16 @@ impl AppState {
             return false;
         }
         let id = run.id.clone();
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+        ) && self.selected.as_deref() != Some(&run.thread_id)
+            && self
+                .run(&id)
+                .is_none_or(|previous| !previous.status.terminal())
+        {
+            self.unread.insert(run.thread_id.clone());
+        }
         let mut rewritten = false;
         match self.run_mut(&id) {
             Some(existing) => {
@@ -954,6 +1007,7 @@ impl AppState {
         self.requests.retain(|r| r.thread_id != id);
         self.inputs.retain(|i| i.thread_id != id);
         self.drafts.remove(&id);
+        self.unread.remove(&id);
         self.timeline.remove_thread(&id);
         if self.selected.as_deref() == Some(id.as_str()) {
             self.selected = None;
@@ -1168,19 +1222,46 @@ fn merge_run(existing: &mut Run, incoming: Run) {
 
 impl AppState {
     pub fn select_thread(&mut self, id: Option<String>) {
+        self.local_selected = id
+            .as_ref()
+            .filter(|id| self.local_order.contains(id))
+            .cloned();
         self.selected = id.filter(|id| self.thread(id).is_some());
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|id| self.unread.remove(id))
+        {
+            self.sidebar_revision += 1;
+        }
         self.notice = None;
     }
 
     /// Opens the new thread's draft.
     pub fn new_thread(&mut self) {
         self.selected = None;
+        if let Some(previous) = self.drafts.remove(NEW_THREAD) {
+            let id = self.allocate_local_draft();
+            self.drafts.insert(id.clone(), previous);
+            self.local_selected = Some(id);
+        } else {
+            self.local_selected = Some(
+                self.local_order
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| self.allocate_local_draft()),
+            );
+        }
         self.notice = None;
     }
 
     pub fn set_draft_text(&mut self, text: &str) {
         let key = self.draft_key();
-        self.drafts.entry(key).or_default().text = text.to_owned();
+        let draft = self.drafts.entry(key).or_default();
+        draft.text = text.to_owned();
+        draft
+            .mentions
+            .retain(|m| !m.display.is_empty() && text.contains(&m.display));
     }
 
     pub fn toggle_mode(&mut self) {
@@ -1251,7 +1332,7 @@ impl AppState {
         let draft_key = self.draft_key();
         let key = format!("submit:{draft_key}");
         let draft = self.take_draft();
-        let text = draft.text.trim().to_owned();
+        let text = draft.outgoing().trim().to_owned();
         let Some(thread_id) = self.selected.clone() else {
             let mut send = Command::new(new_command_id("send"), CommandKind::SendMessage);
             send.message = text.clone();
@@ -1269,11 +1350,27 @@ impl AppState {
                 key,
                 create,
                 Purpose::CreateThread {
+                    draft_key,
                     then_send: Box::new(send),
                     draft,
                 },
             ));
         };
+        Some(self.send_existing(thread_id, key, draft_key, draft, text))
+    }
+
+    /// Submit a child's own draft while its parent stays selected in the sidebar.
+    pub fn submit_child(&mut self, child: &str) -> Option<Command> {
+        let parent=self.selected.as_deref()?;
+        if !self.tasks.iter().any(|t| t.parent_thread_id==parent && t.child_thread_id==child) {return None;}
+        let key=format!("submit:{child}");
+        if self.pending_by_key(&key).is_some() || self.drafts.get(child)?.is_blank() {return None;}
+        let draft=self.drafts.remove(child)?;
+        let text=draft.outgoing().trim().to_owned();
+        Some(self.send_existing(child.into(),key,child.into(),draft,text))
+    }
+
+    fn send_existing(&mut self, thread_id:String, key:String, draft_key:String, draft:Draft, text:String) -> Command {
         let active = self.active_run(&thread_id).cloned();
         let mut command = match active {
             Some(run)
@@ -1292,7 +1389,7 @@ impl AppState {
         command.interaction_mode = draft.mode.wire().to_owned();
         command.attachments = draft.attachments.clone();
         self.notice = None;
-        Some(self.track(key, command, Purpose::Message { draft_key, draft }))
+        self.track(key, command, Purpose::Message { draft_key, draft })
     }
 
     /// Stops the shown thread's active run.
@@ -1370,7 +1467,7 @@ impl AppState {
 
     fn restore(&mut self, purpose: Purpose) {
         match purpose {
-            Purpose::CreateThread { draft, .. } => self.restore_draft(NEW_THREAD.to_owned(), draft),
+            Purpose::CreateThread { draft_key, draft, .. } => self.restore_draft(draft_key, draft),
             Purpose::Message { draft_key, draft } => self.restore_draft(draft_key, draft),
             Purpose::Respond { request_id } => {
                 let mut run_id = None;
@@ -1470,17 +1567,21 @@ impl AppState {
 
     fn on_accepted(&mut self, pending: PendingCommand, receipt: Receipt) -> Option<Command> {
         match pending.purpose {
-            Purpose::CreateThread { then_send, draft } => {
+            Purpose::CreateThread { draft_key, then_send, draft } => {
                 let mut then_send = *then_send;
                 let thread_id = receipt.thread_id.clone();
                 if thread_id.is_empty() {
                     self.notice = Some(Notice::new(NoticeLevel::Error, "Core 未返回新会话 ID。"));
-                    self.restore_draft(NEW_THREAD.to_owned(), draft);
+                    self.restore_draft(draft_key, draft);
                     return None;
                 }
                 self.show_new_thread(&thread_id, &pending.command);
-                if draft.mode != InteractionMode::Default {
-                    self.drafts.entry(thread_id.clone()).or_default().mode = draft.mode;
+                if self.selected.is_none() && self.draft_key() == draft_key {
+                    self.select_thread(Some(thread_id.clone()));
+                }
+                self.local_order.retain(|id| id != &draft_key);
+                if let Some(later_edits) = self.drafts.remove(&draft_key) {
+                    self.restore_draft(thread_id.clone(), later_edits);
                 }
                 then_send.thread_id = thread_id.clone();
                 self.notice = None;
@@ -1505,7 +1606,7 @@ impl AppState {
                 let thread_id = receipt.thread_id.clone();
                 if !thread_id.is_empty() {
                     self.show_new_thread(&thread_id, &pending.command);
-                    self.selected = Some(thread_id);
+                    self.select_thread(Some(thread_id));
                 }
                 self.notice = Some(Notice::new(
                     NoticeLevel::Info,
@@ -1541,12 +1642,10 @@ impl AppState {
                 provider_id: command.provider_id.clone(),
                 model: command.model.clone(),
                 approval_policy: command.approval_policy.clone(),
+                workspace: command.workspace.clone(),
                 ..Thread::default()
             });
             self.sidebar_revision += 1;
-        }
-        if self.selected.is_none() {
-            self.selected = Some(thread_id.to_owned());
         }
     }
 }

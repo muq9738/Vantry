@@ -15,7 +15,7 @@ use super::{ghost_button, primary_button};
 use crate::{
     controller,
     state::{ApprovalDecision, ApprovalView, RequestKind, Risk},
-    theme::{PALETTE, metrics},
+    theme::{metrics, palette},
 };
 
 pub(crate) fn approval_modal() -> impl IntoElement {
@@ -30,14 +30,16 @@ pub(crate) fn approval_modal() -> impl IntoElement {
 }
 
 fn risk_color(risk: Risk) -> AdaptiveColor {
+    let colors = palette();
     match risk {
-        Risk::Low => PALETTE.success,
-        Risk::Medium => PALETTE.warning,
-        Risk::High => PALETTE.danger,
+        Risk::Low => colors.success,
+        Risk::Medium => colors.warning,
+        Risk::High => colors.danger,
     }
 }
 
 fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl IntoElement {
+    let colors = palette();
     let view_of = move || current.get();
     let field = move |f: fn(&ApprovalView) -> String| {
         move || current.with(|v| v.as_ref().map(f).unwrap_or_default())
@@ -79,7 +81,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .bg(PALETTE.scrim)
+                .bg(colors.scrim)
                 .p_6()
                 .child(
                     view()
@@ -89,9 +91,9 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                         .gap_3()
                         .p_5()
                         .rounded(px(14.0))
-                        .bg(PALETTE.approval)
+                        .bg(colors.approval)
                         .border_1()
-                        .border_color(PALETTE.approval_border)
+                        .border_color(colors.approval_border)
                         .shadow_xl()
                         .child(
                             view()
@@ -111,7 +113,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                     })
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_size(px(13.0))
-                                    .text_color(PALETTE.warning),
+                                    .text_color(colors.warning),
                                 )
                                 .child(view().flex_1())
                                 .child(when(
@@ -119,7 +121,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                     move || {
                                         text(move || format!("共 {} 项待处理", queue_len.get()))
                                             .text_size(px(11.5))
-                                            .text_color(PALETTE.muted)
+                                            .text_color(colors.muted)
                                     },
                                 )),
                         )
@@ -133,7 +135,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                     )
                                 })
                                 .text_size(px(12.0))
-                                .text_color(PALETTE.muted)
+                                .text_color(colors.muted)
                             },
                         ))
                         .child(
@@ -141,7 +143,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                 .select_text()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_size(px(15.0))
-                                .text_color(PALETTE.ink),
+                                .text_color(colors.ink),
                         )
                         .child(when(
                             move || {
@@ -151,14 +153,14 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                 scroll()
                                     .max_h(px(220.0))
                                     .rounded(px(8.0))
-                                    .bg(PALETTE.code)
+                                    .bg(colors.code)
                                     .child(
                                         text(field(|v| v.body.clone()))
                                             .select_text()
                                             .font_family("Menlo")
                                             .text_size(px(12.0))
                                             .line_height(LineHeight::Multiple(1.5))
-                                            .text_color(PALETTE.ink)
+                                            .text_color(colors.ink)
                                             .px_3()
                                             .py_2(),
                                     )
@@ -179,7 +181,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                         current.with(|v| v.as_ref().map_or("", |v| v.risk.hint()))
                                     })
                                     .text_size(px(12.0))
-                                    .text_color(PALETTE.muted),
+                                    .text_color(colors.muted),
                                 ),
                         )
                         .child(when(
@@ -189,7 +191,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                             move || {
                                 text(field(|v| v.error.clone()))
                                     .text_size(px(12.0))
-                                    .text_color(PALETTE.danger)
+                                    .text_color(colors.danger)
                             },
                         ))
                         .child(answers(view_of(), value, busy, answer))
@@ -205,7 +207,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                         text("响应未确认，重试将沿用原来的回答。")
                                             .flex_1()
                                             .text_size(px(11.5))
-                                            .text_color(PALETTE.warning),
+                                            .text_color(colors.warning),
                                     )
                                     .child(ghost_button("重试", move || {
                                         controller::retry(key.clone())
@@ -231,6 +233,7 @@ fn answers(
     busy: Memo<bool>,
     answer: impl Fn(ApprovalDecision) + Clone + 'static,
 ) -> AnyElement {
+    let colors = palette();
     let Some(request) = request else {
         return view().into_element();
     };
@@ -290,16 +293,16 @@ fn answers(
                     .px_3()
                     .py_2()
                     .rounded(px(8.0))
-                    .bg(PALETTE.card)
+                    .bg(colors.card)
                     .border_1()
-                    .border_color(PALETTE.line)
+                    .border_color(colors.line)
                     .text_size(px(13.0))
-                    .text_color(PALETTE.ink),
+                    .text_color(colors.ink),
             )
             .child(
                 text("私密内容以掩码输入，只交给本次请求的一次性文件；桌面不显示、不保存、不写日志。")
                     .text_size(px(11.5))
-                    .text_color(PALETTE.muted),
+                    .text_color(colors.muted),
             )
             .child(
                 nsh_base_row()
@@ -315,6 +318,60 @@ fn answers(
                             submit(ApprovalDecision::Submit(secret))
                         })
                         .disabled(move || busy.get() || value.with(String::is_empty)),
+                    ),
+            )
+            .into_element();
+    }
+    if request.kind == RequestKind::Terminal {
+        let req_id = request.request_id.clone();
+        let tr = request.terminal_run.clone();
+        let (title, command, cwd) = match tr {
+            Some(p) => (p.title, p.command, p.cwd),
+            None => (
+                request.headline.clone(),
+                request.prefill.clone(),
+                String::new(),
+            ),
+        };
+        let run_id = req_id.clone();
+        let done_id = req_id.clone();
+        let done_cwd = cwd.clone();
+        let cancel_id = req_id;
+        let empty_cmd = command.trim().is_empty();
+        return view_column()
+            .child(
+                text("将在右侧内置终端中以真实 PTY 启动该命令，完成后自动回传退出码给 Agent。")
+                    .text_size(px(12.0))
+                    .text_color(colors.muted),
+            )
+            .child(
+                nsh_base_row()
+                    .child(view_spacer())
+                    .child(
+                        ghost_button("取消请求", move || {
+                            controller::cancel_terminal_task(cancel_id.clone())
+                        })
+                        .disabled(move || busy.get()),
+                    )
+                    .child(
+                        ghost_button("标记已完成", move || {
+                            controller::complete_terminal_task(
+                                done_id.clone(),
+                                done_cwd.clone(),
+                            )
+                        })
+                        .disabled(move || busy.get()),
+                    )
+                    .child(
+                        primary_button("在内置终端中运行", move || {
+                            controller::start_terminal_task(
+                                run_id.clone(),
+                                title.clone(),
+                                command.clone(),
+                                cwd.clone(),
+                            )
+                        })
+                        .disabled(move || busy.get() || empty_cmd),
                     ),
             )
             .into_element();
@@ -366,11 +423,11 @@ fn answers(
                         .px_3()
                         .py_2()
                         .rounded(px(8.0))
-                        .bg(if terminal { PALETTE.code } else { PALETTE.card })
+                        .bg(if terminal { colors.code } else { colors.card })
                         .border_1()
-                        .border_color(PALETTE.line)
+                        .border_color(colors.line)
                         .text_size(px(13.0))
-                        .text_color(PALETTE.ink),
+                        .text_color(colors.ink),
                 )
                 .child(
                     nsh_base_row()

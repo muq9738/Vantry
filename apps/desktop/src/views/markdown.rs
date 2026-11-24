@@ -13,7 +13,7 @@ use nsh_core::{LineHeight, prelude::*};
 use crate::{
     controller,
     state::markdown::{Block, DiffKind, Inline, ListItem, MarkdownDoc, Spanned},
-    theme::{PALETTE, metrics},
+    theme::{metrics, palette},
 };
 
 const MONO: &str = "Menlo";
@@ -41,6 +41,7 @@ pub(crate) fn static_document(doc: &MarkdownDoc) -> impl IntoElement {
 }
 
 fn block_view(block: &Block) -> AnyElement {
+    let colors = palette();
     match block {
         Block::Heading { level, inlines } => {
             let size = match level {
@@ -52,13 +53,19 @@ fn block_view(block: &Block) -> AnyElement {
             inline_text(inlines)
                 .text_size(px(size))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(PALETTE.ink)
+                .text_color(colors.ink)
                 .mt_1()
                 .into_element()
         }
         Block::Paragraph(inlines) => body(inline_text(inlines)).into_element(),
         Block::List { items, .. } => list_view(items).into_element(),
-        Block::Code { lang, code, closed } => code_view(lang, code, *closed).into_element(),
+        Block::Code { lang, code, closed } => {
+            if let Some(el) = super::visuals::render_fenced(lang, code, *closed) {
+                el
+            } else {
+                code_view(lang, code, *closed).into_element()
+            }
+        }
         Block::Diff { lines, .. } => {
             let source: String = lines
                 .iter()
@@ -89,34 +96,36 @@ fn block_view(block: &Block) -> AnyElement {
                         .select_text()
                         .text_size(px(metrics::BODY))
                         .line_height(LineHeight::Multiple(1.6))
-                        .text_color(PALETTE.muted),
+                        .text_color(colors.muted),
                 );
             }
             view()
                 .pl_3()
                 .border_l(px(3.0))
-                .border_l_color(PALETTE.line)
+                .border_l_color(colors.line)
                 .child(column)
                 .into_element()
         }
         Block::Rule => view()
             .h(px(1.0))
             .my_2()
-            .bg(PALETTE.line)
+            .bg(colors.line)
             .into_element(),
         Block::Table { header, rows } => table_view(header, rows).into_element(),
     }
 }
 
 fn body(text: Text) -> Text {
+    let colors = palette();
     text.select_text()
         .text_size(px(metrics::BODY + 0.5))
         .line_height(LineHeight::Multiple(1.65))
-        .text_color(PALETTE.ink)
+        .text_color(colors.ink)
 }
 
 /// A text block of inline spans.
 pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
+    let colors = palette();
     let mut block = text("");
     for inline in inlines {
         block = block.child(match inline {
@@ -127,19 +136,25 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
             Inline::Code(t) => text(t.clone())
                 .font_family(MONO)
                 .text_size(px(12.5))
-                .bg(PALETTE.code)
+                .bg(colors.code)
                 .rounded(px(4.0))
-                .text_color(PALETTE.ink),
-            Inline::Link { text: label, url } => text(label.clone())
-                .underline()
-                .text_color(PALETTE.accent)
-                .tooltip(text(url.clone()).text_size(px(11.5))),
+                .text_color(colors.ink),
+            Inline::Link { text: label, url } => {
+                let href = url.clone();
+                text(label.clone())
+                    .underline()
+                    .text_color(colors.accent)
+                    .cursor(Cursor::Pointer)
+                    .tooltip(text(url.clone()).text_size(px(11.5)))
+                    .on_press(move || controller::open_link(href.clone()))
+            }
         });
     }
     block
 }
 
 fn list_view(items: &[ListItem]) -> impl IntoElement {
+    let colors = palette();
     let mut column = view().flex_col().gap_1();
     for item in items {
         let marker = match item.checked {
@@ -157,7 +172,7 @@ fn list_view(items: &[ListItem]) -> impl IntoElement {
                         .min_w(px(18.0))
                         .text_size(px(metrics::BODY))
                         .line_height(LineHeight::Multiple(1.65))
-                        .text_color(PALETTE.muted),
+                        .text_color(colors.muted),
                 )
                 .child(body(inline_text(&item.inlines)).flex_1()),
         );
@@ -166,6 +181,7 @@ fn list_view(items: &[ListItem]) -> impl IntoElement {
 }
 
 fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
+    let colors = palette();
     let label = if lang.is_empty() { "代码" } else { lang };
     let inner = view().child(
         text(if code.is_empty() { " ".to_owned() } else { code.to_owned() })
@@ -173,7 +189,7 @@ fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
             .font_family(MONO)
             .text_size(px(12.5))
             .line_height(LineHeight::Multiple(1.5))
-            .text_color(PALETTE.ink)
+            .text_color(colors.ink)
             .px_3()
             .py_2(),
     );
@@ -188,12 +204,13 @@ fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
 /// A code well: its label and copy button over `content`, scrolling
 /// sideways for long lines.
 fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
+    let colors = palette();
     view()
         .flex_col()
         .rounded(px(metrics::CARD_RADIUS))
-        .bg(PALETTE.code)
+        .bg(colors.code)
         .border_1()
-        .border_color(PALETTE.line_soft)
+        .border_color(colors.line_soft)
         .overflow_hidden()
         .child(
             view()
@@ -202,13 +219,13 @@ fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
                 .px_3()
                 .py_1()
                 .border_b_1()
-                .border_b_color(PALETTE.line_soft)
+                .border_b_color(colors.line_soft)
                 .child(
                     text(label.to_owned())
                         .flex_1()
                         .font_family(MONO)
                         .text_size(px(11.0))
-                        .text_color(PALETTE.faint),
+                        .text_color(colors.faint),
                 )
                 .child(super::link_button("复制", move || controller::copy(source.clone()))),
         )
@@ -216,6 +233,7 @@ fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
 }
 
 fn diff_colors(kind: DiffKind) -> (AdaptiveColor, AdaptiveColor) {
+    let colors = palette();
     match kind {
         DiffKind::Added => (
             AdaptiveColor::rgb(0xE6F6EA, 0x15301E),
@@ -225,9 +243,9 @@ fn diff_colors(kind: DiffKind) -> (AdaptiveColor, AdaptiveColor) {
             AdaptiveColor::rgb(0xFCE8E8, 0x3A1A1C),
             AdaptiveColor::rgb(0xA4262C, 0xFF9CA0),
         ),
-        DiffKind::Hunk => (AdaptiveColor::TRANSPARENT, PALETTE.accent),
-        DiffKind::Meta => (AdaptiveColor::TRANSPARENT, PALETTE.faint),
-        DiffKind::Context => (AdaptiveColor::TRANSPARENT, PALETTE.muted),
+        DiffKind::Hunk => (AdaptiveColor::TRANSPARENT, colors.accent),
+        DiffKind::Meta => (AdaptiveColor::TRANSPARENT, colors.faint),
+        DiffKind::Context => (AdaptiveColor::TRANSPARENT, colors.muted),
     }
 }
 
@@ -251,10 +269,11 @@ pub(crate) fn diff_text(diff: &str) -> impl IntoElement {
 }
 
 fn table_view(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> impl IntoElement {
+    let colors = palette();
     let cell = |inlines: &[Inline], strong: bool| {
         let t = inline_text(inlines)
             .text_size(px(13.0))
-            .text_color(PALETTE.ink);
+            .text_color(colors.ink);
         view()
             .flex_1()
             .min_w(px(80.0))
@@ -266,14 +285,14 @@ fn table_view(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> impl IntoEle
         .flex_col()
         .rounded(px(8.0))
         .border_1()
-        .border_color(PALETTE.line);
-    let mut head = view().flex_row().bg(PALETTE.soft);
+        .border_color(colors.line);
+    let mut head = view().flex_row().bg(colors.soft);
     for h in header {
         head = head.child(cell(h, true));
     }
     grid = grid.child(head);
     for row in rows {
-        let mut line = view().flex_row().border_t_1().border_t_color(PALETTE.line_soft);
+        let mut line = view().flex_row().border_t_1().border_t_color(colors.line_soft);
         for c in row {
             line = line.child(cell(c, false));
         }

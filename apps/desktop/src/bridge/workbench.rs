@@ -17,10 +17,11 @@
 //! builds its requests and reads its outputs.
 //!
 //! Types the protocol already has (`GitState`, `ModelCatalog`,
-//! `PluginInfo`, `MCPCatalog`, `AppUpdateInfo`, `SSHHostInfo`,
+//! `PluginInfo`, `MCPCatalog`, `AppUpdateInfo`,
 //! `EnvironmentInfo`, `Attachment`) are the protocol's.
 
 pub mod actions;
+pub mod history;
 mod core_bench;
 mod local;
 mod mock;
@@ -32,7 +33,7 @@ pub use local::LocalWorkbench;
 pub use mock::MockWorkbench;
 use vantry_protocol::{
     AppUpdateInfo, Attachment, EnvironmentInfo, GitState, MCPCatalog, ModelCatalog,
-    PiRuntimeStatus, PluginInfo, SSHHostInfo, WorkbenchRequest, WorkbenchResponse,
+    PiRuntimeStatus, PluginInfo, WorkbenchRequest, WorkbenchResponse,
 };
 
 use self::actions::{
@@ -88,7 +89,6 @@ pub struct SettingsData {
     pub update: AppUpdateInfo,
     /// Paired machines (remote environments).
     pub peers: Vec<EnvironmentInfo>,
-    pub ssh_hosts: Vec<SSHHostInfo>,
     /// The built-in Pi runtime (`pi.status`).
     pub pi: Option<PiRuntimeStatus>,
     pub sandbox: Option<SandboxInfo>,
@@ -123,9 +123,6 @@ impl SettingsData {
         }
         if action.starts_with("plugins.") && action != names::PLUGINS_RUN && action != names::PLUGINS_PANEL {
             self.plugins = response.plugins.clone();
-        }
-        if !response.ssh_hosts.is_empty() {
-            self.ssh_hosts = response.ssh_hosts.clone();
         }
         match action {
             names::SANDBOX_GET | names::SANDBOX_SET => {
@@ -203,6 +200,10 @@ pub trait WorkbenchBridge: Send + Sync + 'static {
     fn git_status(&self) -> BridgeFuture<GitState>;
     /// The unified diff of `path` (all files when `None`), staged or not.
     fn git_diff(&self, path: Option<String>, staged: bool) -> BridgeFuture<String>;
+    fn git_log(&self, _branch: String, _path:String, _compare: bool) -> BridgeFuture<Vec<history::CommitRow>> { Box::pin(async {Err(BridgeError::unavailable("当前工作区没有本地 Git 日志"))}) }
+    fn revision_files(&self, _revision: history::Revision) -> BridgeFuture<Vec<String>> { Box::pin(async {Err(BridgeError::unavailable("当前工作区没有本地 Git 对象"))}) }
+    fn revision_diff(&self, _revision: history::Revision, _path: String) -> BridgeFuture<String> { Box::pin(async {Err(BridgeError::unavailable("当前工作区没有本地 Git 对象"))}) }
+    fn git_apply_hunk(&self, _patch: String, _reverse: bool) -> BridgeFuture<()> { Box::pin(async {Err(BridgeError::unavailable("当前工作区不支持按块暂存"))}) }
     fn git_stage(&self, paths: Vec<String>) -> BridgeFuture<()>;
     fn git_unstage(&self, paths: Vec<String>) -> BridgeFuture<()>;
     /// Commits what is staged; resolves to the commit's summary line.
@@ -223,7 +224,7 @@ pub trait WorkbenchBridge: Send + Sync + 'static {
     fn terminal_resize(&self, _session: String, _rows: u16, _cols: u16) -> BridgeFuture<()> {
         Box::pin(async { Ok(()) })
     }
-    /// Models, plugins, MCP servers, the update, peers, SSH hosts.
+    /// Models, plugins, MCP servers, updates and peers.
     fn settings(&self) -> BridgeFuture<SettingsData>;
     /// Makes file `path` an attachment for the next message.
     fn attach(&self, path: PathBuf) -> BridgeFuture<Attachment>;
@@ -342,7 +343,10 @@ pub fn parse_git_status(text: &str) -> GitState {
         status: text.to_owned(),
         ..GitState::default()
     };
-    for line in text.lines() {
+    let nul = text.contains('\0');
+    let records: Box<dyn Iterator<Item=&str>> = if nul {Box::new(text.split_terminator('\0'))}else{Box::new(text.lines())};
+    let mut records=records.peekable();
+    while let Some(line)=records.next() {
         if let Some(head) = line.strip_prefix("## ") {
             let (branches, tracking) = match head.split_once(" [") {
                 Some((b, t)) => (b, t.trim_end_matches(']')),
@@ -372,20 +376,23 @@ pub fn parse_git_status(text: &str) -> GitState {
             continue;
         }
         let (codes, path) = line.split_at(2);
-        let path = path.trim_start();
+        let path = path.strip_prefix(' ').unwrap_or(path);
         let index = codes[..1].to_owned();
         let worktree = codes[1..2].to_owned();
         if index == "U" || worktree == "U" || codes == "AA" || codes == "DD" {
             state.conflicts = true;
         }
-        let (original, path) = match path.split_once(" -> ") {
-            Some((from, to)) => (from.to_owned(), to.to_owned()),
-            None => (String::new(), path.to_owned()),
-        };
+        let (original, path) = if nul {
+            let original = if matches!(index.as_str(),"R"|"C") || matches!(worktree.as_str(),"R"|"C") { records.next().unwrap_or_default() } else {""};
+            (original.to_owned(),path.to_owned())
+        } else {match path.split_once(" -> ") {
+            Some((from, to)) => (unquote(from),unquote(to)),
+            None => (String::new(),unquote(path)),
+        }};
         if let Some(files) = state.files.as_mut() {
             files.push(vantry_protocol::GitFile {
-                path: unquote(&path),
-                original_path: unquote(&original),
+                path,
+                original_path: original,
                 index,
                 worktree,
             });
@@ -404,6 +411,14 @@ fn unquote(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_status_preserves_unicode_spaces_newlines_and_rename_order() {
+        let state=parse_git_status("## main\0R  新 名\0old name\0??  a\nb -> c\0");
+        let files=state.files.unwrap();
+        assert_eq!((&files[0].path,&files[0].original_path),(&"新 名".to_owned(),&"old name".to_owned()));
+        assert_eq!(files[1].path," a\nb -> c");
+    }
 
     #[test]
     fn paths_stay_inside_the_workspace() {

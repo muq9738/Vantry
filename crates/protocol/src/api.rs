@@ -1544,42 +1544,6 @@ pub struct GitState {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SSHHostInfo {
-    pub alias: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub user: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub host_name: String,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub port: i64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub proxy_jump: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub forward_agent: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub has_identity_file: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source_file: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reachable: Option<bool>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub probe_error: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub probe_failure: String,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub latency_ms: i64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub remote_socket: String,
-    #[serde(rename = "remoteOS", default, skip_serializing_if = "String::is_empty")]
-    pub remote_os: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub has_herdr: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PluginSettingOption {
     pub value: String,
     pub label: String,
@@ -1729,8 +1693,9 @@ pub struct WorkbenchResponse {
     pub attachment: Option<Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitState>,
+    // Older clients may still serialize this retired display-only field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ssh_hosts: Vec<SSHHostInfo>,
+    pub ssh_hosts: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

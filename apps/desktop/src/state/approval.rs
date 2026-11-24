@@ -64,6 +64,45 @@ const SECRET_WORDS: &[&str] = &[
     "api key", "api_key", "apikey", "token", "otp",
 ];
 
+/// Structured payload carried by `vantry_terminal_run` via Pi's editor UI request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRunPayload {
+    pub title: String,
+    pub command: String,
+    pub cwd: String,
+}
+
+/// Recognizes Vantry's structured interactive terminal request (`vantry_terminal_run`).
+pub fn parse_terminal_run_payload(request: &PendingRequest) -> Option<TerminalRunPayload> {
+    if request.method != "editor" || request.prefill.trim().is_empty() {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(&request.prefill).ok()?;
+    if val["kind"].as_str() != Some("vantry_terminal_run") {
+        return None;
+    }
+    let command = val["command"].as_str()?.trim().to_owned();
+    if command.is_empty() {
+        return None;
+    }
+    let mut title = val["title"].as_str().unwrap_or("").trim().to_owned();
+    if title.is_empty() {
+        title = request
+            .title
+            .trim()
+            .trim_start_matches("交互终端 · ")
+            .trim_start_matches("交互终端")
+            .trim()
+            .to_owned();
+    }
+    let cwd = val["cwd"].as_str().unwrap_or("").trim().to_owned();
+    Some(TerminalRunPayload {
+        title,
+        command,
+        cwd,
+    })
+}
+
 /// What the modal shows for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalView {
@@ -78,6 +117,8 @@ pub struct ApprovalView {
     pub body: String,
     pub options: Vec<String>,
     pub prefill: String,
+    /// Parsed `vantry_terminal_run` command & directory when `kind == RequestKind::Terminal`.
+    pub terminal_run: Option<TerminalRunPayload>,
     /// The approval select's options, when it is one.
     pub allow_once: Option<String>,
     pub allow_session: Option<String>,
@@ -119,7 +160,12 @@ pub fn request_kind(request: &PendingRequest, secret_tool: bool) -> RequestKind 
     }
     match request.method.as_str() {
         "select" => RequestKind::Choice,
-        "editor" if request.title.trim_start().starts_with("交互终端") => RequestKind::Terminal,
+        "editor"
+            if parse_terminal_run_payload(request).is_some()
+                || request.title.trim_start().starts_with("交互终端") =>
+        {
+            RequestKind::Terminal
+        }
         "input" => {
             let text = format!("{}\n{}", request.title, request.message).to_lowercase();
             if secret_tool || SECRET_WORDS.iter().any(|w| text.contains(w)) {
@@ -134,10 +180,22 @@ pub fn request_kind(request: &PendingRequest, secret_tool: bool) -> RequestKind 
 
 /// [`approval_view`], knowing whether the run is inside [`SECRET_TOOL`].
 pub fn approval_view_with(request: &PendingRequest, secret_tool: bool) -> ApprovalView {
-    let (headline, body) = split_title(request);
+    let terminal_run = parse_terminal_run_payload(request);
+    let (mut headline, mut body) = split_title(request);
+    if let Some(ref tr) = terminal_run {
+        if !tr.title.is_empty() {
+            headline = tr.title.clone();
+        }
+        let mut lines = vec![format!("命令: {}", tr.command)];
+        if !tr.cwd.is_empty() {
+            lines.push(format!("目录: {}", tr.cwd));
+        }
+        body = lines.join("\n");
+    }
     let body = truncate_chars(&body, MAX_BODY_CHARS);
     let (allow_once, allow_session, deny) = approval_options(request);
     let risk = assess_risk(&request.title, &body, &request.message);
+    let kind = request_kind(request, secret_tool);
     ApprovalView {
         request_id: request.id.clone(),
         thread_id: request.thread_id.clone(),
@@ -147,16 +205,17 @@ pub fn approval_view_with(request: &PendingRequest, secret_tool: bool) -> Approv
         body,
         options: request.options.clone(),
         // A secret is never prefilled.
-        prefill: if request_kind(request, secret_tool) == RequestKind::Secret {
+        prefill: if kind == RequestKind::Secret {
             String::new()
         } else {
             request.prefill.clone()
         },
+        terminal_run,
         allow_once,
         allow_session,
         deny,
         risk,
-        kind: request_kind(request, secret_tool),
+        kind,
         status: request.status.clone(),
         error: request.error.clone(),
     }

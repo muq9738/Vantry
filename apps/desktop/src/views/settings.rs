@@ -1,28 +1,9 @@
-//! Settings, backed by the Core's workbench (`views` read the loaded
-//! [`SettingsData`]; every change is a workbench action through the
-//! controller, whose answer updates what is shown):
-//!
-//! - 常规与模型: the model catalog, default model and thinking level, the
-//!   built-in Pi runtime and its quick setup (the API key is typed masked
-//!   and leaves the desktop with the request);
-//! - MCP 服务器: the catalog, a switch per server, probe, add and remove,
-//!   trusting the project's configuration;
-//! - 插件: the installed plugins, enable / disable, their native panels;
-//! - 远端互联与配对: remote access, one-time pairing codes, redeeming a
-//!   code, paired machines and allowed devices (revocable), SSH hosts and
-//!   environments;
-//! - 安全与沙盒: the sandbox mode and the default approval policy;
-//! - 应用更新: check, download (delta or full), install;
-//! - 用量统计: tokens, cost, latency, per model;
-//! - 外观: the Stardust theme.
-//!
-//! Forms sit outside the data-driven parts, so a catalog refresh never
-//! takes the focus from what is being typed.
+//! Six preference pages and the catalog forms shared with the workbench dock.
 
-use nsh_core::{LineHeight, prelude::*};
-use vantry_protocol::{MCPServerInfo, PluginInfo, SSHHostInfo};
+use nsh_core::{LineHeight, element::desktop::{MenuItem,popup_menu}, prelude::*};
+use vantry_protocol::{MCPServerInfo, PluginInfo};
 
-use super::{badge, caption, ghost_button, link_button, pill, primary_button, switch_row};
+use super::{badge, caption, ghost_button, link_button, pill, primary_button, segment, segments, switch_row};
 use crate::{
     bridge::workbench::{
         SettingsData,
@@ -36,42 +17,39 @@ use crate::{
         APPROVAL_POLICIES,
         ui::{Catalogs, MainView, SettingsPage, ThemePreference},
     },
-    theme::{PALETTE, metrics},
+    theme::{metrics, palette},
 };
 
 const MONO: &str = "Menlo";
 
-/// The loaded settings (none while loading or failed).
-type Data = Memo<Option<SettingsData>>;
+type Data = Memo<Option<std::sync::Arc<SettingsData>>>;
 
 pub(crate) fn settings() -> impl IntoElement {
     let page = computed(|| controller::ui().with(|u| u.settings));
-    dynamic(move || page.get().map(|_| dialog(page).into_element()))
+    when(move || page.get().is_some(), move || dialog(page))
 }
 
 /// Sections each page shows (for the "not served" note).
 fn sections_of(page: SettingsPage) -> &'static [&'static str] {
     match page {
         SettingsPage::Models => &[names::MODELS, names::PI_STATUS],
-        SettingsPage::Extensions => &[names::MCP_LIST],
-        SettingsPage::Plugins => &[names::PLUGINS_LIST],
         SettingsPage::Remote => &[
             names::REMOTE_STATUS,
-            names::SSH_HOSTS,
             names::ENVIRONMENTS_LIST,
             names::PROJECTS_LIST,
         ],
         SettingsPage::Permissions => &[names::SANDBOX_GET],
         SettingsPage::About => &[names::UPDATE_STATUS],
         SettingsPage::Usage => &[names::USAGE_SUMMARY],
-        SettingsPage::Appearance => &[],
+        SettingsPage::Appearance | SettingsPage::General => &[],
     }
 }
 
 fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
+    let colors = palette();
     let catalogs = computed(|| controller::ui().with(|u| u.catalogs.clone()));
     let data: Data = computed(move || match catalogs.get() {
-        Catalogs::Loaded(data) => Some(*data),
+        Catalogs::Loaded(data) => Some(data),
         _ => None,
     });
     nsh_base::dialog()
@@ -82,101 +60,203 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .bg(PALETTE.scrim)
-                .p_6()
+                .bg(colors.scrim)
+                .px(px(16.0))
+                .py(px(20.0))
                 .child(
                     view()
                         .w_full()
-                        .max_w(px(900.0))
-                        .h(px(620.0))
+                        .max_w(px(940.0))
+                        .h(move || {
+                            px((nsh_core::element::window().height.0 - 40.0).clamp(1.0, 700.0))
+                        })
                         .flex_row()
+                        .style_when(compact, |s| s.flex_col())
                         .rounded(px(14.0))
-                        .bg(PALETTE.canvas)
+                        .bg(colors.canvas)
                         .border_1()
-                        .border_color(PALETTE.line)
+                        .border_color(colors.line)
                         .shadow_xl()
                         .overflow_hidden()
-                        .child(nav(page, catalogs))
+                        .child(when(
+                            move || page.get() != Some(SettingsPage::Usage),
+                            move || nav(page, catalogs),
+                        ))
                         .child(
                             view()
                                 .flex_1()
                                 .flex_col()
-                                .child(feedback_line())
+                                .min_w_0()
+                                .min_h_0()
                                 .child(
-                                    scroll().flex_1().child(
-                                        view()
-                                            .flex_col()
-                                            .gap_3()
-                                            .p_5()
-                                            .child(degraded_note(page, data))
-                                            .child(dynamic(move || match page.get() {
-                                                Some(SettingsPage::Models) => models_page(data, catalogs).into_element(),
-                                                Some(SettingsPage::Extensions) => mcp_page(data).into_element(),
-                                                Some(SettingsPage::Plugins) => plugins_page(data).into_element(),
-                                                Some(SettingsPage::Remote) => remote_page(data).into_element(),
-                                                Some(SettingsPage::Permissions) => security_page(data).into_element(),
-                                                Some(SettingsPage::About) => update_page(data).into_element(),
-                                                Some(SettingsPage::Usage) => usage_page(data).into_element(),
-                                                Some(SettingsPage::Appearance) | None => appearance_page().into_element(),
-                                            })),
-                                    ),
-                                ),
+                                    row()
+                                        .h(px(64.0))
+                                        .pl(px(28.0))
+                                        .pr_4()
+                                        .child(
+                                            text(move || {
+                                                crate::tr(
+                                                    page.get()
+                                                        .unwrap_or(SettingsPage::General)
+                                                        .label(),
+                                                )
+                                            })
+                                            .flex_1()
+                                            .text_size(px(21.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(colors.ink),
+                                        )
+                                        .child(super::icon_button(
+                                            crate::icons::Icon::X,
+                                            "关闭设置",
+                                            controller::close_settings,
+                                        )),
+                                )
+                                .child(feedback_line())
+                                .child(dynamic(move || {
+                                    page.get().map(|current| {
+                                        let body = match current {
+                                            SettingsPage::General => general_page().into_element(),
+                                            SettingsPage::Models => {
+                                                models_page(data, catalogs).into_element()
+                                            }
+                                            SettingsPage::Remote => {
+                                                remote_page(data).into_element()
+                                            }
+                                            SettingsPage::Permissions => {
+                                                security_page(data).into_element()
+                                            }
+                                            SettingsPage::About => update_page(data).into_element(),
+                                            SettingsPage::Usage => usage_page(data).into_element(),
+                                            SettingsPage::Appearance => {
+                                                appearance_page().into_element()
+                                            }
+                                        };
+                                        scroll()
+                                            .flex_1()
+                                            .child(
+                                                view()
+                                                    .flex_col()
+                                                    .gap_3()
+                                                    .px(px(28.0))
+                                                    .pb_8()
+                                                    .pt_1()
+                                                    .child(degraded_note(page, data))
+                                                    .child(body),
+                                            )
+                                            .into_element()
+                                    })
+                                })),
                         ),
                 ),
         )
 }
 
-fn nav(page: Memo<Option<SettingsPage>>, catalogs: Memo<Catalogs>) -> impl IntoElement {
-    view()
-        .w(px(196.0))
-        .flex_col()
-        .gap_0p5()
-        .p_3()
-        .bg(PALETTE.sidebar)
-        .border_r_1()
-        .border_r_color(PALETTE.line)
-        .child(
-            text("设置")
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(15.0))
-                .text_color(PALETTE.ink)
-                .px_2()
-                .pb_2(),
-        )
-        .children(SettingsPage::ALL.map(|p| {
-            nsh_base::button()
-                .selected(move || page.get() == Some(p))
-                .on_press(move || controller::open_settings(p))
-                .px_2()
-                .py_1p5()
-                .rounded(px(8.0))
-                .bg(move || if page.get() == Some(p) { PALETTE.card } else { AdaptiveColor::TRANSPARENT })
-                .hover(|s| s.bg(PALETTE.soft))
-                .child(text(p.label()).text_size(px(13.0)).text_color(PALETTE.ink))
-        }))
-        .child(view().flex_1())
-        .child(
-            text(move || match catalogs.get() {
-                Catalogs::Loading => "正在读取…".to_owned(),
-                Catalogs::Failed(e) => format!("读取失败：{e}"),
-                _ => String::new(),
+fn compact() -> bool {
+    nsh_core::element::window().width.0 - 32.0 < 680.0
+}
+
+fn nav_items(page: Memo<Option<SettingsPage>>) -> impl Iterator<Item = impl IntoElement> {
+    SettingsPage::ALL.into_iter().map(move |p| {
+        let colors = palette();
+        let glyph = match p {
+            SettingsPage::General => crate::icons::Icon::Settings,
+            SettingsPage::Appearance => crate::icons::Icon::Sun,
+            SettingsPage::Permissions => crate::icons::Icon::Shield,
+            SettingsPage::Models => crate::icons::Icon::Bot,
+            SettingsPage::Remote => crate::icons::Icon::Server,
+            _ => crate::icons::Icon::CircleHelp,
+        };
+        nsh_base::button()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .selected(move || page.get() == Some(p))
+            .on_press(move || controller::open_settings(p))
+            .h(px(34.0))
+            .px_3()
+            .min_w(px(110.0))
+            .rounded(px(8.0))
+            .bg(move || {
+                if page.get() == Some(p) {
+                    colors.info_bg
+                } else {
+                    AdaptiveColor::TRANSPARENT
+                }
             })
-            .px_2()
-            .text_size(px(11.0))
-            .text_color(PALETTE.faint),
-        )
-        .child(
+            .hover(|s| s.bg(colors.soft))
+            .child(crate::icons::icon(glyph, 14.0, move || {
+                if page.get() == Some(p) {
+                    colors.info_ink
+                } else {
+                    colors.muted
+                }
+            }))
+            .child(
+                text(crate::tr(p.label()))
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(move || {
+                        if page.get() == Some(p) {
+                            colors.info_ink
+                        } else {
+                            colors.ink
+                        }
+                    }),
+            )
+    })
+}
+
+fn nav(page: Memo<Option<SettingsPage>>, catalogs: Memo<Catalogs>) -> impl IntoElement {
+    let colors = palette();
+    dynamic(move || {
+        if compact() {
+            scroll()
+                .horizontal()
+                .h(px(54.0))
+                .flex_shrink_0()
+                .bg(colors.sidebar)
+                .child(row().p_2().children(nav_items(page)))
+                .into_element()
+        } else {
             view()
-                .flex_row()
-                .gap_1()
-                .child(link_button("刷新", controller::reload_catalogs))
+                .w(px(216.0))
+                .flex_shrink_0()
+                .flex_col()
+                .gap_0p5()
+                .p_3()
+                .bg(colors.sidebar)
+                .border_r_1()
+                .border_r_color(colors.line)
+                .child(
+                    text(crate::tr("设置"))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(15.0))
+                        .text_color(colors.ink)
+                        .px_2()
+                        .pb_2(),
+                )
+                .children(nav_items(page))
                 .child(view().flex_1())
-                .child(ghost_button("完成", controller::close_settings)),
-        )
+                .child(
+                    text(move || match catalogs.get() {
+                        Catalogs::Loading => "正在读取…".to_owned(),
+                        Catalogs::Failed(e) => format!("读取失败：{e}"),
+                        _ => String::new(),
+                    })
+                    .px_2()
+                    .text_size(px(11.0))
+                    .text_color(colors.faint),
+                )
+                .child(caption(concat!("Vantry v", env!("CARGO_PKG_VERSION"))))
+                .into_element()
+        }
+    })
 }
 
 /// The last operation's outcome, over the page.
 fn feedback_line() -> impl IntoElement {
+    let colors = palette();
     let feedback = computed(|| controller::ui().with(|u| u.forms.feedback.clone()));
     when(
         move || feedback.with(Option::is_some),
@@ -188,16 +268,16 @@ fn feedback_line() -> impl IntoElement {
                 .gap_2()
                 .px_5()
                 .py_1p5()
-                .bg(move || if ok() { PALETTE.soft } else { PALETTE.approval })
+                .bg(move || if ok() { colors.soft } else { colors.approval })
                 .border_b_1()
-                .border_b_color(PALETTE.line_soft)
-                .child(super::dot(move || if ok() { PALETTE.success } else { PALETTE.danger }))
+                .border_b_color(colors.line_soft)
+                .child(super::dot(move || if ok() { colors.success } else { colors.danger }))
                 .child(
                     text(move || feedback.with(|f| f.as_ref().map(|f| f.text.clone()).unwrap_or_default()))
                         .flex_1()
                         .select_text()
                         .text_size(px(12.0))
-                        .text_color(PALETTE.ink),
+                        .text_color(colors.ink),
                 )
                 .child(link_button("✕", controller::dismiss_feedback).accessibility_label("关闭提示"))
         },
@@ -206,6 +286,7 @@ fn feedback_line() -> impl IntoElement {
 
 /// Which of the page's sections the Core did not serve.
 fn degraded_note(page: Memo<Option<SettingsPage>>, data: Data) -> impl IntoElement {
+    let colors = palette();
     let note = computed(move || {
         let Some(page) = page.get() else {
             return String::new();
@@ -223,7 +304,7 @@ fn degraded_note(page: Memo<Option<SettingsPage>>, data: Data) -> impl IntoEleme
             if missing.is_empty() {
                 String::new()
             } else {
-                format!("Core 暂未提供：{}；以下显示本机可读的信息。", missing.join("、"))
+                format!("部分设置暂不可用：{}", missing.join("、"))
             }
         })
     });
@@ -234,37 +315,40 @@ fn degraded_note(page: Memo<Option<SettingsPage>>, data: Data) -> impl IntoEleme
                 .px_3()
                 .py_1p5()
                 .rounded(px(8.0))
-                .bg(PALETTE.soft)
+                .bg(colors.soft)
                 .text_size(px(11.5))
                 .line_height(LineHeight::Multiple(1.45))
-                .text_color(PALETTE.muted)
+                .text_color(colors.muted)
         },
     )
 }
 
 fn title(label: &str) -> Text {
-    text(label.to_owned())
+    let colors = palette();
+    text(crate::tr(label).to_owned())
         .font_weight(FontWeight::SEMIBOLD)
         .text_size(px(16.0))
-        .text_color(PALETTE.ink)
+        .text_color(colors.ink)
 }
 
 fn hint(label: impl IntoReactive<SharedString>) -> Text {
+    let colors = palette();
     text(label)
         .text_size(px(12.0))
         .line_height(LineHeight::Multiple(1.45))
-        .text_color(PALETTE.muted)
+        .text_color(colors.muted)
 }
 
 fn card() -> View {
+    let colors = palette();
     view()
         .flex_col()
         .gap_1()
         .p_3()
         .rounded(px(metrics::CARD_RADIUS))
-        .bg(PALETTE.card)
+        .bg(colors.card)
         .border_1()
-        .border_color(PALETTE.line)
+        .border_color(colors.line)
 }
 
 /// Whether settings operation `key` runs.
@@ -279,22 +363,23 @@ fn field(
     on_change: impl Fn(&str) + 'static,
     placeholder: &'static str,
 ) -> impl IntoElement {
+    let colors = palette();
     nsh_base::input()
         .value(value)
         .on_change(on_change)
         .placeholder(placeholder)
-        .placeholder_color(move || color(PALETTE.faint))
+        .placeholder_color(move || color(colors.faint))
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .flex_1()
         .px_2()
         .py_1()
         .rounded(px(7.0))
-        .bg(PALETTE.canvas)
+        .bg(colors.canvas)
         .border_1()
-        .border_color(PALETTE.line)
+        .border_color(colors.line)
         .text_size(px(12.5))
-        .text_color(PALETTE.ink)
+        .text_color(colors.ink)
 }
 
 /// A field whose text is hidden (keys, pairing codes).
@@ -303,51 +388,178 @@ fn secret_field(
     on_change: impl Fn(&str) + 'static,
     placeholder: &'static str,
 ) -> impl IntoElement {
+    let colors = palette();
     nsh_base::input()
         .masked(true)
         .value(value)
         .on_change(on_change)
         .placeholder(placeholder)
-        .placeholder_color(move || color(PALETTE.faint))
+        .placeholder_color(move || color(colors.faint))
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .flex_1()
         .px_2()
         .py_1()
         .rounded(px(7.0))
-        .bg(PALETTE.canvas)
+        .bg(colors.canvas)
         .border_1()
-        .border_color(PALETTE.line)
+        .border_color(colors.line)
         .text_size(px(12.5))
-        .text_color(PALETTE.ink)
+        .text_color(colors.ink)
 }
 
 fn row() -> View {
     view().flex_row().items_center().gap_2()
 }
 
-// --------------------------------------------------------------- general
+fn setting_label(label: &'static str) -> Text {
+    text(crate::tr(label)).text_size(px(13.5)).text_color(palette().ink)
+}
+
+fn general_page() -> impl IntoElement {
+    let enter = computed(|| controller::ui().with(|u| u.send_with_enter));
+    let colors = palette();
+    view()
+        .flex_col()
+        .gap_3()
+        .child(title("语言与输入"))
+        .child(
+            card()
+                .gap_3()
+                .child(
+                    row()
+                        .min_h(px(44.0))
+                        .child(
+                            view()
+                                .flex_1()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(setting_label("界面语言").font_weight(FontWeight::MEDIUM))
+                                .child(hint("切换后立即生效，包括菜单、提示与自动提交摘要语言。")),
+                        )
+                        .child(
+                            nsh_base::button()
+                                .on_press(|| {
+                                    let items = crate::state::language::Language::ALL
+                                        .into_iter()
+                                        .map(|language| {
+                                            MenuItem::new(language.name())
+                                                .checked(
+                                                    controller::ui()
+                                                        .with_untracked(|u| u.locale == language),
+                                                )
+                                                .on_select(move || {
+                                                    controller::ui()
+                                                        .update(|u| u.locale = language)
+                                                })
+                                        })
+                                        .collect();
+                                    drop(popup_menu(items));
+                                })
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .h(px(32.0))
+                                .px_3()
+                                .rounded(px(8.0))
+                                .bg(colors.canvas)
+                                .border_1()
+                                .border_color(colors.line)
+                                .hover(|s| s.bg(colors.soft))
+                                .child(
+                                    text(|| controller::ui().with(|u| u.locale.name()))
+                                        .text_size(px(12.5))
+                                        .text_color(colors.ink),
+                                )
+                                .child(crate::icons::icon(
+                                    crate::icons::Icon::ChevronDown,
+                                    12.0,
+                                    colors.faint,
+                                )),
+                        ),
+                )
+                .child(
+                    row()
+                        .flex_wrap()
+                        .min_h(px(48.0))
+                        .pt_2p5()
+                        .border_t_1()
+                        .border_t_color(colors.line_soft)
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(220.0))
+                                .flex_col()
+                                .gap_0p5()
+                                .child(setting_label("发送快捷键").font_weight(FontWeight::MEDIUM))
+                                .child(hint(
+                                    "默认 Enter 发送，⌘ Enter / Shift+Enter 换行；运行中按住 Ctrl 点击发送可临时切换排队与追加。",
+                                )),
+                        )
+                        .child(segments().children([false, true].map(move |value| {
+                            segment(
+                                crate::tr(if value {
+                                    "Enter 发送"
+                                } else {
+                                    "Ctrl Enter 发送"
+                                }),
+                                move || enter.get() == value,
+                                move || controller::ui().update(|u| u.send_with_enter = value),
+                            )
+                        }))),
+                ),
+        )
+        .child(title("子任务"))
+        .child(card().child(switch_row(
+            crate::tr("子任务自动续行"),
+            crate::tr("子任务全部完成后，父任务自动带着结果继续。"),
+            || controller::ui().with(|u| !u.manual_delivery),
+            || controller::ui().update(|u| u.manual_delivery = !u.manual_delivery),
+        )))
+}
+
+pub(crate) fn dock_catalog(mcp: bool) -> impl IntoElement {
+    let data = computed(|| {
+        controller::ui().with(|u| match &u.catalogs {
+            Catalogs::Loaded(d) => Some(d.clone()),
+            _ => None,
+        })
+    });
+    scroll().flex_1().child(
+        view()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .child(feedback_line())
+            .child(if mcp {
+                mcp_page(data).into_element()
+            } else {
+                plugins_page(data).into_element()
+            })
+            .child(link_button("刷新", controller::reload_catalogs)),
+    )
+}
 
 fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
+    let colors = palette();
     let current = computed(|| controller::state().with(|s| s.new_thread.model.clone()));
-    let provider = computed(|| controller::state().with(|s| s.new_thread.provider_id.clone()));
     let pi_provider = computed(|| controller::ui().with(|u| u.forms.pi_provider.clone()));
     let pi_model = computed(|| controller::ui().with(|u| u.forms.pi_model.clone()));
     let pi_key_set = computed(|| controller::ui().with(|u| !u.forms.pi_key.is_empty()));
-    let saving = busy("pi.setup");
+    let saving = computed(busy("pi.setup"));
+    let setup=signal(false);
+    let catalog_open=signal(false);
     view()
         .flex_col()
         .gap_2()
-        .child(title("常规与模型"))
-        .child(hint(move || format!("执行器：{}（新会话使用）", provider.get())))
-        // The Pi runtime.
+        .child(title("Pi 执行器"))
         .child(dynamic(move || {
             let pi = data.with(|d| d.as_ref().and_then(|d| d.pi.clone()));
             match pi {
                 Some(pi) => card()
                     .child(
                         row()
-                            .child(super::dot(if pi.compat_blocked { PALETTE.danger } else { PALETTE.success }))
+                            .child(super::dot(if pi.compat_blocked { colors.danger } else { colors.success }))
                             .child(
                                 text(format!(
                                     "Pi 运行时 · {}{}",
@@ -356,11 +568,13 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                                 ))
                                 .flex_1()
                                 .text_size(px(13.0))
-                                .text_color(PALETTE.ink),
+                                .text_color(colors.ink),
                             )
+                            .child(ghost_button("配置模型", move ||setup.set(!setup.get_untracked())))
+                            .child(link_button("刷新",controller::reload_catalogs))
                             .child(when(pi.update_available, {
                                 let latest = pi.latest_version.clone();
-                                move || badge(format!("可更新 {latest}"), PALETTE.accent)
+                                move || badge(format!("可更新 {latest}"), colors.accent)
                             })),
                     )
                     .child(when(!pi.compat_reason.is_empty(), {
@@ -383,11 +597,12 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                             ))
                     })
                     .into_element(),
-                None => hint("Pi 运行时状态由 Core 提供；连接后在此显示。").into_element(),
+                None => hint("Pi 状态暂不可用").into_element(),
             }
         }))
-        // Quick setup: provider, key (masked), default model.
-        .child(
+        .child(card().child(caption("Pi 运行时与配置")).child(hint(move ||data.with(|d|d.as_ref().and_then(|d|d.pi.as_ref()).map(|pi|format!("{}\n{}",pi.active_path,pi.agent_dir)).unwrap_or_default()))))
+        .child(row().child(title("MCP").flex_1()).child(ghost_button("管理 MCP",||{controller::close_settings();controller::select_dock_tab(crate::state::workbench::DockTab::Mcp);})))
+        .child(when(move ||setup.get(),move ||
             card()
                 .gap_2()
                 .child(caption("快速配置"))
@@ -402,24 +617,24 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                 .child(
                     row()
                         .child(view().flex_1())
-                        .child(primary_button(move || if saving() { "保存中…" } else { "保存配置" }, controller::pi_setup_save).disabled(busy("pi.setup"))),
-                ),
-        )
-        // The catalog.
+                        .child(primary_button(move || if saving.get() { "保存中…" } else { "保存配置" }, controller::pi_setup_save).disabled(busy("pi.setup"))),
+                )))
+        .child(ghost_button("模型目录",move ||catalog_open.set(!catalog_open.get_untracked())))
         .child(dynamic(move || {
+            if !catalog_open.get(){return view().into_element();}
             let Some(data) = data.get() else {
                 return text(move || match catalogs.get() {
                     Catalogs::Failed(e) => format!("读取失败：{e}"),
                     _ => "正在读取模型目录…".to_owned(),
                 })
                 .text_size(px(12.0))
-                .text_color(PALETTE.faint)
+                .text_color(colors.faint)
                 .into_element();
             };
             let ids: Vec<String> = data.models.models.iter().flatten().map(|m| m.id.clone()).collect();
             let mut column = view().flex_col().gap_2();
             for warning in &data.models.warnings {
-                column = column.child(text(warning.clone()).text_size(px(12.0)).text_color(PALETTE.warning));
+                column = column.child(text(warning.clone()).text_size(px(12.0)).text_color(colors.warning));
             }
             if !data.models.thinking_levels.is_empty() {
                 let levels = data.models.thinking_levels.clone();
@@ -464,7 +679,7 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                                 view()
                                     .flex_1()
                                     .flex_col()
-                                    .child(text(if model.name.is_empty() { model.id.clone() } else { model.name.clone() }).text_size(px(13.0)).text_color(PALETTE.ink))
+                                    .child(text(if model.name.is_empty() { model.id.clone() } else { model.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
                                     .child(
                                         text(format!(
                                             "{} · 上下文 {}k{}",
@@ -474,10 +689,10 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                                         ))
                                         .font_family(MONO)
                                         .text_size(px(11.0))
-                                        .text_color(PALETTE.faint),
+                                        .text_color(colors.faint),
                                     ),
                             )
-                            .child(when(data.models.default == model.id, || badge("Core 默认", PALETTE.muted)))
+                            .child(when(data.models.default == model.id, || badge("Core 默认", colors.muted)))
                             .child(pill(
                                 {
                                     let on = on.clone();
@@ -493,9 +708,8 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
         }))
 }
 
-// -------------------------------------------------------------------- MCP
-
 fn mcp_page(data: Data) -> impl IntoElement {
+    let colors = palette();
     let enabled = computed(|| controller::ui().with(|u| u.extensions_enabled));
     let draft_open = computed(|| controller::ui().with(|u| u.forms.mcp_draft.is_some()));
     view()
@@ -519,7 +733,7 @@ fn mcp_page(data: Data) -> impl IntoElement {
             let Some(data) = data.get() else {
                 return hint("正在读取 MCP 目录…").into_element();
             };
-            let mcp = data.mcp;
+            let mcp = &data.mcp;
             let mut column = view().flex_col().gap_2();
             if !mcp.notice.is_empty() {
                 column = column.child(hint(mcp.notice.clone()));
@@ -532,21 +746,21 @@ fn mcp_page(data: Data) -> impl IntoElement {
                     row()
                         .child(caption(format!("项目配置：{}", mcp.project_file)).flex_1())
                         .child(if mcp.project_trusted {
-                            badge("已信任", PALETTE.success).into_element()
+                            badge("已信任", colors.success).into_element()
                         } else {
                             link_button("信任项目配置", controller::mcp_trust).disabled(busy("mcp.trust")).into_element()
                         }),
                 );
             }
             if !mcp.probe_error.is_empty() {
-                column = column.child(text(mcp.probe_error.clone()).text_size(px(11.5)).text_color(PALETTE.danger));
+                column = column.child(text(mcp.probe_error.clone()).text_size(px(11.5)).text_color(colors.danger));
             }
-            let servers = mcp.servers.unwrap_or_default();
+            let servers = mcp.servers.as_deref().unwrap_or_default();
             if servers.is_empty() {
                 column = column.child(hint("还没有 MCP 服务器。"));
             }
             for server in servers {
-                column = column.child(mcp_row(server));
+                column = column.child(mcp_row(server.clone()));
             }
             column.into_element()
         }))
@@ -608,6 +822,7 @@ fn mcp_form() -> impl IntoElement {
 }
 
 fn mcp_row(server: MCPServerInfo) -> impl IntoElement {
+    let colors = palette();
     let name = server.name.clone();
     let catalog_on = server.enabled;
     let on = {
@@ -629,32 +844,32 @@ fn mcp_row(server: MCPServerInfo) -> impl IntoElement {
     } else {
         (server.live_state.clone(), false)
     };
+    let toggle_scope=server.scope.clone();
     let toggle_name = name.clone();
     let probe_name = name.clone();
     let remove_name = name.clone();
     card()
         .child(switch_row(name.clone(), detail, on.clone(), move || {
-            controller::mcp_set_enabled(toggle_name.clone(), !on())
+            controller::mcp_set_enabled(toggle_name.clone(),toggle_scope.clone(), !on())
         }))
         .child(
             row()
                 .child(when(!state.is_empty(), move || {
-                    badge(state.clone(), if bad { PALETTE.danger } else { PALETTE.success })
+                    badge(state.clone(), if bad { colors.danger } else { colors.success })
                 }))
                 .child(view().flex_1())
                 .child(link_button("测试探活", move || controller::mcp_probe(probe_name.clone())).disabled(busy(format!("mcp.probe:{name}"))))
-                .child(link_button("删除", move || controller::mcp_remove(remove_name.clone())).disabled(busy(format!("mcp:{}", server.name)))),
+                .child(link_button("删除", move || controller::mcp_remove(remove_name.clone(),server.scope.clone())).disabled(busy(format!("mcp:{}", server.name)))),
         )
 }
 
-// ---------------------------------------------------------------- plugins
-
 fn plugins_page(data: Data) -> impl IntoElement {
+    let source=signal(String::new());
     view()
         .flex_col()
         .gap_2()
         .child(title("插件"))
-        .child(hint("插件由 Core 插件宿主运行；原生面板在主区域打开，动作经 plugins.run 回传。"))
+        .child(row().child(field(move ||source.get(),move |s|source.set(s.into()),"插件目录、归档路径或 GitHub 仓库")).child(ghost_button("安装插件",move ||{let mut request=actions::request("plugins.install");request.name=source.get_untracked().trim().to_owned();controller::settings_op("plugin.install",request,"已安装插件");}).disabled(move || source.get().trim().is_empty() || busy("plugin.install")())) )
         .child(dynamic(move || {
             let Some(data) = data.get() else {
                 return hint("正在读取插件…").into_element();
@@ -663,14 +878,15 @@ fn plugins_page(data: Data) -> impl IntoElement {
                 return hint("没有已安装的插件。").into_element();
             }
             let mut column = view().flex_col().gap_2();
-            for plugin in data.plugins {
-                column = column.child(plugin_row(plugin));
+            for plugin in &data.plugins {
+                column = column.child(plugin_row(plugin.clone()));
             }
             column.into_element()
         }))
 }
 
 fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
+    let colors = palette();
     let id = plugin.id.clone();
     let enabled = !plugin.disabled;
     let mut opens: Vec<(String, String)> = plugin
@@ -694,13 +910,13 @@ fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
                 .flex_wrap()
                 .child(badge(
                     if plugin.has_update { format!("{} → {}", plugin.version, plugin.latest_version) } else if plugin.version.is_empty() { "—".to_owned() } else { plugin.version.clone() },
-                    if plugin.has_update { PALETTE.accent } else { PALETTE.muted },
+                    if plugin.has_update { colors.accent } else { colors.muted },
                 ))
-                .child(when(plugin.builtin, || badge("内置", PALETTE.muted)))
-                .child(when(plugin.needs_process_grant && !plugin.granted, || badge("需授权进程", PALETTE.warning)))
+                .child(when(plugin.builtin, || badge("内置", colors.muted)))
+                .child(when(plugin.needs_process_grant && !plugin.granted, || badge("需授权进程", colors.warning)))
                 .child(when(!plugin.error.is_empty(), {
                     let error = plugin.error.clone();
-                    move || badge(error.clone(), PALETTE.danger)
+                    move || badge(error.clone(), colors.danger)
                 }))
                 .child(view().flex_1())
                 .children(opens.into_iter().map(|(page, label)| {
@@ -710,9 +926,8 @@ fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
         )
 }
 
-// ----------------------------------------------------------------- remote
-
 fn remote_page(data: Data) -> impl IntoElement {
+    let colors = palette();
     let target = computed(|| controller::ui().with(|u| u.remote_target.clone()));
     let code = computed(|| controller::ui().with(|u| u.forms.pair_code.clone()));
     let name = computed(|| controller::ui().with(|u| u.forms.pair_name.clone()));
@@ -720,12 +935,11 @@ fn remote_page(data: Data) -> impl IntoElement {
     view()
         .flex_col()
         .gap_2()
-        .child(title("远端互联与配对"))
+        .child(row().child(title("远端互联与配对").flex_1()).child(link_button("刷新",controller::reload_catalogs)))
         .child(hint(move || match target.get() {
             Some(target) => format!("当前连接：{target}"),
             None => "当前连接：本机 Core".to_owned(),
         }))
-        // This machine: status and a one-time code.
         .child(dynamic(move || {
             let remote = data.with(|d| d.as_ref().and_then(|d| d.remote.clone()));
             let Some(remote) = remote else {
@@ -736,8 +950,8 @@ fn remote_page(data: Data) -> impl IntoElement {
                 .gap_2()
                 .child(
                     row()
-                        .child(super::dot(if ok { PALETTE.success } else if remote.error.is_empty() { PALETTE.faint } else { PALETTE.danger }))
-                        .child(text(remote.summary()).flex_1().text_size(px(13.0)).text_color(PALETTE.ink))
+                        .child(super::dot(if ok { colors.success } else if remote.error.is_empty() { colors.faint } else { colors.danger }))
+                        .child(text(remote.summary()).flex_1().text_size(px(13.0)).text_color(colors.ink))
                         .child(ghost_button(move || if busy("pair.create")() { "生成中…" } else { "生成配对码" }, controller::pair_create).disabled(busy("pair.create"))),
                 );
             if !remote.pairing_code.is_empty() {
@@ -747,7 +961,7 @@ fn remote_page(data: Data) -> impl IntoElement {
                     row()
                         .p_2()
                         .rounded(px(8.0))
-                        .bg(PALETTE.soft)
+                        .bg(colors.soft)
                         .child(
                             text(code)
                                 .select_text()
@@ -755,7 +969,7 @@ fn remote_page(data: Data) -> impl IntoElement {
                                 .font_family(MONO)
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_size(px(15.0))
-                                .text_color(PALETTE.ink),
+                                .text_color(colors.ink),
                         )
                         .child(when(!remote.pairing_expires_at.is_empty(), {
                             let at = remote.pairing_expires_at.clone();
@@ -767,7 +981,6 @@ fn remote_page(data: Data) -> impl IntoElement {
             }
             c.into_element()
         }))
-        // Redeem a code from another machine.
         .child(
             card()
                 .gap_2()
@@ -799,10 +1012,6 @@ fn remote_page(data: Data) -> impl IntoElement {
                     column = column.child(client_row(client.clone(), confirm.as_deref() == Some(client.id.as_str())));
                 }
             }
-            column = column.child(caption(format!("SSH 主机 · {}", data.ssh_hosts.len())));
-            for host in data.ssh_hosts.clone() {
-                column = column.child(ssh_row(host));
-            }
             column = column.child(caption(format!("远端环境 · {}", data.environments.len())));
             for env in data.environments.clone() {
                 column = column.child(environment_row(env));
@@ -827,10 +1036,11 @@ fn short_time(at: &str) -> String {
 }
 
 fn revoke_buttons(id: String, confirming: bool, label: &'static str) -> AnyElement {
+    let colors = palette();
     if confirming {
         let yes = id.clone();
         row()
-            .child(text("确认撤销？").text_size(px(11.5)).text_color(PALETTE.danger))
+            .child(text("确认撤销？").text_size(px(11.5)).text_color(colors.danger))
             .child(link_button("撤销", move || controller::peer_revoke(yes.clone())).disabled(busy(format!("revoke:{id}"))))
             .child(link_button("取消", || controller::ask_revoke(None)))
             .into_element()
@@ -840,12 +1050,13 @@ fn revoke_buttons(id: String, confirming: bool, label: &'static str) -> AnyEleme
 }
 
 fn peer_row(peer: RemotePeer, confirming: bool) -> impl IntoElement {
+    let colors = palette();
     let id = peer.id.clone();
     let reach = match peer.reachable {
-        Some(true) if peer.latency_ms > 0 => (format!("在线 · {} ms", peer.latency_ms), PALETTE.success),
-        Some(true) => ("在线".to_owned(), PALETTE.success),
-        Some(false) => ("离线".to_owned(), PALETTE.muted),
-        None => ("未检测".to_owned(), PALETTE.faint),
+        Some(true) if peer.latency_ms > 0 => (format!("在线 · {} ms", peer.latency_ms), colors.success),
+        Some(true) => ("在线".to_owned(), colors.success),
+        Some(false) => ("离线".to_owned(), colors.muted),
+        None => ("未检测".to_owned(), colors.faint),
     };
     let rd_id = id.clone();
     card().child(
@@ -854,7 +1065,7 @@ fn peer_row(peer: RemotePeer, confirming: bool) -> impl IntoElement {
                 view()
                     .flex_1()
                     .flex_col()
-                    .child(text(if peer.name.is_empty() { peer.id.clone() } else { peer.name.clone() }).text_size(px(13.0)).text_color(PALETTE.ink))
+                    .child(text(if peer.name.is_empty() { peer.id.clone() } else { peer.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
                     .child(
                         text(format!(
                             "{}{}{}",
@@ -864,7 +1075,7 @@ fn peer_row(peer: RemotePeer, confirming: bool) -> impl IntoElement {
                         ))
                         .font_family(MONO)
                         .text_size(px(11.0))
-                        .text_color(PALETTE.faint),
+                        .text_color(colors.faint),
                     ),
             )
             .child(badge(reach.0, reach.1))
@@ -878,9 +1089,10 @@ fn peer_row(peer: RemotePeer, confirming: bool) -> impl IntoElement {
 }
 
 fn client_row(client: RemoteClient, confirming: bool) -> impl IntoElement {
+    let colors = palette();
     card().child(
         row()
-            .child(text(client.name.clone()).flex_1().text_size(px(13.0)).text_color(PALETTE.ink))
+            .child(text(client.name.clone()).flex_1().text_size(px(13.0)).text_color(colors.ink))
             .child(when(!client.created_at.is_empty(), {
                 let at = client.created_at.clone();
                 move || caption(format!("配对于 {}", short_time(&at)))
@@ -889,107 +1101,119 @@ fn client_row(client: RemoteClient, confirming: bool) -> impl IntoElement {
     )
 }
 
-fn ssh_row(host: SSHHostInfo) -> impl IntoElement {
-    let detail = format!(
-        "{}{}{}",
-        if host.user.is_empty() { String::new() } else { format!("{}@", host.user) },
-        if host.host_name.is_empty() { host.alias.clone() } else { host.host_name.clone() },
-        if host.port > 0 { format!(":{}", host.port) } else { String::new() },
-    );
-    let reach = match host.reachable {
-        Some(true) => format!("可达 · {} ms", host.latency_ms),
-        Some(false) => "不可达".to_owned(),
-        None => "未检测".to_owned(),
-    };
-    let ok = host.reachable == Some(true);
-    card().child(
-        row()
-            .child(text(host.alias.clone()).text_size(px(13.0)).text_color(PALETTE.ink))
-            .child(text(detail).flex_1().font_family(MONO).text_size(px(11.0)).text_color(PALETTE.faint))
-            .child(badge(reach, if ok { PALETTE.success } else { PALETTE.muted })),
-    )
-}
-
 fn environment_row(env: EnvironmentEntry) -> impl IntoElement {
+    let colors = palette();
     let id = env.id.clone();
     card().child(
         row()
-            .child(text(if env.name.is_empty() { env.id.clone() } else { env.name.clone() }).text_size(px(13.0)).text_color(PALETTE.ink))
-            .child(text(env.target()).flex_1().font_family(MONO).text_size(px(11.0)).text_color(PALETTE.faint))
+            .child(text(if env.name.is_empty() { env.id.clone() } else { env.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
+            .child(text(env.target()).flex_1().font_family(MONO).text_size(px(11.0)).text_color(colors.faint))
             .child(link_button("移除", move || controller::environment_remove(id.clone())).disabled(busy(format!("env:{}", env.id)))),
     )
 }
 
 fn project_row(project: ProjectEntry) -> impl IntoElement {
+    let colors = palette();
     let id = project.id.clone();
     card().child(
         row()
-            .child(text(project.name.clone()).text_size(px(13.0)).text_color(PALETTE.ink))
-            .child(text(project.path.clone()).flex_1().font_family(MONO).text_size(px(11.0)).text_color(PALETTE.faint))
+            .child(text(project.name.clone()).text_size(px(13.0)).text_color(colors.ink))
+            .child(text(project.path.clone()).flex_1().font_family(MONO).text_size(px(11.0)).text_color(colors.faint))
             .child(link_button("移除", move || controller::project_remove(id.clone())).disabled(busy(format!("project:{}", project.id)))),
     )
 }
 
-// --------------------------------------------------------------- security
-
 fn security_page(data: Data) -> impl IntoElement {
     let policy = computed(|| controller::ui().with(|u| u.default_policy.clone()));
     let sandbox = computed(move || data.with(|d| d.as_ref().and_then(|d| d.sandbox.clone())));
-    view()
+    let content = view()
         .flex_col()
         .gap_3()
-        .child(title("安全与沙盒"))
+        .child(title("新会话默认工具权限"))
+        .child(
+            card().children(APPROVAL_POLICIES.iter().map(|(value, label)| {
+                let value = *value;
+                let (name, detail) = match value {
+                    "ask" => ("逐项询问", "执行工具前逐项确认。"),
+                    "auto-accept-edits" => (
+                        "自动改文件 · 命令询问",
+                        "文件修改自动应用；运行命令前询问你。",
+                    ),
+                    "auto" => ("自动执行", "直接运行命令与修改文件，适合可信项目。"),
+                    _ => (*label, ""),
+                };
+                nsh_base::button()
+                    .accessibility_label(name)
+                    .selected(move || policy.get() == value)
+                    .on_press(move || controller::set_default_policy(value.into()))
+                    .min_h(px(56.0))
+                    .px_3()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        view()
+                            .flex_1()
+                            .flex_col()
+                            .child(setting_label(name))
+                            .child(hint(detail)),
+                    )
+                    .child(
+                        text(move || if policy.get() == value { "◉" } else { "○" })
+                            .text_color(palette().accent),
+                    )
+            })),
+        )
+        .child(title("工作区沙箱隔离"))
         .child(
             card()
                 .gap_2()
-                .child(caption("执行沙盒"))
-                .child(hint(move || match sandbox.get() {
-                    Some(s) if s.env_override => "沙盒模式由环境变量 VANTRY_SANDBOX 指定，此处不能修改。".to_owned(),
-                    Some(_) => "工具及其子进程继承执行进程的沙盒。".to_owned(),
-                    None => "沙盒状态由 Core 提供；连接后可切换。".to_owned(),
-                }))
-                .children(SANDBOX_MODES.iter().map(|(mode, label, help)| {
-                    let mode_on = (*mode).to_owned();
-                    let mode_set = (*mode).to_owned();
-                    let needs_support = *mode == "workspace-write";
-                    row()
-                        .child(
-                            pill(*label, move || sandbox.with(|s| s.as_ref().is_some_and(|s| s.mode == mode_on)), move || {
-                                controller::sandbox_set(mode_set.clone())
-                            })
-                            .disabled(move || {
-                                busy("sandbox")()
-                                    || sandbox.with(|s| match s {
-                                        None => true,
-                                        Some(s) => s.env_override || (needs_support && !s.supported),
-                                    })
-                            }),
-                        )
-                        .child(hint(*help))
-                })),
-        )
-        .child(
-            card()
-                .gap_2()
-                .child(caption("新会话默认审批"))
-                .child(hint("bash / write / edit 等工具的确认方式；子任务继承父会话。"))
-                .child(row().children(APPROVAL_POLICIES.iter().map(|(value, label)| {
-                    let value = (*value).to_owned();
-                    let compare = value.clone();
-                    pill(*label, move || policy.get() == compare, move || controller::set_default_policy(value.clone()))
-                }))),
-        )
+                .child(when(move || sandbox.with(|s|s.as_ref().is_some_and(|v|v.env_override)),
+                    ||hint("VANTRY_SANDBOX_MODE 已锁定此设置")))
+                .children(
+                    SANDBOX_MODES
+                        .iter()
+                        .filter(|(mode, _, _)| *mode != "read-only")
+                        .map(|(mode, label, help)| {
+                            let mode_on = (*mode).to_owned();
+                            let mode_set = (*mode).to_owned();
+                            let needs_support = *mode == "workspace-write";
+                            row()
+                                .child(
+                                    pill(
+                                        *label,
+                                        move || {
+                                            sandbox.with(|s| {
+                                                s.as_ref().is_some_and(|s| s.mode == mode_on)
+                                            })
+                                        },
+                                        move || controller::sandbox_set(mode_set.clone()),
+                                    )
+                                    .disabled(move || {
+                                        busy("sandbox")()
+                                            || sandbox.with(|s| match s {
+                                                None => true,
+                                                Some(s) => {
+                                                    s.env_override
+                                                        || (needs_support && !s.supported)
+                                                }
+                                            })
+                                    }),
+                                )
+                                .child(hint(*help))
+                        }),
+                ),
+        );
+    content
 }
 
-// ----------------------------------------------------------------- update
-
 fn update_page(data: Data) -> impl IntoElement {
+    let colors = palette();
     let working = busy("update");
     view()
         .flex_col()
         .gap_2()
         .child(title("应用更新"))
-        .child(text(format!("Vantry {}（NSH 原生桌面）", env!("CARGO_PKG_VERSION"))).text_size(px(13.0)).text_color(PALETTE.ink))
+        .child(text(format!("Vantry {}", env!("CARGO_PKG_VERSION"))).text_size(px(13.0)).text_color(colors.ink))
         .child(dynamic(move || {
             let Some(update) = data.with(|d| d.as_ref().map(|d| d.update.clone())) else {
                 return hint("正在读取更新状态…").into_element();
@@ -1013,9 +1237,9 @@ fn update_page(data: Data) -> impl IntoElement {
                 .gap_2()
                 .child(
                     row()
-                        .child(super::dot(PALETTE.accent))
-                        .child(text(format!("有新版本 {}", update.latest_version)).flex_1().font_weight(FontWeight::SEMIBOLD).text_size(px(13.0)).text_color(PALETTE.ink))
-                        .child(badge(size, PALETTE.muted)),
+                        .child(super::dot(colors.accent))
+                        .child(text(format!("有新版本 {}", update.latest_version)).flex_1().font_weight(FontWeight::SEMIBOLD).text_size(px(13.0)).text_color(colors.ink))
+                        .child(badge(size, colors.muted)),
                 )
                 .child(when(!update.notes.is_empty(), {
                     let notes = update.notes.clone();
@@ -1031,7 +1255,7 @@ fn update_page(data: Data) -> impl IntoElement {
                 } else if update.delta_available {
                     "将优先下载增量包，失败时自动回退完整包。".to_owned()
                 } else {
-                    "下载后校验签名，再由 vantry-service 安装。".to_owned()
+                    "下载完成后可重启安装。".to_owned()
                 }))
                 .child(
                     row()
@@ -1052,16 +1276,15 @@ fn update_page(data: Data) -> impl IntoElement {
         )
 }
 
-// ------------------------------------------------------------------ usage
-
 fn usage_page(data: Data) -> impl IntoElement {
+    let colors = palette();
     view()
         .flex_col()
         .gap_2()
-        .child(row().child(title("用量统计")).child(view().flex_1()).child(link_button("刷新", controller::usage_refresh).disabled(busy("usage"))))
+        .child(row().child(view().flex_1()).child(link_button("刷新", controller::usage_refresh).disabled(busy("usage"))))
         .child(dynamic(move || {
             let Some(usage) = data.with(|d| d.as_ref().and_then(|d| d.usage.clone())) else {
-                return hint("用量汇总由 Core 提供；连接后在此显示。").into_element();
+                return hint("暂无用量数据").into_element();
             };
             let stat = |label: &'static str, value: String| {
                 view()
@@ -1070,11 +1293,11 @@ fn usage_page(data: Data) -> impl IntoElement {
                     .gap_0p5()
                     .p_3()
                     .rounded(px(metrics::CARD_RADIUS))
-                    .bg(PALETTE.card)
+                    .bg(colors.card)
                     .border_1()
-                    .border_color(PALETTE.line)
+                    .border_color(colors.line)
                     .child(caption(label))
-                    .child(text(value).font_weight(FontWeight::SEMIBOLD).text_size(px(17.0)).text_color(PALETTE.ink))
+                    .child(text(value).font_weight(FontWeight::SEMIBOLD).text_size(px(17.0)).text_color(colors.ink))
             };
             let mut column = view()
                 .flex_col()
@@ -1108,11 +1331,12 @@ fn usage_page(data: Data) -> impl IntoElement {
 }
 
 fn usage_row(model: ModelUsage, top: i64) -> impl IntoElement {
+    let colors = palette();
     let share = (model.total_tokens as f32 / top as f32).clamp(0.0, 1.0);
     card()
         .child(
             row()
-                .child(text(model.model.clone()).flex_1().font_family(MONO).text_size(px(12.0)).text_color(PALETTE.ink))
+                .child(text(model.model.clone()).flex_1().font_family(MONO).text_size(px(12.0)).text_color(colors.ink))
                 .child(caption(format!(
                     "{} 次 · {} · ${:.2}{}",
                     model.runs,
@@ -1126,42 +1350,108 @@ fn usage_row(model: ModelUsage, top: i64) -> impl IntoElement {
                 .h(px(4.0))
                 .flex_row()
                 .rounded_full()
-                .bg(PALETTE.soft)
-                .child(view().h(px(4.0)).flex_grow(share.max(0.01)).rounded_full().bg(PALETTE.accent))
+                .bg(colors.soft)
+                .child(view().h(px(4.0)).flex_grow(share.max(0.01)).rounded_full().bg(colors.accent))
                 .child(view().flex_grow((1.0 - share).max(0.0))),
         )
 }
 
-// ------------------------------------------------------------- appearance
-
 fn appearance_page() -> impl IntoElement {
+    let colors = palette();
     let theme = computed(|| controller::ui().with(|u| u.theme));
+    let preset = computed(|| controller::ui().with(|u| u.theme_preset));
     view()
         .flex_col()
         .gap_3()
-        .child(title("外观"))
-        .child(hint("Stardust（星尘）：浅色暖纸侧栏与白色阅读画布，深色石墨侧栏与深灰画布。"))
+        .child(title("主题风格").pt_2())
         .child(
-            row().children(ThemePreference::ALL.map(|t| {
-                pill(t.label(), move || theme.get() == t, move || controller::set_theme(t))
-            })),
+            row()
+                .flex_wrap()
+                .children(crate::theme::ThemePreset::ALL.map(move |choice| {
+                    let sw = choice.colors();
+                    nsh_base::button()
+                        .basis(px(124.0))
+                        .flex_grow(1.0)
+                        .max_w(px(170.0))
+                        .gap_2()
+                        .p_2()
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(move || {
+                            if preset.get() == choice {
+                                colors.accent
+                            } else {
+                                colors.line
+                            }
+                        })
+                        .bg(colors.card)
+                        .on_press(move || controller::ui().update(|u| u.theme_preset = choice))
+                        .child(
+                            view()
+                                .flex_row()
+                                .h(px(72.0))
+                                .rounded(px(7.0))
+                                .overflow_hidden()
+                                .bg(sw.canvas)
+                                .child(
+                                    view()
+                                        .w(px(30.0))
+                                        .bg(sw.sidebar)
+                                        .p_1()
+                                        .child(view().h(px(6.0)).rounded_full().bg(sw.accent)),
+                                )
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .p_2()
+                                        .gap_1()
+                                        .child(view().h(px(4.0)).w(px(30.0)).bg(sw.ink))
+                                        .child(view().h(px(4.0)).bg(sw.muted))
+                                        .child(
+                                            view()
+                                                .h(px(13.0))
+                                                .bg(sw.card)
+                                                .border_1()
+                                                .border_color(sw.line),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            row()
+                                .px_1()
+                                .child(
+                                    text(choice.label())
+                                        .flex_1()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_size(px(13.0))
+                                        .text_color(colors.ink),
+                                )
+                                .child(when(
+                                    move || preset.get() == choice,
+                                    move || {
+                                        crate::icons::icon(
+                                            crate::icons::Icon::Check,
+                                            14.0,
+                                            colors.accent,
+                                        )
+                                    },
+                                )),
+                        )
+                })),
         )
         .child(
-            view()
-                .flex_row()
-                .gap_3()
-                .child(swatch("侧栏", PALETTE.sidebar))
-                .child(swatch("画布", PALETTE.canvas))
-                .child(swatch("强调", PALETTE.accent))
-                .child(swatch("审批", PALETTE.approval)),
+            card().mt_3().child(
+                row()
+                    .min_h(px(36.0))
+                    .flex_wrap()
+                    .child(setting_label("明暗模式").flex_1())
+                    .child(segments().children(ThemePreference::ALL.map(|t| {
+                        segment(
+                            crate::tr(t.label()),
+                            move || theme.get() == t,
+                            move || controller::set_theme(t),
+                        )
+                    }))),
+            ),
         )
-}
-
-fn swatch(label: &'static str, fill: AdaptiveColor) -> impl IntoElement {
-    view()
-        .flex_col()
-        .items_center()
-        .gap_1()
-        .child(view().w(px(44.0)).h(px(28.0)).rounded(px(6.0)).bg(fill).border_1().border_color(PALETTE.line))
-        .child(text(label).text_size(px(11.0)).text_color(PALETTE.muted))
 }

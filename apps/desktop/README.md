@@ -6,8 +6,8 @@ Wave 2 (P2) 起对接真实 `vantry-client` / `vantry-protocol` 的 NSH 桌面�
 
 | 路径 | 职责 |
 |---|---|
-| `src/main.rs` | 解析 0.1.42 兼容命令行，启动 NSH 原生窗口（macOS AppKit / Linux GTK / Windows Win32）；`--remote` / `--peer` 也打开窗口 |
-| `src/cli.rs` | `vantry [desktop] [选项]`：兼容 Go `flag`；`core`、`ctl`、`provider-worker`、`relay`、`rd-relay`、`apply-update` 连同原始参数转交服务程序；`--socket`、`--mock`；`Endpoint` 路由（本机 / 演示 / SSH / 配对主机）与 `desktop-state.json` 路径 |
+| `src/main.rs` | 解析 0.1.42 兼容命令行，启动 NSH 原生窗口（macOS AppKit / Linux GTK / Windows Win32）；`--peer` 也打开窗口 |
+| `src/cli.rs` | `vantry [desktop] [选项]`：兼容 Go `flag`；`core`、`ctl`、`provider-worker`、`relay`、`rd-relay`、`apply-update` 连同原始参数转交服务程序；`--socket`、`--mock`；`Endpoint` 路由（本机 / 演示 / 配对主机）与 `desktop-state.json` 路径 |
 | `src/service.rs` | 查找 `vantry-service` / `vantry-relay`（本程序目录 → `libexec` → `PATH`，跳过自身）；Unix 以 `exec` 透明替换进程（参数、信号、退出码不变），其他平台等待子进程并转交退出码；找不到时给出中文提示（退出码 127）；生成 `ensure-core` 参数（数据目录、非默认 socket、provider、model、`--controlled-delay` 等 Core 参数、工作区） |
 | `src/autostart.rs` | 本机目标且非 `--mock` / `--attach-only` 时：`/v1/health` 不可达 → 运行 `vantry-service ensure-core …`（60 s 超时、`kill_on_drop`）→ 轮询 health 至就绪（20 s），连接层显示「正在启动本地 Core…」；失败时保留错误提示并继续重连 |
 | `src/bridge.rs` | `CoreBridge` trait、错误分类（`ClientError` 映射）、事件类型名、`connect(Endpoint)`、`RemoteBridge`（远端传输未接入时返回 `not_ready`，窗口保持重试） |
@@ -60,4 +60,4 @@ cargo test --locked -p vantry-desktop
 
 服务端合同（由 `vantry-service` 实现）：`vantry-service ensure-core --data-dir <目录> [--socket …] --provider … [--model …] [--controlled-delay …] [--pi-executable …] [--magpie-settings …] [--workspace-kind … --workspace … --repository … --branch … --base-ref …]`，Core 已运行或启动完成后以 0 退出；工作台动作名见 `workbench/actions.rs::names`。
 
-尚未覆盖：远端传输（SSH 转发、配对主机直连 / 中继，`--remote` / `--peer` 仍为 `RemoteBridge`）、远程桌面媒体帧（画布容器 `vantry-remote-desktop-canvas`，会话状态已接 `rd.*`），以及真机 IME、长流式滚动、焦点、键盘 Esc 与掩码输入的人工验收。
+尚未覆盖：远端传输（配对主机直连 / 中继，`--peer` 使用 `RemoteBridge`）、远程桌面媒体帧（画布容器 `vantry-remote-desktop-canvas`，会话状态已接 `rd.*`），以及真机 IME、长流式滚动、焦点、键盘 Esc 与掩码输入的人工验收。

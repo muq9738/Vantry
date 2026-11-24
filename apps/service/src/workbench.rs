@@ -26,6 +26,7 @@ pub struct Workbench {
     pub options: CoreOptions,
     magpie: Option<PathBuf>,
     pub identity: Arc<IdentityStore>,
+    pub federator: Arc<crate::federation::Federator>,
     invitations: vantry_connectivity::bootstrap::Publisher,
     updater: AsyncMutex<UpdateManager>,
     plugins: Mutex<plugins::Host>,
@@ -50,6 +51,10 @@ impl Workbench {
     pub fn new(core: Core, options: CoreOptions, magpie: Option<PathBuf>) -> Result<Self> {
         let data = core.directory();
         let identity = Arc::new(IdentityStore::open(data, "Vantry")?);
+        let federator = Arc::new(crate::federation::Federator::open(
+            data.to_owned(),
+            identity.clone(),
+        )?);
         let updater = AsyncMutex::new(UpdateManager::new(UpdateOptions {
             data_dir: Some(data.into()),
             ..Default::default()
@@ -75,6 +80,7 @@ impl Workbench {
             magpie,
             invitations: vantry_connectivity::bootstrap::Publisher::new(identity.clone())?,
             identity,
+            federator,
             updater,
             plugins,
             desktop: AsyncMutex::new(None),
@@ -145,13 +151,39 @@ impl Workbench {
             "usage.summary" => {
                 out.output = crate::usage::summary(&self.core, &self.options.model, &r.thread_id)?;
             }
-            "workspace" | "files.list" | "files.read" | "reply.image" | "terminal.open" => {
+            "workspace" | "files.list" | "files.read" | "files.search" | "reply.image"
+            | "terminal.open" => {
                 return tokio::task::block_in_place(|| self.workspace(r));
+            }
+            "skills.list" => {
+                return tokio::task::block_in_place(|| self.skills(r));
             }
             s if s.starts_with("git.") => return tokio::task::block_in_place(|| self.git(r)),
             "projects.list" | "projects.add" | "projects.remove" => return self.projects(r),
             "environments.list" | "environments.upsert" | "environments.remove" => {
                 return self.environments(r);
+            }
+            "orchestration.environments" => {
+                let mut entries = vec![];
+                for peer in &self.identity.snapshot().peers {
+                    entries.push(json!({
+                        "environmentId": peer.id,
+                        "name": peer.pair.name,
+                        "transport": "paired",
+                    }));
+                }
+                if let Ok(catalog) = environments::Catalog::open(data)
+                    && let Ok(list) = catalog.load()
+                {
+                    for env in list.into_iter().filter(|e| e.kind == environments::Kind::Remote) {
+                        entries.push(json!({
+                            "environmentId": env.id,
+                            "name": env.name,
+                            "transport": "paired",
+                        }));
+                    }
+                }
+                out.output = json!({"environments": entries}).to_string();
             }
             "environment.info" => {
                 let host = self.identity.snapshot().host;
@@ -165,16 +197,22 @@ impl Workbench {
                 .to_string();
             }
             "environment.directories" => return self.directories(r),
-            "ssh.hosts" => {
-                out.ssh_hosts = vantry_platform::sshconfig::discover(
-                    &user_home_dir().context("missing home")?,
-                    false,
-                )?
-            }
             s if s.starts_with("plugins.") => {
                 return tokio::task::block_in_place(|| self.plugins(r));
             }
-            "remote.status" | "remote.peers.list" => return self.remote_status(),
+            "remote.status" | "remote.peers.list" | "access.status" | "access.discover" => return self.remote_status(),
+            "rd.permissions" => {
+                use vantry_platform::hostplatform::{Capabilities, Permission};
+                let caps = Capabilities::probe();
+                let access = |p: &Permission| json!({"state": match p {
+                    Permission::Granted => "granted", Permission::Denied => "denied",
+                    Permission::Unavailable => "unavailable", Permission::Unknown => "unknown",
+                }, "canRequest": false, "canOpenSettings": false});
+                out.output = json!({"platform": if cfg!(target_os = "macos") { "darwin" } else { caps.os },
+                    "screenCapture":access(&caps.screen_capture), "inputControl":access(&caps.accessibility),
+                    "canHost":matches!(caps.screen_capture, Permission::Granted) && matches!(caps.accessibility, Permission::Granted)
+                }).to_string();
+            }
             "remote.pair.create" => return self.pair().await,
             "remote.pair.redeem" => return self.redeem(r).await,
             "remote.peers.revoke" => return self.revoke(r),
@@ -273,6 +311,10 @@ impl Workbench {
                 }
                 out.output = json!({"entries":entries}).to_string();
             }
+            "files.search" => {
+                let matches = crate::workbench_git::search_files(&root, &r.message, 40)?;
+                out.output = json!({"results": matches}).to_string();
+            }
             "files.read" => {
                 let bytes = workspace::read(
                     &root,
@@ -321,6 +363,17 @@ impl Workbench {
             _ => {}
         }
 
+        Ok(out)
+    }
+    fn skills(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
+        let mut out = WorkbenchResponse::default();
+        let cwd = match self.root(&r)? {
+            Some(path) => path,
+            None => self.core.directory().to_owned(),
+        };
+        let skills = vantry_pi_runtime::discover_skills(&vantry_pi_runtime::agent_dir(), &cwd);
+        out.workspace = cwd.display().to_string();
+        out.output = json!({"skills": skills}).to_string();
         Ok(out)
     }
     fn changes(&self, query: Option<&str>) -> Result<Value> {
@@ -397,12 +450,125 @@ impl Workbench {
         let mut out = WorkbenchResponse::default();
         let input = r.input.as_ref().unwrap_or(&Value::Null);
         let s = r.action.as_str();
+        if matches!(
+            s,
+            "git.worktree.status" | "git.worktree.merge_cleanup" | "git.worktree.cleanup"
+        ) {
+            let spec = if !r.thread_id.is_empty() {
+                self.core
+                    .thread_detail(&r.thread_id, 0)
+                    .ok()
+                    .and_then(|d| d.thread.workspace)
+            } else {
+                None
+            };
+            let checkout = self.root(&r).ok().flatten();
+            if let Some(ref p) = checkout {
+                out.workspace = p.display().to_string();
+            }
+            out.output = match s {
+                "git.worktree.status" => crate::workbench_git::worktree_status(
+                    self.core.directory(),
+                    &r.thread_id,
+                    checkout.as_deref(),
+                    spec.as_ref(),
+                )?
+                .to_string(),
+                "git.worktree.merge_cleanup" => {
+                    crate::workbench_git::worktree_cleanup(self.core.directory(), &r.thread_id, true)?
+                        .to_string()
+                }
+                "git.worktree.cleanup" => crate::workbench_git::worktree_cleanup(
+                    self.core.directory(),
+                    &r.thread_id,
+                    false,
+                )?
+                .to_string(),
+                _ => unreachable!(),
+            };
+            return Ok(out);
+        }
 
         let root = self.root(&r)?.context("workspace required")?;
         out.workspace = root.display().to_string();
+        if matches!(
+            s,
+            "git.checkpoints.list"
+                | "git.checkpoints.capture"
+                | "git.checkpoints.diff"
+                | "git.checkpoints.restore"
+        ) {
+            let repo = match git::Repository::discover(&root) {
+                Ok(v) => v,
+                Err(_) if s == "git.checkpoints.list" => {
+                    out.output = json!({"checkpoints": []}).to_string();
+                    return Ok(out);
+                }
+                Err(e) => return Err(e),
+            };
+            let repo_root = repo.root();
+            match s {
+                "git.checkpoints.list" => {
+                    let list = crate::workbench_git::list_checkpoints(repo_root)?;
+                    out.output = json!({"checkpoints": list}).to_string();
+                }
+                "git.checkpoints.capture" => {
+                    let cp =
+                        crate::workbench_git::capture_checkpoint(repo_root, &r.name, &r.message)?;
+                    out.output = json!({"checkpoint": cp}).to_string();
+                }
+                "git.checkpoints.diff" => {
+                    out.output = crate::workbench_git::diff_checkpoint(repo_root, &r.name)?;
+                }
+                "git.checkpoints.restore" => {
+                    if !r.thread_id.is_empty() {
+                        ensure!(
+                            !self
+                                .core
+                                .thread_detail(&r.thread_id, 50)?
+                                .runs
+                                .into_iter()
+                                .flatten()
+                                .any(|run| !run.status.terminal()),
+                            "请等待会话任务结束后再恢复工作区快照"
+                        );
+                    }
+                    out.output =
+                        crate::workbench_git::restore_checkpoint(repo_root, &r.name)?.to_string();
+                }
+                _ => unreachable!(),
+            }
+            return Ok(out);
+        }
+
         let repo = git::Repository::discover(&root)?;
         let root = root.canonicalize()?;
         let prefix = root.strip_prefix(repo.root())?;
+        if s == "git.log" {
+            let commits = crate::workbench_git::git_log(repo.root(), &r)?;
+            out.git = Some(GitState {
+                root: repo.root().display().to_string(),
+                branch: repo.branch().unwrap_or_default(),
+                commits,
+                ..Default::default()
+            });
+            return Ok(out);
+        }
+        if s == "git.commit_detail" {
+            out.output = crate::workbench_git::git_commit_detail(repo.root(), &r.name)?.to_string();
+            return Ok(out);
+        }
+        if s == "git.compare" {
+            out.output =
+                crate::workbench_git::git_compare(repo.root(), &r.branch, &r.name)?.to_string();
+            return Ok(out);
+        }
+        if s == "git.commit_op" && r.message.trim() == "patch" {
+            if let Some(patch) = crate::workbench_git::handle_extra_git_action(&repo, &r, input)? {
+                out.output = patch;
+                return Ok(out);
+            }
+        }
         let selected: Vec<_> = r
             .paths
             .iter()
@@ -424,15 +590,17 @@ impl Workbench {
         } else {
             paths.clone()
         };
-        if !matches!(s, "git.status" | "git.branches" | "git.diff") && !r.thread_id.is_empty() {
+        if !matches!(s, "git.status" | "git.branches" | "git.diff" | "git.fetch")
+            && !r.thread_id.is_empty()
+        {
             ensure!(
                 !self
                     .core
-                    .snapshot()?
+                    .thread_detail(&r.thread_id, 50)?
                     .runs
                     .into_iter()
                     .flatten()
-                    .any(|run| run.thread_id == r.thread_id && !run.status.terminal()),
+                    .any(|run| !run.status.terminal()),
                 "thread has active runs"
             );
         }
@@ -444,7 +612,14 @@ impl Workbench {
             "git.unstage" => repo.unstage(&paths)?,
             "git.discard" => repo.discard(&paths)?,
             "git.commit" => out.output = repo.commit(&r.message)?,
-            "git.checkout" => repo.switch(&r.branch, false)?,
+            "git.checkout" => {
+                let target = if !r.branch.trim().is_empty() {
+                    r.branch.trim()
+                } else {
+                    r.name.trim()
+                };
+                repo.switch(target, false)?;
+            }
             "git.merge" => {
                 ensure!(repo.branches()?.contains(&r.branch), "unknown merge branch");
                 let result = hostprocess::capture(
@@ -466,7 +641,13 @@ impl Workbench {
                 out.output = String::from_utf8_lossy(&result.stdout).into();
             }
             "git.status" | "git.branches" => {}
-            _ => bail!("unknown Git action"),
+            _ => {
+                if let Some(text) = crate::workbench_git::handle_extra_git_action(&repo, &r, input)? {
+                    out.output = text;
+                } else {
+                    bail!("unknown Git action");
+                }
+            }
         };
         let files: Vec<_> = repo
             .status()?
@@ -487,7 +668,7 @@ impl Workbench {
                 Some(file)
             })
             .collect();
-        out.git = Some(GitState {
+        let mut git_state = GitState {
             root: repo.root().display().to_string(),
             branch: repo.branch().unwrap_or_default(),
             status: if files.is_empty() { "clean" } else { "dirty" }.into(),
@@ -495,7 +676,9 @@ impl Workbench {
             branches: Some(repo.branches()?),
             diff: repo.diff(false, &diff_paths)?,
             ..Default::default()
-        });
+        };
+        crate::workbench_git::enrich_git_state(&repo, &mut git_state);
+        out.git = Some(git_state);
 
         Ok(out)
     }
@@ -538,12 +721,14 @@ impl Workbench {
 
         let cat = environments::Catalog::open(data)?;
         if action == "environments.upsert" {
-            cat.upsert(serde_json::from_value(input.clone())?)?;
+            let entry: environments::Entry = serde_json::from_value(input.clone())?;
+            ensure!(entry.kind != environments::Kind::Ssh, "SSH environments are unsupported");
+            cat.upsert(entry)?;
         } else if action == "environments.remove" {
             cat.remove(input["id"].as_str().unwrap_or(&r.name))?;
         }
         out.output = json!({
-        "environments":cat.load()?}
+        "environments":cat.load()?.into_iter().filter(|e| e.kind != environments::Kind::Ssh).collect::<Vec<_>>()}
         )
         .to_string();
 
@@ -597,9 +782,25 @@ impl Workbench {
                     crate::plugin_source::install(&mut host, source, data)?;
                 }
             }
+            "plugins.update" => {
+                let manifest = host.manifest_info(&r.plugin_id)?;
+                ensure!(
+                    !manifest.repo.trim().is_empty(),
+                    "plugin has no configured update repository"
+                );
+                crate::plugin_source::install(&mut host, &manifest.repo, data)?;
+            }
             "plugins.uninstall" | "plugins.remove" => host.uninstall(&r.plugin_id)?,
             "plugins.enable" | "plugins.disable" => {
                 host.set_enabled(&r.plugin_id, s == "plugins.enable")?
+            }
+            "plugins.setting" => {
+                let key = input["key"]
+                    .as_str()
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or(&r.name);
+                let val = input["value"].as_str().unwrap_or(&r.message);
+                host.set_setting(&r.plugin_id, key, val)?;
             }
             "plugins.grant" => {
                 host.set_process_grant(&r.plugin_id, input["granted"].as_bool().unwrap_or(r.amend))?
@@ -658,7 +859,7 @@ impl Workbench {
             .iter()
             .map(|p| {
                 json!({
-                "id":p.id,"name":p.pair.name,"direct":p.pair.direct}
+                "id":p.id,"name":p.pair.name,"deviceId":p.pair.device_id,"direct":p.pair.direct}
                 )
             })
             .collect();
@@ -668,7 +869,8 @@ impl Workbench {
             .map(|c| json!({"id":c.id,"name":c.name,"createdAt":c.created_at}))
             .collect();
         out.output =
-            json!({"identity":self.identity.public_identity(),"peers":peers,"clients":clients})
+            json!({"enabled":cfg.enabled,"name":cfg.host.name,"direct":cfg.host.direct,
+                    "identity":self.identity.public_identity(),"peers":peers,"clients":clients})
                 .to_string();
 
         Ok(out)
@@ -855,12 +1057,20 @@ impl Workbench {
                     "0.0.0.0:0"
                 };
                 let host_name = self.identity.snapshot().host.name;
+                let allow_input = input["allowInput"].as_bool().unwrap_or(true)
+                    && std::env::var("VANTRY_RD_LOOPBACK").as_deref() != Ok("1");
                 let host = Arc::new(
                     DesktopHost::start(
                         bind,
                         &host_name,
-                        Arc::new(|ev| {
+                        Arc::new(move |ev| {
                             tracing::debug!(kind = %ev.kind, x = ev.x, y = ev.y, "rd input");
+                            #[cfg(target_os = "macos")]
+                            if allow_input {
+                                crate::rd_macos::inject_input(&ev);
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = allow_input;
                         }),
                     )
                     .await?,
@@ -871,7 +1081,7 @@ impl Workbench {
                     tokio::spawn(async move {
                         let mut seq = 0u64;
                         let tmp = std::env::temp_dir().join(format!(
-                            "vantry-rd-{}.png",
+                            "vantry-rd-{}.jpg",
                             uuid::Uuid::new_v4().simple()
                         ));
                         while Arc::strong_count(&cap_host) > 1 {
@@ -879,7 +1089,7 @@ impl Workbench {
                                 let out_path = tmp.clone();
                                 let ok = tokio::task::spawn_blocking(move || {
                                     Command::new("/usr/sbin/screencapture")
-                                        .args(["-x", "-t", "png"])
+                                        .args(["-x", "-t", "jpg", "-C"])
                                         .arg(&out_path)
                                         .status()
                                         .is_ok_and(|s| s.success())
@@ -887,17 +1097,18 @@ impl Workbench {
                                 .await
                                 .unwrap_or(false);
                                 if ok && let Ok(bytes) = fs::read(&tmp) {
+                                    let (width, height) = crate::rd_macos::main_display_size();
                                     seq += 1;
                                     cap_host.publish_frame(DesktopFrame {
                                         seq,
-                                        width: 1280,
-                                        height: 800,
-                                        mime: "image/png".into(),
+                                        width,
+                                        height,
+                                        mime: "image/jpeg".into(),
                                         data_b64: STANDARD.encode(bytes),
                                     });
                                 }
                             }
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            tokio::time::sleep(Duration::from_millis(120)).await;
                         }
                         let _ = fs::remove_file(&tmp);
                     });
@@ -1010,6 +1221,18 @@ impl ServiceExtension for Workbench {
             "orchestration.v1",
             "plugins.v1",
             "updater.v1",
+            // The v0.1.42 desktop requires these stable wire identifiers before
+            // opening a paired environment, even for a read-only thread list.
+            "workbench.v3",
+            "workbench.skills.v1",
+            "plugins.native-pages",
+            "remote-access.alma-relay",
+            "remote-access.native.v1",
+            "remote-access.direct-discovery",
+            "environments.sessions",
+            "orchestration.environments.v1",
+            "provider.pi.scripted-tools.v1",
+            "remote-desktop.permissions.v1",
             "remote.v1",
             EMBEDDED_PI_CAPABILITY,
             LEGACY_PI_RUNTIME_CAPABILITY,

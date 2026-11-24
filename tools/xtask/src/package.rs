@@ -131,9 +131,57 @@ struct Report<'a> {
     archive: String,
     archive_bytes: u64,
     zip_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_image: Option<DiskImage>,
     budget_bytes: u64,
     within_budget: bool,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskImage {
+    name: String,
+    bytes: u64,
+    budget_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn disk_image(stage: &Path, app: &Path, name: String) -> Result<DiskImage> {
+    const LIMIT: u64 = 50_000_000;
+    let payload = tempfile::tempdir_in(stage)?;
+    let staged_app = payload.path().join("Vantry.app");
+    fs::rename(app, &staged_app)?;
+    std::os::unix::fs::symlink("/Applications", payload.path().join("Applications"))?;
+    let image = stage.join(&name);
+    let status = Command::new("/usr/bin/hdiutil")
+        .args([
+            "create",
+            "-quiet",
+            "-fs",
+            "HFS+",
+            "-format",
+            "ULFO",
+            "-volname",
+            "Vantry",
+            "-srcfolder",
+        ])
+        .arg(payload.path())
+        .arg(&image)
+        .status()
+        .context("create macOS disk image")?;
+    ensure!(status.success(), "hdiutil create failed ({status})");
+    let bytes = image.metadata()?.len();
+    ensure!(
+        bytes < LIMIT,
+        "DMG is {bytes} bytes, limit is below {LIMIT} bytes"
+    );
+    fs::rename(staged_app, app)?;
+    Ok(DiskImage {
+        name,
+        bytes,
+        budget_bytes: LIMIT,
+    })
+}
+
 struct Bundle {
     root: PathBuf,
     files: Vec<Entry>,
@@ -515,6 +563,15 @@ pub fn run(o: Options) -> Result<()> {
             stage.path().join("Vantry-macos-arm64.zip"),
         )?;
     }
+    #[cfg(target_os = "macos")]
+    let disk_image = if mac && o.profile == "release" {
+        let name = format!("Vantry-{}-macos-{}.dmg", env!("CARGO_PKG_VERSION"), p.arch);
+        Some(disk_image(stage.path(), &bundle.root, name)?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let disk_image = None;
     let mut components = BTreeMap::from([
         ("desktop", 0),
         ("service", 0),
@@ -536,6 +593,7 @@ pub fn run(o: Options) -> Result<()> {
         archive,
         archive_bytes: bytes,
         zip_bytes: (ext == "zip").then_some(bytes),
+        disk_image,
         budget_bytes: 25_000_000,
         within_budget: bytes <= 25_000_000,
     };
@@ -551,6 +609,12 @@ pub fn run(o: Options) -> Result<()> {
     )?;
     fs::rename(stage.path(), &out)
         .with_context(|| format!("publish to {} (choose an empty destination)", out.display()))?;
+    if let Some(image) = &report.disk_image {
+        println!(
+            "{}  {} bytes (limit < {} bytes)",
+            image.name, image.bytes, image.budget_bytes
+        );
+    }
     println!("{:<16} {:>14}", "Component", "Bytes");
     for (name, bytes) in report.component_bytes {
         println!("{name:<16} {bytes:>14}");

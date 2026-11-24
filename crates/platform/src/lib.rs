@@ -8,7 +8,6 @@ pub mod plugins;
 pub mod projects;
 #[cfg(unix)]
 pub mod pty;
-pub mod sshconfig;
 #[cfg(test)]
 mod tests;
 pub mod workspace;

@@ -1,5 +1,5 @@
 //! The timeline: a virtual list over the shown thread's rows, keyed by
-//! their stable ids, resting at the bottom like a chat and following
+//! their stable ids, opening at the latest message and following
 //! streamed text while the reader is at the end; scrolled up, it stays put
 //! and offers "跳到最新".
 //!
@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use nsh_core::{LineHeight, ListAlignment, prelude::*};
 
-use super::{dot, ghost_button, link_button, markdown, primary_button};
+use super::{dot, ghost_button, markdown, primary_button, small_icon_button};
 use crate::{
     controller,
+    icons::{Icon, icon},
     state::{ApprovalDecision, ApprovalView, Risk, TimelineItem, ToolStatus, markdown::MarkdownDoc},
-    theme::{PALETTE, metrics},
+    theme::{metrics, palette},
 };
 
 /// Within this distance of the end, new content keeps the list at the end.
@@ -46,13 +47,24 @@ fn kind_of(item: &TimelineItem) -> Kind {
 
 pub(crate) fn timeline() -> impl IntoElement {
     let thread = computed(|| controller::state().with(|s| s.selected.clone()));
+    // Each thread opens at its latest turn. Stream updates keep its native scroll position.
+    dynamic(move || {
+        thread.get();
+        untracked(|| thread_timeline(thread))
+    })
+}
+
+fn thread_timeline(thread: Memo<Option<String>>) -> impl IntoElement {
+    let colors = palette();
     // The thread and its structure revision: the keys follow this only.
     let structure = computed(move || {
         let thread = thread.get();
-        controller::state().with(|s| thread.map(|t| {
-            let revision = s.timeline.structure(&t);
-            (t, revision)
-        }))
+        controller::state().with(|s| {
+            thread.map(|t| {
+                let revision = s.timeline.structure(&t);
+                (t, revision)
+            })
+        })
     });
     let keys = computed(move || {
         let current = structure.get();
@@ -62,22 +74,26 @@ pub(crate) fn timeline() -> impl IntoElement {
                 .unwrap_or_default()
         })
     });
-    let has_thread = computed(move || thread.with(Option::is_some));
     let at_end = signal(true);
     let list = element_ref();
+    let opening = std::cell::Cell::new(true);
 
     view()
         .flex_1()
         .relative()
-        .bg(PALETTE.canvas)
+        .bg(colors.canvas)
         .child(
             virtual_list(move || keys.with(Vec::len), move |at| row(at, thread))
                 .keys(move || keys.get())
                 .estimated_item_size(px(72.0))
-                .alignment(ListAlignment::Bottom)
+                .alignment(ListAlignment::Top)
                 .follow_end(px(FOLLOW_THRESHOLD))
                 .content_padding_y(px(20.0))
-                .empty(empty_state(has_thread))
+                .on_layout(move |bounds: &Bounds<Points>| {
+                    if bounds.size.height.0 > 0.0 && opening.replace(false) {
+                        list.scroll_to_end(false);
+                    }
+                })
                 .on_scroll(move |e: &ScrollEvent| {
                     let distance = e.content_size.height.0 - (e.offset.y.0 + e.size.height.0);
                     let near = distance <= FOLLOW_THRESHOLD;
@@ -97,48 +113,22 @@ pub(crate) fn timeline() -> impl IntoElement {
                             list.scroll_to_end(true);
                             at_end.set(true);
                         })
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .px_3()
-                        .py_1()
+                        .py_1p5()
                         .rounded_full()
-                        .bg(PALETTE.card)
+                        .bg(colors.card)
                         .border_1()
-                        .border_color(PALETTE.line)
+                        .border_color(colors.line)
                         .shadow_sm()
                         .active(|s| s.opacity(0.7))
-                        .child(
-                            text("跳到最新 ↓")
-                                .text_size(px(12.0))
-                                .text_color(PALETTE.ink),
-                        ),
+                        .child(icon(Icon::ArrowDown, 13.0, colors.ink))
+                        .child(text("跳到最新").text_size(px(12.0)).text_color(colors.ink)),
                 )
             },
         ))
-}
-
-fn empty_state(has_thread: Memo<bool>) -> impl IntoElement {
-    view()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .py_16()
-        .gap_2()
-        .child(
-            text(move || {
-                if has_thread.get() {
-                    "这个会话还没有消息"
-                } else {
-                    "开始一段新对话"
-                }
-            })
-            .text_size(px(22.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(PALETTE.ink),
-        )
-        .child(
-            text("Enter 发送，Shift+Enter 换行；运行中发送会追加给当前任务。")
-                .text_size(px(13.0))
-                .text_color(PALETTE.muted),
-        )
 }
 
 /// A cell at `at`: its parts follow the row now at that position.
@@ -175,6 +165,7 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
 type ItemMemo = Memo<Option<TimelineItem>>;
 
 fn user_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
     let user = computed(move || match item.get() {
         Some(TimelineItem::User {
             run_id,
@@ -214,53 +205,71 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                 .child(when(plan, || {
                     text("规划模式")
                         .text_size(px(10.5))
-                        .text_color(PALETTE.accent)
+                        .text_color(colors.accent)
                 }))
                 .child(
                     view()
-                        .px_4()
-                        .py_2p5()
-                        .rounded(px(14.0))
-                        .bg(PALETTE.user)
+                        .flex_row()
+                        .items_end()
+                        .gap_1p5()
                         .child(
-                            text(text_of)
-                                .select_text()
-                                .text_size(px(metrics::BODY))
-                                .line_height(LineHeight::Multiple(1.55))
-                                .text_color(PALETTE.ink),
+                            view()
+                                .px_4()
+                                .py_2p5()
+                                .rounded(px(16.0))
+                                .bg(colors.user)
+                                .child(
+                                    text(text_of)
+                                        .select_text()
+                                        .text_size(px(metrics::BODY))
+                                        .line_height(LineHeight::Multiple(1.55))
+                                        .text_color(colors.ink),
+                                ),
+                        )
+                        .child(
+                            view()
+                                .pb_1()
+                                .opacity(move || if hovered.get() { 1.0_f32 } else { 0.45_f32 })
+                                .child(small_icon_button(Icon::Copy, "复制消息", move || {
+                                    controller::copy(text_of());
+                                })),
                         ),
                 )
                 .child(when(
                     move || !attachments().is_empty(),
                     move || {
-                        text(move || format!("📎 {}", attachments()))
-                            .text_size(px(11.5))
-                            .text_color(PALETTE.muted)
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(icon(Icon::Paperclip, 12.0, colors.muted))
+                            .child(
+                                text(attachments)
+                                    .text_size(px(11.5))
+                                    .text_color(colors.muted),
+                            )
                     },
                 ))
-                .child(
-                    view()
-                        .flex_row()
-                        .gap_1()
-                        .opacity(move || if hovered.get() { 1.0_f32 } else { 0.35_f32 })
-                        .child(link_button("复制", move || controller::copy(text_of())))
-                        .child(
-                            link_button("从此分叉", move || {
-                                controller::fork(thread_id(), Some(run_id()))
-                            })
-                            .disabled(move || !settled.get()),
-                        )
-                        .child(
-                            link_button("回退到此前", move || {
-                                controller::ask_rewind(thread_id(), run_id())
-                            })
-                            .disabled(move || !settled.get()),
-                        ),
-                ),
+                .child(when(
+                    move || hovered.get() && settled.get(),
+                    move || {
+                        view()
+                            .flex_row()
+                            .gap_0p5()
+                            .pr_7()
+                            .child(small_icon_button(Icon::GitFork, "从此分叉", move || {
+                                controller::fork(thread_id(), Some(run_id()));
+                            }))
+                            .child(small_icon_button(Icon::Undo2, "回退到此前", move || {
+                                controller::ask_rewind(thread_id(), run_id());
+                            }))
+                    },
+                )),
         )
 }
 
 fn reasoning_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
     let reasoning = computed(move || match item.get() {
         Some(TimelineItem::Reasoning {
             text, streaming, ..
@@ -274,28 +283,34 @@ fn reasoning_row(item: ItemMemo) -> impl IntoElement {
         .gap_1()
         .pl_3()
         .border_l(px(2.0))
-        .border_l_color(PALETTE.line)
+        .border_l_color(colors.line)
         .child(
             nsh_base::button()
                 .accessibility_label("展开思考")
                 .on_press(move || open.set(!open.get_untracked()))
                 .flex_row()
                 .items_center()
-                .gap_1()
+                .gap_1p5()
                 .active(|s| s.opacity(0.6))
+                .child(icon(Icon::Brain, 13.0, colors.faint))
                 .child(
-                    text(move || {
-                        let arrow = if open.get() { "▾" } else { "▸" };
-                        if streaming() {
-                            format!("{arrow} 思考中…")
+                    text(move || if streaming() { "思考中…" } else { "已思考" })
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.faint),
+                )
+                .child(dynamic(move || {
+                    icon(
+                        if open.get() {
+                            Icon::ChevronDown
                         } else {
-                            format!("{arrow} 思考")
-                        }
-                    })
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(PALETTE.faint),
-                ),
+                            Icon::ChevronRight
+                        },
+                        12.0,
+                        colors.faint,
+                    )
+                    .into_element()
+                })),
         )
         .child(
             text(move || {
@@ -306,11 +321,12 @@ fn reasoning_row(item: ItemMemo) -> impl IntoElement {
             .italic()
             .text_size(px(13.0))
             .line_height(LineHeight::Multiple(1.5))
-            .text_color(PALETTE.muted),
+            .text_color(colors.muted),
         )
 }
 
 fn text_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
     let doc = computed(move || match item.get() {
         Some(TimelineItem::Text { doc, .. }) => Some(doc),
         _ => None::<Arc<MarkdownDoc>>,
@@ -330,10 +346,21 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
         }) => Some((run_id, start, end)),
         _ => None,
     };
+    let settled = computed(move || {
+        let run = match item.get() {
+            Some(TimelineItem::Text { run_id, .. }) => Some(run_id),
+            _ => None,
+        };
+        controller::state().with(|s| {
+            run.and_then(|id| s.run(&id).map(|r| (r.status.terminal(), r.thread_id.clone())))
+                .is_some_and(|(done, thread)| done && s.active_run(&thread).is_none())
+        })
+    });
+    let thread_id = move || controller::state().with_untracked(|s| s.selected.clone().unwrap_or_default());
     let hovered = signal(false);
     view()
         .flex_col()
-        .gap_1()
+        .gap_1p5()
         .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
         .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
         .child(markdown::document(doc))
@@ -343,21 +370,47 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
                 .w(px(8.0))
                 .h(px(8.0))
                 .rounded_full()
-                .bg(PALETTE.accent)
+                .bg(colors.accent)
                 .animate_pulse()
         }))
+        // Quiet v0.1.42 reply action bar: copy / quote / fork / rewind / preview
         .child(when(
-            move || hovered.get() && !streaming(),
+            move || !streaming(),
             move || {
                 view()
                     .flex_row()
+                    .items_center()
                     .gap_1()
-                    .child(link_button("复制", move || {
+                    .opacity(move || if hovered.get() { 1.0_f32 } else { 0.55_f32 })
+                    .child(small_icon_button(Icon::Copy, "复制回复", move || {
                         if let Some((run, start, end)) = range() {
                             controller::copy_reply(run, start, end);
                         }
                     }))
-                    .child(link_button("在预览中打开", move || {
+                    .child(small_icon_button(Icon::Quote, "引用到输入框", move || {
+                        if let Some((run, start, end)) = range() {
+                            let snippet = controller::state()
+                                .with_untracked(|s| s.text_of(&run, start, end));
+                            controller::quote_to_draft(snippet);
+                        }
+                    }))
+                    .child(
+                        small_icon_button(Icon::GitFork, "从此分叉", move || {
+                            if let Some((run, _, _)) = range() {
+                                controller::fork(thread_id(), Some(run));
+                            }
+                        })
+                        .disabled(move || !settled.get()),
+                    )
+                    .child(
+                        small_icon_button(Icon::Undo2, "回退到此前", move || {
+                            if let Some((run, _, _)) = range() {
+                                controller::ask_rewind(thread_id(), run);
+                            }
+                        })
+                        .disabled(move || !settled.get()),
+                    )
+                    .child(small_icon_button(Icon::Eye, "在预览中打开", move || {
                         if let Some((run, start, end)) = range() {
                             let text = controller::state()
                                 .with_untracked(|s| s.text_of(&run, start, end));
@@ -369,15 +422,17 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
 }
 
 fn tool_status_color(status: ToolStatus) -> AdaptiveColor {
+    let colors = palette();
     match status {
-        ToolStatus::Running => PALETTE.accent,
-        ToolStatus::AwaitingApproval => PALETTE.warning,
-        ToolStatus::Completed => PALETTE.success,
-        ToolStatus::Failed | ToolStatus::Interrupted => PALETTE.danger,
+        ToolStatus::Running => colors.accent,
+        ToolStatus::AwaitingApproval => colors.warning,
+        ToolStatus::Completed => colors.success,
+        ToolStatus::Failed | ToolStatus::Interrupted => colors.danger,
     }
 }
 
 fn tool_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
     let tool = computed(move || match item.get() {
         Some(TimelineItem::Tool {
             name,
@@ -398,7 +453,7 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
         .flex_col()
         .rounded(px(metrics::CARD_RADIUS))
         .border_1()
-        .border_color(PALETTE.line)
+        .border_color(colors.line)
         .overflow_hidden()
         .child(
             nsh_base::button()
@@ -409,13 +464,24 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
                 .gap_2()
                 .px_3()
                 .py_2()
-                .hover(|s| s.bg(PALETTE.soft))
+                .hover(|s| s.bg(colors.soft))
                 .child(dot(move || tool_status_color(status())))
+                .child(dynamic(move || {
+                    let name = tool
+                        .with(|t| t.as_ref().map(|t| t.0.to_ascii_lowercase()).unwrap_or_default());
+                    let glyph = match name.as_str() {
+                        "bash" | "shell" | "terminal" | "vantry_terminal_run" => Icon::Terminal,
+                        "read" | "write" | "edit" => Icon::FileText,
+                        "grep" | "find" | "ls" => Icon::Search,
+                        _ => Icon::Wrench,
+                    };
+                    icon(glyph, 13.5, colors.muted).into_element()
+                }))
                 .child(
                     text(field(|t| t.0.clone()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_size(px(12.5))
-                        .text_color(PALETTE.ink),
+                        .text_color(colors.ink),
                 )
                 .child(
                     text(field(|t| t.1.clone()))
@@ -423,49 +489,57 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
                         .number_of_lines(1u32)
                         .font_family("Menlo")
                         .text_size(px(12.0))
-                        .text_color(PALETTE.muted),
+                        .text_color(colors.muted),
                 )
                 .child(
                     text(move || status().label())
                         .text_size(px(11.0))
                         .text_color(move || tool_status_color(status())),
                 )
-                .child(
-                    text(move || if open.get() { "▾" } else { "▸" })
-                        .text_size(px(11.0))
-                        .text_color(PALETTE.faint),
-                ),
+                .child(dynamic(move || {
+                    icon(
+                        if open.get() {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        },
+                        13.0,
+                        colors.faint,
+                    )
+                    .into_element()
+                })),
         )
         .child(when(
             move || open.get() && tool.with(|t| t.as_ref().is_some_and(|t| !t.3.is_empty())),
             move || {
-                view().px_3().py_2().border_t_1().border_t_color(PALETTE.line_soft).child(
+                view().px_3().py_2().border_t_1().border_t_color(colors.line_soft).child(
                     text(field(|t| t.3.clone()))
                         .select_text()
                         .font_family("Menlo")
                         .text_size(px(11.5))
                         .line_height(LineHeight::Multiple(1.45))
-                        .text_color(PALETTE.muted),
+                        .text_color(colors.muted),
                 )
             },
         ))
         .child(when(
             move || tool.with(|t| t.as_ref().is_some_and(|t| !t.4.is_empty())),
             move || {
-                view().px_3().py_2().bg(PALETTE.code).child(
+                view().px_3().py_2().bg(colors.code).child(
                     text(field(|t| t.4.clone()))
                         .select_text()
                         .number_of_lines(move || if open.get() { 0u32 } else { 6u32 })
                         .font_family("Menlo")
                         .text_size(px(11.5))
                         .line_height(LineHeight::Multiple(1.45))
-                        .text_color(PALETTE.muted),
+                        .text_color(colors.muted),
                 )
             },
         ))
 }
 
 fn approval_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
     let view_of = computed(move || match item.get() {
         Some(TimelineItem::Approval { view, .. }) => Some(view),
         _ => None,
@@ -491,21 +565,28 @@ fn approval_row(item: ItemMemo) -> impl IntoElement {
         .px_4()
         .py_3()
         .rounded(px(12.0))
-        .bg(PALETTE.approval)
+        .bg(colors.approval)
         .border_1()
-        .border_color(PALETTE.approval_border)
+        .border_color(colors.approval_border)
         .child(
-            text(state_text)
-                .text_size(px(12.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(PALETTE.warning),
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .child(icon(Icon::ShieldCheck, 14.0, colors.warning))
+                .child(
+                    text(state_text)
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.warning),
+                ),
         )
         .child(
             text(headline)
                 .select_text()
                 .number_of_lines(2u32)
                 .text_size(px(13.5))
-                .text_color(PALETTE.ink),
+                .text_color(colors.ink),
         )
         .child(when(
             move || !body().is_empty(),
@@ -515,8 +596,8 @@ fn approval_row(item: ItemMemo) -> impl IntoElement {
                     .number_of_lines(4u32)
                     .font_family("Menlo")
                     .text_size(px(12.0))
-                    .text_color(PALETTE.ink)
-                    .bg(PALETTE.code)
+                    .text_color(colors.ink)
+                    .bg(colors.code)
                     .rounded(px(6.0))
                     .px_2()
                     .py_1()
@@ -525,7 +606,7 @@ fn approval_row(item: ItemMemo) -> impl IntoElement {
         .child(
             text(move || risk().hint())
                 .text_size(px(11.5))
-                .text_color(PALETTE.muted),
+                .text_color(colors.muted),
         )
         .child(
             view()
@@ -556,6 +637,7 @@ fn approval_row(item: ItemMemo) -> impl IntoElement {
 }
 
 fn status_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
     let error = move || matches!(item.get(), Some(TimelineItem::Status { error: true, .. }));
     text(move || match item.get() {
         Some(TimelineItem::Status { text, .. }) => text,
@@ -565,9 +647,9 @@ fn status_row(item: ItemMemo) -> impl IntoElement {
     .text_size(px(12.5))
     .text_color(move || {
         if error() {
-            PALETTE.danger
+            colors.danger
         } else {
-            PALETTE.faint
+            colors.faint
         }
     })
 }

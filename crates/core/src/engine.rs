@@ -158,6 +158,12 @@ impl Core {
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.read(snapshot)
     }
+    pub fn thread_summaries(&self) -> Result<ThreadSummaries> {
+        self.read(thread_summaries)
+    }
+    pub fn thread_detail(&self, thread_id: &str, limit_runs: i64) -> Result<ThreadDetail> {
+        self.read(|db| thread_detail(db, thread_id, limit_runs))
+    }
     pub fn status(&self) -> Result<ServerStatus> {
         self.read(|db| {
             let active_runs = db.query_row(

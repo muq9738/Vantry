@@ -96,6 +96,10 @@ impl Session {
         // STDIN is already the slave by the time Command runs pre_exec.
         unsafe {
             command.pre_exec(|| {
+                // A background Core can inherit ignored SIGINT from its launcher.
+                if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }

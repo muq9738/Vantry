@@ -58,12 +58,6 @@ pub struct DesktopArgs {
     /// 仅连接现有 Core，不自动启动
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false")]
     pub attach_only: bool,
-    /// SSH 远程主机
-    #[arg(long, value_name = "HOST")]
-    pub remote: Option<String>,
-    /// 远端 Core socket 绝对路径
-    #[arg(long, value_name = "PATH")]
-    pub remote_socket: Option<String>,
     /// 通过会话配对码添加的主机 ID
     #[arg(long, value_name = "ID")]
     pub peer: Option<String>,
@@ -107,11 +101,6 @@ pub struct DesktopArgs {
 pub enum Target {
     /// The local Core (its socket in [`LaunchConfig::endpoint`]).
     Local,
-    /// A Core over SSH (`--remote`): Wave 2.
-    Ssh {
-        host: String,
-        socket: Option<String>,
-    },
     /// A paired peer (`--peer`): Wave 2.
     Peer { id: String, mode: String },
 }
@@ -155,12 +144,6 @@ impl LaunchConfig {
         match (&self.endpoint, &self.target) {
             (Endpoint::Mock, _) => None,
             (_, Target::Local) => Some(self.data_dir.join(file)),
-            (_, Target::Ssh { host, .. }) => Some(
-                self.data_dir
-                    .join("environment-state")
-                    .join(format!("ssh-{}", safe_component(host)))
-                    .join(file),
-            ),
             (_, Target::Peer { id, .. }) => Some(
                 self.data_dir
                     .join("environment-state")
@@ -199,7 +182,6 @@ impl LaunchConfig {
         }
         match &self.target {
             Target::Local => "本机".to_owned(),
-            Target::Ssh { host, .. } => host.clone(),
             Target::Peer { id, .. } => id.clone(),
         }
     }
@@ -305,25 +287,15 @@ fn resolve(
             "peer-mode 只能为 auto、direct 或 relay".to_owned(),
         ));
     }
-    let target = match (&args.peer, &args.remote) {
-        (Some(_), Some(_)) => {
-            return Err(CliError("--peer 与 --remote 不能同时使用".to_owned()));
-        }
-        (Some(id), None) => Target::Peer {
-            id: id.clone(),
-            mode: args.peer_mode.clone(),
-        },
-        (None, Some(host)) => Target::Ssh {
-            host: host.clone(),
-            socket: args.remote_socket.clone(),
-        },
-        (None, None) => Target::Local,
+    let target = match &args.peer {
+        Some(id) => Target::Peer { id: id.clone(), mode: args.peer_mode.clone() },
+        None => Target::Local,
     };
     if args.mock && target != Target::Local {
         return Err(CliError("--mock 不能与远程连接同时使用".to_owned()));
     }
     if args.socket.is_some() && target != Target::Local {
-        return Err(CliError("--socket 只用于本机 Core；远端请用 --remote-socket".to_owned()));
+        return Err(CliError("--socket 只用于本机 Core".to_owned()));
     }
     let endpoint = match &target {
         _ if args.mock => Endpoint::Mock,
@@ -332,10 +304,6 @@ fn resolve(
                 Some(socket) => absolute(socket)?,
                 None => data_dir.join("core.sock"),
             },
-        },
-        Target::Ssh { host, socket } => Endpoint::Ssh {
-            host: host.clone(),
-            remote_socket: socket.clone(),
         },
         Target::Peer { id, mode } => Endpoint::Peer {
             id: id.clone(),
@@ -612,29 +580,7 @@ mod tests {
     #[test]
     fn remote_targets_are_recognised() {
         let env = env_with(&[("HOME", "/h")]);
-        let config = desktop(
-            &["-remote", "devbox", "-remote-socket", "/run/core.sock"],
-            &env,
-        );
-        assert_eq!(
-            config.target,
-            Target::Ssh {
-                host: "devbox".into(),
-                socket: Some("/run/core.sock".into())
-            }
-        );
-        assert_eq!(config.workspace_label(), "devbox");
-        assert_eq!(
-            config.endpoint,
-            Endpoint::Ssh {
-                host: "devbox".into(),
-                remote_socket: Some("/run/core.sock".into())
-            }
-        );
-        assert_eq!(
-            config.state_path(),
-            Some(config.data_dir.join("environment-state/ssh-devbox/desktop-state.json"))
-        );
+        assert!(parse(&args(&["--remote", "devbox"]), &env).is_err());
         let config = desktop(&["-peer", "p1", "-peer-mode", "relay"], &env);
         assert_eq!(
             config.target,
@@ -650,8 +596,6 @@ mod tests {
                 mode: "relay".into()
             }
         );
-        let err = parse(&args(&["--remote", "h", "--socket", "/x.sock"]), &env).unwrap_err();
-        assert!(err.0.contains("--remote-socket"));
         // The mock keeps no state; the local desktop keeps it in its data dir.
         assert_eq!(desktop(&["--mock"], &env).state_path(), None);
         let local = desktop(&[], &env);

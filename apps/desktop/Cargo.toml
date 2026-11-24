@@ -16,7 +16,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 env_logger.workspace = true
-nsh-base.workspace = true
+nsh-base = { workspace = true, features = ["editor", "term"] }
 nsh-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -183,3 +183,34 @@ fn thinking_rides_on_the_thread_model() {
     assert_eq!(command.model, "anthropic/opus:low");
     assert_eq!(state.current_model(), "anthropic/opus:low");
 }
+
+#[test]
+fn terminal_run_payload_parses_structured_command_and_cwd() {
+    let mut req = request("q9", "editor", "SSH 登录");
+    req.prefill = serde_json::json!({
+        "kind": "vantry_terminal_run",
+        "version": 1,
+        "title": "GitHub 登录",
+        "command": "gh auth login",
+        "cwd": "/tmp/demo"
+    })
+    .to_string();
+    let view = approval_view(&req);
+    assert_eq!(view.kind, RequestKind::Terminal);
+    assert_eq!(view.headline, "GitHub 登录");
+    let tr = view.terminal_run.expect("parsed terminal payload");
+    assert_eq!(tr.command, "gh auth login");
+    assert_eq!(tr.cwd, "/tmp/demo");
+}
+
+#[test]
+fn visual_fences_preserve_arguments_while_code_keeps_language() {
+    use super::markdown::{Block, MarkdownDoc};
+    let doc = MarkdownDoc::parse(
+        "```ask multi\n选择方案\n* A | 推荐\n- B\n```\n\n```chart bar unit=ms\nRedis | 12\n```\n\n```rust no_run\nfn main() {}\n```\n",
+    );
+    assert_eq!(doc.blocks.len(), 3);
+    assert!(matches!(&*doc.blocks[0].block, Block::Code { lang, .. } if lang == "ask multi"));
+    assert!(matches!(&*doc.blocks[1].block, Block::Code { lang, .. } if lang == "chart bar unit=ms"));
+    assert!(matches!(&*doc.blocks[2].block, Block::Code { lang, .. } if lang == "rust"));
+}

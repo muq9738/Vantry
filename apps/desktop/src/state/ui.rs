@@ -62,20 +62,17 @@ impl ThemePreference {
 
     pub const ALL: [ThemePreference; 3] = [
         ThemePreference::System,
-        ThemePreference::Light,
         ThemePreference::Dark,
+        ThemePreference::Light,
     ];
 }
 
 /// A page of the settings view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
-    /// General: models, thinking, the Pi runtime and its quick setup.
+    General,
     Models,
-    /// MCP servers (and user extensions).
-    Extensions,
-    Plugins,
-    /// Remote access, pairing, SSH hosts and environments.
+    /// Remote access, pairing and environments.
     Remote,
     /// Sandbox and the default approval policy.
     Permissions,
@@ -86,25 +83,17 @@ pub enum SettingsPage {
 }
 
 impl SettingsPage {
-    pub const ALL: [SettingsPage; 8] = [
-        SettingsPage::Models,
-        SettingsPage::Extensions,
-        SettingsPage::Plugins,
-        SettingsPage::Remote,
-        SettingsPage::Permissions,
-        SettingsPage::About,
-        SettingsPage::Usage,
-        SettingsPage::Appearance,
+    pub const ALL: [SettingsPage; 6] = [
+        Self::General, Self::Appearance, Self::Permissions, Self::Models, Self::Remote, Self::About,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            SettingsPage::Models => "常规与模型",
-            SettingsPage::Extensions => "MCP 服务器",
-            SettingsPage::Plugins => "插件",
-            SettingsPage::Remote => "远端互联与配对",
-            SettingsPage::Permissions => "安全与沙盒",
-            SettingsPage::About => "应用更新",
+            SettingsPage::General => "通用",
+            SettingsPage::Models => "提供方",
+            SettingsPage::Remote => "环境",
+            SettingsPage::Permissions => "Agent 与权限",
+            SettingsPage::About => "关于与更新",
             SettingsPage::Usage => "用量统计",
             SettingsPage::Appearance => "外观",
         }
@@ -292,7 +281,7 @@ pub enum Catalogs {
     #[default]
     NotLoaded,
     Loading,
-    Loaded(Box<SettingsData>),
+    Loaded(std::sync::Arc<SettingsData>),
     Failed(String),
 }
 
@@ -532,10 +521,19 @@ pub enum Confirm {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiState {
     pub theme: ThemePreference,
+    pub theme_preset: crate::theme::ThemePreset,
     pub sidebar_open: bool,
+    /// Full-window navigation while the main stage is narrow.
+    pub mobile_nav: bool,
     pub filter: SidebarFilter,
     pub dock_open: bool,
     pub dock_tab: DockTab,
+    pub dock_widths: std::collections::BTreeMap<DockTab, f32>,
+    pub dock_maximized: bool,
+    pub locale: super::language::Language,
+    pub send_with_enter: bool,
+    pub manual_delivery: bool,
+    pub child_panel: Option<(String, String)>,
     pub settings: Option<SettingsPage>,
     pub catalogs: Catalogs,
     pub view: MainView,
@@ -562,10 +560,18 @@ impl Default for UiState {
     fn default() -> Self {
         UiState {
             theme: ThemePreference::System,
+            theme_preset: Default::default(),
             sidebar_open: true,
+            mobile_nav: false,
             filter: SidebarFilter::default(),
             dock_open: false,
             dock_tab: DockTab::Files,
+            dock_widths: Default::default(),
+            dock_maximized: false,
+            locale: Default::default(),
+            send_with_enter: true,
+            manual_delivery: false,
+            child_panel: None,
             settings: None,
             catalogs: Catalogs::NotLoaded,
             view: MainView::Conversation,
@@ -592,6 +598,7 @@ impl UiState {
     /// Opens the dock on `tab`, or closes it when `tab` is already shown.
     pub fn toggle_dock_tab(&mut self, tab: DockTab) {
         if self.dock_open && self.dock_tab == tab {
+            self.dock_maximized = false;
             self.dock_open = false;
         } else {
             self.dock_open = true;
@@ -611,7 +618,7 @@ impl UiState {
 
     pub fn on_catalogs(&mut self, result: Result<SettingsData, String>) {
         self.catalogs = match result {
-            Ok(data) => Catalogs::Loaded(Box::new(data)),
+            Ok(data) => Catalogs::Loaded(std::sync::Arc::new(data)),
             Err(reason) => Catalogs::Failed(reason),
         };
     }
@@ -700,7 +707,7 @@ impl UiState {
         match result {
             Ok(response) => {
                 if let Catalogs::Loaded(data) = &mut self.catalogs {
-                    data.absorb(action, &response);
+                    std::sync::Arc::make_mut(data).absorb(action, &response);
                 }
                 if action == crate::bridge::workbench::actions::names::RD_STATUS
                     || action.starts_with("rd.session")
@@ -999,7 +1006,7 @@ mod tests {
         assert_eq!(ui.finish_rename(), None, "a blank title renames nothing");
         ui.begin_rename("t1", "新");
         assert_eq!(ui.finish_rename().unwrap().text, "新");
-        ui.settings = Some(SettingsPage::Extensions);
+        ui.settings = Some(SettingsPage::Models);
         assert!(!ui.open_plugin("remote-desktop", "remote-desktop"));
         assert_eq!((ui.view.clone(), ui.settings), (MainView::RemoteDesktop, None));
         assert!(ui.open_plugin("usage", "main"));

@@ -56,8 +56,10 @@ pub(crate) fn bench() -> Signal<WorkbenchState> {
 /// The bridges and where state is saved, once [`start`] made them.
 #[derive(Default)]
 struct Bridges {
+    owner: Option<Owner>,
     core: Option<Arc<dyn CoreBridge>>,
     workbench: Option<Arc<dyn WorkbenchBridge>>,
+    core_socket: Option<PathBuf>,
     state_path: Option<PathBuf>,
     mock: bool,
 }
@@ -72,6 +74,16 @@ fn bridges<R>(f: impl FnOnce(&Bridges) -> R) -> R {
     global::<Bridges>().with_untracked(f)
 }
 
+/// Runs a job for the lifetime of the window. The initiating menu or reactive
+/// effect can disappear before the job completes.
+fn spawn_for_window(future: impl std::future::Future<Output = ()> + 'static) {
+    if let Some(owner) = bridges(|b| b.owner) {
+        owner.run(|| {
+            spawn(future);
+        });
+    }
+}
+
 fn core() -> Option<Arc<dyn CoreBridge>> {
     bridges(|b| b.core.clone())
 }
@@ -80,15 +92,50 @@ fn workbench() -> Option<Arc<dyn WorkbenchBridge>> {
     bridges(|b| b.workbench.clone())
 }
 
+pub(crate) fn remote_project() -> bool {
+    ui().with(|u| u.remote_target.is_some())
+        || state().with(|s| {
+            s.current_workspace()
+                .is_some_and(|w| !w.environment_id.is_empty())
+        })
+}
+
+/// File and Git jobs keep the checkout and generation they started with.
+fn project_workbench() -> Option<(u64, Arc<dyn WorkbenchBridge>)> {
+    let (root, generation) = bench().with_untracked(|b| (b.root.clone(), b.project_generation));
+    if root.is_empty() {
+        return None;
+    }
+    let bridge: Arc<dyn WorkbenchBridge> = if bridges(|b| b.mock) {
+        workbench()?
+    } else if remote_project() {
+        let sock = bridges(|b| b.core_socket.clone())?;
+        Arc::new(CoreWorkbench::for_core_workspace(
+            sock,
+            root.clone(),
+            LocalWorkbench::new(PathBuf::from(&root), None),
+            None,
+        ))
+    } else {
+        Arc::new(LocalWorkbench::new(PathBuf::from(root), None))
+    };
+    Some((generation, bridge))
+}
+
 /// Connects to the Core `config` names, restores `desktop-state.json` and
 /// keeps the states in step for as long as the calling component lives.
 pub(crate) fn start(config: &LaunchConfig) {
     let mock = config.endpoint == Endpoint::Mock;
     let local = LocalWorkbench::new(config.workspace_root(), config.model.clone());
-    let (core, workbench): (Arc<dyn CoreBridge>, Arc<dyn WorkbenchBridge>) = match &config.endpoint {
+    let (core, workbench, core_socket): (
+        Arc<dyn CoreBridge>,
+        Arc<dyn WorkbenchBridge>,
+        Option<PathBuf>,
+    ) = match &config.endpoint {
         Endpoint::Mock => (
             bridge::connect(&config.endpoint),
             Arc::new(MockWorkbench::demo()),
+            None,
         ),
         // Settings, plugins, remote access … from the Core; files, Git and
         // the terminal on this machine's workspace.
@@ -99,20 +146,24 @@ pub(crate) fn start(config: &LaunchConfig) {
                 local,
                 config.model.clone(),
             )),
+            Some(socket.clone()),
         ),
-        Endpoint::Ssh { .. } | Endpoint::Peer { .. } => {
-            let remote = bridge::RemoteBridge::new(config.endpoint.clone());
+        Endpoint::Peer { .. } => {
+            let remote = bridge::RemoteBridge::new(config.endpoint.clone(), Some(config.data_dir.clone()));
             let sock = remote.socket();
             (
                 Arc::new(remote),
-                Arc::new(CoreWorkbench::new(sock, local, config.model.clone())),
+                Arc::new(CoreWorkbench::new(sock.clone(), local, config.model.clone())),
+                Some(sock),
             )
         }
     };
     let state_path = config.state_path();
     global::<Bridges>().set(Bridges {
+        owner: Some(Owner::current()),
         core: Some(core.clone()),
         workbench: Some(workbench.clone()),
+        core_socket,
         state_path: state_path.clone(),
         mock,
     });
@@ -120,7 +171,7 @@ pub(crate) fn start(config: &LaunchConfig) {
     let saved = state_path.as_deref().map(persist::load);
     let label = core.label();
     let workspace = config.workspace_label();
-    let root = workbench.root();
+    let demo_root = mock.then(|| workbench.root());
     let remote_target = config.endpoint.is_remote().then(|| label.clone());
     let mut restore_error = None;
     state().update(|s| {
@@ -145,12 +196,33 @@ pub(crate) fn start(config: &LaunchConfig) {
             ));
         }
     });
-    bench().update(|b| b.root = root);
-    // A dock left open shows its tab's content again.
-    let (dock_open, tab) = ui().with_untracked(|u| (u.dock_open, u.dock_tab));
-    if dock_open {
-        show_tab(tab);
-    }
+    let project = computed(move || {
+        // When viewing a federated child thread on a local Core whose checkout
+        // belongs to another peer, keep local filesystem isolated; when connected
+        // Expose the paired Core checkout through its workbench.
+        let connected_remote = ui().with(|u| u.remote_target.is_some());
+        if !connected_remote
+            && state().with(|s| {
+                s.current_workspace()
+                    .is_some_and(|w| !w.environment_id.is_empty())
+            })
+        {
+            return String::new();
+        }
+        state()
+            .with(|s| s.checkout_path().map(str::to_owned))
+            .or_else(|| demo_root.clone())
+            .unwrap_or_default()
+    });
+    effect(move || {
+        let root = project.get();
+        untracked(|| {
+            bench().update(|b| b.select_project(root));
+            if let Some(tab) = ui().with_untracked(|u| u.dock_open.then_some(u.dock_tab)) {
+                show_tab(tab);
+            }
+        });
+    });
 
     // The theme follows the preference.
     effect(|| {
@@ -236,19 +308,16 @@ fn schedule_save(file: persist::DesktopStateFile) {
     let Some(path) = bridges(|b| b.state_path.clone()) else {
         return;
     };
-    set_timeout(SAVE_AFTER, move || {
+    spawn_for_window(async move {
+        timer(SAVE_AFTER).await;
         let current = SAVES.with(|slot| slot.borrow().generation);
         if current != generation {
             return;
         }
-        let path = path.clone();
-        let file = file.clone();
-        spawn(async move {
-            let result = blocking(move || persist::save_atomic(&path, &file)).await;
-            if let Ok(Err(error)) | Err(error) = result.map_err(std::io::Error::other) {
-                eprintln!("vantry: desktop-state.json: {error}");
-            }
-        });
+        let result = blocking(move || persist::save_atomic(&path, &file)).await;
+        if let Ok(Err(error)) | Err(error) = result.map_err(std::io::Error::other) {
+            eprintln!("vantry: desktop-state.json: {error}");
+        }
     });
 }
 
@@ -372,7 +441,7 @@ fn dispatch(command: Command) {
     let Some(core) = core() else {
         return;
     };
-    spawn(async move {
+    spawn_for_window(async move {
         let id = command.command_id.clone();
         let result = call(core.dispatch(command)).await;
         let mut follow_up = None;
@@ -403,6 +472,86 @@ pub(crate) fn submit() {
     intent(AppState::submit);
 }
 
+/// Send an immediate reply from an interactive in-message block (`ask`, `dispatch`, `vantry-ui`).
+pub(crate) fn send_quick_reply(message: String) {
+    let text = message.trim().to_owned();
+    if text.is_empty() {
+        return;
+    }
+    state().update(|s| {
+        s.set_draft_text(&text);
+    });
+    submit();
+}
+
+/// Open a clickable link from a Markdown message (`vantry-thread://`, `file://`, `http(s)://`).
+pub(crate) fn open_link(url: String) {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed.strip_prefix("vantry-thread://") {
+        let thread_id = rest.split(['?', '#']).next().unwrap_or("").trim();
+        if !thread_id.is_empty() {
+            select_thread(thread_id.to_owned());
+        }
+        return;
+    }
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let path_part = rest.split('#').next().unwrap_or(rest);
+        let root = bench().with_untracked(|b| b.root.clone());
+        if !root.is_empty()
+            && let Ok(rel) = std::path::Path::new(path_part).strip_prefix(&root)
+        {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !rel_str.is_empty() {
+                open_search_hit(rel_str);
+                return;
+            }
+        }
+        open_external_target(path_part.to_owned());
+        return;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        open_external_target(trimmed.to_owned());
+    }
+}
+
+/// Render an offline `svg`/`html`/`artifact` block into a local temp HTML file
+/// (zero servers, zero external URLs) and open it when clicked.
+pub(crate) fn open_offline_artifact(kind: String, title: String, source: String) {
+    let doc = if kind == "svg" {
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
+             <style>body{{margin:0;padding:24px;background:#111318;color:#e5e7eb;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui}}svg{{max-width:100%;height:auto}}</style>{source}"
+        )
+    } else if source.to_ascii_lowercase().contains("<html") {
+        source
+    } else {
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
+             <style>:root{{--v-bg:#0f1117;--v-surface:#161a23;--v-surface-2:#1d2230;--v-ink:#e6e8ef;--v-muted:#9aa3b2;--v-line:rgba(255,255,255,.1);--v-accent:#60a5fa;--v-good:#34d399;--v-warn:#fbbf24;--v-bad:#f87171}}body{{margin:0;padding:20px;background:var(--v-bg);color:var(--v-ink);font-family:system-ui,-apple-system,sans-serif}}.tnum{{font-variant-numeric:tabular-nums}}</style>{source}"
+        )
+    };
+    let path = std::env::temp_dir().join(format!(
+        "vantry-artifact-{}.html",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if std::fs::write(&path, doc.as_bytes()).is_ok() {
+        open_external_target(path.display().to_string());
+    }
+}
+
+fn open_external_target(target: String) {
+    std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(&target).status();
+        #[cfg(target_os = "linux")]
+        let _ = std::process::Command::new("xdg-open").arg(&target).status();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &target])
+            .status();
+    });
+}
+
 pub(crate) fn stop() {
     intent(AppState::stop);
 }
@@ -426,9 +575,61 @@ pub(crate) fn respond(request_id: String, decision: ApprovalDecision) {
     });
 }
 
+pub(crate) fn open_child(child: String) {
+    let Some(parent) = state().with_untracked(|s| s.selected.clone()) else {
+        return;
+    };
+    ui().update(|u| {
+        u.child_panel = Some((parent, child));
+        u.dock_open = true;
+        u.dock_maximized = false;
+        u.view = MainView::Conversation;
+    });
+}
+
+pub(crate) fn submit_child(child: &str) {
+    intent(|s| s.submit_child(child));
+}
+
+pub(crate) fn delegate_child(message: String) {
+    let Some(core) = core() else { return };
+    let Some(run) = state().with_untracked(|s| {
+        s.runs
+            .iter()
+            .filter(|r| Some(&r.thread_id) == s.selected.as_ref())
+            .max_by_key(|r| &r.created_at)
+            .cloned()
+    }) else {
+        return;
+    };
+    let parent = run.thread_id.clone();
+    let mut cmd = Command::new(
+        bridge::new_command_id("delegate"),
+        vantry_protocol::CommandKind::DelegateTask,
+    );
+    cmd.thread_id = parent.clone();
+    cmd.parent_run_id = run.id;
+    cmd.parent_attempt_id = run.attempt_id;
+    cmd.message = message;
+    cmd.resume_policy =
+        ui().with_untracked(|u| if u.manual_delivery { "manual" } else { "auto" }.into());
+    spawn_for_window(async move {
+        match call(core.dispatch(cmd)).await {
+            Ok(r) if state().with_untracked(|s| s.selected.as_ref() == Some(&parent)) => {
+                open_child(r.thread_id)
+            }
+            Ok(_) => {}
+            Err(e) => warn(e.message),
+        }
+    });
+}
+
 pub(crate) fn select_thread(id: String) {
+    if state().with_untracked(|s|s.tasks.iter().any(|t|Some(&t.parent_thread_id)==s.selected.as_ref() && t.child_thread_id==id)) { open_child(id); return; }
+    if ui().with_untracked(|u|u.child_panel.is_some()){close_dock();}
     state().update(move |s| s.select_thread(Some(id)));
     ui().update(|u| {
+        u.mobile_nav = false;
         if u.view != MainView::Conversation {
             u.view = MainView::Conversation;
         }
@@ -436,8 +637,41 @@ pub(crate) fn select_thread(id: String) {
 }
 
 pub(crate) fn new_thread() {
-    state().update(AppState::new_thread);
-    ui().update(|u| u.view = MainView::Conversation);
+    state().update(AppState::start_local_draft);
+    ui().update(|u| {
+        u.mobile_nav = false;
+        u.view = MainView::Conversation;
+    });
+}
+
+pub(crate) fn choose_project() {
+    spawn_for_window(async {
+        match pick_paths(nsh_core::file_dialog::OpenDialog::folders().title("添加项目")).await {
+            Ok(Some(paths)) => {
+                if let Some(path) = paths.first() {
+                    start_in_workspace(Some(vantry_protocol::WorkspaceSpec {
+                        kind: "directory".into(),
+                        path: path.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    }));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn(format!("无法打开项目选择器：{error}")),
+        }
+    });
+}
+
+pub(crate) fn start_in_workspace(workspace: Option<vantry_protocol::WorkspaceSpec>) {
+    state().update(|s| {
+        s.start_local_draft();
+        s.new_thread.workspace = workspace;
+    });
+    ui().update(|u| {
+        u.view = MainView::Conversation;
+        u.mobile_nav = false;
+        u.filter.project = None;
+    });
 }
 
 pub(crate) fn set_draft(text: &str) {
@@ -646,28 +880,56 @@ pub(crate) fn pick_attachments() {
     let Some(workbench) = workbench() else {
         return;
     };
-    spawn(async move {
+    if state().with_untracked(|s| s.attachment_imports.contains(&s.draft_key())) {
+        return;
+    }
+    let key = state().with_untracked(|s| s.draft_key());
+    state().update(|s| {
+        s.attachment_imports.insert(key.clone());
+    });
+    spawn_for_window(async move {
         let picked = pick_paths(
             nsh_core::file_dialog::OpenDialog::files()
                 .multiple(true)
                 .title("添加附件"),
         )
         .await;
-        let paths = match picked {
-            Ok(Some(paths)) => paths,
-            Ok(None) => return,
-            Err(error) => {
-                warn(format!("无法打开文件选择器：{error}"));
-                return;
+        match picked {
+            Ok(Some(paths)) => {
+                for path in paths {
+                    match call(workbench.attach(path.clone())).await {
+                        Ok(attachment) => state()
+                            .update(|s| s.add_attachment_to(key.clone(), attachment, Some(path))),
+                        Err(error) => warn(format!("无法附加文件：{}", error.message)),
+                    }
+                }
             }
-        };
-        for path in paths {
-            match call(workbench.attach(path)).await {
-                Ok(attachment) => state().update(move |s| s.add_attachment(attachment)),
-                Err(error) => warn(format!("无法附加文件：{}", error.message)),
-            }
+            Ok(None) => {}
+            Err(error) => warn(format!("无法打开文件选择器：{error}")),
         }
+        state().update(|s| {
+            s.attachment_imports.remove(&key);
+        });
     });
+}
+
+pub(crate) async fn attachment_preview(
+    item: vantry_protocol::Attachment,
+    source: Option<PathBuf>,
+) -> Option<String> {
+    if !item.mime.starts_with("image/") || !(1..=(8 << 20)).contains(&item.size) {
+        return None;
+    }
+    if let Some(workbench) = workbench() {
+        let mut request = actions::request(names::ATTACHMENT_READ);
+        request.input = Some(serde_json::to_value(&item).ok()?);
+        if let Ok(response) = call(workbench.workbench(request)).await
+            && !response.data.is_empty()
+        {
+            return Some(format!("data:{};base64,{}", item.mime, response.data));
+        }
+    }
+    source.and_then(|path| path.to_str().map(nsh_core::platform::clipboard::file_url))
 }
 
 pub(crate) fn remove_attachment(id: String) {
@@ -676,8 +938,61 @@ pub(crate) fn remove_attachment(id: String) {
 
 // --------------------------------------------------------------------- ui
 
+pub(crate) fn narrow_window() -> bool {
+    nsh_core::element::window().width.0 < crate::theme::metrics::NARROW_WIDTH
+}
+
+pub(crate) fn sidebar_visible() -> bool {
+    let narrow = narrow_window();
+    ui().with(|u| if narrow { u.mobile_nav } else { u.sidebar_open })
+}
+
 pub(crate) fn toggle_sidebar() {
-    ui().update(|u| u.sidebar_open = !u.sidebar_open);
+    let narrow = narrow_window();
+    ui().update(|u| {
+        if narrow {
+            u.mobile_nav = !u.mobile_nav
+        } else {
+            u.sidebar_open = !u.sidebar_open
+        }
+    });
+}
+
+pub(crate) fn search_focus_nonce() -> Signal<u64> {
+    global::<u64>()
+}
+
+pub(crate) fn focus_search() {
+    let narrow = narrow_window();
+    ui().update(|u| {
+        if narrow {
+            u.mobile_nav = true
+        } else {
+            u.sidebar_open = true
+        }
+    });
+    let nonce = search_focus_nonce();
+    nonce.set(nonce.get_untracked().wrapping_add(1));
+}
+
+pub(crate) fn quote_to_draft(snippet: String) {
+    let trimmed = snippet.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let quoted: String = trimmed
+        .lines()
+        .take(6)
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let current = state().with_untracked(|s| s.draft().text);
+    let next = if current.trim().is_empty() {
+        format!("{quoted}\n\n")
+    } else {
+        format!("{current}\n\n{quoted}\n\n")
+    };
+    set_draft(&next);
 }
 
 pub(crate) fn cycle_theme() {
@@ -740,7 +1055,7 @@ fn load_catalogs(already_marked: bool) {
     let Some(workbench) = workbench() else {
         return;
     };
-    spawn(async move {
+    spawn_for_window(async move {
         let result = call(workbench.settings()).await.map_err(|e| e.message);
         ui().update(move |u| u.on_catalogs(result));
     });
@@ -762,7 +1077,10 @@ pub(crate) fn toggle_extensions() {
 
 pub(crate) fn show_view(view: MainView) {
     let remote = view == MainView::RemoteDesktop;
-    ui().update(move |u| u.view = view);
+    ui().update(move |u| {
+        u.mobile_nav = false;
+        u.view = view;
+    });
     if remote {
         refresh_rd_status();
     }
@@ -770,7 +1088,10 @@ pub(crate) fn show_view(view: MainView) {
 
 pub(crate) fn open_plugin(id: String, page: String) {
     let mut load = false;
-    ui().update(|u| load = u.open_plugin(&id, &page));
+    ui().update(|u| {
+        u.mobile_nav = false;
+        load = u.open_plugin(&id, &page);
+    });
     if load {
         load_plugin_panel();
     } else if ui().with_untracked(|u| u.view == MainView::RemoteDesktop) {
@@ -783,7 +1104,8 @@ pub(crate) fn open_plugin(id: String, page: String) {
 /// Runs workbench action `request` as settings operation `key`: its
 /// buttons wait, its answer updates the shown catalogs, `done` (or the
 /// Core's message) is the feedback line.
-pub(crate) fn settings_op(key: impl Into<String>, request: WorkbenchRequest, done: &'static str) {
+pub(crate) fn settings_op(key: impl Into<String>, mut request: WorkbenchRequest, done: &'static str) {
+    if request.action.starts_with("mcp.") {request.workspace=bench().with_untracked(|b|b.root.clone());}
     let key = key.into();
     let Some(workbench) = workbench() else {
         return;
@@ -794,7 +1116,7 @@ pub(crate) fn settings_op(key: impl Into<String>, request: WorkbenchRequest, don
         return;
     }
     let action = request.action.clone();
-    spawn(async move {
+    spawn_for_window(async move {
         let result = call(workbench.workbench(request)).await.map_err(|e| e.message);
         ui().update(move |u| u.end_op(&key, &action, result, done));
     });
@@ -804,7 +1126,7 @@ pub(crate) fn dismiss_feedback() {
     ui().update(|u| u.forms.feedback = None);
 }
 
-pub(crate) fn mcp_set_enabled(name: String, enabled: bool) {
+pub(crate) fn mcp_set_enabled(name: String, scope:String, enabled: bool) {
     let Some(workbench) = workbench() else {
         return;
     };
@@ -822,8 +1144,10 @@ pub(crate) fn mcp_set_enabled(name: String, enabled: bool) {
     if !go {
         return;
     }
-    let request = actions::mcp_set_enabled(&name, enabled);
-    spawn(async move {
+    let mut request = actions::mcp_set_enabled(&name, enabled);
+    request.workspace=bench().with_untracked(|b|b.root.clone());
+    request.input.as_mut().expect("mcp.upsert has input")["scope"]=scope.into();
+    spawn_for_window(async move {
         let result = call(workbench.workbench(request)).await.map_err(|e| e.message);
         let failed = result.is_err();
         ui().update(move |u| {
@@ -844,12 +1168,14 @@ pub(crate) fn mcp_probe(name: String) {
     settings_op(format!("mcp.probe:{name}"), actions::mcp_named(names::MCP_PROBE, &name), "探活完成");
 }
 
-pub(crate) fn mcp_remove(name: String) {
-    settings_op(format!("mcp:{name}"), actions::mcp_named(names::MCP_REMOVE, &name), "已删除 MCP 服务器");
+pub(crate) fn mcp_remove(name: String,scope:String) {
+    let mut request=actions::mcp_named(names::MCP_REMOVE,&name);request.input=Some(serde_json::json!({"scope":scope}));
+    settings_op(format!("mcp:{name}"), request, "已删除 MCP 服务器");
 }
 
 pub(crate) fn mcp_trust() {
-    settings_op("mcp.trust", actions::request(names::MCP_TRUST), "已信任项目 MCP 配置");
+    let mut request=actions::request(names::MCP_TRUST);request.input=Some(serde_json::json!({"trusted":true}));
+    settings_op("mcp.trust",request,"已信任项目 MCP 配置");
 }
 
 /// Opens (or closes) the add-server form.
@@ -1035,7 +1361,7 @@ fn load_plugin_panel() {
     }) else {
         return;
     };
-    spawn(async move {
+    spawn_for_window(async move {
         let result = call(workbench.workbench(actions::plugin_panel(&id, &page)))
             .await
             .map(|r| r.output)
@@ -1269,6 +1595,11 @@ pub(crate) fn remote_update(f: impl FnOnce(&mut crate::state::ui::RemoteDesktopS
 pub(crate) fn toggle_dock(tab: DockTab) {
     let mut open = false;
     ui().update(|u| {
+        u.mobile_nav = false;
+        if u.view != MainView::Conversation {
+            u.view = MainView::Conversation;
+            u.dock_open = false;
+        }
         u.toggle_dock_tab(tab);
         open = u.dock_open;
     });
@@ -1278,11 +1609,17 @@ pub(crate) fn toggle_dock(tab: DockTab) {
 }
 
 pub(crate) fn close_dock() {
-    ui().update(|u| u.dock_open = false);
+    ui().update(|u| {
+        u.dock_open = false;
+        u.dock_maximized = false;
+        u.child_panel = None;
+    });
 }
 
 pub(crate) fn select_dock_tab(tab: DockTab) {
     ui().update(move |u| {
+        u.mobile_nav = false;
+        u.view = MainView::Conversation;
         u.dock_open = true;
         u.dock_tab = tab;
     });
@@ -1290,6 +1627,12 @@ pub(crate) fn select_dock_tab(tab: DockTab) {
 }
 
 fn show_tab(tab: DockTab) {
+    ui().update(|u| u.child_panel = None);
+    if matches!(tab, DockTab::Plugins | DockTab::Mcp) { load_settings_catalogs(); }
+    if matches!(tab, DockTab::Git | DockTab::Files) && bench().with_untracked(|b| b.root.is_empty())
+    {
+        return;
+    }
     let mut loads = Vec::new();
     bench().update(|b| loads = b.on_tab(tab));
     run_loads(loads);
@@ -1297,36 +1640,56 @@ fn show_tab(tab: DockTab) {
 
 /// Runs what the dock asked to load.
 fn run_loads(loads: Vec<Load>) {
-    let Some(workbench) = workbench() else {
+    let Some((project, workbench)) = project_workbench() else {
         return;
     };
     for load in loads {
         let workbench = workbench.clone();
-        spawn(async move {
+        spawn_for_window(async move {
             match load {
                 Load::Dir(path) => {
-                    let result = call(workbench.list_dir(path.clone())).await.map_err(|e| e.message);
-                    bench().update(move |b| b.files.on_dir(&path, result));
+                    let result = call(workbench.list_dir(path.clone()))
+                        .await
+                        .map_err(|e| e.message);
+                    bench().update(move |b| {
+                        b.apply_project_result(project, |b| b.files.on_dir(&path, result))
+                    });
                 }
                 Load::File(path) => {
-                    let result = call(workbench.read_file(path.clone())).await.map_err(|e| e.message);
-                    bench().update(move |b| b.files.on_file(&path, result));
+                    let result = call(workbench.read_file(path.clone()))
+                        .await
+                        .map_err(|e| e.message);
+                    bench().update(move |b| {
+                        b.apply_project_result(project, |b| b.files.on_file(&path, result))
+                    });
                 }
                 Load::GitStatus => {
                     let result = call(workbench.git_status()).await.map_err(|e| e.message);
                     let mut next = None;
-                    bench().update(|b| next = b.git.on_status(result));
+                    bench().update(|b| {
+                        b.apply_project_result(project, |b| {
+                            next = b.git.on_status(result);
+                            if next.is_none() && b.git.error.is_none() && b.git.selected.is_none() && let Some(first)=b.git.changes().first() {
+                                next=Some(b.git.select(&first.path,first.staged));
+                            }
+                        })
+                    });
                     run_loads(next.into_iter().collect());
                 }
                 Load::Diff { path, staged } => {
                     let result = call(workbench.git_diff(path.clone(), staged))
                         .await
                         .map_err(|e| e.message);
-                    bench().update(move |b| b.git.on_diff(path.as_deref(), staged, result));
+                    bench().update(move |b| {
+                        b.apply_project_result(project, |b| {
+                            b.git.on_diff(path.as_deref(), staged, result)
+                        })
+                    });
                 }
                 Load::Pr => {
                     let result = call(workbench.pr_summary()).await.map_err(|e| e.message);
-                    bench().update(move |b| b.git.on_pr(result));
+                    bench()
+                        .update(move |b| b.apply_project_result(project, |b| b.git.on_pr(result)));
                 }
             }
         });
@@ -1351,19 +1714,14 @@ pub(crate) fn refresh_files() {
     run_loads(loads);
 }
 
-/// Shows the selected file in the preview tab.
-pub(crate) fn preview_file() {
-    let mut shown = false;
-    bench().update(|b| shown = b.preview_selected_file());
-    if shown {
-        select_dock_tab(DockTab::Preview);
-    }
-}
+mod shell;
+pub(crate) use shell::*;
+mod git_history;
+pub(crate) use git_history::*;
 
-/// Shows `text` (a reply, a document) in the preview tab.
+/// Shows a reply or document in a read-only dialog.
 pub(crate) fn preview_text(title: String, text: String) {
     bench().update(move |b| b.preview.show(&title, &text));
-    select_dock_tab(DockTab::Preview);
 }
 
 pub(crate) fn toggle_preview_source() {
@@ -1392,7 +1750,7 @@ pub(crate) fn set_commit_message(text: &str) {
 
 /// Stages (or unstages) `paths`.
 pub(crate) fn stage(paths: Vec<String>, staged: bool) {
-    let Some(workbench) = workbench() else {
+    let Some((project, workbench)) = project_workbench() else {
         return;
     };
     let mut go = false;
@@ -1400,7 +1758,7 @@ pub(crate) fn stage(paths: Vec<String>, staged: bool) {
     if !go {
         return;
     }
-    spawn(async move {
+    spawn_for_window(async move {
         let future = if staged {
             workbench.git_unstage(paths)
         } else {
@@ -1408,13 +1766,13 @@ pub(crate) fn stage(paths: Vec<String>, staged: bool) {
         };
         let result = call(future).await.map(|()| None).map_err(|e| e.message);
         let mut next = None;
-        bench().update(|b| next = Some(b.git.on_done(result)));
+        bench().update(|b| b.apply_project_result(project, |b| next = Some(b.git.on_done(result))));
         run_loads(next.into_iter().collect());
     });
 }
 
 pub(crate) fn commit() {
-    let Some(workbench) = workbench() else {
+    let Some((project, workbench)) = project_workbench() else {
         return;
     };
     let mut message = None;
@@ -1427,13 +1785,13 @@ pub(crate) fn commit() {
     let Some(message) = message else {
         return;
     };
-    spawn(async move {
+    spawn_for_window(async move {
         let result = call(workbench.git_commit(message))
             .await
             .map(Some)
             .map_err(|e| e.message);
         let mut next = None;
-        bench().update(|b| next = Some(b.git.on_done(result)));
+        bench().update(|b| b.apply_project_result(project, |b| next = Some(b.git.on_done(result))));
         run_loads(next.into_iter().collect());
     });
 }
@@ -1457,7 +1815,7 @@ pub(crate) fn select_terminal(id: String) {
 pub(crate) fn close_terminal(id: String) {
     let mut running = false;
     bench().update(|b| running = b.terminal.close(&id));
-    if running {
+    if running && !shell_close(&id) {
         interrupt_session(id);
     }
 }
@@ -1558,7 +1916,7 @@ pub(crate) fn reveal_workspace() {
 
 /// Switches the workspace's branch.
 pub(crate) fn git_checkout(branch: String) {
-    let Some(workbench) = workbench() else {
+    let Some((project, workbench)) = project_workbench() else {
         return;
     };
     let mut go = false;
@@ -1566,13 +1924,16 @@ pub(crate) fn git_checkout(branch: String) {
     if !go {
         return;
     }
-    spawn(async move {
-        let result = call(workbench.git_checkout(branch)).await.map(|()| None).map_err(|e| e.message);
+    spawn_for_window(async move {
+        let result = call(workbench.git_checkout(branch))
+            .await
+            .map(|()| None)
+            .map_err(|e| e.message);
         let mut next = None;
-        bench().update(|b| next = Some(b.git.on_done(result)));
+        bench().update(|b| b.apply_project_result(project, |b| next = Some(b.git.on_done(result))));
         let mut loads: Vec<Load> = next.into_iter().collect();
         // The tree may differ on the other branch.
-        bench().update(|b| loads.extend(b.files.refresh()));
+        bench().update(|b| b.apply_project_result(project, |b| loads.extend(b.files.refresh())));
         run_loads(loads);
     });
 }
@@ -1583,7 +1944,7 @@ pub(crate) fn ask_discard(path: Option<String>) {
 }
 
 pub(crate) fn git_discard(paths: Vec<String>) {
-    let Some(workbench) = workbench() else {
+    let Some((project, workbench)) = project_workbench() else {
         return;
     };
     let mut go = false;
@@ -1594,10 +1955,13 @@ pub(crate) fn git_discard(paths: Vec<String>) {
     if !go {
         return;
     }
-    spawn(async move {
-        let result = call(workbench.git_discard(paths)).await.map(|()| None).map_err(|e| e.message);
+    spawn_for_window(async move {
+        let result = call(workbench.git_discard(paths))
+            .await
+            .map(|()| None)
+            .map_err(|e| e.message);
         let mut next = None;
-        bench().update(|b| next = Some(b.git.on_done(result)));
+        bench().update(|b| b.apply_project_result(project, |b| next = Some(b.git.on_done(result))));
         run_loads(next.into_iter().collect());
     });
 }
@@ -1619,17 +1983,23 @@ pub(crate) fn set_file_search(text: &str) {
     if text.trim().is_empty() {
         return;
     }
+    let Some((project, workbench)) = project_workbench() else {
+        return;
+    };
     set_timeout(Duration::from_millis(220), move || {
-        if bench().with_untracked(|b| b.files.search.generation) != generation {
+        if bench().with_untracked(|b| {
+            b.project_generation != project || b.files.search.generation != generation
+        }) {
             return;
         }
-        let Some(workbench) = workbench() else {
-            return;
-        };
         let query = text.clone();
-        spawn(async move {
-            let result = call(workbench.search_files(query)).await.map_err(|e| e.message);
-            bench().update(move |b| b.files.search.on_results(generation, result));
+        spawn_for_window(async move {
+            let result = call(workbench.search_files(query))
+                .await
+                .map_err(|e| e.message);
+            bench().update(move |b| {
+                b.apply_project_result(project, |b| b.files.search.on_results(generation, result))
+            });
         });
     });
 }
@@ -1642,6 +2012,7 @@ pub(crate) fn open_search_hit(path: String) {
 // ----------------------------------------------------------------- composer
 
 /// Cycles the thinking level of the shown model (`model:level`).
+#[allow(dead_code)]
 pub(crate) fn cycle_thinking() {
     let (levels, models) = ui().with_untracked(|u| u.thinking_catalog());
     if levels.is_empty() {
@@ -1657,17 +2028,36 @@ pub(crate) fn cycle_thinking() {
     intent(move |s| s.set_model(&next));
 }
 
+pub(crate) fn set_thinking_level(level: String) {
+    let (_, models) = ui().with_untracked(|u| u.thinking_catalog());
+    let current = state().with_untracked(|s| s.current_model());
+    let (base, _) = actions::split_thinking(&current, &models);
+    if base.is_empty() {
+        return;
+    }
+    let next = actions::with_thinking(base, &level);
+    intent(move |s| s.set_model(&next));
+}
+
 /// Escape in the window: closes the model picker, else stops the shown
 /// thread's run (when nothing modal is open).
 pub(crate) fn escape() {
     let (picker, modal_ui) = ui().with_untracked(|u| {
-        (u.model_picker, u.settings.is_some() || u.rename.is_some() || u.confirm.is_some())
+        (
+            u.model_picker,
+            u.settings.is_some() || u.rename.is_some() || u.confirm.is_some(),
+        )
     });
     if picker {
         toggle_model_picker();
         return;
     }
     if modal_ui || state().with_untracked(|s| s.modal_request().is_some()) {
+        return;
+    }
+    if ui().with_untracked(|u| u.dock_open && u.dock_tab != DockTab::Terminal) { close_dock(); return; }
+    if narrow_window() && ui().with_untracked(|u| u.mobile_nav) {
+        ui().update(|u| u.mobile_nav = false);
         return;
     }
     if state().with_untracked(|s| s.composer_status().can_stop) {

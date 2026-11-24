@@ -405,7 +405,6 @@ mod tests {
 
         assert!(!should_autostart(&launch(&["--mock"])));
         assert!(!should_autostart(&launch(&["--attach-only"])));
-        assert!(!should_autostart(&launch(&["--remote", "devbox"])));
         let err = ensure_core_command(&config, &Locator::default()).unwrap_err();
         assert!(err.0.contains("vantry-service"));
     }

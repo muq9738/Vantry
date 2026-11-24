@@ -151,6 +151,13 @@ pub async fn mcp(r: &WorkbenchRequest, root: Option<PathBuf>) -> Result<MCPCatal
                             !project || cfg.get("auth").is_none(),
                             "project MCP provider auth unavailable"
                         );
+                    } else if let Some(existing)=servers.get_mut(&r.name).and_then(Value::as_object_mut) {
+                        let fields=cfg.as_object().unwrap();
+                        ensure!(fields.keys().all(|k|matches!(k.as_str(),"enabled"|"scope"|"name"|"exposure"|"toolExposure"|"lifecycle")),"unsupported partial server update");
+                        for (key,value) in fields {
+                            if !matches!(key.as_str(),"scope"|"name") {existing.insert(key.clone(),value.clone());}
+                        }
+                        return Ok(());
                     } else {
                         ensure!(
                             project

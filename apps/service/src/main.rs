@@ -1,13 +1,17 @@
 mod ctl;
+mod federation;
 mod image;
 mod mcp_probe;
 mod orchestration;
 mod plugin_source;
 mod provider;
+#[cfg(target_os = "macos")]
+mod rd_macos;
 mod relay;
 mod settings;
 mod usage;
 mod workbench;
+mod workbench_git;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
@@ -246,9 +250,23 @@ async fn serve(args: CoreArgs) -> Result<()> {
         model,
         delay: args.controlled_delay,
         magpie: args.magpie_settings,
+        federator: Some(ext.federator.clone()),
     });
     let stop = CancellationToken::new();
     let shutdown = signal()?;
+    let saved = ext.identity.snapshot();
+    let mut relay_targets = Vec::new();
+    if saved.enabled {
+        if !saved.host.relay.is_empty() {
+            relay_targets.push((saved.host.relay.clone(), saved.registration_key.clone()));
+        }
+        for endpoint in &saved.relays {
+            if !endpoint.url.is_empty() && !relay_targets.iter().any(|(url, _)| url == &endpoint.url) {
+                let key = if endpoint.registration_key.is_empty() { &saved.registration_key } else { &endpoint.registration_key };
+                relay_targets.push((endpoint.url.clone(), key.clone()));
+            }
+        }
+    }
     let listener = if let Some(addr) = args.listen_remote {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         ext.identity.set_routes(
@@ -256,6 +274,8 @@ async fn serve(args: CoreArgs) -> Result<()> {
             ext.identity.snapshot().host.relays,
         )?;
         Some(listener)
+    } else if !relay_targets.is_empty() {
+        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
     } else {
         None
     };
@@ -277,6 +297,29 @@ async fn serve(args: CoreArgs) -> Result<()> {
             let t3_task = tokio::spawn(async move {
                 let _ = t3.serve(t3_listener, t3_stop).await;
             });
+            let mut gateway = listener.local_addr()?;
+            if gateway.ip().is_unspecified() {
+                gateway.set_ip(if gateway.is_ipv4() {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                });
+            }
+            let relay_stop = stop.child_token();
+            let mut hosts = tokio::task::JoinSet::new();
+            for (relay, key) in relay_targets {
+                let host = vantry_connectivity::peer::HostConfig {
+                    relay, key, gateway, route: saved.host.route.clone(),
+                    instance: saved.host.device_id.clone(), t3: None,
+                };
+                let (status, _) = tokio::sync::watch::channel(vantry_connectivity::peer::HostState::Connecting);
+                let owner = relay_stop.clone();
+                hosts.spawn(async move {
+                    if host.run(status, owner).await.is_err() {
+                        tracing::warn!("saved IDE relay could not start");
+                    }
+                });
+            }
             let res = vantry_connectivity::peer::serve_gateway_with_t3(
                 listener,
                 ext.identity.clone(),
@@ -286,7 +329,10 @@ async fn serve(args: CoreArgs) -> Result<()> {
                 stop.clone(),
             )
             .await;
+            relay_stop.cancel();
+            while hosts.join_next().await.is_some() {}
             t3_task.abort();
+            let _ = t3_task.await;
             res
         } else {
             stop.cancelled().await;

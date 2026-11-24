@@ -434,17 +434,28 @@ impl Host {
         Ok(())
     }
     pub fn set_enabled(&mut self, id: &str, on: bool) -> Result<()> {
+        self.set_setting(id, "enabled", &on.to_string())
+    }
+    pub fn set_setting(&mut self, id: &str, key: &str, value: &str) -> Result<()> {
         id_ok(id)?;
+        ensure!(!key.trim().is_empty(), "plugin setting key required");
         let _guard = hostfs::lock_dir(&self.dir, true)?;
-        self.manifest(id)?;
+        let manifest = self.manifest(id)?;
+        ensure!(
+            key == "enabled" || manifest.settings.iter().any(|s| s.key == key),
+            "unknown plugin setting {key}"
+        );
         let path = self.data.join(id).join("settings.json");
         let mut settings = self.settings(id)?;
-        settings.insert("enabled".into(), on.to_string());
+        settings.insert(key.to_owned(), value.to_owned());
         hostfs::write_json(&path, &settings)?;
-        if !on {
+        if key == "enabled" && value == "false" {
             self.sessions.remove(id);
         }
         Ok(())
+    }
+    pub fn manifest_info(&self, id: &str) -> Result<Manifest> {
+        self.manifest(id)
     }
     fn active(&self, id: &str) -> Result<Manifest> {
         let m = self.manifest(id)?;

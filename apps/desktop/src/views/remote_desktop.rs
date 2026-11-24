@@ -11,13 +11,14 @@ use super::{caption, dot, ghost_button, link_button, pill, primary_button};
 use crate::{
     controller,
     state::ui::{Catalogs, Quality, RemoteLink, Resolution},
-    theme::PALETTE,
+    theme::palette,
 };
 
 /// The canvas's anchor for the media stream (Wave 3 binds frames to it).
 pub(crate) const CANVAS_ID: &str = "vantry-remote-desktop-canvas";
 
 pub(crate) fn remote_desktop() -> impl IntoElement {
+    let colors = palette();
     let remote = computed(|| controller::ui().with(|u| u.remote.clone()));
     let peers = computed(|| {
         controller::ui().with(|u| match &u.catalogs {
@@ -37,15 +38,15 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
     let connected = move || matches!(remote.with(|r| r.link.clone()), RemoteLink::Connected { .. });
     let busy = move || matches!(remote.with(|r| r.link.clone()), RemoteLink::Connecting { .. });
     let link_color = move || match remote.with(|r| r.link.clone()) {
-        RemoteLink::Connected { .. } => PALETTE.success,
-        RemoteLink::Connecting { .. } => PALETTE.accent,
-        RemoteLink::Failed { .. } => PALETTE.danger,
-        RemoteLink::Idle => PALETTE.faint,
+        RemoteLink::Connected { .. } => colors.success,
+        RemoteLink::Connecting { .. } => colors.accent,
+        RemoteLink::Failed { .. } => colors.danger,
+        RemoteLink::Idle => colors.faint,
     };
     view()
         .flex_1()
         .flex_col()
-        .bg(PALETTE.canvas)
+        .bg(colors.canvas)
         .child(
             view()
                 .flex_row()
@@ -55,19 +56,19 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                 .px_5()
                 .py_2()
                 .border_b_1()
-                .border_b_color(PALETTE.line_soft)
+                .border_b_color(colors.line_soft)
                 .child(dot(link_color))
                 .child(
                     text(move || remote.with(|r| r.status_label()))
                         .number_of_lines(1u32)
                         .text_size(px(12.5))
-                        .text_color(PALETTE.ink),
+                        .text_color(colors.ink),
                 )
                 .child(
                     text(move || remote.with(|r| r.detail()))
                         .number_of_lines(1u32)
                         .text_size(px(11.5))
-                        .text_color(PALETTE.muted),
+                        .text_color(colors.muted),
                 )
                 .child(view().flex_1())
                 .children(Resolution::ALL.map(|res| {
@@ -118,8 +119,8 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                     .gap_2()
                     .px_5()
                     .py_1p5()
-                    .bg(PALETTE.approval)
-                    .child(dot(PALETTE.warning))
+                    .bg(colors.approval)
+                    .child(dot(colors.warning))
                     .child(
                         text(move || {
                             remote.with(|r| {
@@ -129,7 +130,7 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                         })
                         .flex_1()
                         .text_size(px(12.0))
-                        .text_color(PALETTE.ink),
+                        .text_color(colors.ink),
                     )
                     .child(link_button("重新检查", controller::refresh_rd_status))
             },
@@ -154,6 +155,7 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
 /// and forwards normalized pointer, wheel and keyboard events when `control`
 /// is enabled.
 fn canvas_view(remote: Memo<crate::state::ui::RemoteDesktopState>) -> impl IntoElement {
+    let colors = palette();
     let normalize = |x: f32, y: f32| -> (f64, f64) {
         let (w, h) = controller::ui().with_untracked(|u| u.remote.canvas_size);
         let w = if w > 1 { w as f64 } else { 960.0 };
@@ -171,7 +173,7 @@ fn canvas_view(remote: Memo<crate::state::ui::RemoteDesktopState>) -> impl IntoE
         .rounded(px(10.0))
         .bg(AdaptiveColor::rgb(0x0F1012, 0x0B0C0E))
         .border_1()
-        .border_color(move || if remote.with(|r| r.control) { PALETTE.accent } else { PALETTE.line })
+        .border_color(move || if remote.with(|r| r.control) { colors.accent } else { colors.line })
         .on_layout(|bounds: &Bounds<Points>| {
             let w = bounds.size.width.0.max(0.0).round() as u32;
             let h = bounds.size.height.0.max(0.0).round() as u32;
@@ -283,6 +285,7 @@ fn canvas_view(remote: Memo<crate::state::ui::RemoteDesktopState>) -> impl IntoE
 }
 
 fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Copy + 'static) -> impl IntoElement {
+    let colors = palette();
     view()
         .w_full()
         .max_w(px(420.0))
@@ -290,14 +293,14 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
         .gap_2()
         .p_5()
         .rounded(px(14.0))
-        .bg(PALETTE.card)
+        .bg(colors.card)
         .border_1()
-        .border_color(PALETTE.line)
+        .border_color(colors.line)
         .child(
             text("连接远程桌面")
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_size(px(16.0))
-                .text_color(PALETTE.ink),
+                .text_color(colors.ink),
         )
         .child(caption("选择一台已配对的主机"))
         .child(when(
@@ -308,12 +311,12 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                     .gap_1()
                     .p_2()
                     .rounded(px(8.0))
-                    .bg(PALETTE.approval)
+                    .bg(colors.approval)
                     .child(
                         text(|| controller::ui().with(|u| u.remote.status_label()))
                             .select_text()
                             .text_size(px(12.0))
-                            .text_color(PALETTE.danger),
+                            .text_color(colors.danger),
                     )
                     .child(link_button("重试", || {
                         let peer = controller::ui().with_untracked(|u| match &u.remote.link {
@@ -331,7 +334,7 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
             || {
                 text("还没有已配对的主机。在 设置 › 远端互联与配对 中兑换配对码即可添加。")
                     .text_size(px(12.0))
-                    .text_color(PALETTE.faint)
+                    .text_color(colors.faint)
             },
         ))
         .child(
@@ -340,7 +343,7 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                 .gap_1p5()
                 .pt_2()
                 .border_t_1()
-                .border_t_color(PALETTE.line_soft)
+                .border_t_color(colors.line_soft)
                 .child(caption("局域网直连（vantry-lan://）"))
                 .child(
                     view()
@@ -355,10 +358,10 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                                     controller::remote_update(move |r| r.direct_link = val);
                                 })
                                 .placeholder("粘贴 vantry-lan:// 连接地址")
-                                .placeholder_color(move || color(PALETTE.faint))
+                                .placeholder_color(move || color(colors.faint))
                                 .flex_1()
                                 .text_size(px(12.0))
-                                .text_color(PALETTE.ink),
+                                .text_color(colors.ink),
                         )
                         .child(
                             primary_button("直连", || {
@@ -378,7 +381,7 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                 .gap_1p5()
                 .pt_2()
                 .border_t_1()
-                .border_t_color(PALETTE.line_soft)
+                .border_t_color(colors.line_soft)
                 .child(
                     view()
                         .flex_row()
@@ -403,7 +406,7 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                         text(|| controller::ui().with(|u| u.remote.host_lan_link.clone()))
                             .select_text()
                             .text_size(px(11.0))
-                            .text_color(PALETTE.muted)
+                            .text_color(colors.muted)
                     },
                 )),
         )
@@ -420,7 +423,7 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                         text(move || peer.with(|p| format!("{}（{}）", p.1, p.0)))
                             .flex_1()
                             .text_size(px(13.0))
-                            .text_color(PALETTE.ink),
+                            .text_color(colors.ink),
                     )
                     .child(
                         primary_button(move || if busy() { "连接中…" } else { "连接" }, move || {

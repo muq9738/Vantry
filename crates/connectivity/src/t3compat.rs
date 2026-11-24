@@ -398,7 +398,7 @@ impl T3Server {
                 let query = req.uri().query().unwrap_or("");
                 let ticket = query.split('&').find_map(|pair| {
                     let (k, v) = pair.split_once('=')?;
-                    (k == "ticket").then_some(v.to_owned())
+                    matches!(k, "ticket" | "wsTicket").then_some(v.to_owned())
                 });
                 let auth_ok = if let Some(t) = ticket {
                     let now = Utc::now();
@@ -446,6 +446,8 @@ impl T3Server {
             }
         });
         let core_socket = self.0.opts.core_socket.clone();
+        let active_reqs: Arc<Mutex<HashMap<String, CancellationToken>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         loop {
             let msg = tokio::select! {
                 _ = stop.cancelled() => break,
@@ -457,49 +459,503 @@ impl T3Server {
             let Message::Text(text) = msg else {
                 continue;
             };
-            let Ok(req) = serde_json::from_str::<Value>(&text) else {
+            let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
-            let id = req.get("id").cloned().unwrap_or(Value::Null);
-            let method = req["method"].as_str().unwrap_or("");
-            let params = req.get("params").cloned().unwrap_or(Value::Null);
-            let reply = match method {
-                "ping" => Ok(json!({"pong": true})),
-                "health" => core_http_json(&core_socket, Method::GET, "/v1/health", None).await,
-                "orchestration.snapshot" | "snapshot" => {
-                    core_http_json(&core_socket, Method::GET, "/v1/snapshot", None).await
-                }
-                "orchestration.dispatch" | "command" => {
-                    core_http_json(&core_socket, Method::POST, "/v1/commands", Some(params)).await
-                }
-                "workbench" => {
-                    core_http_json(&core_socket, Method::POST, "/v1/workbench", Some(params)).await
-                }
-                "orchestration.subscribe" | "subscribe" => {
-                    let after = params["after"].as_i64().unwrap_or(0);
-                    let sock = core_socket.clone();
-                    let sub_tx = tx.clone();
-                    let sub_stop = stop.clone();
-                    tokio::spawn(async move {
-                        let _ = stream_core_events(&sock, after, sub_tx, sub_stop).await;
-                    });
-                    Ok(json!({"subscribed": true, "after": after}))
-                }
-                other => Err(anyhow!("unknown T3 RPC method {other}")),
+            let frames = match parsed {
+                Value::Array(arr) => arr,
+                other => vec![other],
             };
-            let frame = match reply {
-                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                Err(err) => {
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": err.to_string()}})
+            for req in frames {
+                // Effect-RPC wire protocol (`_tag` / `tag` / `payload`) used by T3 clients.
+                if let Some(tag) = req.get("_tag").and_then(Value::as_str) {
+                    match tag {
+                        "Ping" => {
+                            if tx
+                                .send(Message::text(json!({"_tag": "Pong"}).to_string()))
+                                .await
+                                .is_err()
+                            {
+                                stop.cancel();
+                                break;
+                            }
+                        }
+                        "Ack" | "Pong" | "Eof" | "ResendPreviousSeq" => {}
+                        "Interrupt" => {
+                            if let Some(req_id) = req.get("requestId") {
+                                let key = req_id.to_string();
+                                if let Some(tok) = active_reqs.lock().unwrap().remove(&key) {
+                                    tok.cancel();
+                                }
+                            }
+                        }
+                        "Request" => {
+                            let req_id = req.get("id").cloned().unwrap_or(Value::Null);
+                            let method = req["tag"].as_str().unwrap_or("").to_owned();
+                            let payload = req.get("payload").cloned().unwrap_or(json!({}));
+                            if req_id.is_null() || method.is_empty() {
+                                continue;
+                            }
+                            let key = req_id.to_string();
+                            let req_stop = stop.child_token();
+                            {
+                                let mut map = active_reqs.lock().unwrap();
+                                if map.contains_key(&key) || map.len() >= 256 {
+                                    let _ = tx.try_send(Message::text(
+                                        t3_exit(&req_id, Err(anyhow!("重复或超限的 RPC 请求")))
+                                            .to_string(),
+                                    ));
+                                    continue;
+                                }
+                                map.insert(key.clone(), req_stop.clone());
+                            }
+                            let this = self.clone();
+                            let sock = core_socket.clone();
+                            let tx_clone = tx.clone();
+                            let reqs_map = active_reqs.clone();
+                            tokio::spawn(async move {
+                                this.handle_effect_rpc(
+                                    sock, &req_id, &method, payload, tx_clone, req_stop,
+                                )
+                                .await;
+                                reqs_map.lock().unwrap().remove(&key);
+                            });
+                        }
+                        _ => {}
+                    }
+                    continue;
                 }
-            };
-            if tx.send(Message::text(frame.to_string())).await.is_err() {
-                break;
+
+                // Backwards-compatible JSON-RPC 2.0 dispatch (`method` / `params`).
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("");
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let reply = match method {
+                    "ping" => Ok(json!({"pong": true})),
+                    "health" => core_http_json(&core_socket, Method::GET, "/v1/health", None).await,
+                    "orchestration.snapshot" | "snapshot" => {
+                        core_http_json(&core_socket, Method::GET, "/v1/snapshot", None).await
+                    }
+                    "orchestration.dispatch" | "command" => {
+                        core_http_json(&core_socket, Method::POST, "/v1/commands", Some(params))
+                            .await
+                    }
+                    "workbench" => {
+                        core_http_json(&core_socket, Method::POST, "/v1/workbench", Some(params))
+                            .await
+                    }
+                    "orchestration.subscribe" | "subscribe" => {
+                        let after = params["after"].as_i64().unwrap_or(0);
+                        let sock = core_socket.clone();
+                        let sub_tx = tx.clone();
+                        let sub_stop = stop.clone();
+                        tokio::spawn(async move {
+                            let _ = stream_core_events(&sock, after, sub_tx, sub_stop).await;
+                        });
+                        Ok(json!({"subscribed": true, "after": after}))
+                    }
+                    other => Err(anyhow!("unknown T3 RPC method {other}")),
+                };
+                let frame = match reply {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err(err) => {
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": err.to_string()}})
+                    }
+                };
+                if tx.send(Message::text(frame.to_string())).await.is_err() {
+                    stop.cancel();
+                    break;
+                }
             }
         }
         stop.cancel();
         let _ = writer.await;
     }
+
+    fn t3_descriptor(&self) -> Value {
+        json!({
+            "environmentId": self.environment_id(),
+            "label": self.0.opts.name,
+            "platform": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+            "version": self.0.opts.version,
+        })
+    }
+
+    fn t3_server_config(&self) -> Value {
+        json!({
+            "environment": self.t3_descriptor(),
+            "providers": [{
+                "provider": self.0.opts.provider,
+                "enabled": true,
+                "installed": true,
+                "models": if self.0.opts.model.is_empty() { json!([]) } else { json!([{"id": self.0.opts.model, "name": self.0.opts.model}]) },
+            }],
+            "cwd": self.0.opts.data_dir,
+        })
+    }
+
+    async fn handle_effect_rpc(
+        &self,
+        core_socket: PathBuf,
+        req_id: &Value,
+        method: &str,
+        payload: Value,
+        tx: mpsc::Sender<Message>,
+        req_stop: CancellationToken,
+    ) {
+        let send_chunk = |val: Value| {
+            let msg = json!({"_tag": "Chunk", "requestId": req_id, "values": [val]});
+            tx.send(Message::text(msg.to_string()))
+        };
+        match method {
+            "subscribeServerConfig" => {
+                let _ = send_chunk(json!({
+                    "version": 1,
+                    "type": "snapshot",
+                    "config": self.t3_server_config(),
+                }))
+                .await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeServerLifecycle" => {
+                let env = self.t3_descriptor();
+                let _ = send_chunk(json!({
+                    "version": 1,
+                    "sequence": 1,
+                    "type": "welcome",
+                    "payload": {
+                        "environment": env,
+                        "cwd": self.0.opts.data_dir,
+                        "projectName": self.0.opts.name,
+                        "bootstrapStatus": "complete",
+                    }
+                }))
+                .await;
+                let _ = send_chunk(json!({
+                    "version": 1,
+                    "sequence": 2,
+                    "type": "ready",
+                    "payload": {
+                        "at": Utc::now().to_rfc3339(),
+                        "environment": self.t3_descriptor(),
+                    }
+                }))
+                .await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeProjectClones" => {
+                let _ = send_chunk(json!([])).await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeVcsBranch" => {
+                let _ = send_chunk(json!({"refName": null, "isRepo": false})).await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeVcsStatus" => {
+                let _ = send_chunk(json!({
+                    "_tag": "snapshot",
+                    "local": {
+                        "isRepo": false,
+                        "hasPrimaryRemote": false,
+                        "isDefaultRef": false,
+                        "refName": null,
+                        "hasWorkingTreeChanges": false,
+                        "workingTree": {"files": [], "insertions": 0, "deletions": 0},
+                    },
+                    "remote": null,
+                }))
+                .await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeTerminalMetadata" => {
+                let _ = send_chunk(json!({"type": "snapshot", "terminals": []})).await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeWorktreeSetup" => {
+                let _ = send_chunk(Value::Null).await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribeDiscoveredLocalServers" => {
+                let _ = send_chunk(json!({"servers": [], "scannedAt": Utc::now().to_rfc3339()}))
+                    .await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "scheduledTasks.subscribe" => {
+                let _ = send_chunk(json!({"tasks": []})).await;
+                req_stop.cancelled().await;
+                return;
+            }
+            "subscribePreviewEvents" => {
+                req_stop.cancelled().await;
+                return;
+            }
+            "orchestration.subscribeShell" | "orchestration.subscribeThread" => {
+                let filter_thread = payload["threadId"].as_str().unwrap_or("").to_owned();
+                let snap = core_http_json(&core_socket, Method::GET, "/v1/snapshot", None).await;
+                let after = snap
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| s["sequence"].as_i64())
+                    .unwrap_or(0);
+                if let Ok(s) = snap {
+                    let initial = if method == "orchestration.subscribeThread" && !filter_thread.is_empty() {
+                        build_t3_thread_projection(&s, &filter_thread)
+                    } else {
+                        build_t3_shell_snapshot(&s)
+                    };
+                    let _ = send_chunk(json!({
+                        "type": "snapshot",
+                        "snapshotSequence": after,
+                        "snapshot": initial,
+                    }))
+                    .await;
+                }
+                let _ = stream_t3_effect_events(
+                    &core_socket,
+                    after,
+                    req_id.clone(),
+                    filter_thread,
+                    tx,
+                    req_stop,
+                )
+                .await;
+                return;
+            }
+            _ => {}
+        }
+
+        let result: Result<Value> = match method {
+            "orchestration.getShellSnapshot" => {
+                core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
+                    .await
+                    .map(|s| build_t3_shell_snapshot(&s))
+            }
+            "orchestration.getArchivedShellSnapshot" => {
+                core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
+                    .await
+                    .map(|s| {
+                        let shell = build_t3_shell_snapshot(&s);
+                        json!({
+                            "schemaVersion": 2,
+                            "snapshotSequence": shell["snapshotSequence"],
+                            "projects": shell["projects"],
+                            "threads": shell["archivedThreads"],
+                        })
+                    })
+            }
+            "orchestration.getOlderSettledThreads" => {
+                core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
+                    .await
+                    .map(|s| {
+                        json!({
+                            "snapshotSequence": s["sequence"].as_i64().unwrap_or(0),
+                            "threads": [],
+                            "counts": [],
+                        })
+                    })
+            }
+            "orchestration.getThreadProjection" => {
+                let tid = payload["threadId"].as_str().unwrap_or("");
+                core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
+                    .await
+                    .map(|s| build_t3_thread_projection(&s, tid))
+            }
+            "orchestration.getThreadSnapshot" => {
+                let tid = payload["threadId"].as_str().unwrap_or("");
+                core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
+                    .await
+                    .map(|s| {
+                        json!({
+                            "snapshotSequence": s["sequence"].as_i64().unwrap_or(0),
+                            "projection": build_t3_thread_projection(&s, tid),
+                        })
+                    })
+            }
+            "orchestration.getThreadTitles" => {
+                let ids: Vec<String> = payload["threadIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
+                    .await
+                    .map(|s| {
+                        let mut map = serde_json::Map::new();
+                        for t in s["threads"].as_array().into_iter().flatten() {
+                            if let Some(id) = t["id"].as_str()
+                                && (ids.is_empty() || ids.iter().any(|wanted| wanted == id))
+                            {
+                                map.insert(
+                                    id.to_owned(),
+                                    Value::String(
+                                        t["title"].as_str().unwrap_or_default().to_owned(),
+                                    ),
+                                );
+                            }
+                        }
+                        Value::Object(map)
+                    })
+            }
+            "orchestration.dispatchCommand" => {
+                let cmd = payload
+                    .get("command")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(payload);
+                core_http_json(&core_socket, Method::POST, "/v1/commands", Some(cmd)).await
+            }
+            "orchestration.launchThread" => {
+                core_http_json(
+                    &core_socket,
+                    Method::POST,
+                    "/v1/orchestration/threads/launch",
+                    Some(payload),
+                )
+                .await
+            }
+            "server.getConfig" | "getServerConfig" => Ok(self.t3_server_config()),
+            "server.refreshProviders" => {
+                let cfg = self.t3_server_config();
+                Ok(json!({"providers": cfg["providers"]}))
+            }
+            "server.probe" | "server.reportClientActivity" => Ok(json!({})),
+            other => Err(anyhow!("unknown T3 RPC method {other}")),
+        };
+        let _ = tx
+            .send(Message::text(t3_exit(req_id, result).to_string()))
+            .await;
+    }
+}
+
+fn t3_exit(req_id: &Value, result: Result<Value>) -> Value {
+    let exit = match result {
+        Ok(val) => json!({"_tag": "Success", "value": val}),
+        Err(err) => json!({
+            "_tag": "Failure",
+            "cause": [{"_tag": "Die", "defect": {"name": "Error", "message": err.to_string()}}]
+        }),
+    };
+    json!({"_tag": "Exit", "requestId": req_id, "exit": exit})
+}
+
+fn build_t3_shell_snapshot(snap: &Value) -> Value {
+    let seq = snap["sequence"].as_i64().unwrap_or(0);
+    let mut active = Vec::new();
+    let mut archived = Vec::new();
+    for t in snap["threads"].as_array().into_iter().flatten() {
+        if t["archived"].as_bool().unwrap_or(false) {
+            archived.push(t.clone());
+        } else {
+            active.push(t.clone());
+        }
+    }
+    json!({
+        "schemaVersion": 2,
+        "snapshotSequence": seq,
+        "projects": [],
+        "threads": active,
+        "archivedThreads": archived,
+    })
+}
+
+fn build_t3_thread_projection(snap: &Value, thread_id: &str) -> Value {
+    let thread = snap["threads"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|t| t["id"].as_str() == Some(thread_id)))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let runs: Vec<Value> = snap["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["threadId"].as_str() == Some(thread_id))
+        .cloned()
+        .collect();
+    let requests: Vec<Value> = snap["requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["threadId"].as_str() == Some(thread_id))
+        .cloned()
+        .collect();
+    json!({
+        "threadId": thread_id,
+        "thread": thread,
+        "runs": runs,
+        "requests": requests,
+    })
+}
+
+async fn stream_t3_effect_events(
+    core: &Path,
+    after: i64,
+    req_id: Value,
+    filter_thread: String,
+    tx: mpsc::Sender<Message>,
+    stop: CancellationToken,
+) -> Result<()> {
+    let (io, token) = connect_core(core).await?;
+    let (mut sender, conn) = client_http1::handshake(TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/v1/events?after={after}"))
+        .header("host", "vantry.local");
+    if let Some(t) = token {
+        builder = builder.header(vantry_protocol::LOCAL_TOKEN_HEADER, t);
+    }
+    let res = sender
+        .send_request(builder.body(Full::new(Bytes::new()))?)
+        .await?;
+    ensure!(res.status().is_success(), "Core event subscribe failed");
+    let mut body = res.into_body();
+    let mut buf = Vec::new();
+    loop {
+        let frame = tokio::select! {
+            _ = stop.cancelled() => break,
+            f = body.frame() => match f {
+                Some(Ok(frame)) => frame,
+                _ => break,
+            }
+        };
+        if let Some(data) = frame.data_ref() {
+            buf.extend_from_slice(data);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.drain(..=pos).collect::<Vec<_>>();
+                if let Ok(env) = serde_json::from_slice::<Value>(&line) {
+                    let ev = env.get("event").unwrap_or(&env);
+                    if !filter_thread.is_empty()
+                        && ev["threadId"].as_str() != Some(filter_thread.as_str())
+                    {
+                        continue;
+                    }
+                    let msg = json!({
+                        "_tag": "Chunk",
+                        "requestId": req_id,
+                        "values": [{"type": "event", "event": ev}],
+                    });
+                    if tx.send(Message::text(msg.to_string())).await.is_err() {
+                        driver.abort();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    driver.abort();
+    Ok(())
 }
 
 async fn connect_core(core: &Path) -> Result<(crate::transport::Stream, Option<String>)> {
@@ -656,6 +1112,26 @@ mod tests {
         let reply = ws.next().await.unwrap()?;
         let parsed: Value = serde_json::from_str(reply.to_text()?)?;
         assert_eq!(parsed["result"]["pong"], true);
+
+        // Effect-RPC wire protocol (`_tag` / `tag` / `payload`) used by T3 clients.
+        ws.send(Message::text(r#"{"_tag":"Ping"}"#)).await?;
+        let pong = ws.next().await.unwrap()?;
+        let pong_json: Value = serde_json::from_str(pong.to_text()?)?;
+        assert_eq!(pong_json["_tag"], "Pong");
+
+        ws.send(Message::text(
+            r#"{"_tag":"Request","id":10,"tag":"server.getConfig","payload":{}}"#,
+        ))
+        .await?;
+        let cfg_reply = ws.next().await.unwrap()?;
+        let cfg_json: Value = serde_json::from_str(cfg_reply.to_text()?)?;
+        assert_eq!(cfg_json["_tag"], "Exit");
+        assert_eq!(cfg_json["requestId"], 10);
+        assert_eq!(cfg_json["exit"]["_tag"], "Success");
+        assert_eq!(
+            cfg_json["exit"]["value"]["environment"]["environmentId"],
+            "env_test"
+        );
 
         server.revoke_all()?;
         assert!(server.clients().is_empty());

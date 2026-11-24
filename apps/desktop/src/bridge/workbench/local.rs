@@ -56,7 +56,7 @@ impl LocalWorkbench {
 }
 
 /// Runs `git -C root args…` and gives its stdout; a failure carries stderr.
-async fn run_git(root: &std::path::Path, args: &[String]) -> Result<String, BridgeError> {
+pub(super) async fn run_git(root: &std::path::Path, args: &[String]) -> Result<String, BridgeError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -155,7 +155,13 @@ impl WorkbenchBridge for LocalWorkbench {
         Box::pin(async move {
             let status = run_git(
                 &root,
-                &["status".into(), "--porcelain=v1".into(), "-b".into()],
+                &[
+                    "status".into(),
+                    "--porcelain=v1".into(),
+                    "-b".into(),
+                    "-z".into(),
+                    "--untracked-files=normal".into(),
+                ],
             )
             .await?;
             let mut state = parse_git_status(&status);
@@ -172,6 +178,22 @@ impl WorkbenchBridge for LocalWorkbench {
             {
                 state.branches = Some(branches.lines().map(str::to_owned).collect());
             }
+            if let Ok(remotes) = run_git(
+                &root,
+                &[
+                    "for-each-ref".into(),
+                    "--format=%(refname:short)".into(),
+                    "refs/remotes".into(),
+                ],
+            )
+            .await
+            {
+                state.remote_branches = remotes
+                    .lines()
+                    .filter(|l| !l.ends_with("/HEAD"))
+                    .map(str::to_owned)
+                    .collect();
+            }
             Ok(state)
         })
     }
@@ -181,7 +203,35 @@ impl WorkbenchBridge for LocalWorkbench {
         if staged {
             args.push("--cached".into());
         }
-        self.git(dashdash(args, path.into_iter().collect()))
+        let root = self.root.clone();
+        Box::pin(async move {
+            let text = run_git(&root, &dashdash(args, path.clone().into_iter().collect())).await?;
+            if !staged && text.is_empty() && let Some(path) = path {
+                // Never run `git diff --no-index` on an untracked directory (e.g. `target/`).
+                if path.ends_with('/') || root.join(&path).is_dir() {
+                    return Ok(String::new());
+                }
+                let untracked = run_git(&root, &dashdash(vec!["ls-files".into(), "--others".into(), "--exclude-standard".into()],vec![path.clone()])).await?;
+                if !untracked.is_empty() {
+                    let out = Command::new("git").arg("-C").arg(&root).args(["diff","--no-index","--no-color","--","/dev/null",&path]).kill_on_drop(true).output().await.map_err(io_error)?;
+                    if out.status.code()==Some(1) {return Ok(String::from_utf8_lossy(&out.stdout).into_owned());}
+                }
+            }
+            Ok(text)
+        })
+    }
+
+    fn git_log(&self, branch: String, path:String, compare: bool) -> BridgeFuture<Vec<super::history::CommitRow>> {
+        let root=self.root.clone(); Box::pin(async move {super::history::log(&root,&branch,&path,compare).await})
+    }
+    fn revision_files(&self, revision: super::history::Revision) -> BridgeFuture<Vec<String>> {
+        let root=self.root.clone(); Box::pin(async move {super::history::files(&root,&revision).await})
+    }
+    fn revision_diff(&self, revision: super::history::Revision, path: String) -> BridgeFuture<String> {
+        let root=self.root.clone(); Box::pin(async move {super::history::diff(&root,&revision,path).await})
+    }
+    fn git_apply_hunk(&self, patch: String, reverse: bool) -> BridgeFuture<()> {
+        let root=self.root.clone(); Box::pin(async move {super::history::apply(&root,patch,reverse).await})
     }
 
     fn git_stage(&self, paths: Vec<String>) -> BridgeFuture<()> {
@@ -289,7 +339,7 @@ impl WorkbenchBridge for LocalWorkbench {
                     let _ = libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                     let _ = libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                     let mut term: libc::termios = std::mem::zeroed();
-                    if libc::tcgetattr(slave.as_raw_fd(), &mut term) == 0 {
+                    if !command.is_empty() && libc::tcgetattr(slave.as_raw_fd(), &mut term) == 0 {
                         // Disable local echo and ONLCR so streamed output stays clean
                         // while preserving full TTY/interactive semantics (isatty == 1).
                         term.c_lflag &= !(libc::ECHO);
@@ -303,9 +353,13 @@ impl WorkbenchBridge for LocalWorkbench {
                 let slave_out = slave
                     .try_clone()
                     .map_err(|e| BridgeError::unavailable(format!("PTY 复制失败：{e}")))?;
-                let mut std_cmd = std::process::Command::new("/bin/sh");
+                let mut std_cmd = if command.is_empty() {
+                    let mut shell=std::process::Command::new(std::env::var_os("SHELL").unwrap_or_else(||"/bin/sh".into()));
+                    shell.arg("-i");shell
+                } else {
+                    let mut shell=std::process::Command::new("/bin/sh");shell.args(["-c", &command]);shell
+                };
                 std_cmd
-                    .args(["-c", &command])
                     .current_dir(&root)
                     .env("TERM", "xterm-256color")
                     .stdin(Stdio::from(slave_in))
@@ -340,6 +394,8 @@ impl WorkbenchBridge for LocalWorkbench {
                         let _ = prev_kill.send(());
                     }
                 }
+                // Allow the first resize, keystroke or close as soon as the master is registered.
+                let _ = sink.send(String::new());
                 let pump_sink = sink.clone();
                 let pump = tokio::task::spawn_blocking(move || {
                     let mut buf = [0u8; 4096];
@@ -540,7 +596,6 @@ impl WorkbenchBridge for LocalWorkbench {
     fn settings(&self) -> BridgeFuture<SettingsData> {
         let model = self.model.clone();
         Box::pin(async move {
-            let ssh_hosts = local_ssh_hosts().await;
             Ok(SettingsData {
                 models: local_catalog(model.as_deref()),
                 mcp: MCPCatalog {
@@ -549,21 +604,19 @@ impl WorkbenchBridge for LocalWorkbench {
                     ..MCPCatalog::default()
                 },
                 update: local_update(),
-                ssh_hosts,
                 ..SettingsData::default()
             })
         })
     }
 
     /// What the desktop answers without a Core: the command line's model,
-    /// the SSH config's hosts, this build's version; nothing else.
+    /// and this build’s version.
     fn workbench(&self, request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
         let model = self.model.clone();
         Box::pin(async move {
             let mut response = WorkbenchResponse::default();
             match request.action.as_str() {
                 names::MODELS => response.catalog = Some(local_catalog(model.as_deref())),
-                names::SSH_HOSTS => response.ssh_hosts = local_ssh_hosts().await,
                 names::UPDATE_STATUS => response.update = Some(local_update()),
                 action => {
                     return Err(BridgeError::new(
@@ -674,16 +727,6 @@ fn local_update() -> AppUpdateInfo {
     }
 }
 
-async fn local_ssh_hosts() -> Vec<vantry_protocol::SSHHostInfo> {
-    match std::env::var_os("HOME") {
-        Some(home) => tokio::fs::read_to_string(PathBuf::from(home).join(".ssh/config"))
-            .await
-            .map(|text| parse_ssh_hosts(&text))
-            .unwrap_or_default(),
-        None => Vec::new(),
-    }
-}
-
 /// Folders a search skips.
 const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "target", ".agent", "dist", "build"];
 /// The most files a search looks at, and the largest it reads.
@@ -787,50 +830,6 @@ pub(crate) fn pr_from_log(branch: String, base: String, log: &str) -> PrSummary 
         body,
         commits,
     }
-}
-
-/// `Host` entries of an OpenSSH config (no wildcards).
-pub(crate) fn parse_ssh_hosts(text: &str) -> Vec<vantry_protocol::SSHHostInfo> {
-    let mut hosts: Vec<vantry_protocol::SSHHostInfo> = Vec::new();
-    // Whether the current `Host` block named a usable alias.
-    let mut current = false;
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((key, value)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let value = value.trim();
-        match key.to_ascii_lowercase().as_str() {
-            "host" => {
-                current = false;
-                for alias in value.split_whitespace().filter(|a| !a.contains(['*', '?', '!'])) {
-                    hosts.push(vantry_protocol::SSHHostInfo {
-                        alias: alias.to_owned(),
-                        ..Default::default()
-                    });
-                    current = true;
-                }
-            }
-            _ if !current => {}
-            "hostname" => {
-                if let Some(last) = hosts.last_mut() {
-                    last.host_name = value.to_owned();
-                }
-            }
-            "user" => {
-                if let Some(last) = hosts.last_mut() {
-                    last.user = value.to_owned();
-                }
-            }
-            "port" => {
-                if let Some(last) = hosts.last_mut() {
-                    last.port = value.parse().unwrap_or(0);
-                }
-            }
-            _ => {}
-        }
-    }
-    hosts
 }
 
 #[cfg(test)]
@@ -1003,19 +1002,12 @@ mod tests {
     }
 
     #[test]
-    fn pr_text_and_ssh_hosts_parse() {
+    fn pr_text_parses() {
         let pr = pr_from_log("feat/x".into(), "origin/main".into(), "b2 second\na1 first\n");
         assert_eq!(pr.title, "first");
         assert_eq!(pr.body, "- first\n- second");
         assert_eq!(pr.commits.len(), 2);
         let empty = pr_from_log("main".into(), String::new(), "");
         assert_eq!(empty.title, "main");
-
-        let hosts = parse_ssh_hosts(
-            "Host build devbox\n  HostName 10.0.0.2\n  User ci\n  Port 2222\nHost *\n  User x\n",
-        );
-        assert_eq!(hosts.len(), 2);
-        assert_eq!(hosts[1].alias, "devbox");
-        assert_eq!((hosts[1].host_name.as_str(), hosts[1].port), ("10.0.0.2", 2222));
     }
 }

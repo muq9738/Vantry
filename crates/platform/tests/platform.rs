@@ -13,7 +13,6 @@ use vantry_platform::{
     hostplatform::{Capabilities, Paths},
     plugins::Host,
     projects::{Settings, Store},
-    sshconfig,
     workspace::{self, WorkspaceSpec},
 };
 
@@ -277,39 +276,6 @@ fn environment_v1_roundtrip_and_validation() -> Result<()> {
     assert!(catalog.load().is_err());
     Ok(())
 }
-#[test]
-fn ssh_include_cycles_negation_and_first_value_wins() -> Result<()> {
-    let t = temp();
-    let ssh = t.path().join(".ssh");
-    fs::create_dir_all(ssh.join("conf d"))?;
-    fs::write(
-        ssh.join("config"),
-        "Include \"conf d/*.conf\"\nHost dev-* !dev-prod\n  User fallback\n  ProxyJump gateway\nHost *\n  Port 2022\nHost github.com\n  User git\nMatch exec ignored\n  Include never\n",
-    )?;
-    fs::write(
-        ssh.join("conf d/a.conf"),
-        "Include config\nHost dev-one secondary\n HostName=%h.example\n User=alice\n Port 2222\n IdentityFile \"~/key with space\" # keep path only\n",
-    )?;
-    let found = sshconfig::discover(t.path(), false)?;
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].aliases, ["dev-one", "secondary"]);
-    assert!(found[0].has_identity_file);
-    let dev = sshconfig::resolve(t.path(), "dev-one")?;
-    assert_eq!(
-        (
-            dev.host_name.as_str(),
-            dev.user.as_str(),
-            dev.port,
-            dev.proxy_jump.as_str()
-        ),
-        ("dev-one.example", "alice", 2222, "gateway")
-    );
-    assert_eq!(dev.identity_files, [t.path().join("key with space")]);
-    assert_eq!(sshconfig::resolve(t.path(), "dev-prod")?.proxy_jump, "");
-    assert_eq!(sshconfig::resolve(t.path(), "dev-two")?.port, 2022);
-    Ok(())
-}
-
 fn zip(files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, content) in files {

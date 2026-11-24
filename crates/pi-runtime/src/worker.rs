@@ -38,6 +38,8 @@ pub struct JobRequest {
     #[serde(default)]
     pub expected_model: String,
     #[serde(default)]
+    pub thinking_level: String,
+    #[serde(default)]
     pub enable_user_extensions: bool,
     #[serde(rename = "enableUserMCP", default)]
     pub enable_user_mcp: bool,
@@ -334,6 +336,29 @@ async fn execute(
         "unsupported execution provider"
     );
     let cwd = crate::workspace::cwd(job)?;
+    let stop_file = dir.join("stop.json");
+    let (_workspace_lock, waited_for_lock) = crate::workspace::lock_workspace_dir(
+        &cwd,
+        &job.data_dir,
+        &stop_file,
+        &journal.failed,
+        || {
+            journal.record(json!({
+                "type": "workspace_lock_wait",
+                "path": cwd,
+            }));
+        },
+    )
+    .await?;
+    if waited_for_lock {
+        journal.record(json!({
+            "type": "workspace_lock_acquired",
+            "path": cwd,
+        }));
+    }
+    if stop_file.try_exists()? {
+        return Ok(());
+    }
     let sessions = job.data_dir.join("sessions");
     disk::directory(&sessions)?;
     let _session_lock = crate::session::lock_thread(&sessions, &req.thread_id)?;
@@ -365,14 +390,20 @@ async fn execute(
     let model = [&req.model, &job.expected_model, &job.default_model]
         .into_iter()
         .find(|v| !v.is_empty());
+    let mut requested_thinking = job.thinking_level.trim().parse::<pi_ai::ThinkingLevel>().ok();
     if let Some(model) = model {
-        if let Some((provider, id)) = model.split_once('/') {
+        let (base_model, suffix_thinking) = crate::split_model_thinking(model);
+        if suffix_thinking.is_some() {
+            requested_thinking = suffix_thinking;
+        }
+        if let Some((provider, id)) = base_model.split_once('/') {
             options.provider = Some(provider.into());
             options.model = Some(id.into());
         } else {
-            options.model = Some(model.clone());
+            options.model = Some(base_model.to_owned());
         }
     }
+    options.thinking = requested_thinking;
     crate::mcp::configure(&mut options, job);
     // Give the stock approval extension the same per-attempt environment as the Go worker.
     // Module-local bindings avoid changing process-wide environment during a live session.
@@ -392,6 +423,15 @@ async fn execute(
     } else {
         job.executable.clone()
     };
+    let instructions_path = crate::instructions::write_worker_instruction_files(
+        job,
+        dir,
+        &socket,
+        &exe,
+        &interaction,
+    )?;
+    options.resources.append_system_prompt =
+        Some(vec![instructions_path.to_string_lossy().into_owned()]);
     let policy = if req.approval_policy.is_empty() {
         "auto"
     } else {
@@ -448,9 +488,10 @@ async fn execute(
             }
         }
         if !job.expected_model.is_empty() {
+            let (expected_base, _) = crate::split_model_thinking(&job.expected_model);
             let selected = session.model().context("no selected model")?;
             ensure!(
-                format!("{}/{}", selected.provider, selected.id) == job.expected_model,
+                format!("{}/{}", selected.provider, selected.id) == expected_base,
                 "selected model differs from requested model"
             );
         }

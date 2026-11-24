@@ -2,12 +2,16 @@
 mod attachments;
 mod catalog;
 mod controlled;
+mod instructions;
 pub mod mcp;
 mod pdf;
 mod sandbox;
 mod session;
 pub use attachments::attachment_payload;
-pub use catalog::{MagpieSelection, ResolvedModelCatalog, model_catalog, resolve_model_catalog};
+pub use catalog::{
+    MagpieSelection, ResolvedModelCatalog, SkillInfo, discover_skills, model_catalog,
+    resolve_model_catalog, split_model_thinking,
+};
 pub use controlled::{ControlledStep, ControlledTestProvider};
 pub use sandbox::WorkspaceSandbox;
 pub use session::{clone_session_file, truncate_session_file};

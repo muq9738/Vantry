@@ -13,7 +13,7 @@ use std::{
 use tokio::sync::Notify;
 use vantry_protocol::{
     AppUpdateInfo, Attachment, EnvironmentInfo, GitFile, GitState, MCPCatalog, MCPServerInfo,
-    ModelCatalog, ModelInfo, PiRuntimeStatus, PluginInfo, PluginNavItem, SSHHostInfo,
+    ModelCatalog, ModelInfo, PiRuntimeStatus, PluginInfo, PluginNavItem,
     WorkbenchRequest, WorkbenchResponse,
 };
 
@@ -513,14 +513,6 @@ fn demo_settings() -> SettingsData {
         provider_id: "pi".into(),
         ..EnvironmentInfo::default()
     }],
-    ssh_hosts: vec![SSHHostInfo {
-        alias: "build-box".into(),
-        host_name: "10.0.0.8".into(),
-        user: "ci".into(),
-        reachable: Some(true),
-        latency_ms: 18,
-        ..SSHHostInfo::default()
-    }],
     pi: Some(PiRuntimeStatus {
         active_source: "builtin".into(),
         active_version: "0.12.31".into(),
@@ -597,7 +589,7 @@ fn demo_settings() -> SettingsData {
     environments: vec![EnvironmentEntry {
         id: "env-build".into(),
         name: "构建机".into(),
-        kind: "ssh".into(),
+        kind: "peer".into(),
         host: "build-box".into(),
         ..EnvironmentEntry::default()
     }],
@@ -872,7 +864,6 @@ impl Repo {
                 settings.projects.retain(|p| p.id != request.name);
                 out = output_of(&serde_json::json!({ "projects": settings.projects }));
             }
-            names::SSH_HOSTS => out.ssh_hosts = settings.ssh_hosts.clone(),
             names::ATTACHMENT_IMPORT => {
                 use base64::Engine;
                 let data = base64::engine::general_purpose::STANDARD

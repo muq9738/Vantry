@@ -261,3 +261,196 @@ pub(crate) fn snapshot(db: &Connection) -> Result<Snapshot> {
     }
     Ok(snap)
 }
+
+/// Direct SQL projection for `/v1/threads/summaries` without loading run bodies,
+/// tool calls, or per-run telemetry.
+pub(crate) fn thread_summaries(db: &Connection) -> Result<ThreadSummaries> {
+    use std::collections::HashMap;
+    let seq = sequence(db)?;
+    let raw_threads: Vec<Thread> = rows(db, "SELECT * FROM threads ORDER BY created_at,id", [])?;
+
+    #[derive(Default)]
+    struct RunStats {
+        run_count: i64,
+        active_runs: i64,
+        latest_run_id: String,
+        latest_status: Option<RunStatus>,
+        max_updated_at: String,
+    }
+    let mut stats: HashMap<String, RunStats> = HashMap::new();
+    {
+        let mut stmt = db.prepare(
+            "SELECT id, thread_id, status, updated_at FROM runs ORDER BY created_at, id",
+        )?;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            let run_id: String = row.get(0)?;
+            let thread_id: String = row.get(1)?;
+            let status_str: String = row.get(2)?;
+            let updated_ns: i64 = row.get(3)?;
+            let updated_at = timestamp(updated_ns);
+            let status: Option<RunStatus> =
+                serde_json::from_value(Value::String(status_str)).ok();
+            let entry = stats.entry(thread_id).or_default();
+            entry.run_count += 1;
+            if matches!(
+                status,
+                Some(RunStatus::Queued | RunStatus::Running | RunStatus::Waiting)
+            ) {
+                entry.active_runs += 1;
+            }
+            entry.latest_run_id = run_id;
+            entry.latest_status = status;
+            if updated_at > entry.max_updated_at {
+                entry.max_updated_at = updated_at;
+            }
+        }
+    }
+
+    let mut pending_inputs: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = db.prepare(
+            "SELECT thread_id, COUNT(*) FROM inputs WHERE status IN ('queued','pending','') GROUP BY thread_id",
+        )?;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            pending_inputs.insert(row.get(0)?, row.get(1)?);
+        }
+    }
+
+    let mut pending_requests: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = db.prepare(
+            "SELECT thread_id, COUNT(*) FROM provider_requests WHERE status IN ('pending','responding','') GROUP BY thread_id",
+        )?;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            pending_requests.insert(row.get(0)?, row.get(1)?);
+        }
+    }
+
+    let threads = raw_threads
+        .into_iter()
+        .map(|thread| {
+            let st = stats.remove(&thread.id).unwrap_or_default();
+            let updated_at = if !st.max_updated_at.is_empty() && st.max_updated_at > thread.created_at
+            {
+                st.max_updated_at
+            } else {
+                thread.created_at.clone()
+            };
+            let pi = pending_inputs.remove(&thread.id).unwrap_or(0);
+            let pr = pending_requests.remove(&thread.id).unwrap_or(0);
+            ThreadSummary {
+                project_path: thread.project_path,
+                id: thread.id,
+                title: thread.title,
+                provider_id: thread.provider_id,
+                model: thread.model,
+                workspace: thread.workspace,
+                parent_thread_id: thread.parent_thread_id,
+                parent_task_id: thread.parent_task_id,
+                created_by_thread_id: thread.created_by_thread_id,
+                pinned: thread.pinned,
+                archived: thread.archived,
+                snoozed_until: thread.snoozed_until,
+                approval_policy: thread.approval_policy,
+                created_at: thread.created_at,
+                updated_at,
+                run_count: st.run_count,
+                active_runs: st.active_runs,
+                pending_inputs: pi,
+                pending_requests: pr,
+                latest_run_id: st.latest_run_id,
+                latest_status: st.latest_status,
+            }
+        })
+        .collect();
+
+    Ok(ThreadSummaries {
+        sequence: seq,
+        threads: Some(threads),
+    })
+}
+
+/// Scoped SQL query for `/v1/threads/detail` reading only the target thread's rows.
+pub(crate) fn thread_detail(
+    db: &Connection,
+    thread_id: &str,
+    limit_runs: i64,
+) -> Result<ThreadDetail> {
+    let seq = sequence(db)?;
+    let thread: Thread = match one(db, "SELECT * FROM threads WHERE id=?", [thread_id]) {
+        Ok(t) => t,
+        Err(crate::Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => {
+            return Err(crate::Error::Api(
+                ErrorCode::NotFound,
+                format!("thread {thread_id} not found"),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let run_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM runs WHERE thread_id=?",
+        [thread_id],
+        |r| r.get(0),
+    )?;
+    let (mut runs, truncated_runs) = if limit_runs > 0 && run_count > limit_runs {
+        let mut tail: Vec<Run> = rows(
+            db,
+            "SELECT * FROM runs WHERE thread_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
+            params![thread_id, limit_runs],
+        )?;
+        tail.reverse();
+        (tail, true)
+    } else {
+        (
+            rows(
+                db,
+                "SELECT * FROM runs WHERE thread_id=? ORDER BY created_at, id",
+                [thread_id],
+            )?,
+            false,
+        )
+    };
+    for r in &mut runs {
+        r.telemetry = crate::telemetry::read(db, &r.id)?;
+    }
+    let tasks = rows(
+        db,
+        "SELECT * FROM tasks WHERE parent_thread_id=? OR child_thread_id=? ORDER BY created_at, id",
+        params![thread_id, thread_id],
+    )?;
+    let inputs = rows(
+        db,
+        "SELECT * FROM inputs WHERE thread_id=? ORDER BY created_at, id",
+        [thread_id],
+    )?;
+    let tools = rows(
+        db,
+        "SELECT * FROM tool_calls WHERE thread_id=? ORDER BY updated_at, id",
+        [thread_id],
+    )?;
+    let requests = rows(
+        db,
+        "SELECT * FROM provider_requests WHERE thread_id=? ORDER BY created_at, id",
+        [thread_id],
+    )?;
+    let project_updates = rows(
+        db,
+        "SELECT * FROM project_updates ORDER BY source_sequence",
+        [],
+    )?;
+    Ok(ThreadDetail {
+        project_updates,
+        sequence: seq,
+        thread,
+        runs: Some(runs),
+        tasks: Some(tasks),
+        inputs: Some(inputs),
+        tools: Some(tools),
+        requests: Some(requests),
+        run_count,
+        truncated_runs,
+    })
+}

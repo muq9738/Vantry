@@ -291,7 +291,38 @@ fn parse_blocks(source: &str, base: usize) -> Vec<Spanned> {
             continue;
         }
         if let Some((marker, count, info)) = fence(line) {
-            let lang = info.split_whitespace().next().unwrap_or("").to_owned();
+            let first = info.split_whitespace().next().unwrap_or("");
+            let lower = first.to_ascii_lowercase();
+            let preserve_args = matches!(
+                lower.as_str(),
+                "ask"
+                    | "dispatch"
+                    | "callout"
+                    | "kv"
+                    | "limits"
+                    | "timeline"
+                    | "tree"
+                    | "api"
+                    | "chart"
+                    | "vantry-ui"
+                    | "mermaid"
+                    | "flow"
+                    | "state"
+                    | "sequence"
+                    | "er"
+                    | "class"
+                    | "math"
+                    | "latex"
+                    | "tex"
+                    | "svg"
+                    | "html"
+                    | "artifact"
+            );
+            let lang = if preserve_args {
+                info.trim().to_owned()
+            } else {
+                first.to_owned()
+            };
             let mut body = Vec::new();
             let mut closed = false;
             i += 1;
@@ -305,7 +336,6 @@ fn parse_blocks(source: &str, base: usize) -> Vec<Spanned> {
                 i += 1;
             }
             let code = body.join("\n");
-            let lower = lang.to_ascii_lowercase();
             let block = if lower == "diff" || lower == "patch" {
                 Block::Diff {
                     lines: diff_lines(&code),

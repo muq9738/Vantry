@@ -388,13 +388,10 @@ async fn route(
             response(ok, status)
         }
         "/v1/snapshot" | "/v1/state" => response(ok, core.snapshot()?),
-        "/v1/threads/summaries" => response(ok, build_thread_summaries(&core.snapshot()?)),
+        "/v1/threads/summaries" => response(ok, core.thread_summaries()?),
         "/v1/threads/detail" => {
             let (thread_id, limit_runs) = parse_thread_detail_query(query.as_deref())?;
-            response(
-                ok,
-                build_thread_detail(&core.snapshot()?, &thread_id, limit_runs)?,
-            )
+            response(ok, core.thread_detail(&thread_id, limit_runs)?)
         }
         "/v1/workbench" => {
             let Some(ext) = extension else {
@@ -447,80 +444,6 @@ async fn route(
     })
 }
 
-fn build_thread_summaries(snapshot: &Snapshot) -> ThreadSummaries {
-    let runs = snapshot.runs.as_deref().unwrap_or(&[]);
-    let inputs = &snapshot.inputs;
-    let requests = &snapshot.requests;
-    let threads = snapshot
-        .threads
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .map(|thread| {
-            let mut run_count = 0i64;
-            let mut active_runs = 0i64;
-            let mut latest_run_id = String::new();
-            let mut latest_status = None;
-            let mut updated_at = thread.created_at.clone();
-            for run in runs.iter().filter(|r| r.thread_id == thread.id) {
-                run_count += 1;
-                if matches!(
-                    run.status,
-                    RunStatus::Queued | RunStatus::Running | RunStatus::Waiting
-                ) {
-                    active_runs += 1;
-                }
-                latest_run_id = run.id.clone();
-                latest_status = Some(run.status);
-                if !run.updated_at.is_empty() && run.updated_at > updated_at {
-                    updated_at = run.updated_at.clone();
-                }
-            }
-            let pending_inputs = inputs
-                .iter()
-                .filter(|i| {
-                    i.thread_id == thread.id
-                        && matches!(i.status.as_str(), "queued" | "pending" | "")
-                })
-                .count() as i64;
-            let pending_requests = requests
-                .iter()
-                .filter(|r| {
-                    r.thread_id == thread.id
-                        && matches!(r.status.as_str(), "pending" | "responding" | "")
-                })
-                .count() as i64;
-            ThreadSummary {
-                project_path: thread.project_path.clone(),
-                id: thread.id.clone(),
-                title: thread.title.clone(),
-                provider_id: thread.provider_id.clone(),
-                model: thread.model.clone(),
-                workspace: thread.workspace.clone(),
-                parent_thread_id: thread.parent_thread_id.clone(),
-                parent_task_id: thread.parent_task_id.clone(),
-                created_by_thread_id: thread.created_by_thread_id.clone(),
-                pinned: thread.pinned,
-                archived: thread.archived,
-                snoozed_until: thread.snoozed_until.clone(),
-                approval_policy: thread.approval_policy.clone(),
-                created_at: thread.created_at.clone(),
-                updated_at,
-                run_count,
-                active_runs,
-                pending_inputs,
-                pending_requests,
-                latest_run_id,
-                latest_status,
-            }
-        })
-        .collect();
-    ThreadSummaries {
-        sequence: snapshot.sequence,
-        threads: Some(threads),
-    }
-}
-
 fn parse_thread_detail_query(query: Option<&str>) -> Result<(String, i64)> {
     let mut thread_id = String::new();
     let mut limit_runs = 0i64;
@@ -547,74 +470,6 @@ fn parse_thread_detail_query(query: Option<&str>) -> Result<(String, i64)> {
         return Err(invalid("threadId is required"));
     }
     Ok((thread_id, limit_runs))
-}
-
-fn build_thread_detail(
-    snapshot: &Snapshot,
-    thread_id: &str,
-    limit_runs: i64,
-) -> Result<ThreadDetail> {
-    let thread = snapshot
-        .threads
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|t| t.id == thread_id)
-        .cloned()
-        .ok_or_else(|| Error::Api(ErrorCode::NotFound, format!("thread {thread_id} not found")))?;
-    let all_runs: Vec<Run> = snapshot
-        .runs
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter(|r| r.thread_id == thread_id)
-        .cloned()
-        .collect();
-    let run_count = all_runs.len() as i64;
-    let (runs, truncated_runs) = if limit_runs > 0 && all_runs.len() > limit_runs as usize {
-        let start = all_runs.len() - limit_runs as usize;
-        (all_runs[start..].to_vec(), true)
-    } else {
-        (all_runs, false)
-    };
-    let tasks = snapshot
-        .tasks
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter(|t| t.parent_thread_id == thread_id || t.child_thread_id == thread_id)
-        .cloned()
-        .collect();
-    let inputs = snapshot
-        .inputs
-        .iter()
-        .filter(|i| i.thread_id == thread_id)
-        .cloned()
-        .collect();
-    let tools = snapshot
-        .tools
-        .iter()
-        .filter(|t| t.thread_id == thread_id)
-        .cloned()
-        .collect();
-    let requests = snapshot
-        .requests
-        .iter()
-        .filter(|r| r.thread_id == thread_id)
-        .cloned()
-        .collect();
-    Ok(ThreadDetail {
-        project_updates: snapshot.project_updates.clone(),
-        sequence: snapshot.sequence,
-        thread,
-        runs: Some(runs),
-        tasks: Some(tasks),
-        inputs: Some(inputs),
-        tools: Some(tools),
-        requests: Some(requests),
-        run_count,
-        truncated_runs,
-    })
 }
 
 fn events(core: Core, after: i64) -> Result<Response<Body>> {

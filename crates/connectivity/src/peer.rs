@@ -27,7 +27,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::DuplexStream,
     net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
     time::{Instant, timeout},
@@ -169,53 +168,6 @@ pub enum Route {
     Auto,
     Direct,
     Relay,
-    /// An OpenSSH host alias and the remote authenticated gateway's host:port.
-    Ssh {
-        alias: String,
-        address: String,
-    },
-}
-async fn ssh(alias: &str, address: &str, tasks: &Tasks) -> Result<DuplexStream> {
-    use std::process::Stdio;
-    ensure!(
-        !alias.is_empty()
-            && !alias.starts_with('-')
-            && alias
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b)),
-        "invalid SSH host"
-    );
-    let a: http::uri::Authority = address.parse().map_err(|_| anyhow!("invalid SSH target"))?;
-    ensure!(
-        a.port_u16().is_some() && !address.contains('@'),
-        "invalid SSH target"
-    );
-    let mut child = tokio::process::Command::new("ssh")
-        .args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=8",
-            "-W",
-            address,
-            "--",
-            alias,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let (a, b) = tokio::io::duplex(64 << 10);
-    let (mut r, mut w) = tokio::io::split(b);
-    let stop = tasks.stop.clone();
-    tasks.owned(async move{tokio::select!{_=stop.cancelled()=>{},_=tokio::io::copy(&mut r,&mut stdin)=>{},_=tokio::io::copy(&mut stdout,&mut w)=>{}}let _=child.kill().await;let _=child.wait().await;});
-    Ok(a)
 }
 pub struct PeerConnection {
     pub mode: &'static str,
@@ -238,39 +190,21 @@ impl PeerConnection {
         let candidates = async {
             let mut attempts = FuturesUnordered::new();
             let mut targets = Vec::new();
-            match route {
-                Route::Ssh { alias, address } => targets.push(("ssh", address, Some(alias), 0)),
-                mode => {
-                    if !matches!(mode, Route::Relay) {
-                        for (i, v) in pair.direct.iter().take(8).enumerate() {
-                            targets.push(("direct", v.clone(), None, i as u64 * 150))
-                        }
-                    }
-                    if !matches!(mode, Route::Direct) {
-                        for (i, url) in std::iter::once(&pair.relay)
-                            .chain(&pair.relays)
-                            .filter(|s| !s.is_empty())
-                            .take(8)
-                            .enumerate()
-                        {
-                            if !targets.iter().any(|(m, v, _, _)| *m == "relay" && v == url) {
-                                targets.push((
-                                    "relay",
-                                    url.clone(),
-                                    None,
-                                    if matches!(mode, Route::Auto) && !pair.direct.is_empty() {
-                                        450
-                                    } else {
-                                        0
-                                    } + i as u64 * 150,
-                                ))
-                            }
-                        }
+            if !matches!(route, Route::Relay) {
+                for (i, address) in pair.direct.iter().take(8).enumerate() {
+                    targets.push(("direct", address.clone(), i as u64 * 150));
+                }
+            }
+            if !matches!(route, Route::Direct) {
+                let delay = if matches!(route, Route::Auto) && !pair.direct.is_empty() { 450 } else { 0 };
+                for (i, url) in std::iter::once(&pair.relay).chain(&pair.relays).filter(|url| !url.is_empty()).take(8).enumerate() {
+                    if !targets.iter().any(|(mode, target, _)| *mode == "relay" && target == url) {
+                        targets.push(("relay", url.clone(), delay + i as u64 * 150));
                     }
                 }
             }
             let slots = Arc::new(Semaphore::new(4));
-            for (mode, target, alias, delay) in targets {
+            for (mode, target, delay) in targets {
                 let tls = tls.clone();
                 let tasks = &tasks;
                 let client = &client;
@@ -285,7 +219,6 @@ impl PeerConnection {
                     let dial = async {
                         let raw: Stream = match mode {
                             "direct" => Box::new(TcpStream::connect(target).await?),
-                            "ssh" => Box::new(ssh(&alias.unwrap(), &target, tasks).await?),
                             _ => {
                                 let u = relay_url(&target, private_http())?;
                                 let ws = websocket(
@@ -357,33 +290,64 @@ impl PeerConnection {
     }
     pub async fn get_json(self, path: &str) -> Result<Value> {
         let res = self.request(Method::GET, path, None).await?;
-        ensure!(
-            res.status().is_success(),
-            "Core rejected request (HTTP {})",
-            res.status()
-        );
-        Ok(serde_json::from_slice(
-            &Limited::new(res.into_body(), 1 << 20)
-                .collect()
-                .await
-                .map_err(|_| anyhow!("invalid Core response body"))?
-                .to_bytes(),
-        )?)
+        let status = res.status();
+        let bytes = Limited::new(res.into_body(), 16 << 20)
+            .collect()
+            .await
+            .map_err(|_| anyhow!("invalid Core response body"))?
+            .to_bytes();
+        if !status.is_success() {
+            if let Ok(err) = serde_json::from_slice::<Value>(&bytes)
+                && let Some(msg) = err["message"].as_str()
+            {
+                bail!("Core rejected request (HTTP {status}): {msg}");
+            }
+            bail!("Core rejected request (HTTP {status})");
+        }
+        Ok(serde_json::from_slice(&bytes)?)
     }
     pub async fn post_json(self, path: &str, value: Value) -> Result<Value> {
         let res = self.request(Method::POST, path, Some(value)).await?;
-        ensure!(
-            res.status().is_success(),
-            "Core rejected request (HTTP {})",
-            res.status()
-        );
-        Ok(serde_json::from_slice(
-            &Limited::new(res.into_body(), 16 << 20)
+        let status = res.status();
+        let bytes = Limited::new(res.into_body(), 16 << 20)
+            .collect()
+            .await
+            .map_err(|_| anyhow!("invalid Core response body"))?
+            .to_bytes();
+        if !status.is_success() {
+            if let Ok(err) = serde_json::from_slice::<Value>(&bytes)
+                && let Some(msg) = err["message"].as_str()
+            {
+                bail!("Core rejected request (HTTP {status}): {msg}");
+            }
+            bail!("Core rejected request (HTTP {status})");
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+    pub async fn subscribe_events(self, after: i64) -> Result<PeerEventStream> {
+        let tasks = self.tasks.clone();
+        let res = self
+            .request(Method::GET, &format!("/v1/events?after={after}"), None)
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let bytes = Limited::new(res.into_body(), 64 << 10)
                 .collect()
                 .await
-                .map_err(|_| anyhow!("invalid Core response body"))?
-                .to_bytes(),
-        )?)
+                .map(|b| b.to_bytes())
+                .unwrap_or_default();
+            if let Ok(err) = serde_json::from_slice::<Value>(&bytes)
+                && let Some(msg) = err["message"].as_str()
+            {
+                bail!("Core rejected event stream (HTTP {status}): {msg}");
+            }
+            bail!("Core rejected event stream (HTTP {status})");
+        }
+        Ok(PeerEventStream {
+            body: res.into_body(),
+            buf: Vec::new(),
+            _tasks: tasks,
+        })
     }
     pub async fn proxy_http(self, mut req: Request<Incoming>) -> Result<Reply> {
         if !self.secret.is_empty() {
@@ -417,6 +381,57 @@ impl PeerConnection {
     }
     pub async fn health(self) -> Result<Value> {
         self.get_json("/v1/health").await
+    }
+}
+
+pub struct PeerEventStream {
+    body: Incoming,
+    buf: Vec<u8>,
+    _tasks: Tasks,
+}
+
+impl PeerEventStream {
+    pub async fn next_event(&mut self) -> Result<Option<vantry_protocol::CoreEvent>> {
+        fn parse_line(trimmed: &str) -> Result<vantry_protocol::CoreEvent> {
+            let val: Value = serde_json::from_str(trimmed)?;
+            if let Some(err) = val.get("error") {
+                let msg = err["message"].as_str().unwrap_or("event stream error");
+                bail!("{msg}");
+            }
+            if let Some(ev) = val.get("event") {
+                return Ok(serde_json::from_value(ev.clone())?);
+            }
+            Ok(serde_json::from_value(val)?)
+        }
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                let trimmed = std::str::from_utf8(&line)?.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                return Ok(Some(parse_line(trimmed)?));
+            }
+            match self.body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.buf.extend_from_slice(&data);
+                    }
+                }
+                Some(Err(e)) => return Err(anyhow!("peer event stream error: {e}")),
+                None => {
+                    if self.buf.is_empty() {
+                        return Ok(None);
+                    }
+                    let tail = std::mem::take(&mut self.buf);
+                    let trimmed = std::str::from_utf8(&tail)?.trim();
+                    if trimmed.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(parse_line(trimmed)?));
+                }
+            }
+        }
     }
 }
 pub async fn redeem(

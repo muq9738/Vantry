@@ -9,7 +9,6 @@ pub mod manager;
 pub mod pairing;
 pub mod peer;
 pub mod relay;
-pub mod ssh;
 pub mod t3compat;
 pub mod transport;
 mod turn;

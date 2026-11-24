@@ -550,6 +550,221 @@ fn the_sidebar_groups_nests_subtasks_and_filters() {
     assert_eq!(ids, ["parent", "child"]);
 }
 
+#[test]
+fn switching_unsent_drafts_does_not_redirect_a_late_create_or_its_edits() {
+    let mut state = loaded(vec![thread("existing", "")], vec![]);
+    state.start_local_draft();
+    let first = state.draft_key();
+    state.start_local_draft();
+    assert_eq!(state.draft_key(), first, "reuse the empty draft");
+    state.set_draft_text("first send");
+    let create = state.submit().unwrap();
+    state.set_draft_text("written while creating");
+    state.start_local_draft();
+    let second = state.draft_key();
+    state.set_draft_text("second draft");
+    let send = state
+        .on_command_result(
+            &create.command_id,
+            Ok(Receipt {
+                thread_id: "created".into(),
+                ..accepted(&create)
+            }),
+        )
+        .unwrap();
+    assert_eq!(send.thread_id, "created");
+    assert_eq!(send.message, "first send");
+    assert_eq!(state.draft_key(), second);
+    assert_eq!(state.draft().text, "second draft");
+    assert_eq!(state.drafts["created"].text, "written while creating");
+    assert_eq!(state.local_order, [second.clone()]);
+    let rejected = state.submit().unwrap();
+    state.select_thread(Some("existing".into()));
+    state.on_command_result(
+        &rejected.command_id,
+        Ok(Receipt {
+            accepted: false,
+            ..accepted(&rejected)
+        }),
+    );
+    assert_eq!(state.drafts[&second].text, "second draft");
+    assert_eq!(state.selected.as_deref(), Some("existing"));
+    state.discard_local_draft(&second);
+    assert!(state.local_order.is_empty());
+}
+
+#[test]
+fn attachment_import_finishes_in_the_draft_that_opened_the_picker() {
+    let mut state = loaded(vec![thread("other", "")], vec![]);
+    state.start_local_draft();
+    let original = state.draft_key();
+    state.attachment_imports.insert(original.clone());
+    state.set_draft_text("待上传");
+    assert!(!state.composer_status().can_submit);
+    state.select_thread(Some("other".into()));
+    let image = Attachment {
+        id: "file_1".into(),
+        name: "样图.png".into(),
+        mime: "image/png".into(),
+        size: 50,
+    };
+    state.add_attachment_to(
+        original.clone(),
+        image.clone(),
+        Some("/tmp/样图.png".into()),
+    );
+    assert!(state.draft().attachments.is_empty());
+    state.attachment_imports.remove(&original);
+    state.select_thread(Some(original));
+    assert_eq!(state.draft().attachments, [image]);
+    assert!(state.composer_status().can_submit);
+}
+
+#[test]
+fn projects_keep_full_paths_and_group_worktrees_with_the_repository() {
+    use super::sidebar::{project_name, workspace_key};
+    let checkout = WorkspaceSpec {
+        kind: "worktree".into(),
+        path: "/tmp/worktrees/a".into(),
+        repository: "/one/repo/./".into(),
+        branch: "topic".into(),
+        ..Default::default()
+    };
+    assert_eq!(workspace_key(Some(&checkout), ""), "/one/repo");
+    assert_eq!(
+        workspace_key(None, r"C:\projects\team\..\repo\"),
+        "C:/projects/repo"
+    );
+    assert_eq!(workspace_key(None, "/data/workspaces/session-1/chat"), "");
+    assert_eq!(project_name(""), "无项目");
+    let now = chrono::Utc::now();
+    let mut first = thread("first", "2026-01-02T04:00:00Z");
+    first.project_path = "/one/repo".into();
+    let mut other = thread("other", "2026-01-03T04:00:00Z");
+    other.project_path = "/two/repo".into();
+    let mut child = thread("checkout", "2026-01-02T04:00:00Z");
+    child.workspace = Some(checkout);
+    let mut state = loaded(
+        vec![first, other, child],
+        vec![run(
+            "latest",
+            "checkout",
+            RunStatus::Completed,
+            "2026-01-03T01:00:00-05:00",
+        )],
+    );
+    state.select_thread(Some("checkout".into()));
+    assert_eq!(state.checkout_path(), Some("/tmp/worktrees/a"));
+    assert_eq!(state.current_project_key(), "/one/repo");
+    state.select_thread(Some("other".into()));
+    assert_eq!(state.checkout_path(), Some("/two/repo"));
+    let mut filter = SidebarFilter::default();
+    let sections = state.sidebar_sections(&filter, now);
+    assert_eq!(
+        sections
+            .iter()
+            .map(|s| s.project.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("/one/repo"), Some("/two/repo")]
+    );
+    assert_eq!(sections[0].rows[0].branch, "topic");
+    filter.project_open.insert("/one/repo".into(), false);
+    assert!(state.sidebar_sections(&filter, now)[0].folded);
+    filter.query = "/one".into();
+    let shown = state.sidebar_sections(&filter, now);
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].rows.len(), 2);
+    assert_eq!(filter.project_open.get("/one/repo"), Some(&false));
+    filter.query.clear();
+    filter.project = Some("/two/repo".into());
+    assert_eq!(state.sidebar_sections(&filter, now)[0].rows[0].id, "other");
+}
+
+#[test]
+fn project_show_more_does_not_expand_other_projects() {
+    let now = chrono::Utc::now();
+    let mut threads = Vec::new();
+    for project in ["/one", "/two"] {
+        for i in 0..7 {
+            let mut item = thread(&format!("{project}-{i}"), "2026-01-01T00:00:00Z");
+            item.project_path = project.into();
+            threads.push(item);
+        }
+    }
+    let state = loaded(threads, vec![]);
+    let mut filter = SidebarFilter::default();
+    assert!(
+        state
+            .sidebar_sections(&filter, now)
+            .iter()
+            .all(|s| (s.rows.len(), s.hidden) == (5, 2))
+    );
+    filter.show_all.insert("/one".into());
+    let sections = state.sidebar_sections(&filter, now);
+    assert_eq!((sections[0].rows.len(), sections[1].rows.len()), (7, 5));
+}
+
+#[test]
+fn inbox_prioritizes_approval_and_tracks_new_background_results_once() {
+    use super::sidebar::InboxKind;
+    let mut state = loaded(vec![thread("open", ""), thread("other", "")], vec![]);
+    state.select_thread(Some("open".into()));
+    let reply = run("r1", "other", RunStatus::Completed, "2026-01-02T12:00:00Z");
+    state.apply_event(&ev(
+        11,
+        events::RUN_COMPLETED,
+        "other",
+        "r1",
+        json!({"run": reply}),
+    ));
+    let own = run("r2", "open", RunStatus::Completed, "2026-01-02T12:10:00Z");
+    state.apply_event(&ev(
+        12,
+        events::RUN_COMPLETED,
+        "open",
+        "r2",
+        json!({"run": own}),
+    ));
+    let request = PendingRequest {
+        id: "q".into(),
+        thread_id: "open".into(),
+        status: "pending".into(),
+        title: "确认操作".into(),
+        ..Default::default()
+    };
+    state.apply_event(&ev(
+        13,
+        events::REQUEST_UPDATED,
+        "open",
+        "r2",
+        json!({"request": request}),
+    ));
+    assert_eq!(
+        state.inbox().iter().map(|i| i.kind).collect::<Vec<_>>(),
+        [InboxKind::Approval, InboxKind::Reply]
+    );
+    state.select_thread(Some("other".into()));
+    state.select_thread(Some("open".into()));
+    state.apply_event(&ev(
+        14,
+        events::RUN_COMPLETED,
+        "other",
+        "r1",
+        json!({"run": reply}),
+    ));
+    assert_eq!(state.inbox().len(), 1);
+    assert_eq!(state.inbox()[0].request.as_deref(), Some("q"));
+    let failure = run("r3", "other", RunStatus::Failed, "2026-01-02T12:30:00Z");
+    state.apply_event(&ev(
+        15,
+        events::RUN_FAILED,
+        "other",
+        "r3",
+        json!({"run": failure}),
+    ));
+    assert_eq!(state.inbox()[1].kind, InboxKind::Failed);
+}
+
 // --------------------------------------------------------------- end to end
 
 /// The desktop's loop without a window: commands to the in-memory Core,
