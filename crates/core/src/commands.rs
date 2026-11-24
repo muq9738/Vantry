@@ -394,7 +394,7 @@ fn input_receipt(i: &Input) -> Receipt {
     }
 }
 fn send(db: &Connection, c: &Command) -> Result<Receipt> {
-    if c.message.trim().is_empty() {
+    if c.message.trim().is_empty() && (c.kind != SendMessage || c.attachments.is_empty()) {
         return Err(invalid("message is required"));
     }
     let key = if c.kind == InterThreadSend {

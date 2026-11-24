@@ -159,6 +159,19 @@ fn status(s: &Snapshot, key: &str) -> RunStatus {
         .status
 }
 #[tokio::test]
+async fn image_only_message_reaches_the_provider_without_placeholder_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let th = cmd(&h.core, "thread.create", json!({})).thread_id;
+    cmd(&h.core, "message.send", json!({"threadId": th, "attachments": [{"id":"file_img", "name":"image.png", "mime":"image/png", "size": 8}]}));
+    let e = h.next().await;
+    assert!(e.req.message.is_empty());
+    assert_eq!(e.req.attachments.unwrap()[0].id, "file_img");
+    e.done.send(Ok(())).unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
 async fn commands_queue_steer_approvals_and_thread_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open(dir.path(), true);

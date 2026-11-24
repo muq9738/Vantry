@@ -83,11 +83,26 @@ def running_model():
             worker.join()
 
 
+def test_environment(home, root):
+    env = {key: os.environ[key] for key in ('SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    env.update(HOME=str(home), USERPROFILE=str(home), APPDATA=str(home / 'AppData' / 'Roaming'),
+               LOCALAPPDATA=str(home / 'AppData' / 'Local'), TMPDIR=str(root), TEMP=str(root), TMP=str(root),
+               PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', NO_PROXY='127.0.0.1,localhost',
+               PATH=os.environ['PATH'] if os.name == 'nt' else os.defpath)
+    return env
+
+
+def kill_worker(process):
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)], capture_output=True, timeout=10)
+    else:
+        os.killpg(process.pid, signal.SIGKILL)
+
+
 def run_case(root, server, decision):
     home, data, cwd = (root / name for name in ['home', 'data', 'work'])
     for d in (home, data, cwd): d.mkdir(parents=True)
-    env = {'HOME': str(home), 'PATH': os.defpath, 'TMPDIR': str(root), 'PI_OFFLINE':'1',
-           'NO_PROXY':'127.0.0.1,localhost', 'PI_SKIP_VERSION_CHECK':'1'}
+    env = test_environment(home, root)
     agent = home / '.pi/agent'
     if decision == 'allow':
         agent = home / 'explicit-pi'
@@ -106,7 +121,7 @@ def run_case(root, server, decision):
         dump(path, doc)
     subprocess.run(setup_cmd, input=json.dumps(setup), text=True, env=env, check=True, timeout=15)
     assert load(agent/'auth.json')['other']['key'] == 'unrelated'
-    assert (agent/'auth.json').stat().st_mode & 0o777 == 0o600
+    if os.name == 'posix': assert (agent/'auth.json').stat().st_mode & 0o777 == 0o600
     assert load(agent/'settings.json')['extraSetting']
     assert load(agent/'models.json')['providers']['local']['models'] == [{'id':'fixture','name':'Keep me'}]
     ext = agent/'extensions/probe.ts'
@@ -121,7 +136,7 @@ def run_case(root, server, decision):
     cmd = [BINARY, 'provider-worker', '--job-dir', str(job)]
     initial = len(server.requests)
     proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            start_new_session=True, text=True)
+                            start_new_session=os.name == 'posix', text=True)
     def deliver(control):
         subprocess.run([BINARY,'worker-control','--job-dir',str(job)],input=json.dumps(control),
                        text=True,env=env,check=True,timeout=10)
@@ -137,7 +152,7 @@ def run_case(root, server, decision):
             if dialogs and not responded:
                 responded = True
                 if decision == 'crash':
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    kill_worker(proc)
                     proc.wait(timeout=10)
                     with (job/'events.jsonl').open('ab') as journal: journal.write(b'{"sequence":')
                     recovery = subprocess.run(cmd, env=env, capture_output=True, timeout=10)
@@ -159,7 +174,7 @@ def run_case(root, server, decision):
         assert result['status']==expected_status, (decision, result, logs)
         assert responded, (decision, logs, events())
     finally:
-        if proc.poll() is None: os.killpg(proc.pid, signal.SIGKILL)
+        if proc.poll() is None: kill_worker(proc)
         proc.wait()
         proc.stdout.close()
     log = events()
@@ -197,8 +212,8 @@ def run_case(root, server, decision):
 def check_session_titles(root, model):
     root.mkdir()
     data = root / 'data'
-    env = dict(HOME=str(root), PATH=os.defpath, PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1',
-               PI_CODING_AGENT_DIR=str(root / 'pi'), NO_PROXY='127.0.0.1,localhost')
+    env = test_environment(root, root)
+    env['PI_CODING_AGENT_DIR'] = str(root / 'pi')
     setup = dict(providerId='local', baseUrl=f'http://127.0.0.1:{model.server_port}/v1',
                  apiKey='local-fixture', models=['fixture'], setDefault=True)
     subprocess.run([BINARY, 'pi-setup'], input=json.dumps(setup), text=True, env=env, check=True, timeout=10)

@@ -930,6 +930,10 @@ pub(crate) fn paste_images(paste: &PasteEvent) {
     let key = state().with_untracked(|s| s.draft_key());
     let mut images = Vec::new();
     for file in paste.files.iter().filter(|f| f.mime.starts_with("image/")) {
+        if !matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+            warn("请粘贴 PNG、JPEG、GIF 或 WebP 图片。");
+            continue;
+        }
         if !(1..=8 << 20).contains(&file.data.len()) { warn("图片须在 8 MB 以内。"); continue; }
         images.push((file.name.clone(),file.data.clone()));
     }

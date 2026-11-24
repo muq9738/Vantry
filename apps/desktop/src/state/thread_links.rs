@@ -87,6 +87,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_skill_is_a_name_chip_and_reaches_pi_as_a_leading_command() {
+        let src = "/skill:pdf [前次](vantry-thread://one) 请提取文字";
+        let (skill, links, body) = draft_parts(src);
+        assert_eq!(skill, Some("pdf"));
+        assert_eq!(body, "请提取文字");
+        assert_eq!(compose(skill, links.iter().map(|l| l.source), body), src);
+        assert_eq!(with_body(src, "修改"), "/skill:pdf [前次](vantry-thread://one) 修改");
+    }
+
+    #[test]
     fn editing_and_sending_references_with_identical_titles() {
         let a = "[接手](vantry-thread://one)";
         let b = "[接手](vantry-thread://two)";
