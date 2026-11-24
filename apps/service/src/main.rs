@@ -275,8 +275,17 @@ async fn serve(args: CoreArgs) -> Result<()> {
             ext.identity.snapshot().host.relays,
         )?;
         Some(listener)
-    } else if !relay_targets.is_empty() {
-        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
+    } else if saved.enabled || !relay_targets.is_empty() || !saved.t3_listen().is_empty() {
+        let bind_direct = if saved.direct_port() > 0 {
+            format!("0.0.0.0:{}", saved.direct_port())
+        } else {
+            "0.0.0.0:0".to_owned()
+        };
+        let listener = match tokio::net::TcpListener::bind(&bind_direct).await {
+            Ok(l) => l,
+            Err(_) => tokio::net::TcpListener::bind("0.0.0.0:0").await?,
+        };
+        Some(listener)
     } else {
         None
     };
@@ -293,7 +302,10 @@ async fn serve(args: CoreArgs) -> Result<()> {
                     model: ext.options.model.clone(),
                 },
             )?;
-            let (t3_listener, t3_addr) = t3.bind_loopback().await?;
+            let configured_t3 = saved.t3_listen();
+            let (t3_listener, t3_addr) = t3
+                .bind_configured((!configured_t3.is_empty()).then_some(configured_t3))
+                .await?;
             let t3_stop = stop.clone();
             let t3_task = tokio::spawn(async move {
                 let _ = t3.serve(t3_listener, t3_stop).await;
@@ -310,8 +322,12 @@ async fn serve(args: CoreArgs) -> Result<()> {
             let mut hosts = tokio::task::JoinSet::new();
             for (relay, key) in relay_targets {
                 let host = vantry_connectivity::peer::HostConfig {
-                    relay, key, gateway, route: saved.host.route.clone(),
-                    instance: saved.host.device_id.clone(), t3: None,
+                    relay,
+                    key,
+                    gateway,
+                    route: saved.host.route.clone(),
+                    instance: saved.host.device_id.clone(),
+                    t3: Some(t3_addr),
                 };
                 let (status, _) = tokio::sync::watch::channel(vantry_connectivity::peer::HostState::Connecting);
                 let owner = relay_stop.clone();

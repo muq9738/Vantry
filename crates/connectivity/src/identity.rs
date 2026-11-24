@@ -172,6 +172,29 @@ pub struct Configuration {
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
+impl Configuration {
+    pub fn direct_port(&self) -> u16 {
+        self.extra
+            .get("directPort")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(0)
+    }
+    pub fn t3_listen(&self) -> &str {
+        self.extra
+            .get("t3Listen")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    }
+    pub fn public_url(&self) -> &str {
+        self.extra
+            .get("publicUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    }
+}
 fn cert(pem: &str) -> Result<CertificateDer<'static>> {
     rustls_pemfile::certs(&mut pem.as_bytes())
         .next()
@@ -396,7 +419,7 @@ impl Configuration {
     }
     pub fn server_tls(&self, mtls: bool) -> Result<Arc<ServerConfig>> {
         let b = ServerConfig::builder_with_provider(provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])?;
+            .with_safe_default_protocol_versions()?;
         let b = if mtls {
             let mut roots = RootCertStore::empty();
             for c in self.clients.iter().filter(|c| !c.certificate.is_empty()) {

@@ -291,7 +291,7 @@ impl PeerConnection {
     pub async fn get_json(self, path: &str) -> Result<Value> {
         let res = self.request(Method::GET, path, None).await?;
         let status = res.status();
-        let bytes = Limited::new(res.into_body(), 16 << 20)
+        let bytes = Limited::new(res.into_body(), 256 << 20)
             .collect()
             .await
             .map_err(|_| anyhow!("invalid Core response body"))?
@@ -309,7 +309,7 @@ impl PeerConnection {
     pub async fn post_json(self, path: &str, value: Value) -> Result<Value> {
         let res = self.request(Method::POST, path, Some(value)).await?;
         let status = res.status();
-        let bytes = Limited::new(res.into_body(), 16 << 20)
+        let bytes = Limited::new(res.into_body(), 256 << 20)
             .collect()
             .await
             .map_err(|_| anyhow!("invalid Core response body"))?

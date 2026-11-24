@@ -3,14 +3,17 @@
 use crate::{
     pairing::{matches_secret, token},
     transport::{Tasks, accepted, upgrade},
-    web::{Reply, bearer, decode, json, response},
+    web::{Reply, bearer, json, response},
 };
 use anyhow::{Context, Result, anyhow, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{SinkExt, StreamExt};
-use http::{Method, Request};
+use http::{HeaderMap, Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     body::Incoming,
@@ -19,10 +22,11 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
+use ring::{digest, hmac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     fs,
     io::Write,
@@ -63,11 +67,26 @@ pub struct T3Client {
     pub scopes: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacySession {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scopes: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthState {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     environment_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    legacy_signing_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    legacy_sessions: Vec<LegacySession>,
     #[serde(default)]
     clients: Vec<T3Client>,
 }
@@ -224,11 +243,78 @@ impl T3Server {
         }
         let now = Utc::now();
         let state = self.0.state.lock().unwrap();
-        state
+        if let Some(client) = state
             .clients
             .iter()
             .find(|c| c.expires_at > now && matches_secret(&c.token, candidate))
-            .cloned()
+        {
+            return Some(client.clone());
+        }
+        verify_legacy_session(&state, candidate, now)
+    }
+
+    fn session_cookie_name(&self) -> String {
+        let env_id = self.0.state.lock().unwrap().environment_id.trim().to_owned();
+        if !env_id.is_empty() {
+            let d = digest::digest(&digest::SHA256, env_id.as_bytes());
+            let mut hex = String::with_capacity(12);
+            for byte in &d.as_ref()[..6] {
+                use std::fmt::Write;
+                let _ = write!(&mut hex, "{byte:02x}");
+            }
+            return format!("t3_session_{hex}");
+        }
+        "vantry_session".to_owned()
+    }
+
+    fn auth_descriptor(&self) -> Value {
+        json!({
+            "policy": "remote-reachable",
+            "bootstrapMethods": ["one-time-token"],
+            "sessionMethods": ["bearer-access-token", "browser-session-cookie"],
+            "sessionCookieName": self.session_cookie_name(),
+        })
+    }
+
+    fn well_known_descriptor(&self) -> Value {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            _ => "other",
+        };
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        json!({
+            "environmentId": self.environment_id(),
+            "label": self.0.opts.name,
+            "name": self.0.opts.name,
+            "platform": {
+                "os": os,
+                "arch": arch,
+            },
+            "serverVersion": self.0.opts.version,
+            "version": self.0.opts.version,
+            "protocolVersion": 1,
+            "orchestrationProtocolVersion": 2,
+            "provider": self.0.opts.provider,
+            "model": self.0.opts.model,
+            "scopes": SCOPES,
+            "capabilities": {
+                "remoteDesktop": true,
+                "repositoryIdentity": false,
+                "connectionProbe": true,
+                "attachmentUploads": false,
+                "questionAttachments": false,
+                "pullRequests": false,
+                "threadStop": true,
+                "threadPinning": true,
+                "threadSettlement": true,
+                "threadSnooze": true,
+                "agentActivityPublishing": false,
+            },
+        })
     }
 
     fn exchange_token(&self, body: &Value) -> Result<Value, u16> {
@@ -238,12 +324,19 @@ impl T3Server {
             .or_else(|| body["token"].as_str())
             .unwrap_or("");
         let subject_type = body["subject_token_type"].as_str().unwrap_or("");
-        let name = body["client_name"]
+        let name = body["client_label"]
             .as_str()
+            .or_else(|| body["client_name"].as_str())
             .or_else(|| body["name"].as_str())
-            .unwrap_or("T3 Client")
+            .unwrap_or("T3 客户端")
             .trim()
             .to_owned();
+        let wanted_scope = body["scope"].as_str().unwrap_or("").trim();
+        let granted_scope = if wanted_scope.is_empty() {
+            SCOPES.to_owned()
+        } else {
+            wanted_scope.to_owned()
+        };
         if grant != TOKEN_GRANT && !subject_token.is_empty() && subject_type.is_empty() {
             // Allow simplified bootstrap exchange with token field.
         } else if grant != TOKEN_GRANT {
@@ -253,7 +346,7 @@ impl T3Server {
         if subject_type == ACCESS_TYPE {
             let client = self.authorize(subject_token).ok_or(401u16)?;
             let ticket_val = token();
-            let expires = Utc::now() + ChronoDuration::seconds(60);
+            let expires = Utc::now() + ChronoDuration::minutes(5);
             self.0.tickets.lock().unwrap().insert(
                 ticket_val.clone(),
                 WsTicket {
@@ -263,8 +356,9 @@ impl T3Server {
             );
             return Ok(json!({
                 "access_token": client.token,
+                "issued_token_type": ACCESS_TYPE,
                 "token_type": "Bearer",
-                "scope": SCOPES,
+                "scope": if client.scopes.is_empty() { SCOPES } else { &client.scopes },
                 "expires_in": (client.expires_at - Utc::now()).num_seconds().max(0),
                 "ticket": ticket_val,
                 "environmentId": self.environment_id(),
@@ -274,13 +368,14 @@ impl T3Server {
         if !subject_type.is_empty() && subject_type != BOOTSTRAP_TYPE {
             return Err(400);
         }
+        let normalized = subject_token.trim().to_ascii_uppercase();
         let now = Utc::now();
         let valid_code = {
             let mut codes = self.0.codes.lock().unwrap();
             codes.retain(|_, v| v.expires > now);
             let matched = codes
                 .values()
-                .find(|v| matches_secret(&v.code, subject_token))
+                .find(|v| matches_secret(&v.code, subject_token) || matches_secret(&v.code, &normalized))
                 .map(|v| v.code.clone());
             if let Some(k) = matched {
                 codes.remove(&k);
@@ -293,16 +388,16 @@ impl T3Server {
             return Err(401);
         }
         let client = T3Client {
-            id: format!("t3_{}", uuid::Uuid::new_v4().simple()),
+            id: token(),
             name: if name.is_empty() {
-                "T3 Client".into()
+                "T3 客户端".into()
             } else {
                 name
             },
             token: token(),
             created_at: now,
-            expires_at: now + ChronoDuration::days(30),
-            scopes: SCOPES.into(),
+            expires_at: now + ChronoDuration::days(365),
+            scopes: granted_scope,
         };
         let ticket_val = token();
         {
@@ -314,14 +409,15 @@ impl T3Server {
             ticket_val.clone(),
             WsTicket {
                 _client_id: client.id.clone(),
-                expires: now + ChronoDuration::seconds(60),
+                expires: now + ChronoDuration::minutes(5),
             },
         );
         Ok(json!({
             "access_token": client.token,
+            "issued_token_type": ACCESS_TYPE,
             "token_type": "Bearer",
-            "scope": SCOPES,
-            "expires_in": 30 * 86400,
+            "scope": client.scopes,
+            "expires_in": 365 * 86400,
             "client_id": client.id,
             "ticket": ticket_val,
             "environmentId": self.environment_id(),
@@ -329,7 +425,18 @@ impl T3Server {
     }
 
     pub async fn bind_loopback(&self) -> Result<(TcpListener, SocketAddr)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        self.bind_configured(None).await
+    }
+
+    pub async fn bind_configured(&self, configured: Option<&str>) -> Result<(TcpListener, SocketAddr)> {
+        let listener = if let Some(addr) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+            match TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => TcpListener::bind("127.0.0.1:0").await?,
+            }
+        } else {
+            TcpListener::bind("127.0.0.1:0").await?
+        };
         let addr = listener.local_addr()?;
         Ok((listener, addr))
     }
@@ -348,10 +455,21 @@ impl T3Server {
                     let this = this.clone();
                     let group = group.clone();
                     async move {
-                        let reply = this
+                        let origin = req
+                            .headers()
+                            .get("origin")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        let mut reply = this
                             .handle(req, group)
                             .await
-                            .unwrap_or_else(|code| response(code, Bytes::new()));
+                            .unwrap_or_else(|code| match code {
+                                401 => auth_error_reply(),
+                                other => response(other, Bytes::new()),
+                            });
+                        apply_cors_headers(&mut reply, origin.as_deref());
                         Ok::<_, Infallible>(reply)
                     }
                 });
@@ -368,63 +486,194 @@ impl T3Server {
     async fn handle(&self, mut req: Request<Incoming>, tasks: Tasks) -> Result<Reply, u16> {
         let path = req.uri().path().to_owned();
         let method = req.method().clone();
-        match (method, path.as_str()) {
-            (Method::GET, "/.well-known/t3/environment") => Ok(json(
+        if method == Method::OPTIONS {
+            return Ok(response(204, Bytes::new()));
+        }
+        if path == "/ws" && method == Method::GET {
+            let query = req.uri().query().unwrap_or("");
+            let ticket = url::form_urlencoded::parse(query.as_bytes()).find_map(|(k, v)| {
+                matches!(k.as_ref(), "ticket" | "wsTicket").then(|| v.into_owned())
+            });
+            let auth_ok = if let Some(t) = ticket {
+                let now = Utc::now();
+                let mut map = self.0.tickets.lock().unwrap();
+                map.retain(|_, v| v.expires > now);
+                map.remove(&t).is_some()
+            } else {
+                let (tok, _) = extract_request_token(req.headers());
+                self.authorize(&tok).is_some()
+            };
+            if !auth_ok {
+                return Err(401);
+            }
+            let (reply, up) = upgrade(&mut req)?;
+            let this = self.clone();
+            let session_stop = tasks.stop.child_token();
+            self.0.sessions.lock().unwrap().push(session_stop.clone());
+            tasks.spawn(async move {
+                let Ok(ws) = accepted(up, 4 << 20).await else {
+                    return;
+                };
+                this.drive_ws(ws, session_stop).await;
+            });
+            return Ok(reply);
+        }
+
+        if method == Method::GET && path == "/.well-known/t3/environment" {
+            return Ok(json(200, self.well_known_descriptor()));
+        }
+        if method == Method::POST && path == "/oauth/token" {
+            let body = decode_json_or_form(req).await?;
+            return Ok(json(200, self.exchange_token(&body)?));
+        }
+
+        let (req_token, auth_method) = extract_request_token(req.headers());
+        let client = self.authorize(&req_token);
+
+        if method == Method::GET && path == "/api/auth/session" {
+            let mut result = json!({
+                "authenticated": client.is_some(),
+                "auth": self.auth_descriptor(),
+            });
+            if let Some(c) = client {
+                let (granted_scopes, granted_perms) = session_scopes_and_permissions(&c.scopes);
+                result["scopes"] = json!(granted_scopes);
+                result["sessionMethod"] = json!(if auth_method.is_empty() {
+                    "bearer-access-token"
+                } else {
+                    auth_method
+                });
+                result["expiresAt"] = json!(utc_iso(c.expires_at));
+                if !granted_perms.is_empty() {
+                    result["permissions"] = json!(granted_perms);
+                }
+            }
+            return Ok(json(200, result));
+        }
+
+        if method == Method::POST && path == "/api/auth/browser-session" {
+            let body = decode_json_or_form(req).await?;
+            let credential = body["credential"].as_str().unwrap_or("").trim();
+            if credential.is_empty() {
+                return Err(400);
+            }
+            let label = body["label"].as_str().unwrap_or("T3 浏览器会话").trim();
+            let exchanged = self.exchange_token(&json!({
+                "grant_type": TOKEN_GRANT,
+                "subject_token": credential,
+                "subject_token_type": BOOTSTRAP_TYPE,
+                "client_label": label,
+            }))?;
+            let access = exchanged["access_token"].as_str().unwrap_or_default();
+            let cookie_name = self.session_cookie_name();
+            let expires = Utc::now() + ChronoDuration::days(30);
+            let mut reply = json(
                 200,
                 json!({
-                    "protocolVersion": 1,
-                    "environmentId": self.environment_id(),
-                    "name": self.0.opts.name,
-                    "version": self.0.opts.version,
-                    "os": std::env::consts::OS,
-                    "arch": std::env::consts::ARCH,
-                    "provider": self.0.opts.provider,
-                    "model": self.0.opts.model,
-                    "scopes": SCOPES,
-                    "capabilities": [
-                        "orchestration.v1",
-                        "orchestration.snapshot",
-                        "orchestration.dispatch",
-                        "orchestration.subscribe",
-                        "workbench.v1"
-                    ]
+                    "authenticated": true,
+                    "scopes": ["orchestration:read", "orchestration:operate"],
+                    "sessionMethod": "browser-session-cookie",
+                    "expiresAt": utc_iso(expires),
                 }),
-            )),
-            (Method::POST, "/oauth/token") => {
-                let body: Value = decode(req).await?;
-                Ok(json(200, self.exchange_token(&body)?))
+            );
+            if let Ok(val) = format!(
+                "{cookie_name}={access}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
+                30 * 86400
+            )
+            .parse()
+            {
+                reply.headers_mut().insert("set-cookie", val);
             }
-            (Method::GET, "/ws") => {
-                let query = req.uri().query().unwrap_or("");
-                let ticket = query.split('&').find_map(|pair| {
-                    let (k, v) = pair.split_once('=')?;
-                    matches!(k, "ticket" | "wsTicket").then_some(v.to_owned())
-                });
-                let auth_ok = if let Some(t) = ticket {
-                    let now = Utc::now();
-                    let mut map = self.0.tickets.lock().unwrap();
-                    map.retain(|_, v| v.expires > now);
-                    map.remove(&t).is_some()
-                } else {
-                    self.authorize(bearer(req.headers())).is_some()
-                };
-                if !auth_ok {
-                    return Err(401);
-                }
-                let (reply, up) = upgrade(&mut req)?;
-                let this = self.clone();
-                let session_stop = tasks.stop.child_token();
-                self.0.sessions.lock().unwrap().push(session_stop.clone());
-                tasks.spawn(async move {
-                    let Ok(ws) = accepted(up, 4 << 20).await else {
-                        return;
-                    };
-                    this.drive_ws(ws, session_stop).await;
-                });
-                Ok(reply)
-            }
-            _ => Err(404),
+            return Ok(reply);
         }
+
+        let Some(client) = client else {
+            return Err(401);
+        };
+
+        if matches!(
+            path.as_str(),
+            "/api/auth/websocket-ticket"
+                | "/api/auth/websocket-ticket/rpc"
+                | "/api/auth/websocket-ticket/media"
+        ) {
+            if method != Method::POST {
+                return Err(405);
+            }
+            let key = token();
+            let expiry = Utc::now() + ChronoDuration::minutes(5);
+            {
+                let mut tickets = self.0.tickets.lock().unwrap();
+                let now = Utc::now();
+                tickets.retain(|_, v| v.expires > now);
+                if tickets.len() >= 1024 {
+                    return Err(429);
+                }
+                tickets.insert(
+                    key.clone(),
+                    WsTicket {
+                        _client_id: client.id.clone(),
+                        expires: expiry,
+                    },
+                );
+            }
+            return Ok(json(
+                200,
+                json!({
+                    "ticket": key,
+                    "expiresAt": utc_iso(expiry),
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/api/orchestration/shell" {
+            let snap = core_http_json(&self.0.opts.core_socket, Method::GET, "/v1/snapshot", None)
+                .await
+                .map_err(|_| 502u16)?;
+            return Ok(json(200, build_t3_shell_snapshot(&snap, &self.0.opts)));
+        }
+
+        if method == Method::GET
+            && let Some(tail) = path.strip_prefix("/api/orchestration/threads/")
+        {
+            let (id, suffix) = tail.split_once('/').unwrap_or((tail, ""));
+            let snap = core_http_json(&self.0.opts.core_socket, Method::GET, "/v1/snapshot", None)
+                .await
+                .map_err(|_| 502u16)?;
+            let seq = snap["sequence"].as_i64().unwrap_or(0);
+            let Some(projection) = build_t3_thread_projection_opt(&snap, id, &self.0.opts) else {
+                return Ok(json(404, json!({"message": "会话不存在"})));
+            };
+            let result = match suffix {
+                "" => json!({
+                    "snapshotSequence": seq,
+                    "projection": projection,
+                }),
+                "bounded" => json!({
+                    "snapshotSequence": seq,
+                    "projection": projection,
+                    "historyCursor": Value::Null,
+                    "hasMoreHistory": false,
+                    "latestLocalTurnOrdinal": Value::Null,
+                }),
+                "history" => json!({
+                    "snapshotSequence": seq,
+                    "items": [],
+                    "nextCursor": Value::Null,
+                    "hasMoreHistory": false,
+                }),
+                "transcript" => json!({
+                    "threadId": id,
+                    "title": projection["thread"]["title"],
+                    "updatedAt": projection["updatedAt"],
+                    "items": projection["visibleTurnItems"],
+                }),
+                _ => return Err(404),
+            };
+            return Ok(json(200, result));
+        }
+
+        Err(404)
     }
 
     async fn drive_ws(&self, ws: crate::transport::Ws, stop: CancellationToken) {
@@ -710,9 +959,9 @@ impl T3Server {
                     .unwrap_or(0);
                 if let Ok(s) = snap {
                     let initial = if method == "orchestration.subscribeThread" && !filter_thread.is_empty() {
-                        build_t3_thread_projection(&s, &filter_thread)
+                        build_t3_thread_projection(&s, &filter_thread, &self.0.opts)
                     } else {
-                        build_t3_shell_snapshot(&s)
+                        build_t3_shell_snapshot(&s, &self.0.opts)
                     };
                     let _ = send_chunk(json!({
                         "type": "snapshot",
@@ -739,13 +988,13 @@ impl T3Server {
             "orchestration.getShellSnapshot" => {
                 core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
                     .await
-                    .map(|s| build_t3_shell_snapshot(&s))
+                    .map(|s| build_t3_shell_snapshot(&s, &self.0.opts))
             }
             "orchestration.getArchivedShellSnapshot" => {
                 core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
                     .await
                     .map(|s| {
-                        let shell = build_t3_shell_snapshot(&s);
+                        let shell = build_t3_shell_snapshot(&s, &self.0.opts);
                         json!({
                             "schemaVersion": 2,
                             "snapshotSequence": shell["snapshotSequence"],
@@ -769,7 +1018,7 @@ impl T3Server {
                 let tid = payload["threadId"].as_str().unwrap_or("");
                 core_http_json(&core_socket, Method::GET, "/v1/snapshot", None)
                     .await
-                    .map(|s| build_t3_thread_projection(&s, tid))
+                    .map(|s| build_t3_thread_projection(&s, tid, &self.0.opts))
             }
             "orchestration.getThreadSnapshot" => {
                 let tid = payload["threadId"].as_str().unwrap_or("");
@@ -778,7 +1027,7 @@ impl T3Server {
                     .map(|s| {
                         json!({
                             "snapshotSequence": s["sequence"].as_i64().unwrap_or(0),
-                            "projection": build_t3_thread_projection(&s, tid),
+                            "projection": build_t3_thread_projection(&s, tid, &self.0.opts),
                         })
                     })
             }
@@ -850,52 +1099,745 @@ fn t3_exit(req_id: &Value, result: Result<Value>) -> Value {
     json!({"_tag": "Exit", "requestId": req_id, "exit": exit})
 }
 
-fn build_t3_shell_snapshot(snap: &Value) -> Value {
-    let seq = snap["sequence"].as_i64().unwrap_or(0);
-    let mut active = Vec::new();
-    let mut archived = Vec::new();
-    for t in snap["threads"].as_array().into_iter().flatten() {
-        if t["archived"].as_bool().unwrap_or(false) {
-            archived.push(t.clone());
-        } else {
-            active.push(t.clone());
+fn utc_iso(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+fn auth_error_reply() -> Reply {
+    json(
+        401,
+        json!({
+            "_tag": "EnvironmentAuthInvalidError",
+            "code": "auth_invalid",
+            "reason": "invalid_credential",
+            "traceId": token(),
+        }),
+    )
+}
+
+fn apply_cors_headers(reply: &mut Reply, origin: Option<&str>) {
+    let headers = reply.headers_mut();
+    if let Some(o) = origin {
+        if let Ok(v) = o.parse() {
+            headers.insert("access-control-allow-origin", v);
+            headers.insert("access-control-allow-credentials", "true".parse().unwrap());
+            headers.insert("vary", "Origin".parse().unwrap());
+        }
+    } else {
+        headers.insert("access-control-allow-origin", "*".parse().unwrap());
+    }
+    headers.insert(
+        "access-control-allow-headers",
+        "Authorization, Content-Type, DPoP, x-t3-orchestration-protocol"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        "access-control-allow-methods",
+        "GET, POST, OPTIONS".parse().unwrap(),
+    );
+    headers.insert("cache-control", "no-store".parse().unwrap());
+}
+
+fn extract_request_token(headers: &HeaderMap) -> (String, &'static str) {
+    let b = bearer(headers).trim();
+    if !b.is_empty() {
+        return (b.to_owned(), "bearer-access-token");
+    }
+    for header in headers.get_all("cookie") {
+        let Ok(raw) = header.to_str() else { continue };
+        for part in raw.split(';') {
+            let Some((name, val)) = part.trim().split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            let val = val.trim();
+            if !val.is_empty() && (name == "vantry_session" || name.starts_with("t3_session")) {
+                return (val.to_owned(), "browser-session-cookie");
+            }
         }
     }
+    (String::new(), "")
+}
+
+async fn decode_json_or_form(req: Request<Incoming>) -> Result<Value, u16> {
+    let is_form = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded"));
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Limited::new(req.into_body(), 32 << 10).collect(),
+    )
+    .await
+    .map_err(|_| 408u16)?
+    .map_err(|_| 400u16)?
+    .to_bytes();
+    if is_form || (!body.is_empty() && !body.starts_with(b"{")) {
+        let mut map = serde_json::Map::new();
+        for (k, v) in url::form_urlencoded::parse(&body) {
+            map.insert(k.into_owned(), Value::String(v.into_owned()));
+        }
+        if !map.is_empty() {
+            return Ok(Value::Object(map));
+        }
+    }
+    serde_json::from_slice(&body).map_err(|_| 400)
+}
+
+fn session_scopes_and_permissions(raw: &str) -> (Vec<String>, Vec<String>) {
+    const LEGACY_ONLY: &[&str] = &[
+        "orchestration:read",
+        "orchestration:operate",
+        "terminal:operate",
+        "review:write",
+        "access:read",
+        "access:write",
+        "relay:read",
+        "relay:write",
+    ];
+    let mut all = Vec::new();
+    let mut legacy = Vec::new();
+    let mut has_fine = false;
+    for sc in raw.split_whitespace() {
+        if all.iter().any(|s: &String| s == sc) {
+            continue;
+        }
+        all.push(sc.to_owned());
+        if LEGACY_ONLY.contains(&sc) {
+            legacy.push(sc.to_owned());
+        } else {
+            has_fine = true;
+        }
+    }
+    if all.is_empty() {
+        let default = vec!["orchestration:read".into(), "orchestration:operate".into()];
+        return (default, Vec::new());
+    }
+    if legacy.is_empty() {
+        legacy = vec!["orchestration:read".into(), "orchestration:operate".into()];
+    }
+    if has_fine {
+        (legacy, all)
+    } else {
+        (legacy, Vec::new())
+    }
+}
+
+fn verify_legacy_session(state: &AuthState, candidate: &str, now: DateTime<Utc>) -> Option<T3Client> {
+    if state.legacy_signing_key.is_empty() || state.legacy_sessions.is_empty() {
+        return None;
+    }
+    let key = STANDARD.decode(&state.legacy_signing_key).ok()?;
+    if key.len() < 16 {
+        return None;
+    }
+    let (payload_b64, sig_b64) = candidate.split_once('.')?;
+    if payload_b64.is_empty() || sig_b64.is_empty() || sig_b64.contains('.') {
+        return None;
+    }
+    let got_sig = URL_SAFE_NO_PAD.decode(sig_b64).ok()?;
+    let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+    hmac::verify(&mac_key, payload_b64.as_bytes(), &got_sig).ok()?;
+    let raw_claims = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let claims: Value = serde_json::from_slice(&raw_claims).ok()?;
+    let sid = claims["sid"].as_str()?;
+    let kind = claims["kind"].as_str().unwrap_or("");
+    if sid.is_empty() || (!kind.is_empty() && kind != "session") {
+        return None;
+    }
+    if let Some(exp) = claims["exp"].as_i64().filter(|&e| e > 0) {
+        let exp_dt = if exp > 1_000_000_000_000 {
+            DateTime::from_timestamp_millis(exp)
+        } else {
+            DateTime::from_timestamp(exp, 0)
+        };
+        if let Some(dt) = exp_dt
+            && now >= dt
+        {
+            return None;
+        }
+    }
+    let legacy = state
+        .legacy_sessions
+        .iter()
+        .find(|s| s.id == sid && s.expires_at > now)?;
+    let sc = if !legacy.scopes.is_empty() {
+        legacy.scopes.clone()
+    } else {
+        claims["scopes"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| SCOPES.to_owned())
+    };
+    Some(T3Client {
+        id: legacy.id.clone(),
+        name: if legacy.name.is_empty() {
+            claims["label"].as_str().unwrap_or("T3 客户端").to_owned()
+        } else {
+            legacy.name.clone()
+        },
+        token: candidate.to_owned(),
+        created_at: legacy.created_at,
+        expires_at: legacy.expires_at,
+        scopes: sc,
+    })
+}
+
+const SCRATCH_PROJECT_IDENTITY: &str = "vantry:scratch";
+
+fn t3_project_id(identity: &str) -> String {
+    format!("workspace_{}", URL_SAFE_NO_PAD.encode(identity.as_bytes()))
+}
+
+fn is_scratch_path(path: &str, data_dir: &Path) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let normalized = trimmed.replace('\\', "/");
+    let p = Path::new(trimmed);
+    if p.file_name().and_then(|s| s.to_str()) != Some("chat") {
+        return false;
+    }
+    let ws_root = data_dir.join("workspaces");
+    if p.parent().and_then(|d| d.parent()) == Some(ws_root.as_path()) {
+        return true;
+    }
+    normalized.ends_with("/chat") && normalized.contains("/workspaces/")
+}
+
+fn thread_workspace_path(thread: &Value) -> String {
+    let ws = &thread["workspace"];
+    for key in ["repository", "path"] {
+        if let Some(s) = ws[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            return s.to_owned();
+        }
+    }
+    thread["projectPath"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn thread_project_identity(thread: &Value, opts: &T3Options) -> (String, String) {
+    let env_id = thread["workspace"]["environmentId"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or("");
+    let raw = thread_workspace_path(thread);
+    if !env_id.is_empty() {
+        let path = if raw.is_empty() {
+            opts.data_dir.display().to_string()
+        } else {
+            raw
+        };
+        return (format!("environment:{env_id}\n{path}"), path);
+    }
+    if is_scratch_path(&raw, &opts.data_dir) {
+        return (SCRATCH_PROJECT_IDENTITY.to_owned(), String::new());
+    }
+    (raw.clone(), raw)
+}
+
+fn t3_runtime_mode(policy: &str) -> &'static str {
+    match policy {
+        "auto" => "full-access",
+        "auto-accept-edits" => "auto-accept-edits",
+        _ => "approval-required",
+    }
+}
+
+fn t3_run_status(status: &str) -> &str {
+    match status {
+        "waiting_children" => "waiting",
+        "" => "idle",
+        other => other,
+    }
+}
+
+fn is_terminal_run_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+}
+
+fn t3_model_selection(provider: &str, model: &str, opts: &T3Options) -> Value {
+    let p = if !provider.is_empty() {
+        provider
+    } else if !opts.provider.is_empty() {
+        opts.provider.as_str()
+    } else {
+        "pi"
+    };
+    let m = if !model.is_empty() {
+        model
+    } else if !opts.model.is_empty() {
+        opts.model.as_str()
+    } else {
+        "default"
+    };
+    json!({"instanceId": p, "model": m})
+}
+
+fn project_thread_base(thread: &Value, opts: &T3Options) -> Value {
+    let id = thread["id"].as_str().unwrap_or_default();
+    let title = thread["title"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("新会话");
+    let created = thread["createdAt"].as_str().unwrap_or("");
+    let provider = thread["providerId"].as_str().unwrap_or("");
+    let model = thread["model"].as_str().unwrap_or("");
+    let policy = thread["approvalPolicy"].as_str().unwrap_or("");
+    let interaction = thread["interactionMode"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    let (identity, _) = thread_project_identity(thread, opts);
+    let parent_raw = thread["parentThreadId"].as_str().unwrap_or("");
+    let forked_from = thread["forkedFromThreadId"].as_str().unwrap_or("");
+    let (parent, relationship) = if !forked_from.is_empty() {
+        (forked_from, Value::String("fork".into()))
+    } else if !parent_raw.is_empty() {
+        (parent_raw, Value::String("subagent".into()))
+    } else {
+        ("", Value::Null)
+    };
+    let archived = thread["archived"].as_bool().unwrap_or(false);
+    let pinned = thread["pinned"].as_bool().unwrap_or(false);
+    let snoozed = thread["snoozedUntil"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(s.to_owned()))
+        .unwrap_or(Value::Null);
+    let branch = thread["workspace"]["branch"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(s.to_owned()))
+        .unwrap_or(Value::Null);
+    let worktree = if thread["workspace"]["kind"].as_str() == Some("worktree") {
+        thread["workspace"]["path"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| Value::String(s.to_owned()))
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let eff_provider = if !provider.is_empty() {
+        provider
+    } else if !opts.provider.is_empty() {
+        opts.provider.as_str()
+    } else {
+        "pi"
+    };
+    json!({
+        "id": id,
+        "projectId": t3_project_id(&identity),
+        "title": title,
+        "providerInstanceId": eff_provider,
+        "modelSelection": t3_model_selection(provider, model, opts),
+        "runtimeMode": t3_runtime_mode(policy),
+        "interactionMode": interaction,
+        "branch": branch,
+        "worktreePath": worktree,
+        "createdBy": "user",
+        "creationSource": "server",
+        "lineage": {
+            "parentThreadId": if parent.is_empty() { Value::Null } else { Value::String(parent.to_owned()) },
+            "relationshipToParent": relationship,
+            "rootThreadId": if parent.is_empty() { id } else { parent },
+        },
+        "forkedFrom": Value::Null,
+        "activeProviderThreadId": Value::Null,
+        "createdAt": created,
+        "updatedAt": created,
+        "archivedAt": if archived { Value::String(created.to_owned()) } else { Value::Null },
+        "settledOverride": if archived { Value::String("settled".into()) } else { Value::Null },
+        "settledAt": if archived { Value::String(created.to_owned()) } else { Value::Null },
+        "lastVisitedAt": Value::Null,
+        "deletedAt": Value::Null,
+        "pinnedAt": if pinned { Value::String(created.to_owned()) } else { Value::Null },
+        "snoozedUntil": snoozed,
+    })
+}
+
+fn build_t3_shell_snapshot(snap: &Value, opts: &T3Options) -> Value {
+    let seq = snap["sequence"].as_i64().unwrap_or(0);
+    let runs = snap["runs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let tools = snap["tools"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let requests = snap["requests"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let inputs = snap["inputs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+
+    let mut project_meta: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut active = Vec::new();
+    let mut archived = Vec::new();
+
+    for t in snap["threads"].as_array().into_iter().flatten() {
+        let tid = t["id"].as_str().unwrap_or_default();
+        let created = t["createdAt"].as_str().unwrap_or("").to_owned();
+        let (identity, root) = thread_project_identity(t, opts);
+        project_meta
+            .entry(identity)
+            .or_insert_with(|| (root, created.clone()));
+
+        let mut row = project_thread_base(t, opts);
+        row["status"] = json!("idle");
+        row["latestRunId"] = Value::Null;
+        row["activeRunId"] = Value::Null;
+        row["pendingRuntimeRequest"] = Value::Null;
+        row["latestVisibleMessage"] = Value::Null;
+        row["latestUserMessageAt"] = Value::Null;
+        row["hasActionableProposedPlan"] = json!(false);
+
+        let mut count = 0usize;
+        let mut latest_run: Option<&Value> = None;
+        for run in runs.iter().filter(|r| r["threadId"].as_str() == Some(tid)) {
+            count += 1;
+            if !run["output"].as_str().unwrap_or("").is_empty() {
+                count += 1;
+            }
+            if !run["reasoning"].as_str().unwrap_or("").is_empty() {
+                count += 1;
+            }
+            let cur = run["createdAt"].as_str().unwrap_or("");
+            if latest_run.is_none_or(|prev| cur > prev["createdAt"].as_str().unwrap_or("")) {
+                latest_run = Some(run);
+            }
+        }
+        count += tools.iter().filter(|x| x["threadId"].as_str() == Some(tid)).count();
+        count += requests.iter().filter(|x| x["threadId"].as_str() == Some(tid)).count();
+        count += inputs
+            .iter()
+            .filter(|x| {
+                x["threadId"].as_str() == Some(tid)
+                    && ((x["kind"].as_str() == Some("queue") && x["status"].as_str() == Some("queued"))
+                        || (x["kind"].as_str() == Some("steer") && x["status"].as_str() != Some("cancelled")))
+            })
+            .count();
+        row["itemCount"] = json!(count);
+        row["visibleItemCount"] = json!(count);
+
+        if let Some(run) = latest_run {
+            let status = run["status"].as_str().unwrap_or("idle");
+            let rid = run["id"].as_str().unwrap_or("");
+            let r_updated = run["updatedAt"].as_str().unwrap_or("");
+            let r_created = run["createdAt"].as_str().unwrap_or("");
+            row["status"] = json!(t3_run_status(status));
+            row["latestRunId"] = json!(rid);
+            if !r_updated.is_empty() {
+                row["updatedAt"] = json!(r_updated);
+            }
+            if !r_created.is_empty() {
+                row["latestUserMessageAt"] = json!(r_created);
+            }
+            if !is_terminal_run_status(status) {
+                row["activeRunId"] = json!(rid);
+            }
+            let output = run["output"].as_str().unwrap_or("");
+            let (role, text, msg_id) = if !output.is_empty() {
+                ("assistant", output, format!("{rid}/assistant"))
+            } else {
+                ("user", run["input"].as_str().unwrap_or(""), format!("{rid}/user"))
+            };
+            row["latestVisibleMessage"] = json!({
+                "id": msg_id,
+                "role": role,
+                "text": text,
+                "updatedAt": r_updated,
+            });
+        }
+
+        if let Some(req) = requests
+            .iter()
+            .find(|r| r["threadId"].as_str() == Some(tid) && r["status"].as_str() == Some("pending"))
+        {
+            let kind = if req["method"].as_str() == Some("confirm") {
+                "permission"
+            } else {
+                "user_input"
+            };
+            row["pendingRuntimeRequest"] = json!({
+                "id": req["id"],
+                "kind": kind,
+                "createdAt": req["createdAt"],
+            });
+        }
+
+        if t["archived"].as_bool().unwrap_or(false) {
+            archived.push(row);
+        } else {
+            active.push(row);
+        }
+    }
+
+    let mut projects = Vec::with_capacity(project_meta.len());
+    for (identity, (root, created)) in project_meta {
+        if identity == SCRATCH_PROJECT_IDENTITY {
+            projects.push(json!({
+                "id": t3_project_id(&identity),
+                "title": "No project",
+                "workspaceRoot": "",
+                "isScratch": true,
+                "defaultModelSelection": t3_model_selection("", "", opts),
+                "scripts": [],
+                "createdAt": created,
+                "updatedAt": created,
+            }));
+        } else {
+            let title = Path::new(&root)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Vantry");
+            projects.push(json!({
+                "id": t3_project_id(&identity),
+                "title": title,
+                "workspaceRoot": root,
+                "defaultModelSelection": t3_model_selection("", "", opts),
+                "scripts": [],
+                "createdAt": created,
+                "updatedAt": created,
+            }));
+        }
+    }
+
     json!({
         "schemaVersion": 2,
         "snapshotSequence": seq,
-        "projects": [],
+        "projects": projects,
         "threads": active,
         "archivedThreads": archived,
     })
 }
 
-fn build_t3_thread_projection(snap: &Value, thread_id: &str) -> Value {
-    let thread = snap["threads"]
-        .as_array()
-        .and_then(|arr| arr.iter().find(|t| t["id"].as_str() == Some(thread_id)))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let runs: Vec<Value> = snap["runs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|r| r["threadId"].as_str() == Some(thread_id))
-        .cloned()
-        .collect();
-    let requests: Vec<Value> = snap["requests"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|r| r["threadId"].as_str() == Some(thread_id))
-        .cloned()
-        .collect();
-    json!({
-        "threadId": thread_id,
-        "thread": thread,
-        "runs": runs,
-        "requests": requests,
+fn build_t3_thread_projection(snap: &Value, thread_id: &str, opts: &T3Options) -> Value {
+    build_t3_thread_projection_opt(snap, thread_id, opts).unwrap_or_else(|| {
+        json!({
+            "threadId": thread_id,
+            "thread": Value::Null,
+            "updatedAt": "",
+            "runs": [],
+            "attempts": [],
+            "nodes": [],
+            "subagents": [],
+            "providerSessions": [],
+            "providerThreads": [],
+            "providerTurns": [],
+            "runtimeRequests": [],
+            "messages": [],
+            "plans": [],
+            "turnItems": [],
+            "checkpointScopes": [],
+            "checkpoints": [],
+            "contextHandoffs": [],
+            "contextTransfers": [],
+            "visibleTurnItems": [],
+        })
     })
+}
+
+fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Options) -> Option<Value> {
+    let source = snap["threads"]
+        .as_array()?
+        .iter()
+        .find(|t| t["id"].as_str() == Some(thread_id))?;
+    let thread_obj = project_thread_base(source, opts);
+    let mut updated_at = source["createdAt"].as_str().unwrap_or("").to_owned();
+
+    let mut runs_src: Vec<&Value> = snap["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["threadId"].as_str() == Some(thread_id))
+        .collect();
+    runs_src.sort_by_key(|r| r["createdAt"].as_str().unwrap_or(""));
+
+    let mut runs_out = Vec::new();
+    let mut nodes_out = Vec::new();
+    let mut messages_out = Vec::new();
+    let mut turn_items_out = Vec::new();
+    let mut visible_out = Vec::new();
+    let mut runtime_requests_out = Vec::new();
+    let mut ordinal = 0usize;
+
+    let mut push_item = |item: Value| {
+        let pos = visible_out.len();
+        let item_id = item["id"].clone();
+        visible_out.push(json!({
+            "position": pos,
+            "visibility": "local",
+            "sourceThreadId": thread_id,
+            "sourceItemId": item_id,
+            "item": item,
+        }));
+        turn_items_out.push(item);
+    };
+
+    for (idx, run) in runs_src.iter().enumerate() {
+        let rid = run["id"].as_str().unwrap_or("");
+        let status = run["status"].as_str().unwrap_or("idle");
+        let t3_status = t3_run_status(status);
+        let created = run["createdAt"].as_str().unwrap_or("");
+        let updated = run["updatedAt"].as_str().unwrap_or(created);
+        if updated > updated_at.as_str() {
+            updated_at = updated.to_owned();
+        }
+        let completed = if is_terminal_run_status(status) {
+            Value::String(updated.to_owned())
+        } else {
+            Value::Null
+        };
+        let user_msg_id = format!("{rid}/user");
+        let provider = run["providerId"].as_str().unwrap_or("");
+        let model = run["model"].as_str().unwrap_or("");
+        runs_out.push(json!({
+            "id": rid,
+            "threadId": thread_id,
+            "ordinal": idx + 1,
+            "providerInstanceId": if provider.is_empty() { opts.provider.as_str() } else { provider },
+            "modelSelection": t3_model_selection(provider, model, opts),
+            "providerThreadId": Value::Null,
+            "userMessageId": user_msg_id,
+            "rootNodeId": rid,
+            "activeAttemptId": Value::Null,
+            "status": t3_status,
+            "requestedAt": created,
+            "startedAt": created,
+            "completedAt": completed,
+            "checkpointId": Value::Null,
+            "contextHandoffId": Value::Null,
+        }));
+        nodes_out.push(json!({
+            "id": rid,
+            "threadId": thread_id,
+            "runId": rid,
+            "parentNodeId": Value::Null,
+            "rootNodeId": rid,
+            "kind": "root_turn",
+            "status": if t3_status == "queued" { "pending" } else { t3_status },
+            "countsForRun": true,
+            "providerThreadId": Value::Null,
+            "providerTurnId": Value::Null,
+            "nativeItemRef": Value::Null,
+            "runtimeRequestId": Value::Null,
+            "checkpointScopeId": Value::Null,
+            "startedAt": Value::Null,
+            "completedAt": completed,
+        }));
+
+        for role in ["user", "assistant"] {
+            let text = if role == "user" {
+                run["input"].as_str().unwrap_or("")
+            } else {
+                let out = run["output"].as_str().unwrap_or("");
+                if out.is_empty() {
+                    continue;
+                }
+                out
+            };
+            let msg_id = if role == "user" {
+                user_msg_id.clone()
+            } else {
+                format!("{rid}/assistant")
+            };
+            let msg_updated = if role == "user" { created } else { updated };
+            let streaming = role == "assistant" && !is_terminal_run_status(status);
+            messages_out.push(json!({
+                "id": msg_id,
+                "threadId": thread_id,
+                "runId": rid,
+                "nodeId": Value::Null,
+                "role": role,
+                "text": text,
+                "attachments": [],
+                "streaming": streaming,
+                "createdAt": created,
+                "updatedAt": msg_updated,
+                "createdBy": "user",
+                "creationSource": "server",
+            }));
+            let mut item = json!({
+                "id": msg_id,
+                "threadId": thread_id,
+                "runId": rid,
+                "nodeId": Value::Null,
+                "providerThreadId": Value::Null,
+                "providerTurnId": Value::Null,
+                "nativeItemRef": Value::Null,
+                "parentItemId": Value::Null,
+                "ordinal": ordinal,
+                "status": if streaming { "running" } else { "completed" },
+                "title": Value::Null,
+                "startedAt": msg_updated,
+                "completedAt": if streaming { Value::Null } else { Value::String(msg_updated.to_owned()) },
+                "updatedAt": msg_updated,
+                "type": format!("{role}_message"),
+                "messageId": msg_id,
+                "text": text,
+                "streaming": streaming,
+            });
+            if role == "user" {
+                item["inputIntent"] = json!("turn_start");
+                item["attachments"] = json!([]);
+                item["createdBy"] = json!("user");
+            }
+            ordinal += 1;
+            push_item(item);
+        }
+    }
+
+    for req in snap["requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["threadId"].as_str() == Some(thread_id))
+    {
+        let kind = if req["method"].as_str() == Some("confirm") {
+            "permission"
+        } else {
+            "user_input"
+        };
+        runtime_requests_out.push(json!({
+            "id": req["id"],
+            "threadId": thread_id,
+            "runId": req["runId"],
+            "kind": kind,
+            "status": req["status"],
+            "title": req["title"],
+            "prompt": req["prompt"],
+            "createdAt": req["createdAt"],
+        }));
+    }
+
+    Some(json!({
+        "threadId": thread_id,
+        "thread": thread_obj,
+        "updatedAt": updated_at,
+        "runs": runs_out,
+        "attempts": [],
+        "nodes": nodes_out,
+        "subagents": [],
+        "providerSessions": [],
+        "providerThreads": [],
+        "providerTurns": [],
+        "runtimeRequests": runtime_requests_out,
+        "messages": messages_out,
+        "plans": [],
+        "turnItems": turn_items_out,
+        "checkpointScopes": [],
+        "checkpoints": [],
+        "contextHandoffs": [],
+        "contextTransfers": [],
+        "visibleTurnItems": visible_out,
+    }))
 }
 
 async fn stream_t3_effect_events(
@@ -998,7 +1940,7 @@ async fn core_http_json(
         .send_request(builder.body(Full::new(Bytes::from(payload)))?)
         .await?;
     let status = res.status();
-    let data = Limited::new(res.into_body(), 16 << 20)
+    let data = Limited::new(res.into_body(), 256 << 20)
         .collect()
         .await
         .map_err(|_| anyhow!("Core response too large"))?
@@ -1088,24 +2030,57 @@ mod tests {
             .json()
             .await?;
         assert_eq!(meta["environmentId"], "env_test");
+        assert_eq!(meta["orchestrationProtocolVersion"], 2);
+        assert_eq!(meta["capabilities"]["connectionProbe"], true);
 
-        let exchanged: Value = client
-            .post(format!("http://{addr}/oauth/token"))
-            .json(&json!({
-                "grant_type": TOKEN_GRANT,
-                "subject_token": code,
-                "subject_token_type": BOOTSTRAP_TYPE,
-                "client_name": "iPhone"
-            }))
+        let unauth_session: Value = client
+            .get(format!("http://{addr}/api/auth/session"))
             .send()
             .await?
             .json()
             .await?;
-        let ticket = exchanged["ticket"].as_str().unwrap();
+        assert_eq!(unauth_session["authenticated"], false);
+
+        let exchanged: Value = client
+            .post(format!("http://{addr}/oauth/token"))
+            .form(&[
+                ("grant_type", TOKEN_GRANT),
+                ("subject_token", code.as_str()),
+                ("subject_token_type", BOOTSTRAP_TYPE),
+                ("requested_token_type", ACCESS_TYPE),
+                ("client_label", "Vantry for iPhone"),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?;
+        let access_token = exchanged["access_token"].as_str().unwrap().to_owned();
+        assert!(!access_token.is_empty());
+
+        let auth_session: Value = client
+            .get(format!("http://{addr}/api/auth/session"))
+            .bearer_auth(&access_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(auth_session["authenticated"], true);
+        assert_eq!(auth_session["sessionMethod"], "bearer-access-token");
+
+        let rpc_ticket: Value = client
+            .post(format!("http://{addr}/api/auth/websocket-ticket/rpc"))
+            .bearer_auth(&access_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let ticket = rpc_ticket["ticket"].as_str().unwrap();
         assert!(!ticket.is_empty());
 
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?ticket={ticket}")).await?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws?orchestrationProtocol=2&wsTicket={ticket}"
+        ))
+        .await?;
         use futures::SinkExt;
         ws.send(Message::text(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
             .await?;
