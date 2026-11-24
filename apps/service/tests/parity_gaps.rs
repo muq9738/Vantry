@@ -49,6 +49,9 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
 fn init_sample_repo(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     run_git(dir, &["init", "-b", "main"])?;
+    // The service runs its own Git process when the test requests a checkpoint.
+    run_git(dir, &["config", "user.name", "Vantry Test"])?;
+    run_git(dir, &["config", "user.email", "test@vantry.local"])?;
     std::fs::write(dir.join("README.md"), "# Sample\n")?;
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("src/app.rs"), "fn main() {}\n")?;
