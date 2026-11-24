@@ -1,0 +1,1 @@
+ALTER TABLE inputs ADD COLUMN configuration TEXT NOT NULL DEFAULT '';

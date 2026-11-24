@@ -1,0 +1,29 @@
+{
+  "id": "vantry-remote-desktop",
+  "name": "远程桌面",
+  "version": "0.3.1",
+  "runtime": "native",
+  "builtin": false,
+  "repo": "muq9738/vantry-plugin-remote-desktop",
+  "description": "通过独立桌面共享码连接另一台 Vantry；画面与键鼠共享由本机单独授权。",
+  "navigation": [
+    { "title": "远程桌面", "page": "desktop", "icon": "monitor", "nativePanel": "remote-desktop" }
+  ],
+  "settings": [
+    { "key": "enabled", "label": "启用远程桌面插件", "type": "boolean", "default": "true" },
+    {
+      "key": "relayKey",
+      "label": "中继桌面注册令牌",
+      "type": "password",
+      "help": "跨网中继地址沿用 设置 › 远程环境；这里只填该中继桌面模块的注册令牌，仅共享端需要。"
+    },
+    {
+      "key": "quality", "label": "默认画质", "type": "select", "default": "balanced",
+      "options": [
+        { "value": "low", "label": "流畅" },
+        { "value": "balanced", "label": "均衡" },
+        { "value": "ultra", "label": "高清" }
+      ]
+    }
+  ]
+}

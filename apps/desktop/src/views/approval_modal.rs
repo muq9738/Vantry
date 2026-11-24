@@ -1,0 +1,461 @@
+//! The approval modal: the first unanswered extension request (the shown
+//! thread's first), with what it will do, a risk hint, and its answers.
+//! Each answer sends `request.respond` with the request's id; the modal
+//! stays until the Core's `request.updated` settles the request. Escape
+//! puts it aside ("稍后处理"); the timeline keeps its card.
+//!
+//! Three kinds of request: a tool approval (allow once / for the session /
+//! deny), a secret (typed masked, never prefilled, cleared once sent and
+//! never logged), and an interactive terminal or text prompt (a monospace
+//! editor for the terminal, a field or editor otherwise).
+
+use nsh_core::{LineHeight, prelude::*};
+
+use super::{ghost_button, primary_button};
+use crate::{
+    controller,
+    state::{ApprovalDecision, ApprovalView, RequestKind, Risk},
+    theme::{metrics, palette},
+};
+
+pub(crate) fn approval_modal() -> impl IntoElement {
+    let current = computed(|| controller::state().with(|s| s.modal_request()));
+    let current_id = computed(move || current.with(|v| v.as_ref().map(|v| v.request_id.clone())));
+    // Rebuilt per request, so an input's text starts from its prefill.
+    dynamic(move || {
+        current_id
+            .get()
+            .map(|id| modal_for(id, current).into_element())
+    })
+}
+
+fn risk_color(risk: Risk) -> AdaptiveColor {
+    let colors = palette();
+    match risk {
+        Risk::Low => colors.success,
+        Risk::Medium => colors.warning,
+        Risk::High => colors.danger,
+    }
+}
+
+fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl IntoElement {
+    let colors = palette();
+    let view_of = move || current.get();
+    let field = move |f: fn(&ApprovalView) -> String| {
+        move || current.with(|v| v.as_ref().map(f).unwrap_or_default())
+    };
+    let busy = computed(move || current.with(|v| v.as_ref().is_none_or(|v| !v.answerable())));
+    let retry_key = format!("request:{request_id}");
+    let unconfirmed = computed({
+        let key = retry_key.clone();
+        move || {
+            controller::state().with(|s| {
+                s.pending
+                    .iter()
+                    .any(|p| p.key == key && !p.in_flight && p.unconfirmed.is_some())
+            })
+        }
+    });
+    let thread_title = computed(move || {
+        controller::state().with(|s| {
+            let thread_id = current.with(|v| v.as_ref().map(|v| v.thread_id.clone()))?;
+            if s.selected.as_deref() == Some(thread_id.as_str()) {
+                return None;
+            }
+            s.thread(&thread_id).map(|t| t.title.clone())
+        })
+    });
+    let queue_len = computed(|| controller::state().with(|s| s.approval_queue().len()));
+    let value = signal(
+        current.with_untracked(|v| v.as_ref().map(|v| v.prefill.clone()).unwrap_or_default()),
+    );
+    let id = request_id.clone();
+    let answer = move |decision: ApprovalDecision| controller::respond(id.clone(), decision);
+
+    let defer_id = request_id.clone();
+    nsh_base::dialog()
+        .animation(ModalAnimation::Fade)
+        .on_cancel(move || controller::defer_request(defer_id.clone()))
+        .child(
+            view()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .bg(colors.scrim)
+                .p_6()
+                .child(
+                    view()
+                        .w_full()
+                        .max_w(px(metrics::MODAL_WIDTH))
+                        .flex_col()
+                        .gap_3()
+                        .p_5()
+                        .rounded(px(14.0))
+                        .bg(colors.approval)
+                        .border_1()
+                        .border_color(colors.approval_border)
+                        .shadow_xl()
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    text(move || {
+                                        if busy.get() {
+                                            "正在提交响应…".to_owned()
+                                        } else {
+                                            match current.with(|v| v.as_ref().map(|v| v.kind)) {
+                                                Some(RequestKind::Approval) | None => "需要你的确认".to_owned(),
+                                                Some(kind) => kind.label().to_owned(),
+                                            }
+                                        }
+                                    })
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(13.0))
+                                    .text_color(colors.warning),
+                                )
+                                .child(view().flex_1())
+                                .child(when(
+                                    move || queue_len.get() > 1,
+                                    move || {
+                                        text(move || format!("共 {} 项待处理", queue_len.get()))
+                                            .text_size(px(11.5))
+                                            .text_color(colors.muted)
+                                    },
+                                )),
+                        )
+                        .child(when(
+                            move || thread_title.with(Option::is_some),
+                            move || {
+                                text(move || {
+                                    format!(
+                                        "来自会话「{}」",
+                                        thread_title.get().unwrap_or_default()
+                                    )
+                                })
+                                .text_size(px(12.0))
+                                .text_color(colors.muted)
+                            },
+                        ))
+                        .child(
+                            text(field(|v| v.headline.clone()))
+                                .select_text()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(15.0))
+                                .text_color(colors.ink),
+                        )
+                        .child(when(
+                            move || {
+                                current.with(|v| v.as_ref().is_some_and(|v| !v.body.is_empty()))
+                            },
+                            move || {
+                                scroll()
+                                    .max_h(px(220.0))
+                                    .rounded(px(8.0))
+                                    .bg(colors.code)
+                                    .child(
+                                        text(field(|v| v.body.clone()))
+                                            .select_text()
+                                            .font_family("Menlo")
+                                            .text_size(px(12.0))
+                                            .line_height(LineHeight::Multiple(1.5))
+                                            .text_color(colors.ink)
+                                            .px_3()
+                                            .py_2(),
+                                    )
+                            },
+                        ))
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(super::dot(move || {
+                                    risk_color(
+                                        current.with(|v| v.as_ref().map_or(Risk::Low, |v| v.risk)),
+                                    )
+                                }))
+                                .child(
+                                    text(move || {
+                                        current.with(|v| v.as_ref().map_or("", |v| v.risk.hint()))
+                                    })
+                                    .text_size(px(12.0))
+                                    .text_color(colors.muted),
+                                ),
+                        )
+                        .child(when(
+                            move || {
+                                current.with(|v| v.as_ref().is_some_and(|v| !v.error.is_empty()))
+                            },
+                            move || {
+                                text(field(|v| v.error.clone()))
+                                    .text_size(px(12.0))
+                                    .text_color(colors.danger)
+                            },
+                        ))
+                        .child(answers(view_of(), value, busy, answer))
+                        .child(when(
+                            move || unconfirmed.get(),
+                            move || {
+                                let key = retry_key.clone();
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        text("响应未确认，重试将沿用原来的回答。")
+                                            .flex_1()
+                                            .text_size(px(11.5))
+                                            .text_color(colors.warning),
+                                    )
+                                    .child(ghost_button("重试", move || {
+                                        controller::retry(key.clone())
+                                    }))
+                            },
+                        ))
+                        .child(
+                            view()
+                                .flex_row()
+                                .justify_start()
+                                .child(ghost_button("稍后处理", move || {
+                                    controller::defer_request(request_id.clone())
+                                })),
+                        ),
+                ),
+        )
+}
+
+/// The answer buttons for the request's method.
+fn answers(
+    request: Option<ApprovalView>,
+    value: Signal<String>,
+    busy: Memo<bool>,
+    answer: impl Fn(ApprovalDecision) + Clone + 'static,
+) -> AnyElement {
+    let colors = palette();
+    let Some(request) = request else {
+        return view().into_element();
+    };
+    if request.is_approval() {
+        let deny_label = request.deny.clone().unwrap_or_else(|| "拒绝".to_owned());
+        let allow_label = if request.method == "confirm" {
+            "仅允许本次".to_owned()
+        } else {
+            request
+                .allow_once
+                .clone()
+                .unwrap_or_else(|| "允许本次".to_owned())
+        };
+        let (deny, session, allow) = (answer.clone(), answer.clone(), answer);
+        return nsh_base_row()
+            .child(view_spacer())
+            .child(
+                ghost_button(deny_label, move || deny(ApprovalDecision::Deny))
+                    .disabled(move || busy.get()),
+            )
+            .child(when(request.allow_session.is_some(), {
+                let label = request.allow_session.clone().unwrap_or_default();
+                move || {
+                    let session = session.clone();
+                    ghost_button(label.clone(), move || {
+                        session(ApprovalDecision::AllowSession)
+                    })
+                    .disabled(move || busy.get())
+                }
+            }))
+            .child(
+                primary_button(allow_label, move || allow(ApprovalDecision::Allow))
+                    .disabled(move || busy.get()),
+            )
+            .into_element();
+    }
+    if request.kind == RequestKind::Secret {
+        let (cancel, submit) = (answer.clone(), answer);
+        return view_column()
+            .child(
+                nsh_base::input()
+                    .masked(true)
+                    .value(move || value.get())
+                    .on_change(move |text: &str| value.set(text.to_owned()))
+                    .on_submit(move |_: &str| {
+                        let secret = value.get_untracked();
+                        if !secret.is_empty() {
+                            value.set(String::new());
+                            controller::respond(request.request_id.clone(), ApprovalDecision::Submit(secret));
+                        }
+                    })
+                    .placeholder("输入后按回车提交")
+                    .auto_focus(true)
+                    .auto_correct(false)
+                    .auto_capitalize(AutoCapitalize::None)
+                    .min_h(px(34.0))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.0))
+                    .bg(colors.card)
+                    .border_1()
+                    .border_color(colors.line)
+                    .text_size(px(13.0))
+                    .text_color(colors.ink),
+            )
+            .child(
+                text("私密内容以掩码输入，只交给本次请求的一次性文件；桌面不显示、不保存、不写日志。")
+                    .text_size(px(11.5))
+                    .text_color(colors.muted),
+            )
+            .child(
+                nsh_base_row()
+                    .child(view_spacer())
+                    .child(
+                        ghost_button("取消请求", move || cancel(ApprovalDecision::Cancel))
+                            .disabled(move || busy.get()),
+                    )
+                    .child(
+                        primary_button("提交", move || {
+                            let secret = value.get_untracked();
+                            value.set(String::new());
+                            submit(ApprovalDecision::Submit(secret))
+                        })
+                        .disabled(move || busy.get() || value.with(String::is_empty)),
+                    ),
+            )
+            .into_element();
+    }
+    if request.kind == RequestKind::Terminal {
+        let req_id = request.request_id.clone();
+        let tr = request.terminal_run.clone();
+        let (title, command, cwd) = match tr {
+            Some(p) => (p.title, p.command, p.cwd),
+            None => (
+                request.headline.clone(),
+                request.prefill.clone(),
+                String::new(),
+            ),
+        };
+        let run_id = req_id.clone();
+        let done_id = req_id.clone();
+        let done_cwd = cwd.clone();
+        let cancel_id = req_id;
+        let empty_cmd = command.trim().is_empty();
+        return view_column()
+            .child(
+                text("将在右侧内置终端中以真实 PTY 启动该命令，完成后自动回传退出码给 Agent。")
+                    .text_size(px(12.0))
+                    .text_color(colors.muted),
+            )
+            .child(
+                nsh_base_row()
+                    .child(view_spacer())
+                    .child(
+                        ghost_button("取消请求", move || {
+                            controller::cancel_terminal_task(cancel_id.clone())
+                        })
+                        .disabled(move || busy.get()),
+                    )
+                    .child(
+                        ghost_button("标记已完成", move || {
+                            controller::complete_terminal_task(
+                                done_id.clone(),
+                                done_cwd.clone(),
+                            )
+                        })
+                        .disabled(move || busy.get()),
+                    )
+                    .child(
+                        primary_button("在内置终端中运行", move || {
+                            controller::start_terminal_task(
+                                run_id.clone(),
+                                title.clone(),
+                                command.clone(),
+                                cwd.clone(),
+                            )
+                        })
+                        .disabled(move || busy.get() || empty_cmd),
+                    ),
+            )
+            .into_element();
+    }
+    match request.method.as_str() {
+        "select" => {
+            let cancel = answer.clone();
+            let options = request.options.clone();
+            nsh_base_row()
+                .flex_wrap()
+                .child(
+                    options
+                        .into_iter()
+                        .map(|option| {
+                            let choose = answer.clone();
+                            let label = option.clone();
+                            ghost_button(label, move || {
+                                choose(ApprovalDecision::Choose(option.clone()))
+                            })
+                            .disabled(move || busy.get())
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .child(view_spacer())
+                .child(
+                    ghost_button("取消请求", move || cancel(ApprovalDecision::Cancel))
+                        .disabled(move || busy.get()),
+                )
+                .into_element()
+        }
+        _ => {
+            // input / editor: text, then submit or cancel.
+            let multiline = request.method == "editor";
+            let terminal = request.kind == RequestKind::Terminal;
+            let (cancel, submit) = (answer.clone(), answer);
+            let field = nsh_base::input();
+            // A terminal's prompt reads as one.
+            let field = if terminal { field.font_family("Menlo") } else { field };
+            view_column()
+                .child(
+                    field
+                        .multiline(multiline)
+                        .value(move || value.get())
+                        .on_change(move |text: &str| value.set(text.to_owned()))
+                        .placeholder(if terminal { "输入要发送给终端的内容" } else { "输入回复" })
+                        .auto_focus(true)
+                        .auto_correct(!terminal)
+                        .min_h(px(if multiline { 96.0 } else { 34.0 }))
+                        .px_3()
+                        .py_2()
+                        .rounded(px(8.0))
+                        .bg(if terminal { colors.code } else { colors.card })
+                        .border_1()
+                        .border_color(colors.line)
+                        .text_size(px(13.0))
+                        .text_color(colors.ink),
+                )
+                .child(
+                    nsh_base_row()
+                        .child(view_spacer())
+                        .child(
+                            ghost_button("取消请求", move || cancel(ApprovalDecision::Cancel))
+                                .disabled(move || busy.get()),
+                        )
+                        .child(
+                            primary_button(if terminal { "发送到终端" } else { "提交响应" }, move || {
+                                submit(ApprovalDecision::Submit(value.get_untracked()))
+                            })
+                            .disabled(move || busy.get()),
+                        ),
+                )
+                .into_element()
+        }
+    }
+}
+
+fn nsh_base_row() -> View {
+    view().flex_row().items_center().gap_2()
+}
+
+fn view_column() -> View {
+    view().flex_col().gap_2()
+}
+
+fn view_spacer() -> View {
+    view().flex_1()
+}

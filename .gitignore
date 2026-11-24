@@ -1,5 +1,6 @@
 # Local research, screenshots, credentials and validation outputs are private.
 /.agents-debug/
+/target/
 
 # Local credentials and environment files.
 .env

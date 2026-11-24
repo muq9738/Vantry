@@ -1,0 +1,676 @@
+{
+  "CommandKind": [
+    "project.chat.open",
+    "thread.create",
+    "thread.delete",
+    "thread.fork",
+    "thread.rewind",
+    "thread.merge_back",
+    "input.edit",
+    "input.reorder",
+    "input.promote_steer",
+    "thread.model",
+    "input.cancel",
+    "run.steer",
+    "request.respond",
+    "message.send",
+    "run.stop",
+    "task.delegate",
+    "task.followup",
+    "task.acknowledge",
+    "task.dispose",
+    "task.cancel",
+    "task.wake_upgrade",
+    "thread.inter_send",
+    "thread.update",
+    "message.queue",
+    "message.cancel",
+    "message.steer"
+  ],
+  "api.Command": {
+    "version": 1,
+    "commandId": "CommandID",
+    "kind": "request.respond",
+    "threadId": "ThreadID",
+    "title": "Title",
+    "message": "Message",
+    "runId": "RunID",
+    "sourceRunId": "SourceRunID",
+    "targetThreadId": "TargetThreadID",
+    "senderThreadId": "SenderThreadID",
+    "createdByThreadId": "CreatedByThreadID",
+    "createdByRunId": "CreatedByRunID",
+    "deliveryMode": "DeliveryMode",
+    "interactionMode": "InteractionMode",
+    "position": 1,
+    "fallbackToQueue": true,
+    "providerId": "ProviderID",
+    "model": "Model",
+    "workspace": {
+      "environmentId": "EnvironmentID",
+      "kind": "Kind",
+      "path": "Path",
+      "repository": "Repository",
+      "branch": "Branch",
+      "baseRef": "BaseRef"
+    },
+    "parentRunId": "ParentRunID",
+    "parentAttemptId": "ParentAttemptID",
+    "taskId": "TaskID",
+    "generation": 1,
+    "deliveryMessageId": "DeliveryMessageID",
+    "resumePolicy": "ResumePolicy",
+    "pinned": true,
+    "archived": true,
+    "snoozedUntil": "2026-01-02T03:04:05.123456789Z",
+    "force": true,
+    "reason": "Reason",
+    "messageId": "MessageID",
+    "attachments": [
+      {
+        "id": "ID",
+        "name": "Name",
+        "mime": "MIME",
+        "size": 1
+      }
+    ],
+    "approvalPolicy": "ApprovalPolicy",
+    "inputId": "InputID",
+    "requestId": "RequestID",
+    "value": "Value",
+    "confirmed": true,
+    "cancelled": true
+  },
+  "api.Error": {
+    "code": "resync_required",
+    "message": "Message"
+  },
+  "api.Event": {
+    "sequence": 1,
+    "id": "ID",
+    "type": "Type",
+    "threadId": "ThreadID",
+    "runId": "RunID",
+    "attemptId": "AttemptID",
+    "timestamp": "2026-01-02T03:04:05.123456789Z",
+    "data": {
+      "delta": "text"
+    }
+  },
+  "api.PiRuntimeStatus": {
+    "activeSource": "ActiveSource",
+    "activePath": "ActivePath",
+    "activeVersion": "ActiveVersion",
+    "customPath": "CustomPath",
+    "systemPath": "SystemPath",
+    "systemVersion": "SystemVersion",
+    "systemIsNpm": true,
+    "nodeVersion": "NodeVersion",
+    "requiredNode": "RequiredNode",
+    "npmAvailable": true,
+    "latestVersion": "LatestVersion",
+    "updateAvailable": true,
+    "compatVerified": true,
+    "compatBlocked": true,
+    "compatReason": "CompatReason",
+    "canUpgrade": true,
+    "canInstall": true,
+    "activeRuns": 1,
+    "mirrorMode": "MirrorMode",
+    "resolvedRoute": "ResolvedRoute",
+    "npmRegistry": "NPMRegistry",
+    "agentDir": "AgentDir",
+    "configured": true,
+    "modelCount": 1,
+    "defaultModel": "DefaultModel",
+    "error": "Error"
+  },
+  "api.Receipt": {
+    "commandId": "CommandID",
+    "accepted": true,
+    "threadId": "ThreadID",
+    "runId": "RunID",
+    "sequence": 1,
+    "messageId": "MessageID",
+    "inputId": "InputID",
+    "requestId": "RequestID",
+    "taskId": "TaskID",
+    "generation": 1,
+    "deliveryMessageId": "DeliveryMessageID",
+    "delivery": "Delivery"
+  },
+  "api.ServerStatus": {
+    "protocolVersion": 1,
+    "state": "State",
+    "schemaVersion": 1,
+    "pid": 1,
+    "activeRuns": 1,
+    "capabilities": [
+      "Capabilities"
+    ]
+  },
+  "api.Snapshot": {
+    "projectUpdates": [
+      {
+        "id": "ID",
+        "sequence": 1,
+        "threadId": "ThreadID",
+        "sourceThreadId": "SourceThreadID",
+        "runId": "RunID",
+        "attemptId": "AttemptID",
+        "requestId": "RequestID",
+        "title": "Title",
+        "status": "Status",
+        "summary": "Summary",
+        "createdAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ],
+    "sequence": 1,
+    "threads": [
+      {
+        "projectPath": "ProjectPath",
+        "id": "ID",
+        "title": "Title",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "providerId": "ProviderID",
+        "model": "Model",
+        "workspace": {
+          "environmentId": "EnvironmentID",
+          "kind": "Kind",
+          "path": "Path",
+          "repository": "Repository",
+          "branch": "Branch",
+          "baseRef": "BaseRef"
+        },
+        "parentThreadId": "ParentThreadID",
+        "parentTaskId": "ParentTaskID",
+        "createdByThreadId": "CreatedByThreadID",
+        "createdByRunId": "CreatedByRunID",
+        "pinned": true,
+        "archived": true,
+        "snoozedUntil": "2026-01-02T03:04:05.123456789Z",
+        "approvalPolicy": "ApprovalPolicy",
+        "interactionMode": "InteractionMode",
+        "forkedFromThreadId": "ForkedFromThreadID",
+        "forkedFromRunId": "ForkedFromRunID"
+      }
+    ],
+    "runs": [
+      {
+        "id": "ID",
+        "threadId": "ThreadID",
+        "senderThreadId": "SenderThreadID",
+        "attemptId": "AttemptID",
+        "status": "waiting_children",
+        "input": "Input",
+        "attachments": [
+          {
+            "id": "ID",
+            "name": "Name",
+            "mime": "MIME",
+            "size": 1
+          }
+        ],
+        "approvalPolicy": "ApprovalPolicy",
+        "output": "Output",
+        "reasoning": "Reasoning",
+        "interactionMode": "InteractionMode",
+        "error": "Error",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z",
+        "providerId": "ProviderID",
+        "model": "Model",
+        "workspace": {
+          "environmentId": "EnvironmentID",
+          "kind": "Kind",
+          "path": "Path",
+          "repository": "Repository",
+          "branch": "Branch",
+          "baseRef": "BaseRef"
+        },
+        "telemetry": {
+          "phase": "Phase",
+          "compacting": true,
+          "compactionReason": "CompactionReason",
+          "retrying": true,
+          "retryAttempt": 1,
+          "retryMaxAttempts": 1,
+          "retryReason": "RetryReason",
+          "retryWaitSeconds": 1,
+          "retryCount": 1,
+          "turnCount": 1,
+          "inputTokens": 1,
+          "outputTokens": 1,
+          "cacheReadTokens": 1,
+          "cacheWriteTokens": 1,
+          "reasoningTokens": 1,
+          "totalTokens": 1,
+          "lastContextTokens": 1,
+          "costUsd": 1.5,
+          "costEstimated": true,
+          "ttftMs": 1,
+          "durationMs": 1
+        }
+      }
+    ],
+    "tasks": [
+      {
+        "id": "ID",
+        "parentThreadId": "ParentThreadID",
+        "parentRunId": "ParentRunID",
+        "childThreadId": "ChildThreadID",
+        "childRunId": "ChildRunID",
+        "title": "Title",
+        "generation": 1,
+        "status": "waiting_children",
+        "deliveryStatus": "pending",
+        "deliveryMessageId": "DeliveryMessageID",
+        "result": "Result",
+        "error": "Error",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ],
+    "cohorts": [
+      {
+        "parentRunId": "ParentRunID",
+        "generation": 1,
+        "resumePolicy": "ResumePolicy",
+        "deliveryMessageId": "DeliveryMessageID",
+        "status": "pending",
+        "continuationAttemptId": "ContinuationAttemptID",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ],
+    "messages": [
+      {
+        "id": "ID",
+        "threadId": "ThreadID",
+        "message": "Message",
+        "attachments": [
+          {
+            "id": "ID",
+            "name": "Name",
+            "mime": "MIME",
+            "size": 1
+          }
+        ],
+        "status": "Status",
+        "runId": "RunID",
+        "createdAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ],
+    "steering": [
+      {
+        "id": "ID",
+        "commandId": "CommandID",
+        "threadId": "ThreadID",
+        "runId": "RunID",
+        "attemptId": "AttemptID",
+        "message": "Message",
+        "attachments": [
+          {
+            "id": "ID",
+            "name": "Name",
+            "mime": "MIME",
+            "size": 1
+          }
+        ],
+        "status": "accepted",
+        "disposition": "Disposition",
+        "error": "Error",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ],
+    "inputs": [
+      {
+        "commandId": "CommandID",
+        "configuration": {
+          "providerId": "ProviderID",
+          "model": "Model",
+          "approvalPolicy": "ApprovalPolicy",
+          "interactionMode": "InteractionMode"
+        },
+        "id": "ID",
+        "threadId": "ThreadID",
+        "senderThreadId": "SenderThreadID",
+        "runId": "RunID",
+        "attemptId": "AttemptID",
+        "kind": "Kind",
+        "message": "Message",
+        "attachments": [
+          {
+            "id": "ID",
+            "name": "Name",
+            "mime": "MIME",
+            "size": 1
+          }
+        ],
+        "status": "Status",
+        "position": 1,
+        "error": "Error",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ],
+    "tools": [
+      {
+        "id": "ID",
+        "threadId": "ThreadID",
+        "runId": "RunID",
+        "attemptId": "AttemptID",
+        "name": "Name",
+        "arguments": {
+          "delta": "text"
+        },
+        "output": "Output",
+        "status": "Status",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z",
+        "outputOffset": 1
+      }
+    ],
+    "requests": [
+      {
+        "id": "ID",
+        "providerRequestId": "ProviderRequestID",
+        "threadId": "ThreadID",
+        "runId": "RunID",
+        "attemptId": "AttemptID",
+        "method": "Method",
+        "title": "Title",
+        "message": "Message",
+        "options": [
+          "Options"
+        ],
+        "prefill": "Prefill",
+        "status": "Status",
+        "error": "Error",
+        "createdAt": "2026-01-02T03:04:05.123456789Z",
+        "updatedAt": "2026-01-02T03:04:05.123456789Z"
+      }
+    ]
+  },
+  "api.WorkbenchResponse": {
+    "mcp": {
+      "workspace": "Workspace",
+      "userFile": "UserFile",
+      "projectFile": "ProjectFile",
+      "projectTrusted": true,
+      "codemodeDefault": true,
+      "probed": true,
+      "probeError": "ProbeError",
+      "servers": [
+        {
+          "name": "Name",
+          "scope": "Scope",
+          "transport": "Transport",
+          "endpoint": "Endpoint",
+          "enabled": true,
+          "exposure": "Exposure",
+          "toolExposure": {
+            "tool": "direct"
+          },
+          "description": "Description",
+          "error": "Error",
+          "liveState": "LiveState",
+          "tools": [
+            "Tools"
+          ],
+          "liveError": "LiveError"
+        }
+      ],
+      "notice": "Notice"
+    },
+    "data": "Kg==",
+    "workspace": "Workspace",
+    "catalog": {
+      "models": [
+        {
+          "id": "ID",
+          "provider": "Provider",
+          "name": "Name",
+          "reasoning": true,
+          "input": [
+            "Input"
+          ],
+          "contextWindow": 1,
+          "maxTokens": 1
+        }
+      ],
+      "default": "Default",
+      "thinkingLevels": [
+        "ThinkingLevels"
+      ],
+      "configuredDefault": "ConfiguredDefault",
+      "warnings": [
+        "Warnings"
+      ]
+    },
+    "attachment": {
+      "id": "ID",
+      "name": "Name",
+      "mime": "MIME",
+      "size": 1
+    },
+    "git": {
+      "files": [
+        {
+          "path": "Path",
+          "originalPath": "OriginalPath",
+          "index": "Index",
+          "worktree": "Worktree"
+        }
+      ],
+      "root": "Root",
+      "truncated": true,
+      "branch": "Branch",
+      "remoteBranch": "RemoteBranch",
+      "ahead": 1,
+      "behind": 1,
+      "status": "Status",
+      "diff": "Diff",
+      "branches": [
+        "Branches"
+      ],
+      "remoteBranches": [
+        "RemoteBranches"
+      ],
+      "stashes": [
+        {
+          "ref": "Ref",
+          "branch": "Branch",
+          "message": "Message"
+        }
+      ],
+      "commits": [
+        {
+          "id": "ID",
+          "shortId": "ShortID",
+          "subject": "Subject",
+          "author": "Author",
+          "authorTime": "2026-01-02T03:04:05.123456789Z",
+          "refs": [
+            "Refs"
+          ],
+          "parents": [
+            "Parents"
+          ]
+        }
+      ],
+      "conflicts": true
+    },
+    "sshHosts": [
+      {
+        "alias": "Alias",
+        "aliases": [
+          "Aliases"
+        ],
+        "user": "User",
+        "hostName": "HostName",
+        "port": 1,
+        "proxyJump": "ProxyJump",
+        "forwardAgent": true,
+        "hasIdentityFile": true,
+        "sourceFile": "SourceFile",
+        "reachable": true,
+        "probeError": "ProbeError",
+        "probeFailure": "ProbeFailure",
+        "latencyMs": 1,
+        "remoteSocket": "RemoteSocket",
+        "remoteOS": "RemoteOS",
+        "hasHerdr": true
+      }
+    ],
+    "plugins": [
+      {
+        "id": "ID",
+        "name": "Name",
+        "version": "Version",
+        "description": "Description",
+        "repo": "Repo",
+        "builtin": true,
+        "disabled": true,
+        "hasUpdate": true,
+        "latestVersion": "LatestVersion",
+        "needsProcessGrant": true,
+        "granted": true,
+        "settings": [
+          {
+            "key": "Key",
+            "label": "Label",
+            "help": "Help",
+            "type": "Type",
+            "default": "Default",
+            "value": "Value",
+            "options": [
+              {
+                "value": "Value",
+                "label": "Label"
+              }
+            ]
+          }
+        ],
+        "navigation": [
+          {
+            "title": "Title",
+            "page": "Page",
+            "icon": "Icon",
+            "nativePanel": "NativePanel"
+          }
+        ],
+        "error": "Error"
+      }
+    ],
+    "update": {
+      "currentVersion": "CurrentVersion",
+      "latestVersion": "LatestVersion",
+      "available": true,
+      "deltaAvailable": true,
+      "deltaSize": 1,
+      "assetName": "AssetName",
+      "assetSize": 1,
+      "notes": "Notes",
+      "publishedAt": "2026-01-02T03:04:05.123456789Z",
+      "releaseUrl": "ReleaseURL",
+      "staged": true,
+      "stagedVersion": "StagedVersion",
+      "stagedPath": "StagedPath",
+      "targetPath": "TargetPath",
+      "installerPath": "InstallerPath",
+      "usedDelta": true,
+      "canAutoRestart": true
+    },
+    "piRuntime": {
+      "activeSource": "ActiveSource",
+      "activePath": "ActivePath",
+      "activeVersion": "ActiveVersion",
+      "customPath": "CustomPath",
+      "systemPath": "SystemPath",
+      "systemVersion": "SystemVersion",
+      "systemIsNpm": true,
+      "nodeVersion": "NodeVersion",
+      "requiredNode": "RequiredNode",
+      "npmAvailable": true,
+      "latestVersion": "LatestVersion",
+      "updateAvailable": true,
+      "compatVerified": true,
+      "compatBlocked": true,
+      "compatReason": "CompatReason",
+      "canUpgrade": true,
+      "canInstall": true,
+      "activeRuns": 1,
+      "mirrorMode": "MirrorMode",
+      "resolvedRoute": "ResolvedRoute",
+      "npmRegistry": "NPMRegistry",
+      "agentDir": "AgentDir",
+      "configured": true,
+      "modelCount": 1,
+      "defaultModel": "DefaultModel",
+      "error": "Error"
+    },
+    "output": "Output"
+  },
+  "provider.Control": {
+    "id": "ID",
+    "kind": "Kind",
+    "message": "Message",
+    "attachments": [
+      {
+        "id": "ID",
+        "name": "Name",
+        "mime": "MIME",
+        "size": 1
+      }
+    ],
+    "requestId": "RequestID",
+    "value": "Value",
+    "confirmed": true,
+    "cancelled": true
+  },
+  "provider.ControlResult": {
+    "id": "ID",
+    "status": "Status",
+    "error": "Error"
+  },
+  "provider.Event": {
+    "occurredAt": "2026-01-02T03:04:05.123456789Z",
+    "sequence": 1,
+    "delta": "Delta",
+    "type": "Type",
+    "data": {
+      "delta": "text"
+    }
+  },
+  "provider.Request": {
+    "ThreadID": "ThreadID",
+    "SenderThreadID": "SenderThreadID",
+    "SenderTitle": "SenderTitle",
+    "ParentTaskID": "ParentTaskID",
+    "RunID": "RunID",
+    "AttemptID": "AttemptID",
+    "Message": "Message",
+    "Attachments": [
+      {
+        "id": "ID",
+        "name": "Name",
+        "mime": "MIME",
+        "size": 1
+      }
+    ],
+    "ProviderID": "ProviderID",
+    "Model": "Model",
+    "Workspace": {
+      "environmentId": "EnvironmentID",
+      "kind": "Kind",
+      "path": "Path",
+      "repository": "Repository",
+      "branch": "Branch",
+      "baseRef": "BaseRef"
+    },
+    "ApprovalPolicy": "ApprovalPolicy",
+    "InteractionMode": "InteractionMode",
+    "AfterSequence": 1
+  }
+}

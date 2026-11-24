@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""在 Windows 上验证打包后的 Vantry 便携目录及可选个人安装包。
+"""在 Windows 上验证打包后的全 Rust Vantry 便携目录及可选安装包。
 
 验证步骤：
 1. 在最小 PATH（仅 System32）下运行，防止开发机环境掩盖缺失 DLL。
-2. 核验随包资源（Vantry.exe、ghostty-vt.dll、许可文件、可选 remote-desktop helper PE 架构）。
+2. 核验随包资源（Vantry.exe、vantry-service.exe、许可文件、可选 remote-desktop helper PE 架构）。
 3. 在带空格和中文字符的数据目录中真实启动 Core，验证 SQLite 初始化/迁移、本机 IPC、创建与读取线程。
-4. 若目录中存在 NSIS 个人安装包，静默安装到带空格和中文的路径中再次执行全套冒烟，再静默卸载。
 """
 import argparse
 import json
@@ -25,7 +24,7 @@ def clean_windows_env():
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(('VANTRY_', 'MYGO_'))
+        if not key.startswith('VANTRY_')
     }
     system_root = Path(os.environ.get('SystemRoot', r'C:\Windows'))
     # 构建机的工具链 PATH 不能掩盖缺少随包 DLL 的问题。
@@ -51,15 +50,27 @@ def verify_pe_architecture(binary_path, expected_arch='amd64'):
             )
 
 
+def resolve_service_exe(folder):
+    for rel in ['libexec/vantry-service.exe', 'vantry-service.exe']:
+        candidate = folder / rel
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        f'缺少随包服务程序: {folder / "libexec" / "vantry-service.exe"} (或 {folder / "vantry-service.exe"})'
+    )
+
+
 def check_layout(folder, expected_arch='amd64', require_helper=False):
-    for rel in ['Vantry.exe', 'ghostty-vt.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md']:
+    for rel in ['Vantry.exe', 'LICENSE', 'THIRD_PARTY_NOTICES.md']:
         target = folder / rel
         if not target.is_file():
             raise AssertionError(f'缺少随包文件: {target}')
     verify_pe_architecture(folder / 'Vantry.exe', expected_arch)
-    verify_pe_architecture(folder / 'ghostty-vt.dll', expected_arch)
+    verify_pe_architecture(resolve_service_exe(folder), expected_arch)
 
-    licenses_dir = folder / 'licenses'
+    licenses_dir = folder / 'third_party' / 'licenses'
+    if not licenses_dir.is_dir():
+        licenses_dir = folder / 'licenses'
     if not licenses_dir.is_dir() or not any(licenses_dir.iterdir()):
         raise AssertionError(f'缺少第三方许可目录或为空: {licenses_dir}')
 

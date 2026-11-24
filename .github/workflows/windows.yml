@@ -1,8 +1,7 @@
 name: Windows Build and Smoke
 
 env:
-  PYTHONUTF8: '1'
-  PYTHONIOENCODING: utf-8
+  CARGO_TERM_COLOR: always
 
 on:
   workflow_dispatch:
@@ -10,25 +9,21 @@ on:
     branches:
       - main
     paths:
-      - 'cmd/**'
-      - 'internal/**'
-      - 'pkg/**'
-      - 'scripts/build_remote_helper.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'apps/**'
+      - 'crates/**'
+      - 'tools/**'
       - 'scripts/verify_windows_package.py'
-      - 'go.mod'
-      - 'go.sum'
-      - 'mygo.json'
       - '.github/workflows/windows.yml'
   pull_request:
     paths:
-      - 'cmd/**'
-      - 'internal/**'
-      - 'pkg/**'
-      - 'scripts/build_remote_helper.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'apps/**'
+      - 'crates/**'
+      - 'tools/**'
       - 'scripts/verify_windows_package.py'
-      - 'go.mod'
-      - 'go.sum'
-      - 'mygo.json'
       - '.github/workflows/windows.yml'
 
 jobs:
@@ -37,74 +32,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Configure private Go module access (optional)
+      - name: Run Rust workspace tests
         shell: bash
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        run: |
-          if [ -n "${PRIVATE_REPO_TOKEN:-}" ]; then
-            git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-            echo "GOPRIVATE=github.com/muq9738/*" >> "$GITHUB_ENV"
-          fi
+        run: cargo test --workspace --locked
 
-      - name: Go vet and Windows unit tests
+      - name: Build release binaries
+        shell: bash
+        run: cargo build --workspace --release --locked
+
+      - name: Package Windows desktop bundle
         shell: bash
         run: |
-          go vet ./internal/core/... ./internal/app/... ./internal/hostfs/... ./internal/hostprocess/... ./internal/adapters/preview/... ./cmd/vantry/...
-          go test -count=1 ./internal/core/... ./internal/hostfs/... ./internal/hostprocess/... ./cmd/vantry/...
-          go test -count=1 -run TestFileURLFromSlashPath ./internal/adapters/preview/...
-
-      - name: Build Windows remote-desktop helper
-        shell: bash
-        run: python scripts/build_remote_helper.py --platform windows/amd64
-
-      - name: Package Windows desktop app
-        shell: bash
-        env:
-          GOMAXPROCS: '2'
-        run: go tool mygo build --platform windows/amd64
-
-      - name: Verify Windows package and Core/SQLite smoke test
-        shell: bash
-        run: python scripts/verify_windows_package.py --package dist/windows-amd64 --require-helper
-
-      - name: Create portable Windows ZIP archive
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json, zipfile
-          from pathlib import Path
-
-          version = json.loads(Path("mygo.json").read_text(encoding="utf-8"))["version"]
-          src = Path("dist/windows-amd64")
-          out = Path(f"dist/vantry-{version}-windows-amd64.zip")
-          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-              for path in sorted(src.rglob("*")):
-                  if path.is_dir():
-                      continue
-                  if path.parent == src and path.suffix.lower() == ".exe" and path.name.lower() != "vantry.exe":
-                      continue
-                  zf.write(path, path.relative_to(src))
-          print(f"Created {out} ({out.stat().st_size} bytes)")
-          PY
+          cargo run --locked -p xtask -- package desktop --skip-build --profile release --target x86_64-pc-windows-msvc --out-dir dist
+          python scripts/verify_windows_package.py --package dist/Vantry --skip-installer
 
       - name: Upload Windows package artifact
         uses: actions/upload-artifact@v4
         with:
           name: vantry-windows-amd64
           path: |
-            dist/windows-amd64/
             dist/vantry-*-windows-amd64.zip
+            dist/*.json

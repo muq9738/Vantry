@@ -1,0 +1,6 @@
+ALTER TABLE threads ADD COLUMN snoozed_until INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE threads ADD COLUMN created_by_thread_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE threads ADD COLUMN created_by_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN sender_thread_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE inputs ADD COLUMN sender_thread_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE command_receipts ADD COLUMN delivery TEXT NOT NULL DEFAULT '';
