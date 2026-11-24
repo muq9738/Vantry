@@ -1,10 +1,12 @@
 use crate::{Result, invalid};
 use std::{fs, io::Read, path::Path};
 use vantry_protocol::Attachment;
+pub(crate) const MAX_ATTACHMENTS: usize = 32;
+
 /// Match an existing imported attachment using the persisted v1 metadata and content size.
 pub(crate) fn validate(data: &Path, items: &[Attachment]) -> Result<()> {
-    if items.len() > 8 {
-        return Err(invalid("at most eight attachments are supported"));
+    if items.len() > MAX_ATTACHMENTS {
+        return Err(invalid("at most 32 attachments are supported"));
     }
     for item in items {
         let Some(suffix) = item.id.strip_prefix("file_") else {

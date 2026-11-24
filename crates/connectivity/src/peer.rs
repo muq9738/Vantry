@@ -630,7 +630,6 @@ pub async fn serve_gateway_with_t3(
     tasks.close().await;
     result
 }
-#[cfg(unix)]
 async fn gateway_request(
     mut req: Request<Incoming>,
     identity: Arc<IdentityStore>,

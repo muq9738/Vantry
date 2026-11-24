@@ -454,6 +454,25 @@ impl AppState {
         }
     }
 
+    /// Adds `attachment` and inserts its simplified inline mention (`@图1` / `@name`) into the draft.
+    pub fn add_attachment_with_mention(
+        &mut self,
+        key: String,
+        attachment: Attachment,
+        path: Option<std::path::PathBuf>,
+    ) {
+        let draft = self.drafts.entry(key).or_default();
+        if !draft.attachments.iter().any(|a| a.id == attachment.id) {
+            if let Some(path) = path
+                && attachment.mime.starts_with("image/")
+            {
+                draft.image_paths.insert(attachment.id.clone(), path);
+            }
+            draft.insert_attachment_mention(&attachment);
+            draft.attachments.push(attachment);
+        }
+    }
+
     pub fn remove_attachment(&mut self, id: &str) {
         let key = self.draft_key();
         if let Some(draft) = self.drafts.get_mut(&key) {

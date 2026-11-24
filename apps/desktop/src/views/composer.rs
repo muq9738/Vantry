@@ -20,6 +20,7 @@ use crate::{
     icons::{Icon, icon},
     state::{
         APPROVAL_POLICIES, InteractionMode, NoticeLevel, PrimaryAction, QueueItem, QueueItemKind,
+        thread_links::{compose, draft_parts, with_body},
         RunningAction, ui::SettingsPage, workbench::DockTab,
     },
     theme::{metrics, palette},
@@ -124,6 +125,7 @@ fn replace_trigger(draft: &str, trigger: &CompletionTrigger, insert: &str) -> (S
 
 fn slash_suggestions(query: &str) -> Vec<Suggestion> {
     const COMMANDS: &[(&str, &str)] = &[
+        ("/skills", "选择这台机器上的 Pi 技能"),
         ("/plan", "切换规划模式（只分析不改代码）"),
         ("/new", "新建空白会话"),
         ("/fork", "从当前会话分叉"),
@@ -151,55 +153,16 @@ fn slash_suggestions(query: &str) -> Vec<Suggestion> {
         .collect()
 }
 
-fn discover_skills(workspace: &str, query: &str) -> Vec<Suggestion> {
-    let mut roots = Vec::new();
-    if !workspace.is_empty() {
-        roots.push(Path::new(workspace).join(".pi/skills"));
-        roots.push(Path::new(workspace).join(".agents/skills"));
-    }
-    if let Ok(agent_dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        if !agent_dir.trim().is_empty() {
-            roots.push(Path::new(&agent_dir).join("skills"));
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        roots.push(Path::new(&home).join(".pi/agent/skills"));
-        roots.push(Path::new(&home).join(".gemini/config/skills"));
-    }
-    let q = query.trim().to_ascii_lowercase();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || !path.join("SKILL.md").is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !seen.insert(name.to_owned()) {
-                continue;
-            }
-            if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
-                continue;
-            }
-            out.push(Suggestion {
-                key: format!("skill:{name}"),
-                label: format!("${name}"),
-                detail: root.display().to_string(),
-                insert: format!("/{name} "),
-                kind: TriggerKind::Skill,
-            });
-            if out.len() >= 10 {
-                return out;
-            }
-        }
-    }
-    out
+fn skill_suggestions(skills: &[(String, String)], query: &str) -> Vec<Suggestion> {
+    let query = query.trim_start_matches("skill:").to_lowercase();
+    let mut matches: Vec<_> = skills.iter().filter_map(|(name, description)| {
+        let label = name.to_lowercase();
+        let rank = if label == query { 0 } else if label.starts_with(&query) { 1 }
+            else if label.contains(&query) { 2 } else if description.to_lowercase().contains(&query) { 3 } else { return None };
+        Some((rank, Suggestion { key: format!("skill:{name}"), label: name.clone(), detail: description.clone(), insert: name.clone(), kind: TriggerKind::Skill }))
+    }).collect();
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, item)| item).collect()
 }
 
 fn discover_files(workspace: &str, query: &str) -> Vec<Suggestion> {
@@ -266,13 +229,20 @@ fn choose_suggestion(state: Memo<Completions>, index: usize, editor: ElementRef)
     };
     let Some(item) = items.get(index) else { return };
     let slash = item.kind == TriggerKind::Slash;
-    let (text, caret) = replace_trigger(&draft, &trigger, if slash { "" } else { &item.insert });
-    if item.kind == TriggerKind::Skill {
-        let name = item.insert.trim().trim_start_matches('/');
-        controller::state().update(|s| s.set_skill_mention(&text, name));
-    } else {
-        controller::set_draft(&text);
-    }
+    let insert = match item.kind {
+        TriggerKind::Slash if item.insert == "/skills" => "/skill:",
+        TriggerKind::Slash | TriggerKind::Skill => "",
+        TriggerKind::File => &item.insert,
+    };
+    let (text, caret) = replace_trigger(&draft, &trigger, insert);
+    let source = controller::state().with_untracked(|s| {
+        let source = s.draft().text;
+        if item.kind == TriggerKind::Skill {
+            let (_, refs, _) = draft_parts(&source);
+            compose(Some(&item.insert), refs.iter().map(|r| r.source), &text)
+        } else { with_body(&source, &text) }
+    });
+    controller::set_draft(&source);
     editor.focus();
     editor.set_selection(caret, caret);
     if slash {
@@ -294,9 +264,88 @@ fn choose_suggestion(state: Memo<Completions>, index: usize, editor: ElementRef)
     }
 }
 
+fn reference_chips(links: Vec<(String, String)>) -> impl IntoElement {
+    let mut row = view().flex_row().flex_wrap().gap_2();
+    for (index, (title, url)) in links.into_iter().enumerate() {
+        let open = nsh_base::button()
+            .accessibility_label(title.clone())
+            .on_press(move || controller::open_link(url.clone()))
+            .child(text(title).underline().text_color(palette().info_ink));
+        let remove = super::small_icon_button(Icon::X, "移除会话引用", move || {
+            let source = controller::state().with_untracked(|s| s.draft().text);
+            let (skill, mut links, body) = draft_parts(&source);
+            if index < links.len() {
+                links.remove(index);
+                controller::set_draft(&compose(skill, links.iter().map(|link| link.source), body));
+            }
+        });
+        row = row.child(view().flex_row().items_center().gap_1().child(open).child(remove));
+    }
+    row
+}
+
+fn splice_text_at_selection(
+    body: &str,
+    selection: Option<(u32, u32)>,
+    inserted: &str,
+) -> (String, u32) {
+    let (a, b) = match selection {
+        Some((start, end)) => {
+            let s = caret_byte(body, Some((start, start))).unwrap_or(body.len());
+            let e = caret_byte(body, Some((end, end))).unwrap_or(body.len());
+            (s.min(e), s.max(e))
+        }
+        None => (body.len(), body.len()),
+    };
+    let mut next = String::with_capacity(body.len() - (b - a) + inserted.len());
+    next.push_str(&body[..a]);
+    next.push_str(inserted);
+    let caret = next.encode_utf16().count() as u32;
+    next.push_str(&body[b..]);
+    (next, caret)
+}
+
+fn paste_into_composer(paste: &PasteEvent, editor: ElementRef, selection: Option<(u32, u32)>) {
+    let has_images = paste.files.iter().any(|f| f.mime.starts_with("image/"));
+    if !paste.uris.is_empty() {
+        controller::paste_file_uris(&paste.uris);
+        return;
+    }
+    if has_images && paste.text.trim().is_empty() {
+        controller::paste_images(paste);
+        return;
+    }
+    let copied = paste.text.trim();
+    if let Some(link) = vantry_protocol::ThreadLink::parse(copied)
+        && link.source == copied
+    {
+        let source = controller::state().with_untracked(|s| s.draft().text);
+        let (skill, mut links, body) = draft_parts(&source);
+        let (next_body, caret) = splice_text_at_selection(body, selection, "");
+        links.push(link);
+        controller::set_draft(&compose(skill, links.iter().map(|link| link.source), &next_body));
+        editor.set_selection(caret, caret);
+    } else if !paste.text.is_empty() {
+        // nsh-platform-macos does not implement Command::InsertText yet; splice
+        // directly into the controlled draft and move the native caret.
+        let source = controller::state().with_untracked(|s| s.draft().text);
+        let (skill, links, body) = draft_parts(&source);
+        let (next_body, caret) = splice_text_at_selection(body, selection, &paste.text);
+        controller::set_draft(&compose(skill, links.iter().map(|link| link.source), &next_body));
+        editor.set_selection(caret, caret);
+    } else if has_images {
+        controller::paste_images(paste);
+    }
+}
+
 pub(crate) fn composer() -> impl IntoElement {
     let colors = palette();
     let draft = computed(|| controller::state().with(|s| s.draft()));
+    let body = computed(move || draft.with(|d| draft_parts(&d.text).2.to_owned()));
+    let selected_skill = computed(move || draft.with(|d| draft_parts(&d.text).0.map(str::to_owned)));
+    let references = computed(move || draft.with(|d| {
+        draft_parts(&d.text).1.into_iter().map(|link| (link.title, link.url.to_owned())).collect::<Vec<_>>()
+    }));
     let status = computed(|| controller::state().with(|s| s.composer_status()));
     let notice = computed(|| controller::state().with(|s| s.notice.clone()));
     let running_action = computed(|| controller::state().with(|s| s.running_action));
@@ -304,7 +353,7 @@ pub(crate) fn composer() -> impl IntoElement {
     let plan = computed(move || draft.with(|d| d.mode == InteractionMode::Plan));
     let attachments = computed(move || draft.with(|d| d.attachments.clone()));
     let importing =
-        computed(|| controller::state().with(|s| s.attachment_imports.contains(&s.draft_key())));
+        computed(|| controller::state().with(|s| s.attachment_imports.contains_key(&s.draft_key())));
     let running = computed(move || status.with(|s| s.can_stop));
     let editing = computed(move || status.with(|s| s.editing));
     let workspace = computed(|| controller::state().with(|s| s.current_project_key()));
@@ -334,6 +383,8 @@ pub(crate) fn composer() -> impl IntoElement {
 
     let editor = element_ref();
     let card = element_ref();
+    let model_anchor = element_ref();
+    let effort_anchor = element_ref();
     let focused = signal(false);
     let composing = signal(false);
     let selection = signal(None::<(u32, u32)>);
@@ -358,21 +409,35 @@ pub(crate) fn composer() -> impl IntoElement {
             }
         }
     });
+    let skill_context = computed(move || {
+        let trigger = active_trigger(&body.get(), selection.get())?;
+        if matches!(trigger.kind, TriggerKind::File) { return None; }
+        Some(controller::state().with(|s| (s.selected.clone().unwrap_or_default(), s.current_workspace().map(|w| w.path.clone()).unwrap_or_default())))
+    });
+    let skills = signal(Vec::<(String,String)>::new());
+    effect(move || {
+        let ctx = skill_context.get();
+        skills.set(Vec::new());
+        if let Some((id, workspace)) = ctx.clone() {
+            spawn(async move {
+                let result = controller::composer_skills(id, workspace).await;
+                if skill_context.get_untracked() == ctx { skills.set(result); }
+            });
+        }
+    });
     let completion = computed(move || {
         if dismissed.get() || composing.get() {
             return None;
         }
-        let text = draft.with(|d| d.text.clone());
+        let text = body.get();
         let trigger = active_trigger(&text, selection.get())?;
         let items = match trigger.kind {
             TriggerKind::Slash => {
                 let mut choices = slash_suggestions(&trigger.query);
-                if let Some(path) = root.get() {
-                    choices.extend(discover_skills(&path, &trigger.query));
-                }
+                choices.extend(skill_suggestions(&skills.get(), &trigger.query));
                 choices
             }
-            TriggerKind::Skill => discover_skills(&root.get()?, &trigger.query),
+            TriggerKind::Skill => skill_suggestions(&skills.get(), &trigger.query),
             TriggerKind::File => discover_files(&root.get()?, &trigger.query),
         };
         (!items.is_empty()).then_some((text, trigger, items))
@@ -448,10 +513,10 @@ pub(crate) fn composer() -> impl IntoElement {
                 ))
                 .child(when(
                     move || effort_open.get(),
-                    move || effort_popover(effort_open),
+                    move || effort_popover(effort_open, effort_anchor),
                 ))
-                .child(model_picker())
-                // Main floating Stardust composer card
+                .child(model_picker(model_anchor))
+                // Main floating Claude-style composer card
                 .child(
                     view()
                         .element_ref(&card)
@@ -469,7 +534,7 @@ pub(crate) fn composer() -> impl IntoElement {
                                 colors.line
                             }
                         })
-                        .shadow_md()
+                        .shadow_sm()
                         .child(when(
                             move || editing.get(),
                             || {
@@ -478,21 +543,46 @@ pub(crate) fn composer() -> impl IntoElement {
                                     .items_center()
                                     .gap_2()
                                     .child(
-                                        text("正在编辑排队消息")
+                                        text("编辑排队消息")
                                             .flex_1()
                                             .text_size(px(11.5))
                                             .text_color(colors.accent),
                                     )
-                                    .child(link_button("取消编辑", controller::cancel_queue_edit))
+                                    .child(link_button("取消", controller::cancel_queue_edit))
                             },
                         ))
                         .child(when(
                             move || attachments.with(|a| !a.is_empty()),
-                            move || attachment_chips(attachments),
+                            move || attachment_chips(attachments, draft),
                         ))
                         .child(when(
                             move || importing.get(),
                             move || super::caption("正在添加附件…"),
+                        ))
+                        .child(when(move || selected_skill.with(Option::is_some), move || {
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(6.0))
+                                .bg(colors.info_bg)
+                                .child(icon(Icon::Sparkles, 12.0, colors.info_ink))
+                                .child(
+                                    text(move || selected_skill.get().unwrap_or_default())
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.info_ink),
+                                )
+                                .child(super::small_icon_button(Icon::X, "移除技能", || {
+                                    let source = controller::state().with_untracked(|s| s.draft().text);
+                                    controller::set_draft(crate::state::thread_links::skill_prefix(&source).1);
+                                }))
+                        }))
+                        .child(when(
+                            move || references.with(|links| !links.is_empty()),
+                            move || dynamic(move || reference_chips(references.get())),
                         ))
                         .child(
                             nsh_base::input()
@@ -513,11 +603,16 @@ pub(crate) fn composer() -> impl IntoElement {
                                 })
                                 .multiline(true)
                                 .submit_behavior(move || if send_with_enter.get() { SubmitBehavior::Submit } else { SubmitBehavior::Newline })
-                                .value(move || draft.with(|d| d.text.clone()))
+                                .value(move || body.get())
+                                .paste_behavior(PasteBehavior::Report)
+                                .on_paste(move |paste: &PasteEvent| {
+                                    paste_into_composer(paste, editor, selection.get_untracked());
+                                })
                                 .on_change(move |text: &str| {
                                     dismissed.set(false);
                                     active.set(0);
-                                    controller::set_draft(text);
+                                    let source = controller::state().with_untracked(|s| with_body(&s.draft().text, text));
+                                    controller::set_draft(&source);
                                 })
                                 .on_submit(move |_: &str| {
                                     if composing.get_untracked() {
@@ -533,7 +628,7 @@ pub(crate) fn composer() -> impl IntoElement {
                                         controller::submit();
                                     }
                                 })
-                                .placeholder("问点什么… @ 文件、$ 技能、/ 命令")
+                                .placeholder("输入消息…")
                                 .placeholder_color(move || color(colors.faint))
                                 .caret_color(move || color(colors.accent))
                                 .auto_focus(true)
@@ -546,21 +641,14 @@ pub(crate) fn composer() -> impl IntoElement {
                                 .line_height(LineHeight::Multiple(1.5))
                                 .text_color(colors.ink),
                         )
-                        .child(toolbar(status, plan, running, running_action, effort_open))
-                        .child(when(
-                            move || running.get(),
-                            move || {
-                                text(move || match running_action.get() {
-                                    RunningAction::Steer => {
-                                        "运行中 · 发送将作为纠偏追加给当前任务 · Esc 停止"
-                                    }
-                                    RunningAction::Queue => {
-                                        "运行中 · 发送将加入排队并在本轮结束后执行 · Esc 停止"
-                                    }
-                                })
-                                .text_size(px(11.0))
-                                .text_color(colors.faint)
-                            },
+                        .child(toolbar(
+                            status,
+                            plan,
+                            running,
+                            running_action,
+                            effort_open,
+                            model_anchor,
+                            effort_anchor,
                         )),
                 )
                 // Quiet host / workspace context strip + turn indicator below the card (matches v0.1.42)
@@ -688,6 +776,8 @@ fn toolbar(
     running: Memo<bool>,
     running_action: Memo<RunningAction>,
     effort_open: Signal<bool>,
+    model_anchor: ElementRef,
+    effort_anchor: ElementRef,
 ) -> impl IntoElement {
     let colors = palette();
     let policy = computed(|| controller::state().with(|s| s.current_policy()));
@@ -704,8 +794,9 @@ fn toolbar(
     view()
         .flex_row()
         .items_center()
-        .gap_2()
-        // Left: clean `+` attach button & `[list-checks] 规划` pill
+        .gap_1p5()
+        .pt_0p5()
+        // Left: clean `+` attach & quiet `规划` toggle
         .child(
             nsh_base::button()
                 .accessibility_label("添加附件")
@@ -714,7 +805,7 @@ fn toolbar(
                 .h(px(28.0))
                 .items_center()
                 .justify_center()
-                .rounded_full()
+                .rounded(px(7.0))
                 .hover(|s| s.bg(colors.soft))
                 .active(|s| s.opacity(0.65))
                 .child(icon(Icon::Plus, 16.0, colors.muted)),
@@ -727,20 +818,12 @@ fn toolbar(
                 .flex_row()
                 .items_center()
                 .gap_1p5()
+                .h(px(28.0))
                 .px_2p5()
-                .py_1()
-                .rounded_full()
-                .border_1()
-                .border_color(move || {
-                    if plan.get() {
-                        colors.accent
-                    } else {
-                        colors.line
-                    }
-                })
+                .rounded(px(7.0))
                 .bg(move || {
                     if plan.get() {
-                        colors.approval
+                        colors.info_bg
                     } else {
                         AdaptiveColor::TRANSPARENT
                     }
@@ -758,7 +841,7 @@ fn toolbar(
                     if plan.get() {
                         colors.accent
                     } else {
-                        colors.ink
+                        colors.muted
                     }
                 })),
         )
@@ -767,86 +850,71 @@ fn toolbar(
             move || running_action_switch(running_action),
         ))
         .child(view().flex_1())
-        // Right: tinted permission pill, unified `π model | ● ▾` capsule, circular send/stop
+        // Right: quiet permission toggle, Claude-style model + effort triggers, send button
         .child(policy_switch(policy))
         .child(
-            view()
+            nsh_base::button()
+                .element_ref(&model_anchor)
+                .accessibility_label("选择模型")
+                .on_press(move || {
+                    effort_open.set(false);
+                    controller::toggle_model_picker();
+                })
                 .flex_row()
                 .items_center()
-                .rounded_full()
-                .bg(colors.soft)
-                .border_1()
-                .border_color(colors.line_soft)
+                .gap_1()
+                .h(px(28.0))
+                .max_w(px(200.0))
+                .px_2()
+                .rounded(px(7.0))
+                .hover(|s| s.bg(colors.soft))
+                .active(|s| s.opacity(0.7))
                 .child(
-                    nsh_base::button()
-                        .accessibility_label("选择模型")
-                        .on_press(move || {
-                            effort_open.set(false);
-                            controller::toggle_model_picker();
-                        })
-                        .flex_row()
-                        .items_center()
-                        .gap_1p5()
-                        .max_w(px(190.0))
-                        .pl_2p5()
-                        .pr_2()
-                        .py_1()
-                        .rounded_full()
-                        .hover(|s| s.bg(colors.card))
-                        .active(|s| s.opacity(0.7))
-                        .child(
-                            text("π")
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(colors.accent),
-                        )
-                        .child(
-                            text(move || {
-                                let raw = model.get();
-                                let (_, models) =
-                                    controller::ui().with_untracked(|u| u.thinking_catalog());
-                                let (base, _) = split_thinking(&raw, &models);
-                                if base.is_empty() {
-                                    "选择模型".to_owned()
-                                } else {
-                                    base.rsplit('/').next().unwrap_or(base).to_owned()
-                                }
-                            })
-                            .number_of_lines(1u32)
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(colors.ink),
-                        ),
+                    text(move || {
+                        let raw = model.get();
+                        let (_, models) =
+                            controller::ui().with_untracked(|u| u.thinking_catalog());
+                        let (base, _) = split_thinking(&raw, &models);
+                        if base.is_empty() {
+                            "选择模型".to_owned()
+                        } else {
+                            clean_model_label(base, "").0
+                        }
+                    })
+                    .number_of_lines(1u32)
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.muted),
                 )
-                .child(view().w(px(1.0)).h(px(14.0)).bg(colors.line))
-                .child(
-                    nsh_base::button()
-                        .accessibility_label("推理强度")
-                        .on_press(move || {
-                            effort_open.set(!effort_open.get_untracked());
-                        })
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .pl_2()
-                        .pr_2p5()
-                        .py_1()
-                        .rounded_full()
-                        .hover(|s| s.bg(colors.card))
-                        .active(|s| s.opacity(0.7))
-                        .child(dot(move || {
-                            effort_dot_color(&thinking.with(|t| t.1.clone()))
-                        }))
-                        .child(when(
-                            move || !thinking.with(|t| t.1.is_empty()),
-                            move || {
-                                text(move || thinking_label(&thinking.with(|t| t.1.clone())))
-                                    .text_size(px(11.0))
-                                    .text_color(colors.muted)
-                            },
-                        ))
-                        .child(icon(Icon::ChevronDown, 12.0, colors.faint)),
-                ),
+                .child(icon(Icon::ChevronDown, 12.0, colors.faint)),
+        )
+        .child(
+            nsh_base::button()
+                .element_ref(&effort_anchor)
+                .accessibility_label("推理强度")
+                .on_press(move || {
+                    controller::ui().update(|u| u.model_picker = false);
+                    effort_open.set(!effort_open.get_untracked());
+                })
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(28.0))
+                .px_2()
+                .rounded(px(7.0))
+                .hover(|s| s.bg(colors.soft))
+                .active(|s| s.opacity(0.7))
+                .child(dot(move || {
+                    effort_dot_color(&thinking.with(|t| t.1.clone()))
+                }))
+                .child(when(
+                    move || !thinking.with(|t| t.1.is_empty()),
+                    move || {
+                        text(move || thinking_label(&thinking.with(|t| t.1.clone())))
+                            .text_size(px(11.5))
+                            .text_color(colors.muted)
+                    },
+                )),
         )
         .child(when(
             move || status.with(|s| s.retry.is_some()),
@@ -930,8 +998,8 @@ fn effort_dot_color(level: &str) -> AdaptiveColor {
     }
 }
 
-/// Interactive Thinking Effort popover above the composer (`v0.1.42` style).
-fn effort_popover(open: Signal<bool>) -> impl IntoElement {
+/// Anchored Thinking Effort popover above the effort trigger.
+fn effort_popover(open: Signal<bool>, anchor: ElementRef) -> impl IntoElement {
     let colors = palette();
     let model = computed(|| controller::state().with(|s| s.current_model()));
     let catalog = computed(|| controller::ui().with(|u| u.thinking_catalog()));
@@ -947,114 +1015,108 @@ fn effort_popover(open: Signal<bool>) -> impl IntoElement {
         list
     });
 
-    view().w_full().flex_row().justify_end().child(
-        view()
-            .w(px(330.0))
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .rounded(px(14.0))
-            .bg(colors.card)
-            .border_1()
-            .border_color(colors.line)
-            .shadow_md()
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1p5()
-                    .child(dot(move || effort_dot_color(&current_level.get())))
-                    .child(
-                        text(move || {
-                            let label = thinking_label(&current_level.get());
-                            format!("推理强度 · {label}")
-                        })
-                        .flex_1()
-                        .text_size(px(12.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.ink),
-                    )
-                    .child(
-                        nsh_base::button()
-                            .accessibility_label("关闭")
-                            .on_press(move || open.set(false))
-                            .w(px(22.0))
-                            .h(px(22.0))
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(colors.soft))
-                            .child(icon(Icon::X, 12.0, colors.faint)),
-                    ),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .p_1()
-                    .rounded(px(10.0))
-                    .bg(colors.soft)
-                    .child(
-                        nsh_base::button()
-                            .on_press(move || {
-                                controller::set_thinking_level(String::new());
-                                open.set(false);
-                            })
-                            .flex_1()
-                            .py_1()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(7.0))
-                            .bg(move || {
-                                if current_level.with(|l| l.is_empty()) {
-                                    colors.card
-                                } else {
-                                    AdaptiveColor::TRANSPARENT
-                                }
-                            })
-                            .child(text("默认").text_size(px(11.5)).text_color(move || {
-                                if current_level.with(|l| l.is_empty()) {
-                                    colors.ink
-                                } else {
-                                    colors.muted
-                                }
-                            })),
-                    )
-                    .child(each(
-                        move || levels.get(),
-                        |l: &String| l.clone(),
-                        move |lvl, _| {
-                            let value = move || lvl.get_untracked();
-                            let selected = move || current_level.get() == lvl.get();
+    overlay()
+        .anchor(&anchor)
+        .placement(Placement::Top)
+        .align(Align::End)
+        .offset(px(8.0))
+        .margin(px(8.0))
+        .w(px(300.0))
+        .on_press_outside(move |_: &Point<Points>| open.set(false))
+        .on_cancel(move || open.set(false))
+        .child(
+            view()
+                .flex_col()
+                .gap_2()
+                .p_2p5()
+                .rounded(px(12.0))
+                .bg(colors.raised)
+                .border_1()
+                .border_color(colors.line)
+                .shadow_lg()
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .px_1()
+                        .child(dot(move || effort_dot_color(&current_level.get())))
+                        .child(
+                            text("推理强度")
+                                .flex_1()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.ink),
+                        ),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_0p5()
+                        .p_0p5()
+                        .rounded(px(8.0))
+                        .bg(colors.soft)
+                        .child(
                             nsh_base::button()
                                 .on_press(move || {
-                                    controller::set_thinking_level(value());
+                                    controller::set_thinking_level(String::new());
                                     open.set(false);
                                 })
                                 .flex_1()
                                 .py_1()
                                 .items_center()
                                 .justify_center()
-                                .rounded(px(7.0))
+                                .rounded(px(6.0))
                                 .bg(move || {
-                                    if selected() {
+                                    if current_level.with(|l| l.is_empty()) {
                                         colors.card
                                     } else {
                                         AdaptiveColor::TRANSPARENT
                                     }
                                 })
-                                .child(
-                                    text(move || thinking_label(&lvl.get()))
-                                        .text_size(px(11.5))
-                                        .text_color(move || {
-                                            if selected() { colors.ink } else { colors.muted }
-                                        }),
-                                )
-                        },
-                    )),
-            ),
-    )
+                                .child(text("默认").text_size(px(11.5)).text_color(move || {
+                                    if current_level.with(|l| l.is_empty()) {
+                                        colors.ink
+                                    } else {
+                                        colors.muted
+                                    }
+                                })),
+                        )
+                        .child(each(
+                            move || levels.get(),
+                            |l: &String| l.clone(),
+                            move |lvl, _| {
+                                let value = move || lvl.get_untracked();
+                                let selected = move || current_level.get() == lvl.get();
+                                nsh_base::button()
+                                    .on_press(move || {
+                                        controller::set_thinking_level(value());
+                                        open.set(false);
+                                    })
+                                    .flex_1()
+                                    .py_1()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .bg(move || {
+                                        if selected() {
+                                            colors.card
+                                        } else {
+                                            AdaptiveColor::TRANSPARENT
+                                        }
+                                    })
+                                    .child(
+                                        text(move || thinking_label(&lvl.get()))
+                                            .text_size(px(11.5))
+                                            .text_color(move || {
+                                                if selected() { colors.ink } else { colors.muted }
+                                            }),
+                                    )
+                            },
+                        )),
+                ),
+        )
 }
 
 /// `@` file / `$` skill / `/` slash command completion popover above the composer.
@@ -1154,18 +1216,13 @@ fn completion_popover(
         )
 }
 
-/// Auto / edits auto / ask tinted pill matching `v0.1.42`'s soft-blue `自动`.
+/// Quiet permission toggle aligned with Claude Desktop's subtle toolbar buttons.
 fn policy_switch(policy: Memo<String>) -> impl IntoElement {
     let colors = palette();
     let style = move || match policy.get().as_str() {
-        "auto" => (colors.info_bg, colors.info_ink, Icon::ShieldCheck, "自动"),
-        "auto-accept-edits" => (
-            colors.success_bg,
-            colors.success,
-            Icon::Shield,
-            "改文件自动",
-        ),
-        _ => (colors.approval, colors.warning, Icon::ShieldOff, "询问"),
+        "auto" => (colors.muted, Icon::ShieldCheck, "自动"),
+        "auto-accept-edits" => (colors.success, Icon::Shield, "改文件自动"),
+        _ => (colors.warning, Icon::ShieldOff, "询问"),
     };
     nsh_base::button()
         .accessibility_label("权限策略")
@@ -1180,20 +1237,20 @@ fn policy_switch(policy: Memo<String>) -> impl IntoElement {
         .flex_row()
         .items_center()
         .gap_1()
-        .px_2p5()
-        .py_1()
-        .rounded_full()
-        .bg(move || style().0)
+        .h(px(28.0))
+        .px_2()
+        .rounded(px(7.0))
+        .hover(|s| s.bg(colors.soft))
         .active(|s| s.opacity(0.75))
         .child(dynamic(move || {
-            let (_, fg, glyph, _) = style();
+            let (fg, glyph, _) = style();
             icon(glyph, 13.0, fg).into_element()
         }))
         .child(
-            text(move || style().3)
+            text(move || style().2)
                 .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(move || style().1),
+                .text_color(move || style().0),
         )
 }
 
@@ -1217,7 +1274,14 @@ fn running_action_switch(action: Memo<RunningAction>) -> impl IntoElement {
         ))
 }
 
-fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
+pub(super) fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
+    attachment_thumbnail_labeled(item, None)
+}
+
+pub(super) fn attachment_thumbnail_labeled(
+    item: Attachment,
+    short_label: Option<String>,
+) -> impl IntoElement {
     let colors = palette();
     let preview = signal(None::<String>);
     let source = controller::state().with_untracked(|s| {
@@ -1227,24 +1291,81 @@ fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
             .cloned()
     });
     let show = signal(false);
-    let name = item.name.clone();
+    let title = short_label.clone().unwrap_or_else(|| item.name.clone());
+    let modal_title = if let Some(lbl) = &short_label {
+        format!("{lbl} · {}", item.name)
+    } else {
+        item.name.clone()
+    };
     spawn(async move {
         preview.set(controller::attachment_preview(item, source).await);
     });
-    view().on_press(move ||show.set(true)).label("预览图片附件")
-        .child(when(move ||show.get(),move ||{
-            let name=name.clone();
-            nsh_base::dialog().on_cancel(move ||show.set(false)).child(view().flex_1().items_center().justify_center().bg(colors.scrim)
-                .child(view().flex_col().p_3().gap_2().rounded(px(16.0)).bg(colors.card)
-                    .child(view().flex_row().items_center().child(super::caption(name).flex_1()).child(super::icon_button(Icon::X,"关闭图片预览",move ||show.set(false))))
-                    .child(dynamic(move || match preview.get(){Some(src)=>image(src).w(move ||px(nsh_core::element::window().width.0*0.72)).h(move ||px(nsh_core::element::window().height.0*0.62)).object_fit(nsh_core::ResizeMode::Contain).into_element(),None=>super::caption("正在载入图片…").into_element()}))))
-        }))
-        .w(px(46.0))
-        .h(px(38.0))
-        .rounded(px(5.0))
+    view()
+        .relative()
+        .on_press(move || show.set(true))
+        .label("预览图片")
+        .w(px(62.0))
+        .h(px(54.0))
+        .rounded(px(8.0))
         .overflow_hidden()
+        .bg(colors.soft)
+        .border_1()
+        .border_color(colors.line)
         .items_center()
         .justify_center()
+        .child(when(move || show.get(), move || {
+            let modal_title = modal_title.clone();
+            nsh_base::dialog()
+                .animation(ModalAnimation::Fade)
+                .on_cancel(move || show.set(false))
+                .child(
+                    view()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .bg(colors.scrim)
+                        .p_6()
+                        .on_press(move || show.set(false))
+                        .child(
+                            view()
+                                .flex_col()
+                                .p_3()
+                                .gap_2()
+                                .rounded(px(14.0))
+                                .bg(colors.raised)
+                                .border_1()
+                                .border_color(colors.line)
+                                .shadow_xl()
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .px_1()
+                                        .child(
+                                            text(modal_title)
+                                                .flex_1()
+                                                .number_of_lines(1u32)
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(colors.ink),
+                                        )
+                                        .child(super::icon_button(
+                                            Icon::X,
+                                            "关闭",
+                                            move || show.set(false),
+                                        )),
+                                )
+                                .child(dynamic(move || match preview.get() {
+                                    Some(src) => image(src)
+                                        .w(move || px(nsh_core::element::window().width.0 * 0.72))
+                                        .h(move || px(nsh_core::element::window().height.0 * 0.66))
+                                        .object_fit(nsh_core::ResizeMode::Contain)
+                                        .into_element(),
+                                    None => super::caption("加载中…").into_element(),
+                                })),
+                        ),
+                )
+        }))
         .child(dynamic(move || match preview.get() {
             Some(src) => image(src)
                 .w_full()
@@ -1253,52 +1374,99 @@ fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
                 .into_element(),
             None => icon(Icon::File, 14.0, colors.muted).into_element(),
         }))
+        .child(when(short_label.is_some(), move || {
+            view()
+                .absolute()
+                .bottom(px(2.0))
+                .left(px(2.0))
+                .px_1()
+                .rounded(px(4.0))
+                .bg(colors.scrim)
+                .child(
+                    text(title.clone())
+                        .number_of_lines(1u32)
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.on_accent),
+                )
+        }))
 }
 
-fn attachment_chips(attachments: Memo<Vec<Attachment>>) -> impl IntoElement {
+fn attachment_chips(
+    attachments: Memo<Vec<Attachment>>,
+    draft: Memo<crate::state::Draft>,
+) -> impl IntoElement {
     let colors = palette();
-    view().flex_row().flex_wrap().gap_1p5().child(each(
+    view().flex_row().flex_wrap().items_center().gap_2().child(each(
         move || attachments.get(),
         |a: &Attachment| a.id.clone(),
         move |attachment, _| {
             let id = move || attachment.with_untracked(|a| a.id.clone());
-            view()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .pl_2()
-                .pr_1()
-                .py_0p5()
-                .rounded(px(8.0))
-                .bg(colors.soft)
-                .child(dynamic(move || {
-                    let item = attachment.get();
-                    if item.mime.starts_with("image/") {
-                        attachment_thumbnail(item).into_element()
-                    } else {
-                        icon(Icon::Paperclip, 12.0, colors.muted).into_element()
-                    }
-                }))
-                .child(
-                    text(move || attachment.with(|a| a.name.clone()))
-                        .number_of_lines(1u32)
-                        .max_w(px(220.0))
-                        .text_size(px(11.5))
-                        .text_color(colors.ink),
-                )
-                .child(
-                    nsh_base::button()
-                        .accessibility_label("移除附件")
-                        .on_press(move || controller::remove_attachment(id()))
-                        .w(px(18.0))
-                        .h(px(18.0))
+            let is_image = move || attachment.with(|a| a.mime.starts_with("image/"));
+            let short = computed(move || {
+                let item = attachment.get();
+                draft.with(|d| d.attachment_short_label(&item))
+            });
+            dynamic(move || {
+                if is_image() {
+                    let item = attachment.get_untracked();
+                    let label = short.get();
+                    view()
+                        .relative()
+                        .child(attachment_thumbnail_labeled(item, Some(label)))
+                        .child(
+                            nsh_base::button()
+                                .accessibility_label("移除附件")
+                                .on_press(move || controller::remove_attachment(id()))
+                                .absolute()
+                                .top(px(-5.0))
+                                .right(px(-5.0))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(colors.card)
+                                .border_1()
+                                .border_color(colors.line)
+                                .hover(|s| s.bg(colors.danger))
+                                .child(icon(Icon::X, 10.0, colors.ink)),
+                        )
+                        .into_element()
+                } else {
+                    view()
+                        .flex_row()
                         .items_center()
-                        .justify_center()
-                        .rounded(px(4.0))
-                        .hover(|s| s.bg(colors.card))
-                        .active(|s| s.opacity(0.6))
-                        .child(icon(Icon::X, 11.0, colors.faint)),
-                )
+                        .gap_1()
+                        .pl_2()
+                        .pr_1()
+                        .h(px(26.0))
+                        .rounded(px(7.0))
+                        .bg(colors.info_bg)
+                        .child(icon(Icon::Paperclip, 11.5, colors.info_ink))
+                        .child(
+                            text(move || format!("@{}", short.get()))
+                                .number_of_lines(1u32)
+                                .max_w(px(180.0))
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.info_ink),
+                        )
+                        .child(
+                            nsh_base::button()
+                                .accessibility_label("移除附件")
+                                .on_press(move || controller::remove_attachment(id()))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .hover(|s| s.bg(colors.card))
+                                .child(icon(Icon::X, 10.5, colors.info_ink)),
+                        )
+                        .into_element()
+                }
+            })
         },
     ))
 }
@@ -1392,8 +1560,27 @@ fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
         }))
 }
 
-/// The model picker: search, the catalog's models, a free entry.
-fn model_picker() -> impl IntoElement {
+/// Extracts a clean display name and short provider tag from raw catalog labels
+/// such as `("qmt-ai/group/deepseek-v4.1-flash", "DeepSeek-V4.1-Flash · routing group · qmt-ai")`.
+fn clean_model_label(id: &str, name: &str) -> (String, String) {
+    let provider = id
+        .split_once('/')
+        .map(|(p, _)| p.to_owned())
+        .unwrap_or_default();
+    let clean_name = if !name.trim().is_empty() {
+        name.split(" · ")
+            .next()
+            .unwrap_or(name)
+            .trim()
+            .to_owned()
+    } else {
+        id.rsplit('/').next().unwrap_or(id).to_owned()
+    };
+    (clean_name, provider)
+}
+
+/// Anchored Claude-style model picker popover.
+fn model_picker(anchor: ElementRef) -> impl IntoElement {
     let colors = palette();
     let open = computed(|| controller::ui().with(|u| u.model_picker));
     let query = computed(|| controller::ui().with(|u| u.model_query.clone()));
@@ -1405,93 +1592,126 @@ fn model_picker() -> impl IntoElement {
     when(
         move || open.get(),
         move || {
-            view()
-                .flex_col()
-                .gap_1()
-                .p_2p5()
-                .rounded(px(12.0))
-                .bg(colors.card)
-                .border_1()
-                .border_color(colors.line)
-                .shadow_md()
+            overlay()
+                .anchor(&anchor)
+                .placement(Placement::Top)
+                .align(Align::End)
+                .offset(px(8.0))
+                .margin(px(8.0))
+                .w(px(340.0))
+                .on_press_outside(|_: &Point<Points>| {
+                    controller::ui().update(|u| {
+                        u.model_picker = false;
+                        u.model_query.clear();
+                    });
+                })
+                .on_cancel(|| {
+                    controller::ui().update(|u| {
+                        u.model_picker = false;
+                        u.model_query.clear();
+                    });
+                })
                 .child(
                     view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .px_1()
-                        .child(icon(Icon::Search, 13.5, colors.faint))
+                        .flex_col()
+                        .gap_1p5()
+                        .p_2()
+                        .rounded(px(12.0))
+                        .bg(colors.raised)
+                        .border_1()
+                        .border_color(colors.line)
+                        .shadow_lg()
                         .child(
-                            nsh_base::input()
-                                .value(move || query.get())
-                                .on_change(|t: &str| controller::set_model_query(t))
-                                .on_submit(move |_: &str| {
-                                    if let Some((id, _)) = choices.get_untracked().first() {
-                                        controller::set_model(id.clone());
-                                    }
-                                })
-                                .placeholder("搜索或输入 provider/model")
-                                .placeholder_color(move || color(colors.faint))
-                                .auto_focus(true)
-                                .auto_correct(false)
-                                .flex_1()
-                                .text_size(px(12.5))
-                                .text_color(colors.ink),
-                        )
-                        .child(
-                            nsh_base::button()
-                                .accessibility_label("关闭")
-                                .on_press(controller::toggle_model_picker)
-                                .w(px(22.0))
-                                .h(px(22.0))
+                            view()
+                                .flex_row()
                                 .items_center()
-                                .justify_center()
-                                .rounded(px(6.0))
-                                .hover(|s| s.bg(colors.soft))
-                                .child(icon(Icon::X, 12.0, colors.faint)),
-                        ),
-                )
-                .child(when(
-                    move || loading.get(),
-                    || {
-                        text("正在读取模型目录…")
-                            .text_size(px(11.5))
-                            .text_color(colors.faint)
-                    },
-                ))
-                .child(
-                    scroll()
-                        .max_h(px(220.0))
-                        .child(view().flex_col().child(each(
-                            move || choices.get(),
-                            |c: &(String, String)| c.0.clone(),
-                            move |choice, _| {
-                                let id = move || choice.with_untracked(|c| c.0.clone());
-                                let on = move || current.get() == choice.with(|c| c.0.clone());
-                                nsh_base::button()
-                                    .on_press(move || controller::set_model(id()))
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
+                                .gap_1p5()
+                                .h(px(30.0))
+                                .px_2()
+                                .rounded(px(8.0))
+                                .bg(colors.soft)
+                                .child(icon(Icon::Search, 13.0, colors.faint))
+                                .child(
+                                    nsh_base::input()
+                                        .value(move || query.get())
+                                        .on_change(|t: &str| controller::set_model_query(t))
+                                        .on_submit(move |_: &str| {
+                                            if let Some((id, _)) = choices.get_untracked().first() {
+                                                controller::set_model(id.clone());
+                                            }
+                                        })
+                                        .placeholder("搜索模型…")
+                                        .placeholder_color(move || color(colors.faint))
+                                        .auto_focus(true)
+                                        .auto_correct(false)
+                                        .flex_1()
+                                        .text_size(px(12.0))
+                                        .text_color(colors.ink),
+                                ),
+                        )
+                        .child(when(
+                            move || loading.get(),
+                            || {
+                                text("读取中…")
                                     .px_2()
-                                    .py_1p5()
-                                    .rounded(px(7.0))
-                                    .hover(|s| s.bg(colors.soft))
-                                    .child(
-                                        text(move || choice.with(|c| c.1.clone()))
-                                            .flex_1()
-                                            .text_size(px(12.5))
-                                            .text_color(colors.ink),
-                                    )
-                                    .child(
-                                        text(move || choice.with(|c| c.0.clone()))
-                                            .font_family("Menlo")
-                                            .text_size(px(11.0))
-                                            .text_color(colors.faint),
-                                    )
-                                    .child(when(on, || icon(Icon::Check, 13.5, colors.accent)))
+                                    .text_size(px(11.5))
+                                    .text_color(colors.faint)
                             },
-                        ))),
+                        ))
+                        .child(
+                            scroll()
+                                .max_h(px(260.0))
+                                .child(view().flex_col().gap_0p5().child(each(
+                                    move || choices.get(),
+                                    |c: &(String, String)| c.0.clone(),
+                                    move |choice, _| {
+                                        let id = move || choice.with_untracked(|c| c.0.clone());
+                                        let on = move || {
+                                            let cur = current.get();
+                                            let cid = choice.with(|c| c.0.clone());
+                                            cur == cid || cur.starts_with(&format!("{cid}:"))
+                                        };
+                                        let parts = computed(move || {
+                                            choice.with(|c| clean_model_label(&c.0, &c.1))
+                                        });
+                                        nsh_base::button()
+                                            .on_press(move || controller::set_model(id()))
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .h(px(32.0))
+                                            .px_2p5()
+                                            .rounded(px(7.0))
+                                            .bg(move || {
+                                                if on() {
+                                                    colors.soft
+                                                } else {
+                                                    AdaptiveColor::TRANSPARENT
+                                                }
+                                            })
+                                            .hover(|s| s.bg(colors.soft))
+                                            .child(
+                                                text(move || parts.with(|p| p.0.clone()))
+                                                    .flex_1()
+                                                    .number_of_lines(1u32)
+                                                    .text_size(px(12.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(colors.ink),
+                                            )
+                                            .child(when(
+                                                move || parts.with(|p| !p.1.is_empty()),
+                                                move || {
+                                                    text(move || parts.with(|p| p.1.clone()))
+                                                        .text_size(px(11.0))
+                                                        .text_color(colors.faint)
+                                                },
+                                            ))
+                                            .child(when(on, || {
+                                                icon(Icon::Check, 13.5, colors.accent)
+                                            }))
+                                    },
+                                ))),
+                        ),
                 )
         },
     )
@@ -1607,5 +1827,37 @@ mod tests {
         );
         assert_eq!(active_trigger("not a /slash", None), None);
         assert!(!slash_suggestions("pl").is_empty());
+    }
+
+    #[test]
+    fn paste_splices_links_and_text_without_insert_text_command() {
+        let (out, caret) = splice_text_at_selection("看下 ", None, "https://example.com/a");
+        assert_eq!(out, "看下 https://example.com/a");
+        assert_eq!(caret, out.encode_utf16().count() as u32);
+
+        let body = "前🌱后";
+        let mid = "前🌱".encode_utf16().count() as u32;
+        let (out, caret) = splice_text_at_selection(body, Some((mid, mid)), "https://x.dev");
+        assert_eq!(out, "前🌱https://x.dev后");
+        assert_eq!(caret, "前🌱https://x.dev".encode_utf16().count() as u32);
+
+        let (replaced, caret) = splice_text_at_selection("hello world", Some((6, 11)), "vantry");
+        assert_eq!(replaced, "hello vantry");
+        assert_eq!(caret, 12);
+    }
+
+    #[test]
+    fn model_labels_strip_routing_noise() {
+        assert_eq!(
+            clean_model_label(
+                "qmt-ai/group/deepseek-v4.1-flash",
+                "DeepSeek-V4.1-Flash · routing group · qmt-ai"
+            ),
+            ("DeepSeek-V4.1-Flash".to_owned(), "qmt-ai".to_owned())
+        );
+        assert_eq!(
+            clean_model_label("dmit-ai/group/claude-opus-5.5", ""),
+            ("claude-opus-5.5".to_owned(), "dmit-ai".to_owned())
+        );
     }
 }

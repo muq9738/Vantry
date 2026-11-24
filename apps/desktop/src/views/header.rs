@@ -143,22 +143,32 @@ pub(crate) fn header() -> impl IntoElement {
                                 && branch.with(|name| !name.is_empty())
                         },
                         move || {
-                            nsh_base::button().accessibility_label("分支操作").on_press(||{controller::select_dock_tab(DockTab::Git);controller::bench().update(|b|{b.git.page=crate::state::workbench::GitPage::Commit;b.git.branch_menu=true;});})
+                            nsh_base::button()
+                                .accessibility_label("分支操作")
+                                .on_press(|| {
+                                    controller::select_dock_tab(DockTab::Git);
+                                    controller::bench().update(|b| {
+                                        b.git.page = crate::state::workbench::GitPage::Commit;
+                                        b.git.branch_menu = true;
+                                    });
+                                })
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
+                                .h(px(22.0))
                                 .px_2()
-                                .py_0p5()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(colors.line_soft)
-                                .child(icon(Icon::GitBranch, 11.0, colors.faint))
+                                .rounded(px(6.0))
+                                .bg(colors.soft)
+                                .hover(|s| s.bg(colors.card))
+                                .active(|s| s.opacity(0.7))
+                                .child(icon(Icon::GitBranch, 11.5, colors.muted))
                                 .child(
                                     text(move || branch.get())
-                                        .max_w(px(130.0))
+                                        .max_w(px(140.0))
                                         .number_of_lines(1u32)
+                                        .font_family("Menlo")
                                         .text_size(px(11.0))
-                                        .text_color(colors.muted),
+                                        .text_color(colors.ink),
                                 )
                         },
                     ))
@@ -418,6 +428,10 @@ pub(crate) fn header() -> impl IntoElement {
                                     view()
                                         .flex_col()
                                         .gap_0p5()
+                                        .child(menu_item(Icon::Copy, "复制会话链接", move || {
+                                            more_open.set(false);
+                                            controller::copy_thread_link(thread_id());
+                                        }))
                                         .child(menu_item(
                                             Icon::Pencil,
                                             "重命名会话",

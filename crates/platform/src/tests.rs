@@ -101,3 +101,29 @@ fn remote_desktop_descriptor_is_a_user_installation() {
     assert!(m.command.is_empty());
     assert_eq!(m.navigation[0].native_panel, "remote-desktop");
 }
+
+#[test]
+fn plugin_manifest_accepts_go_null_arrays_and_maps() {
+    let raw = r#"{
+        "id": "vantry-remote-desktop",
+        "name": "远程桌面",
+        "version": "0.3.1",
+        "runtime": "native",
+        "command": null,
+        "permissions": null,
+        "capabilities": null,
+        "settings": [
+            {"key": "enabled", "label": "启用", "type": "boolean", "options": null}
+        ],
+        "navigation": [
+            {"title": "远程桌面", "page": "desktop", "nativePanel": "remote-desktop"}
+        ],
+        "pages": null
+    }"#;
+    let parsed: plugins::Manifest = serde_json::from_str(raw).unwrap();
+    assert_eq!(parsed.id, "vantry-remote-desktop");
+    assert!(parsed.command.is_empty());
+    assert!(parsed.pages.is_empty());
+    assert_eq!(parsed.settings.len(), 1);
+    assert!(parsed.settings[0].options.is_empty());
+}

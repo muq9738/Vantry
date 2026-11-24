@@ -49,6 +49,9 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
 fn init_sample_repo(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     run_git(dir, &["init", "-b", "main"])?;
+    // The service runs its own Git process when the test requests a checkpoint.
+    run_git(dir, &["config", "user.name", "Vantry Test"])?;
+    run_git(dir, &["config", "user.email", "test@vantry.local"])?;
     std::fs::write(dir.join("README.md"), "# Sample\n")?;
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("src/app.rs"), "fn main() {}\n")?;
@@ -82,8 +85,12 @@ async fn wait_health(client: &CoreClient) -> Result<()> {
 }
 
 fn spawn_core(data: &Path, workspace: &Path, listen_remote: Option<&str>) -> Result<ChildGuard> {
+    let agent = data.with_extension("pi-agent");
+    std::fs::create_dir_all(&agent)?;
+    let root = vantry_pi_runtime::mcp::project_trust_path(workspace);
+    std::fs::write(agent.join("trust.json"), serde_json::to_vec(&json!({(root.display().to_string()): true}))?)?;
     let mut cmd = Command::new(bin());
-    cmd.arg("core")
+    cmd.env("PI_CODING_AGENT_DIR", agent).arg("core")
         .arg("--data-dir")
         .arg(data)
         .arg("--provider")

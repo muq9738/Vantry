@@ -6098,7 +6098,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vantry-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6116,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-connectivity"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6152,7 +6152,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6177,7 +6177,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6201,7 +6201,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-pi-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6225,7 +6225,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6248,7 +6248,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "serde",
@@ -6258,7 +6258,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-relay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -6276,7 +6276,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-service"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6303,7 +6303,7 @@ dependencies = [
 
 [[package]]
 name = "vantry-updater"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6995,7 +6995,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",

@@ -107,26 +107,48 @@ impl Permissions {
         })
     }
 }
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Manifest {
+    #[serde(deserialize_with = "null_as_default")]
     pub id: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub name: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub version: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub min_app_version: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub runtime: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub entry: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub main: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub command: Vec<String>,
+    #[serde(deserialize_with = "null_as_default")]
     pub description: String,
+    #[serde(deserialize_with = "null_as_default")]
     pub repo: String,
     pub builtin: bool,
     pub timeout_ms: u64,
     pub r#async: bool,
     pub permissions: Value,
+    #[serde(deserialize_with = "null_as_default")]
     pub capabilities: Vec<String>,
+    #[serde(deserialize_with = "null_as_default")]
     pub settings: Vec<PluginSettingSpec>,
+    #[serde(deserialize_with = "null_as_default")]
     pub navigation: Vec<PluginNavItem>,
+    #[serde(deserialize_with = "null_as_default")]
     pub pages: BTreeMap<String, Value>,
 }
 fn version(s: &str) -> Option<[u32; 3]> {

@@ -123,6 +123,12 @@ pub struct SidebarRow {
     pub date_label: String,
     /// Workspace folder name (`Vantry`).
     pub workspace_name: String,
+    /// Full project directory key for copy-path / filter / new-thread-in-project.
+    pub project_key: String,
+    /// Parent thread ID if this row is a delegated subtask.
+    pub parent_thread_id: String,
+    pub unread: bool,
+    pub has_completed_run: bool,
 }
 
 /// A group and its rows.
@@ -332,6 +338,8 @@ struct SidebarTree<'a> {
     task_status: HashMap<&'a str, RunStatus>,
     statuses: HashMap<&'a str, ThreadStatus>,
     activity: HashMap<&'a str, Option<DateTime<Utc>>>,
+    unread: &'a BTreeSet<String>,
+    has_terminal_run: HashMap<&'a str, bool>,
     filter: &'a SidebarFilter,
     now: DateTime<Utc>,
 }
@@ -388,6 +396,14 @@ impl SidebarTree<'_> {
             } else {
                 String::new()
             },
+            project_key: thread_project(thread),
+            parent_thread_id: thread.parent_thread_id.clone(),
+            unread: self.unread.contains(&thread.id),
+            has_completed_run: self
+                .has_terminal_run
+                .get(thread.id.as_str())
+                .copied()
+                .unwrap_or(false),
         });
         if collapsed || depth >= 8 {
             return;
@@ -564,11 +580,19 @@ impl AppState {
                 .and_modify(|latest| *latest = (*latest).max(at))
                 .or_insert(at);
         }
+        let mut has_terminal_run: HashMap<&str, bool> = HashMap::new();
+        for run in &self.runs {
+            if run.status.terminal() {
+                has_terminal_run.insert(run.thread_id.as_str(), true);
+            }
+        }
         let tree = SidebarTree {
             children,
             task_status,
             statuses,
             activity,
+            unread: &self.unread,
+            has_terminal_run,
             filter,
             now,
         };

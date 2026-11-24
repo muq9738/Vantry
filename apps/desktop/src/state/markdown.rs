@@ -529,7 +529,15 @@ pub fn parse_inlines(text: &str) -> Vec<Inline> {
         }
         if c == '[' {
             if let Some((text_end, url_end)) = link_at(&chars, i) {
-                let text: String = chars[i + 1..text_end].iter().collect();
+                let mut label = chars[i + 1..text_end].iter().copied().peekable();
+                let mut text = String::new();
+                while let Some(c) = label.next() {
+                    if c == '\\' && label.peek().is_some_and(char::is_ascii_punctuation) {
+                        text.push(label.next().unwrap());
+                    } else {
+                        text.push(c);
+                    }
+                }
                 let url: String = chars[text_end + 2..url_end].iter().collect();
                 flush(&mut plain, &mut out);
                 out.push(Inline::Link {
@@ -644,6 +652,7 @@ fn link_at(chars: &[char], at: usize) -> Option<(usize, usize)> {
     let mut j = at;
     let text_end = loop {
         match chars.get(j)? {
+            '\\' if chars.get(j + 1).is_some_and(char::is_ascii_punctuation) => j += 1,
             '[' => depth += 1,
             ']' => {
                 depth -= 1;

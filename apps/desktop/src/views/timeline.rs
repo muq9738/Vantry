@@ -164,6 +164,66 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
 
 type ItemMemo = Memo<Option<TimelineItem>>;
 
+fn attachment_short_name(item: &vantry_protocol::Attachment, image_index: usize) -> String {
+    if item.mime.starts_with("image/") && crate::state::draft::is_generic_image_name(&item.name) {
+        format!("图{image_index}")
+    } else {
+        crate::state::draft::middle_truncate_name(&item.name, 20)
+    }
+}
+
+/// Replaces `@attachment-name` references in a sent message with highlighted inline tokens.
+fn highlight_attachment_mentions(
+    inlines: Vec<crate::state::markdown::Inline>,
+    files: &[vantry_protocol::Attachment],
+) -> Vec<crate::state::markdown::Inline> {
+    if files.is_empty() {
+        return inlines;
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut img_seq = 0usize;
+    for file in files {
+        let short = if file.mime.starts_with("image/")
+            && crate::state::draft::is_generic_image_name(&file.name)
+        {
+            img_seq += 1;
+            format!("@图{img_seq}")
+        } else {
+            format!("@{}", crate::state::draft::middle_truncate_name(&file.name, 20))
+        };
+        let raw = format!("@{}", file.name);
+        pairs.push((raw, short.clone()));
+        if !pairs.iter().any(|(k, _)| k == &short) {
+            pairs.push((short.clone(), short));
+        }
+    }
+    pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+
+    let mut out = Vec::with_capacity(inlines.len());
+    for inline in inlines {
+        let crate::state::markdown::Inline::Text(text) = inline else {
+            out.push(inline);
+            continue;
+        };
+        let mut rest = text.as_str();
+        while let Some((at, (needle, display))) = pairs
+            .iter()
+            .filter_map(|p| rest.find(&p.0).map(|pos| (pos, p)))
+            .min_by_key(|(pos, _)| *pos)
+        {
+            if at > 0 {
+                out.push(crate::state::markdown::Inline::Text(rest[..at].into()));
+            }
+            out.push(crate::state::markdown::Inline::Code(display.clone()));
+            rest = &rest[at + needle.len()..];
+        }
+        if !rest.is_empty() {
+            out.push(crate::state::markdown::Inline::Text(rest.into()));
+        }
+    }
+    out
+}
+
 fn user_row(item: ItemMemo) -> impl IntoElement {
     let colors = palette();
     let user = computed(move || match item.get() {
@@ -178,7 +238,8 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     });
     let text_of = move || user.with(|u| u.as_ref().map(|u| u.1.to_string()).unwrap_or_default());
     let plan = move || user.with(|u| u.as_ref().is_some_and(|u| u.2));
-    let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.join("、")).unwrap_or_default());
+    let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.clone()).unwrap_or_default());
+    let visible_text = computed(move || text_of());
     let run_id = move || user.with_untracked(|u| u.as_ref().map(|u| u.0.clone()).unwrap_or_default());
     // Rewind and fork need the run finished and the thread idle.
     let settled = computed(move || {
@@ -212,20 +273,31 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                         .flex_row()
                         .items_end()
                         .gap_1p5()
-                        .child(
+                        .child(when(move || !visible_text.get().trim().is_empty(), move ||
                             view()
                                 .px_4()
                                 .py_2p5()
                                 .rounded(px(16.0))
                                 .bg(colors.user)
-                                .child(
-                                    text(text_of)
+                                .child(dynamic(move || {
+                                    let text = visible_text.get();
+                                    let files = attachments();
+                                    let (skill, body) = crate::state::thread_links::skill_prefix(&text);
+                                    let mut inlines = highlight_attachment_mentions(
+                                        crate::state::thread_links::message_inlines(body),
+                                        &files,
+                                    );
+                                    if let Some(name) = skill {
+                                        inlines.insert(0, crate::state::markdown::Inline::Text(" ".into()));
+                                        inlines.insert(0, crate::state::markdown::Inline::Code(name.to_owned()));
+                                    }
+                                    markdown::inline_text(&inlines)
                                         .select_text()
                                         .text_size(px(metrics::BODY))
                                         .line_height(LineHeight::Multiple(1.55))
-                                        .text_color(colors.ink),
-                                ),
-                        )
+                                        .text_color(colors.ink)
+                                }))
+                        ))
                         .child(
                             view()
                                 .pb_1()
@@ -238,16 +310,41 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                 .child(when(
                     move || !attachments().is_empty(),
                     move || {
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(icon(Icon::Paperclip, 12.0, colors.muted))
-                            .child(
-                                text(attachments)
-                                    .text_size(px(11.5))
-                                    .text_color(colors.muted),
-                            )
+                        let numbered = computed(move || {
+                            let mut img_seq = 0usize;
+                            attachments()
+                                .into_iter()
+                                .map(|item| {
+                                    let lbl = if item.mime.starts_with("image/")
+                                        && crate::state::draft::is_generic_image_name(&item.name)
+                                    {
+                                        img_seq += 1;
+                                        attachment_short_name(&item, img_seq)
+                                    } else {
+                                        attachment_short_name(&item, 0)
+                                    };
+                                    (item, lbl)
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        view().flex_row().flex_wrap().items_center().gap_1p5().child(each(
+                            move || numbered.get(),
+                            |(item, _): &(vantry_protocol::Attachment, String)| item.id.clone(),
+                            |entry, _| {
+                                dynamic(move || {
+                                    let (item, label) = entry.get();
+                                    if item.mime.starts_with("image/") {
+                                        super::composer::attachment_thumbnail_labeled(
+                                            item,
+                                            Some(label),
+                                        )
+                                        .into_element()
+                                    } else {
+                                        super::caption(format!("@{label}")).into_element()
+                                    }
+                                })
+                            },
+                        ))
                     },
                 ))
                 .child(when(
@@ -427,7 +524,7 @@ fn tool_status_color(status: ToolStatus) -> AdaptiveColor {
         ToolStatus::Running => colors.accent,
         ToolStatus::AwaitingApproval => colors.warning,
         ToolStatus::Completed => colors.success,
-        ToolStatus::Failed | ToolStatus::Interrupted => colors.danger,
+        ToolStatus::Failed | ToolStatus::Interrupted => colors.muted,
     }
 }
 
@@ -491,11 +588,9 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
                         .text_size(px(12.0))
                         .text_color(colors.muted),
                 )
-                .child(
-                    text(move || status().label())
-                        .text_size(px(11.0))
-                        .text_color(move || tool_status_color(status())),
-                )
+                .child(when(move || open.get() || matches!(status(), ToolStatus::Running | ToolStatus::AwaitingApproval), move ||
+                    text(move || status().label()).text_size(px(11.0)).text_color(move || tool_status_color(status()))
+                ))
                 .child(dynamic(move || {
                     icon(
                         if open.get() {
@@ -523,7 +618,7 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || tool.with(|t| t.as_ref().is_some_and(|t| !t.4.is_empty())),
+            move || open.get() && tool.with(|t| t.as_ref().is_some_and(|t| !t.4.is_empty())),
             move || {
                 view().px_3().py_2().bg(colors.code).child(
                     text(field(|t| t.4.clone()))

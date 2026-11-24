@@ -33,6 +33,60 @@ impl Draft {
         self.replace_mentions(|mention| &mention.expand)
     }
 
+    /// Short display label (without leading `@`) for an attachment chip.
+    pub fn attachment_short_label(&self, item: &Attachment) -> String {
+        if let Some(m) = self.mentions.iter().find(|m| m.attachment_id == item.id) {
+            return m.display.trim_start_matches('@').to_owned();
+        }
+        middle_truncate_name(&item.name, 18)
+    }
+
+    pub(super) fn build_attachment_mention(&self, item: &Attachment) -> DraftMention {
+        let is_pasted_image = item.mime.starts_with("image/")
+            && is_generic_image_name(&item.name);
+        let display = if is_pasted_image {
+            let mut n = 1usize;
+            loop {
+                let candidate = format!("@图{n}");
+                if !self.mentions.iter().any(|m| m.display == candidate && m.attachment_id != item.id)
+                    && !self.text.contains(&candidate)
+                {
+                    break candidate;
+                }
+                n += 1;
+            }
+        } else {
+            let base = format!("@{}", middle_truncate_name(&item.name, 22));
+            let mut candidate = base.clone();
+            let mut seq = 2usize;
+            while self.mentions.iter().any(|m| m.display == candidate && m.attachment_id != item.id) {
+                candidate = format!("{base}#{seq}");
+                seq += 1;
+            }
+            candidate
+        };
+        DraftMention {
+            kind: 3,
+            display,
+            expand: format!("@{}", item.name),
+            attachment_id: item.id.clone(),
+        }
+    }
+
+    pub(super) fn insert_attachment_mention(&mut self, item: &Attachment) {
+        if self.mentions.iter().any(|m| m.attachment_id == item.id) {
+            return;
+        }
+        let mention = self.build_attachment_mention(item);
+        let token = mention.display.clone();
+        self.mentions.push(mention);
+        if !self.text.is_empty() && !self.text.ends_with(char::is_whitespace) {
+            self.text.push(' ');
+        }
+        self.text.push_str(&token);
+        self.text.push(' ');
+    }
+
     pub(super) fn remove_attachment_mention(&mut self, id: &str) {
         if self.mentions.iter().any(|m| m.attachment_id == id) {
             self.text = self
@@ -77,19 +131,44 @@ impl Draft {
     }
 }
 
+pub(crate) fn is_generic_image_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    let stem = lower.rsplit_once('.').map_or(lower.as_str(), |(s, _)| s);
+    stem == "image"
+        || stem == "clipboard"
+        || stem.starts_with("pasted-image")
+        || stem.starts_with("image-")
+        || stem.starts_with("screenshot")
+        || stem.starts_with("截屏")
+}
+
+/// Shortens a file name from the middle, keeping the extension readable (aligned with T3 Code).
+pub(crate) fn middle_truncate_name(name: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max_chars || max_chars <= 1 {
+        return name.to_owned();
+    }
+    let available = max_chars - 1;
+    let suffix_len = (available.div_ceil(2)).min(10).min(available.saturating_sub(1));
+    let prefix_len = available - suffix_len;
+    let prefix: String = chars[..prefix_len].iter().collect();
+    let suffix: String = chars[chars.len() - suffix_len..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
 impl AppState {
-    pub fn set_skill_mention(&mut self, text: &str, name: &str) {
-        self.set_draft_text(text);
-        let key = self.draft_key();
-        let draft = self.drafts.entry(key).or_default();
-        let display = format!("/{name}");
-        draft.mentions.retain(|m| m.display != display);
-        draft.mentions.push(DraftMention {
-            kind: 2,
-            display,
-            expand: format!("/skill:{name}"),
-            ..Default::default()
-        });
+    pub fn begin_attachment_import(&mut self, key: &str) {
+        *self.attachment_imports.entry(key.to_owned()).or_default() += 1;
+    }
+
+    pub fn finish_attachment_import(&mut self, key: &str) {
+        if let Some(count) = self.attachment_imports.get_mut(key) {
+            *count -= 1;
+            if *count == 0 { self.attachment_imports.remove(key); }
+        }
     }
 
     pub(super) fn restore_local_draft(&mut self, id: &str) -> bool {
@@ -111,7 +190,7 @@ impl AppState {
         if self.selected.is_none()
             && self.local_selected.is_some()
             && self.draft().is_blank()
-            && !self.attachment_imports.contains(&self.draft_key())
+            && !self.attachment_imports.contains_key(&self.draft_key())
             && self
                 .pending_by_key(&format!("submit:{}", self.draft_key()))
                 .is_none()
@@ -135,7 +214,7 @@ impl AppState {
 
     pub fn discard_local_draft(&mut self, id: &str) {
         if !self.local_order.iter().any(|item| item == id)
-            || self.attachment_imports.contains(id)
+            || self.attachment_imports.contains_key(id)
             || self.pending_by_key(&format!("submit:{id}")).is_some()
         {
             return;

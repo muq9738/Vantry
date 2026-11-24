@@ -250,6 +250,19 @@ pub(super) fn open(path: &Path, lock: bool) -> io::Result<File> {
         false,
     )
 }
+// Concurrent replacements can leave the old name delete-pending briefly on Windows.
+fn retry_replace<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for delay in [2, 4, 8, 16, 32, 64, 128] {
+        match operation() {
+            Err(e) if matches!(e.raw_os_error(), Some(5 | 32)) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            result => return result,
+        }
+    }
+    operation()
+}
+
 pub(super) fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (parent, _) = split(path)?;
     let ancestors = chain(parent, true)?;
@@ -258,7 +271,7 @@ pub(super) fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .last()
             .ok_or_else(|| invalid("missing directory"))?,
     )?;
-    match fs::symlink_metadata(path) {
+    match retry_replace(|| fs::symlink_metadata(path)) {
         Ok(m) if m.file_attributes() & 0x400 != 0 || !m.is_file() => {
             return Err(invalid("invalid destination"));
         }
@@ -269,7 +282,9 @@ pub(super) fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     let name = tmp.into_temp_path();
-    check(unsafe { MoveFileExW(wide(&name)?.as_ptr(), wide(path)?.as_ptr(), 9) })
+    let source = wide(&name)?;
+    let target = wide(path)?;
+    retry_replace(|| check(unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 9) }))
 }
 #[link(name = "shell32")]
 unsafe extern "system" {

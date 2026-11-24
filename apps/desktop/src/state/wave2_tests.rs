@@ -598,7 +598,7 @@ fn attachment_import_finishes_in_the_draft_that_opened_the_picker() {
     let mut state = loaded(vec![thread("other", "")], vec![]);
     state.start_local_draft();
     let original = state.draft_key();
-    state.attachment_imports.insert(original.clone());
+    state.begin_attachment_import(&original);
     state.set_draft_text("待上传");
     assert!(!state.composer_status().can_submit);
     state.select_thread(Some("other".into()));
@@ -614,7 +614,7 @@ fn attachment_import_finishes_in_the_draft_that_opened_the_picker() {
         Some("/tmp/样图.png".into()),
     );
     assert!(state.draft().attachments.is_empty());
-    state.attachment_imports.remove(&original);
+    state.finish_attachment_import(&original);
     state.select_thread(Some(original));
     assert_eq!(state.draft().attachments, [image]);
     assert!(state.composer_status().can_submit);

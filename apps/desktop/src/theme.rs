@@ -60,31 +60,31 @@ const fn rgba_pair(light: u32, dark: u32) -> AdaptiveColor {
     }
 }
 
-/// The default Graphite preset from Vantry v0.1.42.
+/// Default warm-charcoal / warm-paper palette inspired by Claude Desktop.
 pub const PALETTE: Palette = Palette {
-    canvas: AdaptiveColor::rgb(0xFCFCFC, 0x0A0A0A),
-    sidebar: AdaptiveColor::rgb(0xF3F4F6, 0x111214),
-    card: AdaptiveColor::rgb(0xFFFFFF, 0x202229),
-    raised: AdaptiveColor::rgb(0xFFFFFF, 0x17181C),
-    soft: AdaptiveColor::rgb(0xF0F2F5, 0x181A1F),
-    code: AdaptiveColor::rgb(0xF4F5F7, 0x060607),
-    ink: AdaptiveColor::rgb(0x111318, 0xF5F6F8),
-    muted: AdaptiveColor::rgb(0x525866, 0xA3A8B4),
-    faint: AdaptiveColor::rgb(0x737A8A, 0x7D8392),
-    line: AdaptiveColor::rgb(0xDFE3EA, 0x272A33),
-    line_soft: AdaptiveColor::rgb(0xEAEDF2, 0x1E2028),
-    accent: AdaptiveColor::rgb(0x1B4ED8, 0x346BF1),
-    user: AdaptiveColor::rgb(0xF0F2F5, 0x1E212B),
-    success: AdaptiveColor::rgb(0x1F9D4C, 0x30D158),
-    warning: AdaptiveColor::rgb(0xB25E00, 0xF5A524),
-    danger: AdaptiveColor::rgb(0xC9252C, 0xFF5A5F),
+    canvas: AdaptiveColor::rgb(0xFAF9F5, 0x1F1E1D),
+    sidebar: AdaptiveColor::rgb(0xF3F2EC, 0x171615),
+    card: AdaptiveColor::rgb(0xECEAE3, 0x2D2C29),
+    raised: AdaptiveColor::rgb(0xFFFFFF, 0x282725),
+    soft: AdaptiveColor::rgb(0xEEECE5, 0x252422),
+    code: AdaptiveColor::rgb(0xF2F0E8, 0x151413),
+    ink: AdaptiveColor::rgb(0x1F1E1D, 0xECEAE4),
+    muted: AdaptiveColor::rgb(0x63615B, 0xA4A19A),
+    faint: AdaptiveColor::rgb(0x8E8B83, 0x73706A),
+    line: AdaptiveColor::rgb(0xE2DFD7, 0x363430),
+    line_soft: AdaptiveColor::rgb(0xEAE7E0, 0x2B2A27),
+    accent: AdaptiveColor::rgb(0xC96442, 0xD97757),
+    user: AdaptiveColor::rgb(0xEFECE4, 0x2B2A27),
+    success: AdaptiveColor::rgb(0x1F9D4C, 0x4ADE80),
+    warning: AdaptiveColor::rgb(0xB45309, 0xEAB308),
+    danger: AdaptiveColor::rgb(0xC9252C, 0xF87171),
     on_accent: AdaptiveColor::rgb(0xFFFFFF, 0xFFFFFF),
-    approval: AdaptiveColor::rgb(0xFFF7E8, 0x2B2416),
-    approval_border: AdaptiveColor::rgb(0xF2C46D, 0x6B5220),
-    info_bg: AdaptiveColor::rgb(0xEBF3FF, 0x1B2B44),
-    info_ink: AdaptiveColor::rgb(0x2563EB, 0x60A5FA),
-    success_bg: AdaptiveColor::rgb(0xE8F7EE, 0x163123),
-    scrim: rgba_pair(0x1F1E1C59, 0x00000099),
+    approval: AdaptiveColor::rgb(0xFDF6E9, 0x2D261C),
+    approval_border: AdaptiveColor::rgb(0xE8C88A, 0x5C492B),
+    info_bg: AdaptiveColor::rgb(0xF6ECE6, 0x332721),
+    info_ink: AdaptiveColor::rgb(0xB85535, 0xE28E70),
+    success_bg: AdaptiveColor::rgb(0xE8F6EC, 0x1B2E22),
+    scrim: rgba_pair(0x18171552, 0x00000088),
 };
 
 const OCEAN: Palette = Palette {
@@ -224,60 +224,60 @@ pub const STARDUST_THEME: &str = r##"{
   "cssVars": {
     "theme": { "radius": "0.625rem" },
     "light": {
-      "background": "#FCFCFC",
-      "foreground": "#111318",
+      "background": "#FAF9F5",
+      "foreground": "#1F1E1D",
       "card": "#FFFFFF",
-      "card-foreground": "#111318",
+      "card-foreground": "#1F1E1D",
       "popover": "#FFFFFF",
-      "popover-foreground": "#111318",
-      "primary": "#1B4ED8",
+      "popover-foreground": "#1F1E1D",
+      "primary": "#C96442",
       "primary-foreground": "#FFFFFF",
-      "secondary": "#F0F2F5",
-      "secondary-foreground": "#111318",
-      "muted": "#F0F2F5",
-      "muted-foreground": "#525866",
-      "accent": "#F0F2F5",
-      "accent-foreground": "#111318",
+      "secondary": "#EEECE5",
+      "secondary-foreground": "#1F1E1D",
+      "muted": "#EEECE5",
+      "muted-foreground": "#63615B",
+      "accent": "#EEECE5",
+      "accent-foreground": "#1F1E1D",
       "destructive": "#C9252C",
-      "border": "#DFE3EA",
-      "input": "#DFE3EA",
-      "ring": "#1B4ED8",
-      "sidebar": "#F3F4F6",
-      "sidebar-foreground": "#111318",
-      "sidebar-primary": "#1B4ED8",
+      "border": "#E2DFD7",
+      "input": "#E2DFD7",
+      "ring": "#C96442",
+      "sidebar": "#F3F2EC",
+      "sidebar-foreground": "#1F1E1D",
+      "sidebar-primary": "#C96442",
       "sidebar-primary-foreground": "#FFFFFF",
-      "sidebar-accent": "#FFFFFF",
-      "sidebar-accent-foreground": "#111318",
-      "sidebar-border": "#DFE3EA",
-      "sidebar-ring": "#1B4ED8"
+      "sidebar-accent": "#ECEAE3",
+      "sidebar-accent-foreground": "#1F1E1D",
+      "sidebar-border": "#E2DFD7",
+      "sidebar-ring": "#C96442"
     },
     "dark": {
-      "background": "#0A0A0A",
-      "foreground": "#F5F6F8",
-      "card": "#17181C",
-      "card-foreground": "#F5F6F8",
-      "popover": "#17181C",
-      "popover-foreground": "#F5F6F8",
-      "primary": "#346BF1",
+      "background": "#1F1E1D",
+      "foreground": "#ECEAE4",
+      "card": "#282725",
+      "card-foreground": "#ECEAE4",
+      "popover": "#282725",
+      "popover-foreground": "#ECEAE4",
+      "primary": "#D97757",
       "primary-foreground": "#FFFFFF",
-      "secondary": "#181A1F",
-      "secondary-foreground": "#F5F6F8",
-      "muted": "#181A1F",
-      "muted-foreground": "#A3A8B4",
-      "accent": "#181A1F",
-      "accent-foreground": "#F5F6F8",
-      "destructive": "#FF5A5F",
-      "border": "#272A33",
-      "input": "#272A33",
-      "ring": "#346BF1",
-      "sidebar": "#111214",
-      "sidebar-foreground": "#F5F6F8",
-      "sidebar-primary": "#346BF1",
+      "secondary": "#252422",
+      "secondary-foreground": "#ECEAE4",
+      "muted": "#252422",
+      "muted-foreground": "#A4A19A",
+      "accent": "#252422",
+      "accent-foreground": "#ECEAE4",
+      "destructive": "#F87171",
+      "border": "#363430",
+      "input": "#363430",
+      "ring": "#D97757",
+      "sidebar": "#171615",
+      "sidebar-foreground": "#ECEAE4",
+      "sidebar-primary": "#D97757",
       "sidebar-primary-foreground": "#FFFFFF",
-      "sidebar-accent": "#202229",
-      "sidebar-accent-foreground": "#F5F6F8",
-      "sidebar-border": "#272A33",
-      "sidebar-ring": "#346BF1"
+      "sidebar-accent": "#2D2C29",
+      "sidebar-accent-foreground": "#ECEAE4",
+      "sidebar-border": "#363430",
+      "sidebar-ring": "#D97757"
     }
   }
 }"##;
@@ -371,11 +371,11 @@ mod tests {
             let byte = |v: f32| (v * 255.0).round() as u32;
             (byte(c.r) << 16) | (byte(c.g) << 8) | byte(c.b)
         };
-        assert_eq!(hex(PALETTE.sidebar.light), 0xF3F4F6);
-        assert_eq!(hex(PALETTE.canvas.light), 0xFCFCFC);
-        assert_eq!(hex(PALETTE.sidebar.dark), 0x111214);
-        assert_eq!(hex(PALETTE.canvas.dark), 0x0A0A0A);
-        assert_eq!(hex(PALETTE.accent.light), 0x1B4ED8);
-        assert_eq!(hex(PALETTE.accent.dark), 0x346BF1);
+        assert_eq!(hex(PALETTE.sidebar.light), 0xF3F2EC);
+        assert_eq!(hex(PALETTE.canvas.light), 0xFAF9F5);
+        assert_eq!(hex(PALETTE.sidebar.dark), 0x171615);
+        assert_eq!(hex(PALETTE.canvas.dark), 0x1F1E1D);
+        assert_eq!(hex(PALETTE.accent.light), 0xC96442);
+        assert_eq!(hex(PALETTE.accent.dark), 0xD97757);
     }
 }

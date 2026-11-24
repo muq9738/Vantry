@@ -5,6 +5,11 @@ env:
 
 on:
   workflow_dispatch:
+    inputs:
+      package:
+        description: Build and smoke-test the portable x64 package
+        type: boolean
+        default: true
   push:
     branches:
       - main
@@ -27,7 +32,19 @@ on:
       - '.github/workflows/windows.yml'
 
 jobs:
+  windows-tests:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --locked --no-fail-fast
+
   windows-amd64:
+    if: github.event_name != 'workflow_dispatch' || inputs.package
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -37,10 +54,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Run Rust workspace tests
-        shell: bash
-        run: cargo test --workspace --locked
 
       - name: Build release binaries
         shell: bash
@@ -56,6 +69,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vantry-windows-amd64
-          path: |
-            dist/vantry-*-windows-amd64.zip
-            dist/*.json
+          if-no-files-found: error
+          path: dist/vantry-*-windows-amd64.zip

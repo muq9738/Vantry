@@ -775,13 +775,28 @@ pub(super) fn git_panel() -> impl IntoElement {
                                                     move || branches.get(),
                                                     |b: &String| format!("local:{b}"),
                                                     move |branch, _| {
+                                                        let hovered = signal(false);
                                                         view()
                                                             .w_full()
+                                                            .h(px(30.0))
                                                             .flex_row()
                                                             .items_center()
                                                             .gap_1()
+                                                            .px_1()
                                                             .rounded(px(7.0))
-                                                            .hover(|s| s.bg(colors.soft))
+                                                            .bg(move || {
+                                                                if hovered.get() {
+                                                                    colors.soft
+                                                                } else {
+                                                                    AdaptiveColor::TRANSPARENT
+                                                                }
+                                                            })
+                                                            .on_mouse_enter(move |_: &MouseEvent| {
+                                                                hovered.set(true)
+                                                            })
+                                                            .on_mouse_leave(move |_: &MouseEvent| {
+                                                                hovered.set(false)
+                                                            })
                                                             .child(
                                                                 nsh_base::button()
                                                                     .on_press(move || {
@@ -792,16 +807,15 @@ pub(super) fn git_panel() -> impl IntoElement {
                                                                     .disabled(move || busy.get())
                                                                     .flex_1()
                                                                     .min_w_0()
+                                                                    .h_full()
                                                                     .flex_row()
                                                                     .items_center()
                                                                     .gap_1p5()
-                                                                    .px_2()
-                                                                    .py_1()
-                                                                    .rounded(px(6.0))
+                                                                    .px_1p5()
                                                                     .child(crate::icons::icon(
                                                                         Icon::GitBranch,
                                                                         12.0,
-                                                                        colors.muted,
+                                                                        colors.faint,
                                                                     ))
                                                                     .child(
                                                                         text(move || branch.get())
@@ -812,32 +826,33 @@ pub(super) fn git_panel() -> impl IntoElement {
                                                                             .text_color(colors.ink),
                                                                     ),
                                                             )
-                                                            .child(
-                                                                nsh_base::button()
-                                                                    .accessibility_label(
-                                                                        "与当前分支比较",
-                                                                    )
-                                                                    .on_press(move || {
-                                                                        controller::git_page(
-                                                                            crate::state::workbench::GitPage::Compare,
-                                                                            Some(branch.get_untracked()),
+                                                            .child(when(
+                                                                move || hovered.get(),
+                                                                move || {
+                                                                    nsh_base::button()
+                                                                        .accessibility_label(
+                                                                            "与当前分支比较",
                                                                         )
-                                                                    })
-                                                                    .flex_shrink_0()
-                                                                    .px_2()
-                                                                    .py_0p5()
-                                                                    .mr_1()
-                                                                    .rounded(px(5.0))
-                                                                    .bg(colors.soft)
-                                                                    .hover(|s| s.bg(colors.info_bg))
-                                                                    .child(
-                                                                        text("比较")
-                                                                            .text_size(px(11.0))
-                                                                            .text_color(
-                                                                                colors.muted,
-                                                                            ),
-                                                                    ),
-                                                            )
+                                                                        .on_press(move || {
+                                                                            controller::git_page(
+                                                                                crate::state::workbench::GitPage::Compare,
+                                                                                Some(branch.get_untracked()),
+                                                                            )
+                                                                        })
+                                                                        .flex_shrink_0()
+                                                                        .h(px(22.0))
+                                                                        .px_2()
+                                                                        .rounded(px(5.0))
+                                                                        .hover(|s| s.bg(colors.card))
+                                                                        .child(
+                                                                            text("比较")
+                                                                                .text_size(px(11.0))
+                                                                                .text_color(
+                                                                                    colors.muted,
+                                                                                ),
+                                                                        )
+                                                                },
+                                                            ))
                                                     },
                                                 ))
                                                 .child(when(

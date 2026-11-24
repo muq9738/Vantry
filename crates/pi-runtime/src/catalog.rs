@@ -87,18 +87,29 @@ pub struct SkillInfo {
 }
 
 /// Discover skills actually visible to embedded Pi for `(agent_dir, cwd)`.
-pub fn discover_skills(agent_dir: &Path, cwd: &Path) -> Vec<SkillInfo> {
-    use pi_coding_agent::resources::skills::{LoadSkillsOptions, load_skills};
-    let loaded = load_skills(&LoadSkillsOptions {
-        cwd: cwd.to_path_buf(),
-        agent_dir: agent_dir.to_path_buf(),
-        skill_paths: Vec::new(),
-        include_defaults: true,
-    });
-    let mut skills: Vec<SkillInfo> = loaded
-        .skills
-        .into_iter()
-        .filter(|s| !s.disable_model_invocation)
+pub async fn discover_skills(agent_dir: &Path, cwd: &Path) -> Result<Vec<SkillInfo>> {
+    use pi_coding_agent::{
+        agent_session::services::resource_loader_options,
+        packages::{PackageManager, PackageManagerOptions},
+        resources::{ResourceLoader, trust::{DefaultProjectTrust, ProjectTrustRequest, ProjectTrustResolution, ProjectTrustStore, resolve_project_trust}},
+        settings::{SettingsManager, SettingsOptions},
+    };
+    let global = SettingsManager::create(cwd, agent_dir, SettingsOptions { project_trusted: false });
+    let home = pi_coding_agent::config::home_dir();
+    let trust = resolve_project_trust(&ProjectTrustStore::new(agent_dir), &ProjectTrustRequest {
+        cwd, home: &home, trust_override: None, extension_decision: None, has_ui: false,
+        default_project_trust: DefaultProjectTrust::parse(global.default_project_trust()),
+    })?;
+    let settings = std::sync::Arc::new(SettingsManager::create(cwd, agent_dir, SettingsOptions {
+        project_trusted: matches!(trust, ProjectTrustResolution::Decided(true)),
+    }));
+    let mut options = resource_loader_options(cwd, agent_dir, &settings, &Default::default());
+    let mut packages = PackageManagerOptions::new(cwd, agent_dir, settings);
+    packages.offline = Some(true);
+    options.package_resources = PackageManager::new(packages).resolve_package_resources(None).await?;
+    let mut loader = ResourceLoader::new(options);
+    loader.resolve_paths();
+    let mut skills: Vec<SkillInfo> = loader.base_skills().0.into_iter()
         .map(|s| {
             let source = format!("{:?}", s.source_info.scope).to_ascii_lowercase();
             let command = format!("skill:{}", s.name);
@@ -112,7 +123,7 @@ pub fn discover_skills(agent_dir: &Path, cwd: &Path) -> Vec<SkillInfo> {
         })
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills
+    Ok(skills)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

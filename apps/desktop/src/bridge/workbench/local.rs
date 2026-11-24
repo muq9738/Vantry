@@ -593,7 +593,7 @@ impl WorkbenchBridge for LocalWorkbench {
         })
     }
 
-    fn settings(&self) -> BridgeFuture<SettingsData> {
+    fn settings(&self, _workspace: String) -> BridgeFuture<SettingsData> {
         let model = self.model.clone();
         Box::pin(async move {
             Ok(SettingsData {

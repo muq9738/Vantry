@@ -155,9 +155,7 @@ impl Workbench {
             | "terminal.open" => {
                 return tokio::task::block_in_place(|| self.workspace(r));
             }
-            "skills.list" => {
-                return tokio::task::block_in_place(|| self.skills(r));
-            }
+            "skills.list" => return self.skills(r).await,
             s if s.starts_with("git.") => return tokio::task::block_in_place(|| self.git(r)),
             "projects.list" | "projects.add" | "projects.remove" => return self.projects(r),
             "environments.list" | "environments.upsert" | "environments.remove" => {
@@ -365,13 +363,13 @@ impl Workbench {
 
         Ok(out)
     }
-    fn skills(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
+    async fn skills(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
         let mut out = WorkbenchResponse::default();
         let cwd = match self.root(&r)? {
             Some(path) => path,
             None => self.core.directory().to_owned(),
         };
-        let skills = vantry_pi_runtime::discover_skills(&vantry_pi_runtime::agent_dir(), &cwd);
+        let skills = vantry_pi_runtime::discover_skills(&vantry_pi_runtime::agent_dir(), &cwd).await?;
         out.workspace = cwd.display().to_string();
         out.output = json!({"skills": skills}).to_string();
         Ok(out)

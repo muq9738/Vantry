@@ -48,39 +48,31 @@ pub(crate) fn conversation(sheet: Memo<bool>) -> impl IntoElement {
                 view()
                     .items_center()
                     .flex_col()
-                    .gap_2()
+                    .gap_1p5()
                     .px_6()
-                    .pb(px(22.0))
+                    .pb(px(18.0))
                     .child(
                         text(move || {
                             project.with(|key| {
                                 if key.is_empty() {
-                                    "今天想构建什么？".to_owned()
+                                    "Vantry".to_owned()
                                 } else {
-                                    format!(
-                                        "想在 {} 构建什么？",
-                                        crate::state::sidebar::project_name(key)
-                                    )
+                                    crate::state::sidebar::project_name(key).to_owned()
                                 }
                             })
                         })
-                        .text_size(px(24.0))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(26.0))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(colors.ink),
                     )
-                    .child(dynamic(move || {
-                        if project.with(String::is_empty) {
-                            text("一个问题、一段代码，或一个待完成的想法。")
-                                .text_size(px(13.0))
-                                .text_color(colors.muted)
-                                .into_element()
-                        } else {
-                            link_button("或不关联项目直接开始", || {
+                    .child(when(
+                        move || !project.with(String::is_empty),
+                        || {
+                            link_button("不关联项目", || {
                                 crate::controller::state().update(|s| s.new_thread.workspace = None)
                             })
-                            .into_element()
-                        }
-                    }))
+                        },
+                    ))
             },
         ))
         .child(when(move || sheet.get(), dock::dock))
@@ -374,36 +366,45 @@ pub(crate) fn caption(label: impl IntoReactive<SharedString>) -> Text {
         .text_color(colors.faint)
 }
 
-/// An on/off switch row: label, hint, its state.
+/// An on/off switch row: label, optional hint, its state.
 pub(crate) fn switch_row(
     label: impl Into<SharedString>,
-    hint: impl IntoReactive<SharedString>,
+    hint: impl Into<SharedString>,
     on: impl Fn() -> bool + Clone + 'static,
     toggle: impl Fn() + 'static,
 ) -> View {
     let colors = palette();
     let label = label.into();
     let switch_label = label.clone();
+    let hint = hint.into();
     let (a, b, c) = (on.clone(), on.clone(), on);
+    let mut left = view().flex_1().flex_col().gap_0p5().child(
+        text(label)
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(colors.ink),
+    );
+    if !hint.is_empty() {
+        left = left.child(
+            text(hint)
+                .number_of_lines(1u32)
+                .text_size(px(11.5))
+                .text_color(colors.faint),
+        );
+    }
     view()
         .flex_row()
         .items_center()
         .gap_3()
-        .py_1p5()
-        .child(
-            view()
-                .flex_1()
-                .flex_col()
-                .child(text(label).text_size(px(13.0)).text_color(colors.ink))
-                .child(text(hint).text_size(px(11.5)).text_color(colors.muted)),
-        )
+        .py_1()
+        .child(left)
         .child(
             nsh_base::button()
                 .accessibility_label(switch_label)
                 .selected(a)
                 .on_press(toggle)
-                .w(px(38.0))
-                .h(px(22.0))
+                .w(px(36.0))
+                .h(px(20.0))
                 .p_0p5()
                 .rounded_full()
                 .flex_row()
@@ -413,10 +414,10 @@ pub(crate) fn switch_row(
                 .child(when(c, || view().w(px(16.0))))
                 .child(
                     view()
-                        .w(px(18.0))
-                        .h(px(18.0))
+                        .w(px(16.0))
+                        .h(px(16.0))
                         .rounded_full()
-                        .bg(colors.card),
+                        .bg(colors.on_accent),
                 ),
         )
 }

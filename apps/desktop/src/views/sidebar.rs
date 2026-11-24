@@ -107,11 +107,12 @@ pub(crate) fn sidebar() -> impl IntoElement {
                 .iter()
                 .rev()
                 .filter_map(|id| {
-                    let title = s
-                        .drafts
-                        .get(id)
-                        .map(|d| crate::state::title_from_message(&d.text))
-                        .unwrap_or_else(|| "新会话".into());
+                    let draft = s.drafts.get(id)?;
+                    // Never show an empty placeholder "新会话" card above the project list.
+                    if draft.text.trim().is_empty() && draft.attachments.is_empty() {
+                        return None;
+                    }
+                    let title = crate::state::title_from_message(&draft.text);
                     (query.is_empty()
                         || title.to_lowercase().contains(&query)
                         || project.to_lowercase().contains(&query))
@@ -289,19 +290,13 @@ pub(crate) fn sidebar() -> impl IntoElement {
                             let hovered = signal(false);
                             view()
                                 .relative()
-                                .h(px(52.0))
-                                .rounded(px(10.0))
-                                .border_1()
+                                .h(px(44.0))
+                                .rounded(px(8.0))
                                 .bg(move || {
                                     if selected.get() {
                                         colors.card
-                                    } else {
-                                        AdaptiveColor::TRANSPARENT
-                                    }
-                                })
-                                .border_color(move || {
-                                    if selected.get() {
-                                        colors.line
+                                    } else if hovered.get() {
+                                        colors.soft
                                     } else {
                                         AdaptiveColor::TRANSPARENT
                                     }
@@ -313,51 +308,42 @@ pub(crate) fn sidebar() -> impl IntoElement {
                                         .on_press(move || controller::select_thread(id()))
                                         .selected(move || selected.get())
                                         .h_full()
-                                        .px_3()
+                                        .px_2p5()
                                         .justify_center()
-                                        .gap_1()
-                                        .child(
-                                            text(move || item.with(|v| v.1.clone()))
-                                                .number_of_lines(1u32)
-                                                .text_size(px(13.0))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(colors.ink),
-                                        )
+                                        .gap_0p5()
                                         .child(
                                             view()
                                                 .flex_row()
                                                 .items_center()
-                                                .gap_1()
-                                                .child(icon(Icon::Sparkles, 11.0, colors.faint))
+                                                .gap_1p5()
+                                                .child(dot(colors.accent))
                                                 .child(
-                                                    text(|| {
-                                                        controller::state().with(|s| {
-                                                            let model = &s.new_thread.model;
-                                                            if model.is_empty() {
-                                                                "默认模型".to_owned()
-                                                            } else {
-                                                                model
-                                                                    .rsplit('/')
-                                                                    .next()
-                                                                    .unwrap_or(model)
-                                                                    .to_owned()
-                                                            }
-                                                        })
-                                                    })
-                                                    .text_size(px(11.0))
-                                                    .text_color(colors.faint),
+                                                    text(move || item.with(|v| v.1.clone()))
+                                                        .flex_1()
+                                                        .number_of_lines(1u32)
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(colors.ink),
                                                 ),
+                                        )
+                                        .child(
+                                            text("草稿")
+                                                .pl(px(13.0))
+                                                .text_size(px(10.5))
+                                                .text_color(colors.faint),
                                         ),
                                 )
                                 .child(when(
                                     move || hovered.get(),
                                     move || {
-                                        view().absolute().top_1().right_1().child(
-                                            small_icon_button(Icon::X, "丢弃草稿", move || {
+                                        view()
+                                            .absolute()
+                                            .right_1()
+                                            .top(px(10.0))
+                                            .child(small_icon_button(Icon::X, "丢弃草稿", move || {
                                                 controller::state()
                                                     .update(|s| s.discard_local_draft(&id()))
-                                            }),
-                                        )
+                                            }))
                                     },
                                 ))
                         },
@@ -380,9 +366,9 @@ pub(crate) fn sidebar() -> impl IntoElement {
                                 .child(
                                     text(move || {
                                         if query.with(|q| q.trim().is_empty()) && !filtered.get() {
-                                            "还没有会话，写下第一条消息即可开始"
+                                            "暂无会话"
                                         } else {
-                                            "没有匹配的会话"
+                                            "无匹配会话"
                                         }
                                     })
                                     .text_size(px(12.0))
@@ -503,54 +489,130 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
         Entry::Project { key, .. } => {
             let folded =
                 computed(move || entry.with(|e| matches!(e, Entry::Project { folded: true, .. })));
+            let hovered = signal(false);
             let name = project_name(&key).to_owned();
+            let toggle_key = key.clone();
+            let add_key = key.clone();
+            let ctx_key = key.clone();
             let glyph = if key.is_empty() {
-                icon(Icon::Folder, 15.0, colors.faint).into_element()
+                icon(Icon::Folder, 14.0, colors.faint).into_element()
             } else {
                 project_badge(&name).into_element()
             };
-            nsh_base::button()
-                .accessibility_label(name.clone())
-                .on_press(move || {
-                    controller::ui().update(|u| {
-                        u.filter
-                            .project_open
-                            .insert(project_section_key(&key).to_owned(), folded.get_untracked());
-                    })
-                })
+            view()
                 .flex_row()
                 .items_center()
-                .gap_1p5()
+                .gap_1()
                 .px_1p5()
+                .mt_1()
                 .h(px(28.0))
                 .rounded(px(7.0))
-                .hover(|s| s.bg(colors.soft))
-                .child(dynamic(move || {
-                    icon(
-                        if folded.get() {
-                            Icon::ChevronRight
-                        } else {
-                            Icon::ChevronDown
-                        },
-                        11.0,
-                        colors.faint,
-                    )
-                }))
-                .child(glyph)
+                .bg(move || {
+                    if hovered.get() {
+                        colors.soft
+                    } else {
+                        AdaptiveColor::TRANSPARENT
+                    }
+                })
+                .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
+                .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
+                .on_context_menu(move |event: &nsh_core::ContextMenuEvent| {
+                    let k = ctx_key.clone();
+                    let k_new = k.clone();
+                    let k_copy = k.clone();
+                    let k_filter = k.clone();
+                    let filtered_this =
+                        controller::ui().with_untracked(|u| u.filter.project.as_deref() == Some(k.as_str()));
+                    let mut items = vec![
+                        MenuItem::new("在此项目新建会话")
+                            .on_select(move || controller::new_thread_in_project(k_new.clone())),
+                    ];
+                    if !k.is_empty() {
+                        items.push(
+                            MenuItem::new("复制路径")
+                                .on_select(move || controller::copy(k_copy.clone())),
+                        );
+                        items.push(
+                            MenuItem::new(if filtered_this {
+                                "取消项目筛选"
+                            } else {
+                                "仅看此项目"
+                            })
+                            .on_select(move || {
+                                controller::ui().update(|u| {
+                                    u.filter.project = if filtered_this {
+                                        None
+                                    } else {
+                                        Some(k_filter.clone())
+                                    };
+                                });
+                            }),
+                        );
+                    }
+                    drop(popup_menu_at(items, event.page_position));
+                })
                 .child(
-                    text(name)
+                    nsh_base::button()
+                        .accessibility_label(name.clone())
+                        .on_press(move || {
+                            controller::ui().update(|u| {
+                                u.filter.project_open.insert(
+                                    project_section_key(&toggle_key).to_owned(),
+                                    folded.get_untracked(),
+                                );
+                            })
+                        })
                         .flex_1()
-                        .number_of_lines(1u32)
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.ink),
+                        .min_w_0()
+                        .h_full()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .child(dynamic(move || {
+                            icon(
+                                if folded.get() {
+                                    Icon::ChevronRight
+                                } else {
+                                    Icon::ChevronDown
+                                },
+                                11.0,
+                                colors.faint,
+                            )
+                        }))
+                        .child(glyph)
+                        .child(
+                            text(name)
+                                .flex_1()
+                                .min_w_0()
+                                .number_of_lines(1u32)
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.muted),
+                        ),
                 )
-                .child(caption(move || {
-                    entry.with(|e| match e {
-                        Entry::Project { count, .. } => count.to_string(),
-                        _ => String::new(),
-                    })
-                }))
+                .child(when(
+                    move || !hovered.get(),
+                    move || {
+                        caption(move || {
+                            entry.with(|e| match e {
+                                Entry::Project { count, .. } => count.to_string(),
+                                _ => String::new(),
+                            })
+                        })
+                        .px_1()
+                    },
+                ))
+                .child(when(
+                    move || hovered.get(),
+                    move || {
+                        let k = add_key.clone();
+                        view().tooltip(text("在此项目新建会话")).child(
+                            small_icon_button(Icon::Plus, "在此项目新建会话", move || {
+                                controller::new_thread_in_project(k.clone());
+                            }),
+                        )
+                    },
+                ))
                 .into_element()
         }
         Entry::More(key, _) => nsh_base::button()
@@ -584,31 +646,96 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
         let id = row.id.clone();
         MenuItem::new(label).on_select(move || apply(id.clone()))
     };
-    let until = if row.snoozed { None } else { Some(24) };
-    let snooze_id = row.id.clone();
-    vec![
-        action("重命名", controller::begin_rename),
-        action(
-            if row.pinned { "取消置顶" } else { "置顶" },
-            controller::toggle_pin,
-        ),
-        MenuItem::new(if row.snoozed {
-            "唤醒"
-        } else {
-            "延后 1 天"
-        })
-        .on_select(move || controller::snooze(snooze_id.clone(), until)),
-        action(
-            if row.archived {
-                "取消归档"
+    let mut items = Vec::new();
+    // Primary creation / branching actions (restoring full MyGo parity)
+    if row.has_completed_run {
+        let fork_id = row.id.clone();
+        items.push(
+            MenuItem::new("从当前会话分叉新会话")
+                .on_select(move || controller::fork(fork_id.clone(), None)),
+        );
+    }
+    if !row.project_key.is_empty() {
+        let id = row.id.clone();
+        items.push(
+            MenuItem::new("在此项目新建会话")
+                .on_select(move || controller::new_thread_in_thread_project(id.clone())),
+        );
+    }
+    if !items.is_empty() {
+        items.push(MenuItem::separator());
+    }
+    items.push(action(
+        if row.pinned { "取消置顶" } else { "置顶" },
+        controller::toggle_pin,
+    ));
+    items.push(action(
+        if row.archived { "移回活跃" } else { "归档" },
+        controller::toggle_archive,
+    ));
+    if row.snoozed {
+        let snooze_id = row.id.clone();
+        items.push(MenuItem::new("唤醒").on_select(move || controller::snooze(snooze_id.clone(), None)));
+    } else {
+        let s1 = row.id.clone();
+        let s24 = row.id.clone();
+        items.push(
+            MenuItem::new("延后 1 小时").on_select(move || controller::snooze(s1.clone(), Some(1))),
+        );
+        items.push(
+            MenuItem::new("延后 1 天").on_select(move || controller::snooze(s24.clone(), Some(24))),
+        );
+    }
+    items.push(MenuItem::separator());
+    items.push(action("重命名", controller::begin_rename));
+    items.push(action(
+        if row.unread { "标为已读" } else { "标为未读" },
+        controller::toggle_unread,
+    ));
+    if !row.parent_thread_id.is_empty() {
+        let parent_id = row.parent_thread_id.clone();
+        items.push(
+            MenuItem::new("打开父会话")
+                .on_select(move || controller::select_thread(parent_id.clone())),
+        );
+    }
+    if !row.project_key.is_empty() {
+        let key = row.project_key.clone();
+        let is_filtered = controller::ui()
+            .with_untracked(|u| u.filter.project.as_deref() == Some(key.as_str()));
+        items.push(
+            MenuItem::new(if is_filtered {
+                "取消项目筛选"
             } else {
-                "归档"
-            },
-            controller::toggle_archive,
-        ),
-        MenuItem::separator(),
-        action("删除会话", controller::ask_delete),
-    ]
+                "按此项目筛选"
+            })
+            .on_select(move || {
+                controller::ui().update(|u| {
+                    u.filter.project = if is_filtered { None } else { Some(key.clone()) };
+                });
+            }),
+        );
+    }
+    items.push(MenuItem::separator());
+    if !row.project_key.is_empty() {
+        let path = row.project_key.clone();
+        items.push(MenuItem::new("复制路径").on_select(move || controller::copy(path.clone())));
+    }
+    if !row.branch.is_empty() {
+        let branch = row.branch.clone();
+        items.push(MenuItem::new("复制分支名").on_select(move || controller::copy(branch.clone())));
+    }
+    items.push(action("复制会话链接", controller::copy_thread_link));
+    let title = row.title.clone();
+    items.push(MenuItem::new("复制会话标题").on_select(move || controller::copy(title.clone())));
+    let raw_id = row.id.clone();
+    items.push(MenuItem::new("复制会话 ID").on_select(move || controller::copy(raw_id.clone())));
+    if !row.project_key.is_empty() {
+        items.push(action("在终端中打开", controller::open_thread_in_terminal));
+    }
+    items.push(MenuItem::separator());
+    items.push(action("删除会话", controller::ask_delete));
+    items
 }
 
 fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> impl IntoElement {
@@ -647,22 +774,14 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
     };
     view()
         .relative()
-        .h(px(52.0))
+        .h(px(48.0))
         .flex_shrink_0()
         .flex_row()
         .items_center()
         .pl(move || px(8.0 + row.with(|r| r.as_ref().map_or(0.0, |r| f32::from(r.depth) * 14.0))))
         .pr_2()
-        .rounded(px(10.0))
+        .rounded(px(8.0))
         .bg(background)
-        .border_1()
-        .border_color(move || {
-            if is_selected.get() {
-                colors.line
-            } else {
-                AdaptiveColor::TRANSPARENT
-            }
-        })
         .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
         .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
         .on_context_menu(move |event: &nsh_core::ContextMenuEvent| {
@@ -790,19 +909,22 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
             move || {
                 view()
                     .absolute()
-                    .right_1()
-                    .top_1()
+                    .right_1p5()
+                    .top(px(12.0))
                     .flex_row()
+                    .items_center()
+                    .gap_0p5()
+                    .px_0p5()
                     .rounded(px(6.0))
                     .bg(background)
                     .child(small_icon_button(
                         Icon::Archive,
-                        "归档或移回会话",
+                        "归档",
                         move || controller::toggle_archive(id()),
                     ))
                     .child(small_icon_button(
                         Icon::Ellipsis,
-                        "更多会话操作",
+                        "更多",
                         move || {
                             if let Some(row) = row.get_untracked() {
                                 drop(popup_menu(thread_menu(&row)));

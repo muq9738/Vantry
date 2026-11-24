@@ -90,9 +90,11 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                                 .min_h_0()
                                 .child(
                                     row()
-                                        .h(px(64.0))
+                                        .h(px(56.0))
                                         .pl(px(28.0))
                                         .pr_4()
+                                        .border_b_1()
+                                        .border_b_color(colors.line_soft)
                                         .child(
                                             text(move || {
                                                 crate::tr(
@@ -102,7 +104,7 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                                                 )
                                             })
                                             .flex_1()
-                                            .text_size(px(21.0))
+                                            .text_size(px(17.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(colors.ink),
                                         )
@@ -179,7 +181,7 @@ fn nav_items(page: Memo<Option<SettingsPage>>) -> impl Iterator<Item = impl Into
             .rounded(px(8.0))
             .bg(move || {
                 if page.get() == Some(p) {
-                    colors.info_bg
+                    colors.card
                 } else {
                     AdaptiveColor::TRANSPARENT
                 }
@@ -187,7 +189,7 @@ fn nav_items(page: Memo<Option<SettingsPage>>) -> impl Iterator<Item = impl Into
             .hover(|s| s.bg(colors.soft))
             .child(crate::icons::icon(glyph, 14.0, move || {
                 if page.get() == Some(p) {
-                    colors.info_ink
+                    colors.ink
                 } else {
                     colors.muted
                 }
@@ -198,9 +200,9 @@ fn nav_items(page: Memo<Option<SettingsPage>>) -> impl Iterator<Item = impl Into
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(move || {
                         if page.get() == Some(p) {
-                            colors.info_ink
-                        } else {
                             colors.ink
+                        } else {
+                            colors.muted
                         }
                     }),
             )
@@ -326,9 +328,10 @@ fn degraded_note(page: Memo<Option<SettingsPage>>, data: Data) -> impl IntoEleme
 fn title(label: &str) -> Text {
     let colors = palette();
     text(crate::tr(label).to_owned())
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(16.0))
-        .text_color(colors.ink)
+        .font_weight(FontWeight::MEDIUM)
+        .text_size(px(12.5))
+        .text_color(colors.muted)
+        .pt_1()
 }
 
 fn hint(label: impl IntoReactive<SharedString>) -> Text {
@@ -336,19 +339,20 @@ fn hint(label: impl IntoReactive<SharedString>) -> Text {
     text(label)
         .text_size(px(12.0))
         .line_height(LineHeight::Multiple(1.45))
-        .text_color(colors.muted)
+        .text_color(colors.faint)
 }
 
 fn card() -> View {
     let colors = palette();
     view()
         .flex_col()
-        .gap_1()
-        .p_3()
-        .rounded(px(metrics::CARD_RADIUS))
-        .bg(colors.card)
+        .gap_1p5()
+        .px_4()
+        .py_3()
+        .rounded(px(10.0))
+        .bg(colors.raised)
         .border_1()
-        .border_color(colors.line)
+        .border_color(colors.line_soft)
 }
 
 /// Whether settings operation `key` runs.
@@ -372,9 +376,9 @@ fn field(
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .flex_1()
-        .px_2()
-        .py_1()
-        .rounded(px(7.0))
+        .h(px(32.0))
+        .px_2p5()
+        .rounded(px(8.0))
         .bg(colors.canvas)
         .border_1()
         .border_color(colors.line)
@@ -398,9 +402,9 @@ fn secret_field(
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .flex_1()
-        .px_2()
-        .py_1()
-        .rounded(px(7.0))
+        .h(px(32.0))
+        .px_2p5()
+        .rounded(px(8.0))
         .bg(colors.canvas)
         .border_1()
         .border_color(colors.line)
@@ -422,20 +426,17 @@ fn general_page() -> impl IntoElement {
     view()
         .flex_col()
         .gap_3()
-        .child(title("语言与输入"))
         .child(
             card()
-                .gap_3()
+                .gap_0()
+                .py_1()
                 .child(
                     row()
-                        .min_h(px(44.0))
+                        .h(px(46.0))
                         .child(
-                            view()
+                            setting_label("界面语言")
                                 .flex_1()
-                                .flex_col()
-                                .gap_0p5()
-                                .child(setting_label("界面语言").font_weight(FontWeight::MEDIUM))
-                                .child(hint("切换后立即生效，包括菜单、提示与自动提交摘要语言。")),
+                                .font_weight(FontWeight::MEDIUM),
                         )
                         .child(
                             nsh_base::button()
@@ -459,7 +460,7 @@ fn general_page() -> impl IntoElement {
                                 .flex_row()
                                 .items_center()
                                 .gap_2()
-                                .h(px(32.0))
+                                .h(px(30.0))
                                 .px_3()
                                 .rounded(px(8.0))
                                 .bg(colors.canvas)
@@ -480,42 +481,39 @@ fn general_page() -> impl IntoElement {
                 )
                 .child(
                     row()
-                        .flex_wrap()
-                        .min_h(px(48.0))
-                        .pt_2p5()
+                        .h(px(46.0))
                         .border_t_1()
                         .border_t_color(colors.line_soft)
                         .child(
-                            view()
+                            setting_label("发送快捷键")
                                 .flex_1()
-                                .min_w(px(220.0))
-                                .flex_col()
-                                .gap_0p5()
-                                .child(setting_label("发送快捷键").font_weight(FontWeight::MEDIUM))
-                                .child(hint(
-                                    "默认 Enter 发送，⌘ Enter / Shift+Enter 换行；运行中按住 Ctrl 点击发送可临时切换排队与追加。",
-                                )),
+                                .font_weight(FontWeight::MEDIUM),
                         )
                         .child(segments().children([false, true].map(move |value| {
                             segment(
                                 crate::tr(if value {
-                                    "Enter 发送"
+                                    "Enter"
                                 } else {
-                                    "Ctrl Enter 发送"
+                                    "⌘/Ctrl+Enter"
                                 }),
                                 move || enter.get() == value,
                                 move || controller::ui().update(|u| u.send_with_enter = value),
                             )
                         }))),
+                )
+                .child(
+                    view()
+                        .border_t_1()
+                        .border_t_color(colors.line_soft)
+                        .py_1()
+                        .child(switch_row(
+                            crate::tr("子任务自动续行"),
+                            "",
+                            || controller::ui().with(|u| !u.manual_delivery),
+                            || controller::ui().update(|u| u.manual_delivery = !u.manual_delivery),
+                        )),
                 ),
         )
-        .child(title("子任务"))
-        .child(card().child(switch_row(
-            crate::tr("子任务自动续行"),
-            crate::tr("子任务全部完成后，父任务自动带着结果继续。"),
-            || controller::ui().with(|u| !u.manual_delivery),
-            || controller::ui().update(|u| u.manual_delivery = !u.manual_delivery),
-        )))
 }
 
 pub(crate) fn dock_catalog(mcp: bool) -> impl IntoElement {
@@ -547,79 +545,187 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
     let pi_model = computed(|| controller::ui().with(|u| u.forms.pi_model.clone()));
     let pi_key_set = computed(|| controller::ui().with(|u| !u.forms.pi_key.is_empty()));
     let saving = computed(busy("pi.setup"));
-    let setup=signal(false);
-    let catalog_open=signal(false);
+    let setup = signal(false);
+    let catalog_open = signal(false);
+    let model_count = computed(move || {
+        data.with(|d| {
+            d.as_ref()
+                .and_then(|d| d.models.models.as_ref())
+                .map_or(0, Vec::len)
+        })
+    });
     view()
         .flex_col()
-        .gap_2()
-        .child(title("Pi 执行器"))
+        .gap_3()
         .child(dynamic(move || {
             let pi = data.with(|d| d.as_ref().and_then(|d| d.pi.clone()));
             match pi {
-                Some(pi) => card()
-                    .child(
-                        row()
-                            .child(super::dot(if pi.compat_blocked { colors.danger } else { colors.success }))
-                            .child(
-                                text(format!(
-                                    "Pi 运行时 · {}{}",
-                                    if pi.active_source.is_empty() { "内置".to_owned() } else { pi.active_source.clone() },
-                                    if pi.active_version.is_empty() { String::new() } else { format!(" {}", pi.active_version) }
+                Some(pi) => {
+                    let ext_on = pi.enable_user_extensions.unwrap_or(true);
+                    let mcp_on = pi.enable_user_mcp.unwrap_or(true);
+                    card()
+                        .gap_2p5()
+                        .child(
+                            row()
+                                .child(super::dot(if pi.compat_blocked {
+                                    colors.danger
+                                } else {
+                                    colors.success
+                                }))
+                                .child(
+                                    text(format!(
+                                        "Pi · {}{}",
+                                        if pi.active_source.is_empty() {
+                                            "内置".to_owned()
+                                        } else {
+                                            pi.active_source.clone()
+                                        },
+                                        if pi.active_version.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" {}", pi.active_version)
+                                        }
+                                    ))
+                                    .flex_1()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(13.0))
+                                    .text_color(colors.ink),
+                                )
+                                .child(when(pi.update_available, {
+                                    let latest = pi.latest_version.clone();
+                                    move || badge(format!("可更新 {latest}"), colors.accent)
+                                }))
+                                .child(ghost_button("配置密钥", move || {
+                                    setup.set(!setup.get_untracked())
+                                }))
+                                .child(super::small_icon_button(
+                                    crate::icons::Icon::RefreshCw,
+                                    "刷新",
+                                    controller::reload_catalogs,
+                                )),
+                        )
+                        .child(when(!pi.compat_reason.is_empty(), {
+                            let reason = pi.compat_reason.clone();
+                            move || hint(reason.clone())
+                        }))
+                        .child(
+                            row()
+                                .child(pill(
+                                    if ext_on { "扩展：开" } else { "扩展：关" },
+                                    move || ext_on,
+                                    move || controller::toggle_pi_setting(Some(!ext_on), None),
                                 ))
-                                .flex_1()
-                                .text_size(px(13.0))
-                                .text_color(colors.ink),
-                            )
-                            .child(ghost_button("配置模型", move ||setup.set(!setup.get_untracked())))
-                            .child(link_button("刷新",controller::reload_catalogs))
-                            .child(when(pi.update_available, {
-                                let latest = pi.latest_version.clone();
-                                move || badge(format!("可更新 {latest}"), colors.accent)
-                            })),
-                    )
-                    .child(when(!pi.compat_reason.is_empty(), {
-                        let reason = pi.compat_reason.clone();
-                        move || hint(reason.clone())
-                    }))
-                    .child({
-                        let ext_on = pi.enable_user_extensions.unwrap_or(true);
-                        let mcp_on = pi.enable_user_mcp.unwrap_or(true);
-                        row()
-                            .child(pill(
-                                if ext_on { "用户扩展：开" } else { "用户扩展：关" },
-                                move || ext_on,
-                                move || controller::toggle_pi_setting(Some(!ext_on), None),
-                            ))
-                            .child(pill(
-                                if mcp_on { "用户 MCP：开" } else { "用户 MCP：关" },
-                                move || mcp_on,
-                                move || controller::toggle_pi_setting(None, Some(!mcp_on)),
-                            ))
-                    })
-                    .into_element(),
-                None => hint("Pi 状态暂不可用").into_element(),
+                                .child(pill(
+                                    if mcp_on { "MCP：开" } else { "MCP：关" },
+                                    move || mcp_on,
+                                    move || controller::toggle_pi_setting(None, Some(!mcp_on)),
+                                ))
+                                .child(view().flex_1())
+                                .child(link_button("管理 MCP", || {
+                                    controller::close_settings();
+                                    controller::select_dock_tab(crate::state::workbench::DockTab::Mcp);
+                                })),
+                        )
+                        .child(
+                            view()
+                                .flex_col()
+                                .gap_0p5()
+                                .pt_2()
+                                .border_t_1()
+                                .border_t_color(colors.line_soft)
+                                .child(
+                                    text(pi.active_path.clone())
+                                        .number_of_lines(1u32)
+                                        .font_family(MONO)
+                                        .text_size(px(11.0))
+                                        .text_color(colors.faint),
+                                )
+                                .child(
+                                    text(pi.agent_dir.clone())
+                                        .number_of_lines(1u32)
+                                        .font_family(MONO)
+                                        .text_size(px(11.0))
+                                        .text_color(colors.faint),
+                                ),
+                        )
+                        .into_element()
+                }
+                None => card().child(hint("Pi 不可用")).into_element(),
             }
         }))
-        .child(card().child(caption("Pi 运行时与配置")).child(hint(move ||data.with(|d|d.as_ref().and_then(|d|d.pi.as_ref()).map(|pi|format!("{}\n{}",pi.active_path,pi.agent_dir)).unwrap_or_default()))))
-        .child(row().child(title("MCP").flex_1()).child(ghost_button("管理 MCP",||{controller::close_settings();controller::select_dock_tab(crate::state::workbench::DockTab::Mcp);})))
-        .child(when(move ||setup.get(),move ||
+        .child(when(move || setup.get(), move || {
             card()
                 .gap_2()
-                .child(caption("快速配置"))
-                .child(hint("密钥写入执行所属机器的 Pi auth.json，桌面不保存、不显示。"))
-                .child(row().child(field(move || pi_provider.get(), |t: &str| controller::set_pi_field(0, t), "Provider（如 anthropic）")))
+                .child(row().child(field(
+                    move || pi_provider.get(),
+                    |t: &str| controller::set_pi_field(0, t),
+                    "Provider（如 anthropic）",
+                )))
                 .child(row().child(secret_field(
-                    move || if pi_key_set.get() { controller::ui().with_untracked(|u| u.forms.pi_key.expose().to_owned()) } else { String::new() },
+                    move || {
+                        if pi_key_set.get() {
+                            controller::ui().with_untracked(|u| u.forms.pi_key.expose().to_owned())
+                        } else {
+                            String::new()
+                        }
+                    },
                     |t: &str| controller::set_pi_field(1, t),
                     "API Key",
                 )))
-                .child(row().child(field(move || pi_model.get(), |t: &str| controller::set_pi_field(2, t), "默认模型 provider/model（可选）")))
                 .child(
                     row()
-                        .child(view().flex_1())
-                        .child(primary_button(move || if saving.get() { "保存中…" } else { "保存配置" }, controller::pi_setup_save).disabled(busy("pi.setup"))),
-                )))
-        .child(ghost_button("模型目录",move ||catalog_open.set(!catalog_open.get_untracked())))
+                        .child(field(
+                            move || pi_model.get(),
+                            |t: &str| controller::set_pi_field(2, t),
+                            "默认模型（可选）",
+                        ))
+                        .child(
+                            primary_button(
+                                move || if saving.get() { "保存中…" } else { "保存" },
+                                controller::pi_setup_save,
+                            )
+                            .disabled(busy("pi.setup")),
+                        ),
+                )
+        }))
+        .child(
+            nsh_base::button()
+                .on_press(move || catalog_open.set(!catalog_open.get_untracked()))
+                .w_full()
+                .h(px(40.0))
+                .px_4()
+                .rounded(px(10.0))
+                .bg(colors.raised)
+                .border_1()
+                .border_color(colors.line_soft)
+                .hover(|s| s.bg(colors.soft))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    text("模型目录")
+                        .flex_1()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(13.0))
+                        .text_color(colors.ink),
+                )
+                .child(
+                    text(move || format!("{}", model_count.get()))
+                        .text_size(px(12.0))
+                        .text_color(colors.faint),
+                )
+                .child(dynamic(move || {
+                    crate::icons::icon(
+                        if catalog_open.get() {
+                            crate::icons::Icon::ChevronDown
+                        } else {
+                            crate::icons::Icon::ChevronRight
+                        },
+                        13.0,
+                        colors.faint,
+                    )
+                })),
+        )
         .child(dynamic(move || {
             if !catalog_open.get(){return view().into_element();}
             let Some(data) = data.get() else {
@@ -864,18 +970,33 @@ fn mcp_row(server: MCPServerInfo) -> impl IntoElement {
 }
 
 fn plugins_page(data: Data) -> impl IntoElement {
-    let source=signal(String::new());
+    let source = signal(String::new());
     view()
         .flex_col()
-        .gap_2()
-        .child(title("插件"))
-        .child(row().child(field(move ||source.get(),move |s|source.set(s.into()),"插件目录、归档路径或 GitHub 仓库")).child(ghost_button("安装插件",move ||{let mut request=actions::request("plugins.install");request.name=source.get_untracked().trim().to_owned();controller::settings_op("plugin.install",request,"已安装插件");}).disabled(move || source.get().trim().is_empty() || busy("plugin.install")())) )
+        .gap_2p5()
+        .child(
+            row()
+                .child(field(
+                    move || source.get(),
+                    move |s| source.set(s.into()),
+                    "本地路径或 GitHub 仓库",
+                ))
+                .child(
+                    ghost_button("安装", move || {
+                        let mut request = actions::request("plugins.install");
+                        request.name = source.get_untracked().trim().to_owned();
+                        controller::settings_op("plugin.install", request, "已安装插件");
+                    })
+                    .h(px(32.0))
+                    .disabled(move || source.get().trim().is_empty() || busy("plugin.install")()),
+                ),
+        )
         .child(dynamic(move || {
             let Some(data) = data.get() else {
-                return hint("正在读取插件…").into_element();
+                return hint("读取中…").into_element();
             };
             if data.plugins.is_empty() {
-                return hint("没有已安装的插件。").into_element();
+                return hint("无插件").into_element();
             }
             let mut column = view().flex_col().gap_2();
             for plugin in &data.plugins {
@@ -892,36 +1013,69 @@ fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
     let mut opens: Vec<(String, String)> = plugin
         .navigation
         .iter()
-        .map(|n| (n.page.clone(), if n.title.is_empty() { "打开面板".to_owned() } else { format!("打开 {}", n.title) }))
+        .map(|n| {
+            (
+                n.page.clone(),
+                if n.title.is_empty() {
+                    "打开".to_owned()
+                } else {
+                    n.title.clone()
+                },
+            )
+        })
         .collect();
     if opens.is_empty() {
-        opens.push(("main".to_owned(), "打开面板".to_owned()));
+        opens.push(("main".to_owned(), "打开".to_owned()));
     }
     let toggle_id = id.clone();
+    let subtitle = if !plugin.description.is_empty() {
+        plugin.description.clone()
+    } else if plugin.name != plugin.id {
+        plugin.id.clone()
+    } else {
+        String::new()
+    };
     card()
+        .gap_2()
         .child(switch_row(
             plugin.name.clone(),
-            if plugin.description.is_empty() { plugin.id.clone() } else { plugin.description.clone() },
+            subtitle,
             move || enabled,
             move || controller::plugin_set_enabled(toggle_id.clone(), !enabled),
         ))
+        .child(when(!plugin.error.is_empty(), {
+            let error = plugin.error.clone();
+            move || {
+                text(error.clone())
+                    .text_size(px(11.5))
+                    .text_color(colors.danger)
+            }
+        }))
         .child(
             row()
                 .flex_wrap()
-                .child(badge(
-                    if plugin.has_update { format!("{} → {}", plugin.version, plugin.latest_version) } else if plugin.version.is_empty() { "—".to_owned() } else { plugin.version.clone() },
-                    if plugin.has_update { colors.accent } else { colors.muted },
-                ))
-                .child(when(plugin.builtin, || badge("内置", colors.muted)))
-                .child(when(plugin.needs_process_grant && !plugin.granted, || badge("需授权进程", colors.warning)))
-                .child(when(!plugin.error.is_empty(), {
-                    let error = plugin.error.clone();
-                    move || badge(error.clone(), colors.danger)
+                .child(when(!plugin.version.is_empty(), {
+                    let v = if plugin.has_update {
+                        format!("{} → {}", plugin.version, plugin.latest_version)
+                    } else {
+                        plugin.version.clone()
+                    };
+                    let tone = if plugin.has_update {
+                        colors.accent
+                    } else {
+                        colors.faint
+                    };
+                    move || badge(v.clone(), tone)
+                }))
+                .child(when(plugin.builtin, || badge("内置", colors.faint)))
+                .child(when(plugin.needs_process_grant && !plugin.granted, || {
+                    badge("需授权", colors.warning)
                 }))
                 .child(view().flex_1())
                 .children(opens.into_iter().map(|(page, label)| {
                     let id = id.clone();
-                    link_button(label, move || controller::open_plugin(id.clone(), page.clone())).disabled(move || !enabled)
+                    ghost_button(label, move || controller::open_plugin(id.clone(), page.clone()))
+                        .disabled(move || !enabled)
                 })),
         )
 }
@@ -934,32 +1088,57 @@ fn remote_page(data: Data) -> impl IntoElement {
     let redeeming = busy("pair.redeem");
     view()
         .flex_col()
-        .gap_2()
-        .child(row().child(title("远端互联与配对").flex_1()).child(link_button("刷新",controller::reload_catalogs)))
-        .child(hint(move || match target.get() {
-            Some(target) => format!("当前连接：{target}"),
-            None => "当前连接：本机 Core".to_owned(),
-        }))
+        .gap_3()
         .child(dynamic(move || {
             let remote = data.with(|d| d.as_ref().and_then(|d| d.remote.clone()));
             let Some(remote) = remote else {
-                return card().child(hint("远端访问状态由 Core 提供；连接后在此显示。")).into_element();
+                return card().child(hint("未连接 Core")).into_element();
             };
             let ok = remote.error.is_empty() && remote.enabled;
-            let mut c = card()
-                .gap_2()
-                .child(
-                    row()
-                        .child(super::dot(if ok { colors.success } else if remote.error.is_empty() { colors.faint } else { colors.danger }))
-                        .child(text(remote.summary()).flex_1().text_size(px(13.0)).text_color(colors.ink))
-                        .child(ghost_button(move || if busy("pair.create")() { "生成中…" } else { "生成配对码" }, controller::pair_create).disabled(busy("pair.create"))),
-                );
+            let mut c = card().gap_2p5().child(
+                row()
+                    .child(super::dot(if ok {
+                        colors.success
+                    } else if remote.error.is_empty() {
+                        colors.faint
+                    } else {
+                        colors.danger
+                    }))
+                    .child(
+                        text(remote.summary())
+                            .flex_1()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(px(13.0))
+                            .text_color(colors.ink),
+                    )
+                    .child(
+                        text(move || match target.get() {
+                            Some(t) => t,
+                            None => "本机".to_owned(),
+                        })
+                        .text_size(px(11.5))
+                        .text_color(colors.faint),
+                    )
+                    .child(
+                        ghost_button(
+                            move || if busy("pair.create")() { "生成中…" } else { "生成配对码" },
+                            controller::pair_create,
+                        )
+                        .disabled(busy("pair.create")),
+                    )
+                    .child(super::small_icon_button(
+                        crate::icons::Icon::RefreshCw,
+                        "刷新",
+                        controller::reload_catalogs,
+                    )),
+            );
             if !remote.pairing_code.is_empty() {
                 let code = remote.pairing_code.clone();
                 let copy = code.clone();
                 c = c.child(
                     row()
-                        .p_2()
+                        .px_3()
+                        .py_2()
                         .rounded(px(8.0))
                         .bg(colors.soft)
                         .child(
@@ -968,28 +1147,41 @@ fn remote_page(data: Data) -> impl IntoElement {
                                 .flex_1()
                                 .font_family(MONO)
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_size(px(15.0))
+                                .text_size(px(14.0))
                                 .text_color(colors.ink),
                         )
                         .child(when(!remote.pairing_expires_at.is_empty(), {
                             let at = remote.pairing_expires_at.clone();
-                            move || caption(format!("有效至 {}", short_time(&at)))
+                            move || caption(format!("至 {}", short_time(&at)))
                         }))
                         .child(link_button("复制", move || controller::copy(copy.clone()))),
                 );
-                c = c.child(hint("一次性配对码：在另一台设备的「兑换配对码」中输入，使用后立即失效。"));
             }
             c.into_element()
         }))
         .child(
             card()
                 .gap_2()
-                .child(caption("兑换配对码，添加远端主机"))
-                .child(row().child(secret_field(move || code.get(), |t: &str| controller::set_pair_field(true, t), "SESSION-… / vantry://connect…")))
+                .child(row().child(secret_field(
+                    move || code.get(),
+                    |t: &str| controller::set_pair_field(true, t),
+                    "SESSION-… / vantry://connect…",
+                )))
                 .child(
                     row()
-                        .child(field(move || name.get(), |t: &str| controller::set_pair_field(false, t), "这台主机的名称（可选）"))
-                        .child(primary_button(move || if redeeming() { "配对中…" } else { "配对" }, controller::pair_redeem).disabled(busy("pair.redeem"))),
+                        .child(field(
+                            move || name.get(),
+                            |t: &str| controller::set_pair_field(false, t),
+                            "主机名称（可选）",
+                        ))
+                        .child(
+                            primary_button(
+                                move || if redeeming() { "配对中…" } else { "配对" },
+                                controller::pair_redeem,
+                            )
+                            .h(px(32.0))
+                            .disabled(busy("pair.redeem")),
+                        ),
                 ),
         )
         .child(dynamic(move || {
@@ -999,27 +1191,38 @@ fn remote_page(data: Data) -> impl IntoElement {
             let confirm = controller::ui().with_untracked(|u| u.forms.confirm_revoke.clone());
             let remote = data.remote.clone().unwrap_or_default();
             let mut column = view().flex_col().gap_2();
-            column = column.child(caption(format!("已配对主机 · {}", remote.peers().len())));
-            if remote.peers().is_empty() {
-                column = column.child(hint("还没有已配对的主机。"));
-            }
-            for peer in remote.peers() {
-                column = column.child(peer_row(peer.clone(), confirm.as_deref() == Some(peer.id.as_str())));
-            }
-            if !remote.clients().is_empty() {
-                column = column.child(caption(format!("允许访问本机的设备 · {}", remote.clients().len())));
-                for client in remote.clients() {
-                    column = column.child(client_row(client.clone(), confirm.as_deref() == Some(client.id.as_str())));
+            if !remote.peers().is_empty() {
+                column = column.child(title(&format!("已配对主机 ({})", remote.peers().len())));
+                for peer in remote.peers() {
+                    column = column.child(peer_row(
+                        peer.clone(),
+                        confirm.as_deref() == Some(peer.id.as_str()),
+                    ));
                 }
             }
-            column = column.child(caption(format!("远端环境 · {}", data.environments.len())));
-            for env in data.environments.clone() {
-                column = column.child(environment_row(env));
+            if !remote.clients().is_empty() {
+                column = column.child(title(&format!("授权设备 ({})", remote.clients().len())));
+                for client in remote.clients() {
+                    column = column.child(client_row(
+                        client.clone(),
+                        confirm.as_deref() == Some(client.id.as_str()),
+                    ));
+                }
+            }
+            if !data.environments.is_empty() {
+                column = column.child(title(&format!("远端环境 ({})", data.environments.len())));
+                for env in data.environments.clone() {
+                    column = column.child(environment_row(env));
+                }
             }
             column = column.child(
                 row()
-                    .child(caption(format!("项目 · {}", data.projects.len())).flex_1())
-                    .child(link_button("添加项目目录", controller::project_add).disabled(busy("project.add"))),
+                    .pt_1()
+                    .child(title(&format!("项目 ({})", data.projects.len())).flex_1())
+                    .child(
+                        ghost_button("添加目录", controller::project_add)
+                            .disabled(busy("project.add")),
+                    ),
             );
             for project in data.projects.clone() {
                 column = column.child(project_row(project));
@@ -1124,86 +1327,78 @@ fn project_row(project: ProjectEntry) -> impl IntoElement {
 }
 
 fn security_page(data: Data) -> impl IntoElement {
+    let colors = palette();
     let policy = computed(|| controller::ui().with(|u| u.default_policy.clone()));
     let sandbox = computed(move || data.with(|d| d.as_ref().and_then(|d| d.sandbox.clone())));
-    let content = view()
+    view()
         .flex_col()
         .gap_3()
-        .child(title("新会话默认工具权限"))
+        .child(title("默认工具权限"))
         .child(
-            card().children(APPROVAL_POLICIES.iter().map(|(value, label)| {
+            card().gap_0().py_1().children(APPROVAL_POLICIES.iter().enumerate().map(|(idx, (value, label))| {
                 let value = *value;
-                let (name, detail) = match value {
-                    "ask" => ("逐项询问", "执行工具前逐项确认。"),
-                    "auto-accept-edits" => (
-                        "自动改文件 · 命令询问",
-                        "文件修改自动应用；运行命令前询问你。",
-                    ),
-                    "auto" => ("自动执行", "直接运行命令与修改文件，适合可信项目。"),
-                    _ => (*label, ""),
+                let name = match value {
+                    "ask" => "逐项询问",
+                    "auto-accept-edits" => "改文件自动 · 命令询问",
+                    "auto" => "自动执行",
+                    _ => *label,
                 };
                 nsh_base::button()
                     .accessibility_label(name)
                     .selected(move || policy.get() == value)
                     .on_press(move || controller::set_default_policy(value.into()))
-                    .min_h(px(56.0))
-                    .px_3()
+                    .h(px(42.0))
+                    .px_1()
+                    .style_when(move || idx > 0, |s| s.border_t_1().border_t_color(colors.line_soft))
                     .flex_row()
                     .items_center()
-                    .child(
-                        view()
-                            .flex_1()
-                            .flex_col()
-                            .child(setting_label(name))
-                            .child(hint(detail)),
-                    )
-                    .child(
-                        text(move || if policy.get() == value { "◉" } else { "○" })
-                            .text_color(palette().accent),
-                    )
+                    .child(setting_label(name).flex_1().font_weight(FontWeight::MEDIUM))
+                    .child(when(
+                        move || policy.get() == value,
+                        move || crate::icons::icon(crate::icons::Icon::Check, 15.0, colors.accent),
+                    ))
             })),
         )
-        .child(title("工作区沙箱隔离"))
+        .child(title("工作区沙箱"))
         .child(
             card()
                 .gap_2()
-                .child(when(move || sandbox.with(|s|s.as_ref().is_some_and(|v|v.env_override)),
-                    ||hint("VANTRY_SANDBOX_MODE 已锁定此设置")))
-                .children(
-                    SANDBOX_MODES
-                        .iter()
-                        .filter(|(mode, _, _)| *mode != "read-only")
-                        .map(|(mode, label, help)| {
-                            let mode_on = (*mode).to_owned();
-                            let mode_set = (*mode).to_owned();
-                            let needs_support = *mode == "workspace-write";
-                            row()
-                                .child(
-                                    pill(
-                                        *label,
-                                        move || {
-                                            sandbox.with(|s| {
-                                                s.as_ref().is_some_and(|s| s.mode == mode_on)
-                                            })
-                                        },
-                                        move || controller::sandbox_set(mode_set.clone()),
-                                    )
-                                    .disabled(move || {
-                                        busy("sandbox")()
-                                            || sandbox.with(|s| match s {
-                                                None => true,
-                                                Some(s) => {
-                                                    s.env_override
-                                                        || (needs_support && !s.supported)
-                                                }
-                                            })
-                                    }),
+                .child(when(
+                    move || sandbox.with(|s| s.as_ref().is_some_and(|v| v.env_override)),
+                    || hint("VANTRY_SANDBOX_MODE 已锁定"),
+                ))
+                .child(
+                    row().children(
+                        SANDBOX_MODES
+                            .iter()
+                            .filter(|(mode, _, _)| *mode != "read-only")
+                            .map(|(mode, label, _)| {
+                                let mode_on = (*mode).to_owned();
+                                let mode_set = (*mode).to_owned();
+                                let needs_support = *mode == "workspace-write";
+                                pill(
+                                    *label,
+                                    move || {
+                                        sandbox.with(|s| {
+                                            s.as_ref().is_some_and(|s| s.mode == mode_on)
+                                        })
+                                    },
+                                    move || controller::sandbox_set(mode_set.clone()),
                                 )
-                                .child(hint(*help))
-                        }),
+                                .disabled(move || {
+                                    busy("sandbox")()
+                                        || sandbox.with(|s| match s {
+                                            None => true,
+                                            Some(s) => {
+                                                s.env_override
+                                                    || (needs_support && !s.supported)
+                                            }
+                                        })
+                                })
+                            }),
+                    ),
                 ),
-        );
-    content
+        )
 }
 
 fn update_page(data: Data) -> impl IntoElement {
@@ -1211,69 +1406,91 @@ fn update_page(data: Data) -> impl IntoElement {
     let working = busy("update");
     view()
         .flex_col()
-        .gap_2()
-        .child(title("应用更新"))
-        .child(text(format!("Vantry {}", env!("CARGO_PKG_VERSION"))).text_size(px(13.0)).text_color(colors.ink))
+        .gap_3()
         .child(dynamic(move || {
-            let Some(update) = data.with(|d| d.as_ref().map(|d| d.update.clone())) else {
-                return hint("正在读取更新状态…").into_element();
+            let update = data.with(|d| d.as_ref().map(|d| d.update.clone()));
+            let Some(update) = update else {
+                return card()
+                    .child(
+                        row()
+                            .child(
+                                text(format!("Vantry {}", env!("CARGO_PKG_VERSION")))
+                                    .flex_1()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(13.5))
+                                    .text_color(colors.ink),
+                            )
+                            .child(
+                                ghost_button("检查更新", || controller::update_op(names::UPDATE_CHECK))
+                                    .disabled(busy("update")),
+                            ),
+                    )
+                    .into_element();
             };
-            let size = if update.delta_available {
-                format!("增量包 {:.1} MB", update.delta_size as f64 / 1_000_000.0)
-            } else if update.asset_size > 0 {
-                format!("完整包 {:.1} MB", update.asset_size as f64 / 1_000_000.0)
+            let current = if update.current_version.is_empty() {
+                env!("CARGO_PKG_VERSION").to_owned()
             } else {
-                "完整包".to_owned()
+                update.current_version.clone()
             };
             if !update.available {
                 return card()
-                    .child(hint(format!(
-                        "当前 {} 已是最新版本。",
-                        if update.current_version.is_empty() { env!("CARGO_PKG_VERSION") } else { &update.current_version }
-                    )))
+                    .child(
+                        row()
+                            .child(
+                                text(format!("Vantry {current}"))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(13.5))
+                                    .text_color(colors.ink),
+                            )
+                            .child(badge("已是最新", colors.success))
+                            .child(view().flex_1())
+                            .child(when(working.clone(), || hint("检查中…")))
+                            .child(
+                                ghost_button("检查更新", || controller::update_op(names::UPDATE_CHECK))
+                                    .disabled(busy("update")),
+                            ),
+                    )
                     .into_element();
             }
+            let size = if update.delta_available {
+                format!("增量 {:.1} MB", update.delta_size as f64 / 1_000_000.0)
+            } else if update.asset_size > 0 {
+                format!("{:.1} MB", update.asset_size as f64 / 1_000_000.0)
+            } else {
+                String::new()
+            };
             card()
-                .gap_2()
+                .gap_2p5()
                 .child(
                     row()
                         .child(super::dot(colors.accent))
-                        .child(text(format!("有新版本 {}", update.latest_version)).flex_1().font_weight(FontWeight::SEMIBOLD).text_size(px(13.0)).text_color(colors.ink))
-                        .child(badge(size, colors.muted)),
+                        .child(
+                            text(format!("Vantry {current} → {}", update.latest_version))
+                                .flex_1()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(13.5))
+                                .text_color(colors.ink),
+                        )
+                        .child(when(!size.is_empty(), {
+                            let size = size.clone();
+                            move || badge(size.clone(), colors.muted)
+                        }))
+                        .child(if update.staged {
+                            primary_button("重启更新", || controller::update_op(names::UPDATE_INSTALL))
+                                .disabled(busy("update"))
+                                .into_element()
+                        } else {
+                            primary_button("下载更新", || controller::update_op(names::UPDATE_DOWNLOAD))
+                                .disabled(busy("update"))
+                                .into_element()
+                        }),
                 )
                 .child(when(!update.notes.is_empty(), {
                     let notes = update.notes.clone();
                     move || hint(notes.clone())
                 }))
-                .child(hint(if update.staged {
-                    format!(
-                        "已下载 {}{}，{}",
-                        update.staged_version,
-                        if update.used_delta { "（增量）" } else { "" },
-                        if update.can_auto_restart { "可重启安装。" } else { "请退出后运行安装程序。" }
-                    )
-                } else if update.delta_available {
-                    "将优先下载增量包，失败时自动回退完整包。".to_owned()
-                } else {
-                    "下载完成后可重启安装。".to_owned()
-                }))
-                .child(
-                    row()
-                        .child(view().flex_1())
-                        .child(if update.staged {
-                            primary_button("重启并更新", || controller::update_op(names::UPDATE_INSTALL)).disabled(busy("update")).into_element()
-                        } else {
-                            primary_button("下载更新", || controller::update_op(names::UPDATE_DOWNLOAD)).disabled(busy("update")).into_element()
-                        }),
-                )
                 .into_element()
         }))
-        .child(
-            row()
-                .child(when(working.clone(), || hint("正在处理更新…")))
-                .child(view().flex_1())
-                .child(ghost_button("检查更新", || controller::update_op(names::UPDATE_CHECK)).disabled(busy("update"))),
-        )
 }
 
 fn usage_page(data: Data) -> impl IntoElement {

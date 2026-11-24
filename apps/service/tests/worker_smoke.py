@@ -46,7 +46,13 @@ class Model(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         self.server.requests.append((self.path, self.headers.get('Authorization'), body))
         tools = [m['content'] for m in body['messages'] if m['role'] == 'tool']
-        if tools:
+        if not body.get('tools') and any('Name this conversation' in str(m['content']) for m in body['messages']):
+            self.server.title_started.set()
+            self.server.title_release.wait(8)
+            deltas = [({'role': 'assistant', 'content': '会话链接渲染'}, None), ({}, 'stop')]
+        elif any('标题回归' in str(m['content']) for m in body['messages'] if m['role'] == 'user'):
+            deltas = [({'role': 'assistant', 'content': '正常回复'}, None), ({}, 'stop')]
+        elif tools:
             deltas = [({'role': 'assistant', 'content': 'recorded'}, None), ({}, 'stop')]
         else:
             call = {'index': 0, 'id': 'call_1', 'type': 'function',
@@ -67,6 +73,8 @@ class Model(BaseHTTPRequestHandler):
 def running_model():
     with ThreadingHTTPServer(('127.0.0.1', 0), Model) as server:
         server.requests = []
+        server.title_started = threading.Event()
+        server.title_release = threading.Event()
         worker = threading.Thread(target=server.serve_forever)
         worker.start()
         try: yield server
@@ -75,11 +83,26 @@ def running_model():
             worker.join()
 
 
+def test_environment(home, root):
+    env = {key: os.environ[key] for key in ('SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    env.update(HOME=str(home), USERPROFILE=str(home), APPDATA=str(home / 'AppData' / 'Roaming'),
+               LOCALAPPDATA=str(home / 'AppData' / 'Local'), TMPDIR=str(root), TEMP=str(root), TMP=str(root),
+               PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', NO_PROXY='127.0.0.1,localhost',
+               PATH=os.environ['PATH'] if os.name == 'nt' else os.defpath)
+    return env
+
+
+def kill_worker(process):
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)], capture_output=True, timeout=10)
+    else:
+        os.killpg(process.pid, signal.SIGKILL)
+
+
 def run_case(root, server, decision):
     home, data, cwd = (root / name for name in ['home', 'data', 'work'])
     for d in (home, data, cwd): d.mkdir(parents=True)
-    env = {'HOME': str(home), 'PATH': os.defpath, 'TMPDIR': str(root), 'PI_OFFLINE':'1',
-           'NO_PROXY':'127.0.0.1,localhost', 'PI_SKIP_VERSION_CHECK':'1'}
+    env = test_environment(home, root)
     agent = home / '.pi/agent'
     if decision == 'allow':
         agent = home / 'explicit-pi'
@@ -98,7 +121,7 @@ def run_case(root, server, decision):
         dump(path, doc)
     subprocess.run(setup_cmd, input=json.dumps(setup), text=True, env=env, check=True, timeout=15)
     assert load(agent/'auth.json')['other']['key'] == 'unrelated'
-    assert (agent/'auth.json').stat().st_mode & 0o777 == 0o600
+    if os.name == 'posix': assert (agent/'auth.json').stat().st_mode & 0o777 == 0o600
     assert load(agent/'settings.json')['extraSetting']
     assert load(agent/'models.json')['providers']['local']['models'] == [{'id':'fixture','name':'Keep me'}]
     ext = agent/'extensions/probe.ts'
@@ -113,7 +136,7 @@ def run_case(root, server, decision):
     cmd = [BINARY, 'provider-worker', '--job-dir', str(job)]
     initial = len(server.requests)
     proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            start_new_session=True, text=True)
+                            start_new_session=os.name == 'posix', text=True)
     def deliver(control):
         subprocess.run([BINARY,'worker-control','--job-dir',str(job)],input=json.dumps(control),
                        text=True,env=env,check=True,timeout=10)
@@ -129,7 +152,7 @@ def run_case(root, server, decision):
             if dialogs and not responded:
                 responded = True
                 if decision == 'crash':
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    kill_worker(proc)
                     proc.wait(timeout=10)
                     with (job/'events.jsonl').open('ab') as journal: journal.write(b'{"sequence":')
                     recovery = subprocess.run(cmd, env=env, capture_output=True, timeout=10)
@@ -151,7 +174,7 @@ def run_case(root, server, decision):
         assert result['status']==expected_status, (decision, result, logs)
         assert responded, (decision, logs, events())
     finally:
-        if proc.poll() is None: os.killpg(proc.pid, signal.SIGKILL)
+        if proc.poll() is None: kill_worker(proc)
         proc.wait()
         proc.stdout.close()
     log = events()
@@ -186,6 +209,63 @@ def run_case(root, server, decision):
         assert load(data/'jobs/a2/result.json')['status']=='completed'
 
 
+def check_session_titles(root, model):
+    root.mkdir()
+    data = root / 'data'
+    env = test_environment(root, root)
+    env['PI_CODING_AGENT_DIR'] = str(root / 'pi')
+    setup = dict(providerId='local', baseUrl=f'http://127.0.0.1:{model.server_port}/v1',
+                 apiKey='local-fixture', models=['fixture'], setDefault=True)
+    subprocess.run([BINARY, 'pi-setup'], input=json.dumps(setup), text=True, env=env, check=True, timeout=10)
+    def ctl(*args):
+        raw = subprocess.check_output([BINARY, 'ctl', '--data-dir', data, *args], env=env, timeout=10)
+        return json.loads(raw)
+    # Reproduce the expensive pre-run add in a disposable repository.
+    def git(*args):
+        return subprocess.run(['git', '-C', root, *args], env=env, check=True,
+                              text=True, capture_output=True, timeout=10).stdout
+    git('init', '-q')
+    git('config', 'user.name', 'fixture')
+    git('config', 'user.email', 'test@localhost')
+    git('commit', '--allow-empty', '-qm', 'base')
+    git('config', 'filter.wait.clean', 'sleep 10')
+    git('config', 'filter.wait.required', 'true')
+    (root / '.gitattributes').write_text('waiting.bin filter=wait\n')
+    (root / 'waiting.bin').write_text('untracked')
+    (root / '.gitignore').write_text('/pi/\n/data/\n')
+    core = subprocess.Popen([BINARY, 'core', '--data-dir', data, '--provider', 'pi', '--model', 'local/fixture', '--workspace', root], env=env)
+    try:
+        for _ in range(200):
+            if (data / 'core.sock').exists(): break
+            assert core.poll() is None
+            time.sleep(.025)
+        prompt = '[旧会话](vantry-thread://old) 标题回归：粘贴链接后需要显示可点击的标题'
+        for manual in (False, True):
+            model.title_started.clear()
+            model.title_release.clear()
+            thread = ctl('create')['threadId']
+            run = ctl('send', '--thread', thread, '--message', prompt)['runId']
+            assert model.title_started.wait(8), 'no model title request within the pre-run budget'
+            if not manual:
+                assert not git('for-each-ref', '--format=%(refname)', 'refs/vantry/checkpoints/')
+                (root / 'waiting.bin').unlink()
+            else:
+                assert git('for-each-ref', '--format=%(refname)', 'refs/vantry/checkpoints/').strip().endswith(run)
+            assert ctl('thread-wait', '--thread', thread, '--run', run)['summary'] == '正常回复'
+            if manual: ctl('rename', '--thread', thread, '--title', '用户命名')
+            model.title_release.set()
+            for _ in range(100):
+                title = ctl('thread-read', '--thread', thread)['thread'].get('title')
+                if title: break
+                time.sleep(.025)
+            assert title == ('用户命名' if manual else '会话链接渲染'), title
+    finally:
+        model.title_release.set()
+        core.terminate()
+        core.wait(timeout=10)
+
+
 with tempfile.TemporaryDirectory() as directory, running_model() as model:
+    check_session_titles(Path(directory) / 'titles', model)
     for decision in ['allow', 'deny', 'timeout', 'cancel', 'steer', 'crash']:
         run_case(Path(directory) / decision, model, decision)

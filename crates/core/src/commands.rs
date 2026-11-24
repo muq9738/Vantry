@@ -43,8 +43,8 @@ pub(crate) fn apply(db: &Connection, c: &Command, options: &CoreOptions) -> Resu
     ) {
         return Err(invalid("unsupported approvalPolicy"));
     }
-    if c.attachments.len() > 8 {
-        return Err(invalid("at most eight attachments are supported"));
+    if c.attachments.len() > crate::attachments::MAX_ATTACHMENTS {
+        return Err(invalid("at most 32 attachments are supported"));
     }
     match c.kind {
         CreateThread | OpenProjectChat => create_thread(db, c, options),
@@ -394,7 +394,7 @@ fn input_receipt(i: &Input) -> Receipt {
     }
 }
 fn send(db: &Connection, c: &Command) -> Result<Receipt> {
-    if c.message.trim().is_empty() {
+    if c.message.trim().is_empty() && (c.kind != SendMessage || c.attachments.is_empty()) {
         return Err(invalid("message is required"));
     }
     let key = if c.kind == InterThreadSend {

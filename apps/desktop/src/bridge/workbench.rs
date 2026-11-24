@@ -225,7 +225,7 @@ pub trait WorkbenchBridge: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
     /// Models, plugins, MCP servers, updates and peers.
-    fn settings(&self) -> BridgeFuture<SettingsData>;
+    fn settings(&self, workspace: String) -> BridgeFuture<SettingsData>;
     /// Makes file `path` an attachment for the next message.
     fn attach(&self, path: PathBuf) -> BridgeFuture<Attachment>;
     /// A Core workbench action (`POST /v1/workbench`); [`actions`] builds

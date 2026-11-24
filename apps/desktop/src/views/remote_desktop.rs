@@ -5,11 +5,15 @@
 //! canvas the media stream draws into. Paired hosts come from the remote
 //! access settings; a failed start shows why and offers a retry.
 
-use nsh_core::prelude::*;
+use nsh_core::{
+    element::desktop::{MenuItem, popup_menu},
+    prelude::*,
+};
 
 use super::{caption, dot, ghost_button, link_button, pill, primary_button};
 use crate::{
     controller,
+    icons::{Icon, icon},
     state::ui::{Catalogs, Quality, RemoteLink, Resolution},
     theme::palette,
 };
@@ -50,11 +54,10 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
         .child(
             view()
                 .flex_row()
-                .flex_wrap()
                 .items_center()
                 .gap_2()
+                .h(px(44.0))
                 .px_5()
-                .py_2()
                 .border_b_1()
                 .border_b_color(colors.line_soft)
                 .child(dot(link_color))
@@ -62,53 +65,115 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
                     text(move || remote.with(|r| r.status_label()))
                         .number_of_lines(1u32)
                         .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(colors.ink),
                 )
                 .child(
                     text(move || remote.with(|r| r.detail()))
                         .number_of_lines(1u32)
                         .text_size(px(11.5))
-                        .text_color(colors.muted),
+                        .text_color(colors.faint),
                 )
                 .child(view().flex_1())
-                .children(Resolution::ALL.map(|res| {
-                    pill(
-                        res.label(),
-                        move || remote.with(|r| r.resolution == res),
-                        move || controller::remote_update(move |r| r.resolution = res),
-                    )
-                }))
-                .child(view().w(px(6.0)))
-                .children(Quality::ALL.map(|q| {
-                    pill(
-                        q.label(),
-                        move || remote.with(|r| r.quality == q),
-                        move || controller::remote_update(move |r| r.quality = q),
-                    )
-                }))
-                .child(view().w(px(6.0)))
-                .child(pill(
-                    "适应窗口",
-                    move || remote.with(|r| r.fit),
-                    || controller::remote_update(|r| r.fit = !r.fit),
+                .child(when(
+                    move || connected() || busy(),
+                    move || {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                nsh_base::button()
+                                    .accessibility_label("分辨率")
+                                    .on_press(move || {
+                                        let cur = remote.with_untracked(|r| r.resolution);
+                                        let items = Resolution::ALL
+                                            .into_iter()
+                                            .map(|res| {
+                                                MenuItem::new(res.label())
+                                                    .checked(cur == res)
+                                                    .on_select(move || {
+                                                        controller::remote_update(move |r| {
+                                                            r.resolution = res
+                                                        })
+                                                    })
+                                            })
+                                            .collect();
+                                        drop(popup_menu(items));
+                                    })
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .h(px(26.0))
+                                    .px_2()
+                                    .rounded(px(6.0))
+                                    .bg(colors.soft)
+                                    .hover(|s| s.bg(colors.card))
+                                    .child(
+                                        text(move || remote.with(|r| r.resolution.label()))
+                                            .text_size(px(11.5))
+                                            .text_color(colors.ink),
+                                    )
+                                    .child(icon(Icon::ChevronDown, 11.0, colors.faint)),
+                            )
+                            .child(
+                                nsh_base::button()
+                                    .accessibility_label("画质")
+                                    .on_press(move || {
+                                        let cur = remote.with_untracked(|r| r.quality);
+                                        let items = Quality::ALL
+                                            .into_iter()
+                                            .map(|q| {
+                                                MenuItem::new(q.label())
+                                                    .checked(cur == q)
+                                                    .on_select(move || {
+                                                        controller::remote_update(move |r| {
+                                                            r.quality = q
+                                                        })
+                                                    })
+                                            })
+                                            .collect();
+                                        drop(popup_menu(items));
+                                    })
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .h(px(26.0))
+                                    .px_2()
+                                    .rounded(px(6.0))
+                                    .bg(colors.soft)
+                                    .hover(|s| s.bg(colors.card))
+                                    .child(
+                                        text(move || remote.with(|r| r.quality.label()))
+                                            .text_size(px(11.5))
+                                            .text_color(colors.ink),
+                                    )
+                                    .child(icon(Icon::ChevronDown, 11.0, colors.faint)),
+                            )
+                            .child(pill(
+                                "适应",
+                                move || remote.with(|r| r.fit),
+                                || controller::remote_update(|r| r.fit = !r.fit),
+                            ))
+                            .child(
+                                pill(
+                                    "键鼠",
+                                    move || remote.with(|r| r.control),
+                                    || controller::remote_update(|r| {
+                                        r.toggle_control();
+                                    }),
+                                )
+                                .disabled(move || !connected()),
+                            )
+                            .child(pill(
+                                "剪贴板",
+                                move || remote.with(|r| r.clipboard),
+                                || controller::remote_update(|r| r.clipboard = !r.clipboard),
+                            ))
+                            .child(ghost_button("断开", controller::remote_disconnect))
+                    },
                 ))
-                .child(
-                    pill(
-                        "键鼠控制",
-                        move || remote.with(|r| r.control),
-                        || controller::remote_update(|r| {
-                            r.toggle_control();
-                        }),
-                    )
-                    .disabled(move || !connected()),
-                )
-                .child(pill(
-                    "剪贴板同步",
-                    move || remote.with(|r| r.clipboard),
-                    || controller::remote_update(|r| r.clipboard = !r.clipboard),
-                ))
-                .child(when(move || connected() || busy(), || ghost_button("断开", controller::remote_disconnect)))
-                .child(link_button("退出远程桌面", controller::remote_exit)),
+                .child(link_button("退出", controller::remote_exit)),
         )
         .child(when(
             move || remote.with(|r| r.status.as_ref().is_some_and(|s| !s.missing_permissions().is_empty())),
@@ -288,32 +353,79 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
     let colors = palette();
     view()
         .w_full()
-        .max_w(px(420.0))
+        .max_w(px(460.0))
         .flex_col()
-        .gap_2()
+        .gap_3()
         .p_5()
         .rounded(px(14.0))
-        .bg(colors.card)
+        .bg(colors.raised)
         .border_1()
         .border_color(colors.line)
+        .shadow_md()
         .child(
-            text("连接远程桌面")
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(16.0))
-                .text_color(colors.ink),
+            view()
+                .flex_row()
+                .items_center()
+                .child(
+                    text("远程桌面")
+                        .flex_1()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(15.0))
+                        .text_color(colors.ink),
+                )
+                .child(ghost_button(
+                    || {
+                        if controller::ui().with(|u| u.remote.host_lan_link.is_empty()) {
+                            "共享本机"
+                        } else {
+                            "停止共享"
+                        }
+                    },
+                    controller::remote_host_toggle,
+                )),
         )
-        .child(caption("选择一台已配对的主机"))
+        .child(when(
+            || controller::ui().with(|u| !u.remote.host_lan_link.is_empty()),
+            || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2p5()
+                    .py_1p5()
+                    .rounded(px(8.0))
+                    .bg(colors.soft)
+                    .child(
+                        text(|| controller::ui().with(|u| u.remote.host_lan_link.clone()))
+                            .flex_1()
+                            .number_of_lines(1u32)
+                            .select_text()
+                            .font_family("Menlo")
+                            .text_size(px(11.0))
+                            .text_color(colors.muted),
+                    )
+                    .child(link_button("复制", || {
+                        let link = controller::ui().with_untracked(|u| u.remote.host_lan_link.clone());
+                        if !link.is_empty() {
+                            controller::copy(link);
+                        }
+                    }))
+            },
+        ))
         .child(when(
             move || controller::ui().with(|u| matches!(u.remote.link, RemoteLink::Failed { .. })),
             || {
                 view()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
                     .rounded(px(8.0))
                     .bg(colors.approval)
                     .child(
                         text(|| controller::ui().with(|u| u.remote.status_label()))
+                            .flex_1()
                             .select_text()
                             .text_size(px(12.0))
                             .text_color(colors.danger),
@@ -329,108 +441,98 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                     }))
             },
         ))
-        .child(when(
-            move || peers.with(Vec::is_empty),
-            || {
-                text("还没有已配对的主机。在 设置 › 远端互联与配对 中兑换配对码即可添加。")
-                    .text_size(px(12.0))
-                    .text_color(colors.faint)
-            },
-        ))
         .child(
             view()
-                .flex_col()
-                .gap_1p5()
-                .pt_2()
-                .border_t_1()
-                .border_t_color(colors.line_soft)
-                .child(caption("局域网直连（vantry-lan://）"))
+                .flex_row()
+                .items_center()
+                .gap_2()
                 .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            nsh_base::input()
-                                .value(|| controller::ui().with(|u| u.remote.direct_link.clone()))
-                                .on_change(|t: &str| {
-                                    let val = t.to_owned();
-                                    controller::remote_update(move |r| r.direct_link = val);
-                                })
-                                .placeholder("粘贴 vantry-lan:// 连接地址")
-                                .placeholder_color(move || color(colors.faint))
-                                .flex_1()
-                                .text_size(px(12.0))
-                                .text_color(colors.ink),
-                        )
-                        .child(
-                            primary_button("直连", || {
-                                let target = controller::ui()
-                                    .with_untracked(|u| u.remote.direct_link.trim().to_owned());
-                                if !target.is_empty() {
-                                    controller::remote_connect(target);
-                                }
-                            })
-                            .disabled(busy),
-                        ),
+                    nsh_base::input()
+                        .value(|| controller::ui().with(|u| u.remote.direct_link.clone()))
+                        .on_change(|t: &str| {
+                            let val = t.to_owned();
+                            controller::remote_update(move |r| r.direct_link = val);
+                        })
+                        .placeholder("vantry-lan:// 连接地址")
+                        .placeholder_color(move || color(colors.faint))
+                        .auto_correct(false)
+                        .auto_capitalize(AutoCapitalize::None)
+                        .flex_1()
+                        .h(px(32.0))
+                        .px_2p5()
+                        .rounded(px(8.0))
+                        .bg(colors.canvas)
+                        .border_1()
+                        .border_color(colors.line)
+                        .text_size(px(12.0))
+                        .text_color(colors.ink),
+                )
+                .child(
+                    primary_button("直连", || {
+                        let target = controller::ui()
+                            .with_untracked(|u| u.remote.direct_link.trim().to_owned());
+                        if !target.is_empty() {
+                            controller::remote_connect(target);
+                        }
+                    })
+                    .h(px(32.0))
+                    .disabled(busy),
                 ),
         )
-        .child(
-            view()
-                .flex_col()
-                .gap_1p5()
-                .pt_2()
-                .border_t_1()
-                .border_t_color(colors.line_soft)
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(caption("本机共享"))
-                        .child(view().flex_1())
-                        .child(ghost_button(
-                            || {
-                                if controller::ui().with(|u| u.remote.host_lan_link.is_empty()) {
-                                    "允许此电脑被控制"
-                                } else {
-                                    "停止共享"
-                                }
-                            },
-                            controller::remote_host_toggle,
-                        )),
-                )
-                .child(when(
-                    || controller::ui().with(|u| !u.remote.host_lan_link.is_empty()),
-                    || {
-                        text(|| controller::ui().with(|u| u.remote.host_lan_link.clone()))
-                            .select_text()
-                            .text_size(px(11.0))
-                            .text_color(colors.muted)
-                    },
-                )),
-        )
-        .child(each(
-            move || peers.get(),
-            |p: &(String, String)| p.0.clone(),
-            move |peer, _| {
-                let id = move || peer.with_untracked(|p| p.0.clone());
+        .child(when(
+            move || !peers.with(Vec::is_empty),
+            move || {
                 view()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        text(move || peer.with(|p| format!("{}（{}）", p.1, p.0)))
-                            .flex_1()
-                            .text_size(px(13.0))
-                            .text_color(colors.ink),
-                    )
-                    .child(
-                        primary_button(move || if busy() { "连接中…" } else { "连接" }, move || {
-                            controller::remote_connect(id())
-                        })
-                        .disabled(busy),
-                    )
+                    .flex_col()
+                    .gap_1p5()
+                    .pt_2()
+                    .border_t_1()
+                    .border_t_color(colors.line_soft)
+                    .child(caption("已配对主机"))
+                    .child(each(
+                        move || peers.get(),
+                        |p: &(String, String)| p.0.clone(),
+                        move |peer, _| {
+                            let id = move || peer.with_untracked(|p| p.0.clone());
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .px_2p5()
+                                .py_2()
+                                .rounded(px(8.0))
+                                .bg(colors.soft)
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            text(move || peer.with(|p| p.1.clone()))
+                                                .number_of_lines(1u32)
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_size(px(13.0))
+                                                .text_color(colors.ink),
+                                        )
+                                        .child(
+                                            text(move || peer.with(|p| p.0.clone()))
+                                                .number_of_lines(1u32)
+                                                .font_family("Menlo")
+                                                .text_size(px(10.5))
+                                                .text_color(colors.faint),
+                                        ),
+                                )
+                                .child(
+                                    primary_button(
+                                        move || if busy() { "连接中…" } else { "连接" },
+                                        move || controller::remote_connect(id()),
+                                    )
+                                    .h(px(30.0))
+                                    .disabled(busy),
+                                )
+                        },
+                    ))
             },
         ))
 }
