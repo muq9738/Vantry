@@ -163,7 +163,12 @@ async fn image_only_message_reaches_the_provider_without_placeholder_text() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open(dir.path(), true);
     let th = cmd(&h.core, "thread.create", json!({})).thread_id;
-    cmd(&h.core, "message.send", json!({"threadId": th, "attachments": [{"id":"file_img", "name":"image.png", "mime":"image/png", "size": 8}]}));
+    let image = json!({"id":"file_img", "name":"image.png", "mime":"image/png", "size": 8});
+    let dir = h.core.directory().join("attachments/file_img");
+    std::fs::create_dir_all(dir.join("content")).unwrap();
+    std::fs::write(dir.join("metadata.json"), image.to_string()).unwrap();
+    std::fs::write(dir.join("content/image.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    cmd(&h.core, "message.send", json!({"threadId": th, "attachments": [image]}));
     let e = h.next().await;
     assert!(e.req.message.is_empty());
     assert_eq!(e.req.attachments.unwrap()[0].id, "file_img");
