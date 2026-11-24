@@ -155,8 +155,14 @@ fn slash_suggestions(query: &str) -> Vec<Suggestion> {
 
 fn skill_suggestions(skills: &[(String, String)], query: &str) -> Vec<Suggestion> {
     let query = query.trim_start_matches("skill:").to_lowercase();
-    skills.iter().filter(|(name, desc)| name.to_lowercase().contains(&query) || desc.to_lowercase().contains(&query))
-        .map(|(name, desc)| Suggestion { key: format!("skill:{name}"), label: name.clone(), detail: desc.clone(), insert: name.clone(), kind: TriggerKind::Skill }).collect()
+    let mut matches: Vec<_> = skills.iter().filter_map(|(name, description)| {
+        let label = name.to_lowercase();
+        let rank = if label == query { 0 } else if label.starts_with(&query) { 1 }
+            else if label.contains(&query) { 2 } else if description.to_lowercase().contains(&query) { 3 } else { return None };
+        Some((rank, Suggestion { key: format!("skill:{name}"), label: name.clone(), detail: description.clone(), insert: name.clone(), kind: TriggerKind::Skill }))
+    }).collect();
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, item)| item).collect()
 }
 
 fn discover_files(workspace: &str, query: &str) -> Vec<Suggestion> {

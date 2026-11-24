@@ -274,7 +274,7 @@ mod tests {
 
     fn launch(args: &[&str]) -> LaunchConfig {
         let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
-        match cli::parse(&args, &|name| (name == "HOME").then(|| "/h".to_owned())).unwrap() {
+        match cli::parse(&args, &|name| matches!(name, "HOME" | "AppData").then(|| "/h".to_owned())).unwrap() {
             Invocation::Desktop(config) => *config,
             other => panic!("expected the desktop, got {other:?}"),
         }
@@ -379,12 +379,13 @@ mod tests {
             "/code/app",
         ]);
         assert!(should_autostart(&config));
+        let expected_data = std::path::absolute("/tmp/vd").unwrap();
         assert_eq!(
             ensure_core_args(&config),
             [
                 "ensure-core",
                 "--data-dir",
-                "/tmp/vd",
+                expected_data.to_str().unwrap(),
                 "--provider",
                 "controlled",
                 "--model",
@@ -401,7 +402,8 @@ mod tests {
         );
         let custom = launch(&["-data-dir", "/tmp/vd", "--socket", "/run/c.sock"]);
         let args = ensure_core_args(&custom);
-        assert_eq!(&args[3..5], ["--socket", "/run/c.sock"]);
+        let expected_socket = std::path::absolute("/run/c.sock").unwrap();
+        assert_eq!(&args[3..5], ["--socket", expected_socket.to_str().unwrap()]);
 
         assert!(!should_autostart(&launch(&["--mock"])));
         assert!(!should_autostart(&launch(&["--attach-only"])));

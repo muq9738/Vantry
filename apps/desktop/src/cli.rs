@@ -437,6 +437,7 @@ mod tests {
                 .iter()
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| (*v).to_owned())
+                .or_else(|| (cfg!(windows) && name == "AppData").then(|| String::from(r"C:\Users\test\AppData\Roaming")))
         }
     }
 
@@ -453,7 +454,9 @@ mod tests {
             &[],
             &env_with(&[("HOME", "/Users/u"), ("XDG_CONFIG_HOME", "/x")]),
         );
-        let expected = if cfg!(target_os = "macos") {
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\test\AppData\Roaming\Vantry")
+        } else if cfg!(target_os = "macos") {
             PathBuf::from("/Users/u/Library/Application Support/Vantry")
         } else {
             PathBuf::from("/x/Vantry")
@@ -477,7 +480,7 @@ mod tests {
             &["desktop"],
             &env_with(&[("VANTRY_DATA_DIR", "/srv/vantry")]),
         );
-        assert_eq!(config.data_dir, PathBuf::from("/srv/vantry"));
+        assert_eq!(config.data_dir, std::path::absolute("/srv/vantry").unwrap());
     }
 
     #[test]
@@ -495,7 +498,7 @@ mod tests {
             ],
             &env_with(&[]),
         );
-        assert_eq!(config.data_dir, PathBuf::from("/tmp/v"));
+        assert_eq!(config.data_dir, std::path::absolute("/tmp/v").unwrap());
         assert!(config.attach_only);
         assert_eq!(config.model.as_deref(), Some("openai/gpt"));
         assert_eq!(config.provider_id, "controlled");
@@ -518,7 +521,7 @@ mod tests {
         assert_eq!(
             config.endpoint,
             Endpoint::Local {
-                socket: PathBuf::from("/run/core.sock")
+                socket: std::path::absolute("/run/core.sock").unwrap()
             }
         );
     }
