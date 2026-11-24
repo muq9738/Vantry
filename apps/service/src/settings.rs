@@ -96,6 +96,7 @@ pub async fn mcp(r: &WorkbenchRequest, root: Option<PathBuf>) -> Result<MCPCatal
                 }
             }
             let _guard = TrustLock(lock);
+            let root = vantry_pi_runtime::mcp::project_trust_path(&root);
             change(&agent.join("trust.json"), |v| {
                 v[root.to_str().context("invalid path")?] = trusted.into();
                 Ok(())

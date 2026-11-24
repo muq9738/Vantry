@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::Write,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -150,12 +150,13 @@ impl Journal {
                     );
                 }
             }
-            let file = File::options().append(true).open(path)?;
+            let mut file = File::options().write(true).open(path)?;
             let (offset, tail) = reader.tail();
             if !tail.is_empty() {
                 disk::atomic(&dir.join("events.partial"), tail)?;
-                file.set_len(offset)?;
+                file.set_len(offset).context("truncate incomplete journal record")?;
             }
+            file.seek(SeekFrom::End(0))?;
             (file, reader.cursor())
         } else {
             (disk::new_file(&path)?, 0)

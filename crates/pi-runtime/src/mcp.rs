@@ -14,6 +14,9 @@ use std::{
 };
 use vantry_protocol::{MCPCatalog, MCPServerInfo};
 
+// Pi strips the Win32 verbatim path prefix before looking up a saved project trust decision.
+pub use pi_coding_agent::resources::paths::canonicalize as project_trust_path;
+
 fn flag(key: &str, fallback: bool) -> bool {
     match std::env::var(key)
         .unwrap_or_default()

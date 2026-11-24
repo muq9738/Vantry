@@ -84,7 +84,7 @@ async fn wait_health(client: &CoreClient) -> Result<()> {
 fn spawn_core(data: &Path, workspace: &Path, listen_remote: Option<&str>) -> Result<ChildGuard> {
     let agent = data.with_extension("pi-agent");
     std::fs::create_dir_all(&agent)?;
-    let root = workspace.canonicalize()?;
+    let root = vantry_pi_runtime::mcp::project_trust_path(workspace);
     std::fs::write(agent.join("trust.json"), serde_json::to_vec(&json!({(root.display().to_string()): true}))?)?;
     let mut cmd = Command::new(bin());
     cmd.env("PI_CODING_AGENT_DIR", agent).arg("core")

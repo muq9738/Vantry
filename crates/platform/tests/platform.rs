@@ -36,6 +36,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 fn repository(root: &Path) -> Result<Repository> {
     fs::create_dir(root)?;
     git(root, &["init", "-b", "main"]);
+    git(root, &["config", "core.autocrlf", "false"]);
     git(root, &["config", "user.name", "P4 Fixture"]);
     git(root, &["config", "user.email", "test@localhost"]);
     git(root, &["config", "commit.gpgsign", "false"]);

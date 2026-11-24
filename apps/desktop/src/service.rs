@@ -379,6 +379,7 @@ mod tests {
             "/code/app",
         ]);
         assert!(should_autostart(&config));
+        let expected_workspace = std::path::absolute("/code/app").unwrap();
         let expected_data = std::path::absolute("/tmp/vd").unwrap();
         assert_eq!(
             ensure_core_args(&config),
@@ -397,7 +398,7 @@ mod tests {
                 "--workspace-kind",
                 "directory",
                 "--workspace",
-                "/code/app",
+                expected_workspace.to_str().unwrap(),
             ]
         );
         let custom = launch(&["-data-dir", "/tmp/vd", "--socket", "/run/c.sock"]);

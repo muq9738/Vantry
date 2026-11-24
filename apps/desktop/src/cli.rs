@@ -559,7 +559,7 @@ mod tests {
         let config = desktop(&["-workspace", "/code/app"], &env);
         let spec = config.workspace.clone().unwrap();
         assert_eq!(spec.kind, "directory");
-        assert_eq!(spec.path, "/code/app");
+        assert_eq!(Path::new(&spec.path), std::path::absolute("/code/app").unwrap());
         assert_eq!(config.workspace_label(), "app");
         let config = desktop(
             &[
@@ -574,7 +574,7 @@ mod tests {
         );
         let spec = config.workspace.unwrap();
         assert_eq!(spec.kind, "worktree");
-        assert_eq!(spec.repository, "/code/repo");
+        assert_eq!(Path::new(&spec.repository), std::path::absolute("/code/repo").unwrap());
         assert_eq!(spec.branch, "feat/x");
         assert_eq!(spec.base_ref, "main");
         assert!(parse(&args(&["-workspace-kind", "worktree"]), &env).is_err());

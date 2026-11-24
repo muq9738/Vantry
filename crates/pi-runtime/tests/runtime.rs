@@ -203,10 +203,7 @@ fn mcp_override_projects_safe_fields_and_tracks_trust() -> Result<()> {
     assert_eq!(servers[2].tool_exposure["b"], "hidden");
     assert_eq!(servers[2].endpoint, "https://example.org");
     assert!(!serde_json::to_string(&c)?.contains("mcp-fixture-credential"));
-    save(
-        &agent.join("trust.json"),
-        json!({cwd.canonicalize()?.display().to_string():true}),
-    )?;
+    pi_coding_agent::resources::trust::ProjectTrustStore::new(&agent).set(&cwd, Some(true))?;
     assert!(mcp::mcp_catalog(&agent, Some(&cwd))?.project_trusted);
     Ok(())
 }

@@ -157,6 +157,8 @@ impl Provider {
             enable_user_mcp,
             sandbox_mode: String::new(),
         };
+        #[cfg(windows)]
+        hostfs::ensure_private_dir(&self.directory(&job.request)?)?;
         let dir = if controlled {
             let pause = ControlledStep::Delay {
                 millis: self.delay.as_millis().try_into()?,
