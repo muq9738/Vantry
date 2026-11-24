@@ -78,18 +78,15 @@ impl Draft {
 }
 
 impl AppState {
-    pub fn set_skill_mention(&mut self, text: &str, name: &str) {
-        self.set_draft_text(text);
-        let key = self.draft_key();
-        let draft = self.drafts.entry(key).or_default();
-        let display = format!("/{name}");
-        draft.mentions.retain(|m| m.display != display);
-        draft.mentions.push(DraftMention {
-            kind: 2,
-            display,
-            expand: format!("/skill:{name}"),
-            ..Default::default()
-        });
+    pub fn begin_attachment_import(&mut self, key: &str) {
+        *self.attachment_imports.entry(key.to_owned()).or_default() += 1;
+    }
+
+    pub fn finish_attachment_import(&mut self, key: &str) {
+        if let Some(count) = self.attachment_imports.get_mut(key) {
+            *count -= 1;
+            if *count == 0 { self.attachment_imports.remove(key); }
+        }
     }
 
     pub(super) fn restore_local_draft(&mut self, id: &str) -> bool {
@@ -111,7 +108,7 @@ impl AppState {
         if self.selected.is_none()
             && self.local_selected.is_some()
             && self.draft().is_blank()
-            && !self.attachment_imports.contains(&self.draft_key())
+            && !self.attachment_imports.contains_key(&self.draft_key())
             && self
                 .pending_by_key(&format!("submit:{}", self.draft_key()))
                 .is_none()
@@ -135,7 +132,7 @@ impl AppState {
 
     pub fn discard_local_draft(&mut self, id: &str) {
         if !self.local_order.iter().any(|item| item == id)
-            || self.attachment_imports.contains(id)
+            || self.attachment_imports.contains_key(id)
             || self.pending_by_key(&format!("submit:{id}")).is_some()
         {
             return;

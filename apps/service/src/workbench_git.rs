@@ -402,6 +402,10 @@ pub fn list_checkpoints(root: &Path) -> Result<Vec<Checkpoint>> {
 }
 
 pub fn capture_checkpoint(root: &Path, id: &str, label: &str) -> Result<Checkpoint> {
+    capture_with_index_timeout(root, id, label, Duration::from_secs(30))
+}
+
+pub fn capture_with_index_timeout(root: &Path, id: &str, label: &str, timeout: Duration) -> Result<Checkpoint> {
     let id = if id.trim().is_empty() {
         format!("cp-{}", Utc::now().format("%Y%m%d%H%M%S"))
     } else {
@@ -428,7 +432,7 @@ pub fn capture_checkpoint(root: &Path, id: &str, label: &str) -> Result<Checkpoi
             .env("GIT_TERMINAL_PROMPT", "0")
             .arg("--literal-pathspecs")
             .args(args);
-        let out = hostprocess::capture(&mut cmd, &[], Duration::from_secs(30), 4 << 20)?;
+        let out = hostprocess::capture(&mut cmd, &[], timeout, 4 << 20)?;
         ensure!(
             out.status.success(),
             "git {} failed: {}",
@@ -442,9 +446,9 @@ pub fn capture_checkpoint(root: &Path, id: &str, label: &str) -> Result<Checkpoi
         .ok()
         .map(|s| s.trim().to_owned());
     if let Some(ref h) = head {
-        let _ = run_with_index(&["read-tree", h]);
+        run_with_index(&["read-tree", h])?;
     }
-    let _ = run_with_index(&["add", "-A"]);
+    run_with_index(&["add", "-A"])?;
     let tree = run_with_index(&["write-tree"])?.trim().to_owned();
     let commit_id = if let Some(ref h) = head {
         git_ok(root, &["commit-tree", &tree, "-p", h, "-m", &msg])?
@@ -485,6 +489,7 @@ pub fn restore_checkpoint(root: &Path, id: &str) -> Result<Value> {
 struct TempFileGuard(PathBuf);
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.with_added_extension("lock"));
         let _ = std::fs::remove_file(&self.0);
     }
 }

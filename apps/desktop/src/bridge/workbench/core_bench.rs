@@ -324,15 +324,16 @@ impl WorkbenchBridge for CoreWorkbench {
 
     /// Every section at once; each one the Core does not serve keeps what
     /// the desktop knows itself and is named in `degraded`.
-    fn settings(&self) -> BridgeFuture<SettingsData> {
+    fn settings(&self, workspace: String) -> BridgeFuture<SettingsData> {
         let socket = self.socket.clone();
         let local = self.local.clone();
         let model = self.model.clone();
         Box::pin(async move {
-            let mut data = local.settings().await?;
+            let mut data = local.settings(workspace.clone()).await?;
             let mut jobs = tokio::task::JoinSet::new();
             for (index, action) in SECTIONS.iter().enumerate() {
                 let mut request = actions::request(action);
+                if *action == names::MCP_LIST { request.workspace.clone_from(&workspace); }
                 if *action == names::MODELS {
                     request.model = model.clone().unwrap_or_default();
                 }
@@ -580,7 +581,7 @@ mod tests {
         assert_eq!(models.catalog.unwrap().default, "openai/gpt");
         let err = fx.bench.workbench(actions::request(names::PLUGINS_LIST)).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotReady);
-        let settings = fx.bench.settings().await.unwrap();
+        let settings = fx.bench.settings(String::new()).await.unwrap();
         assert_eq!(settings.models.default, "openai/gpt", "the local catalog stays");
         assert_eq!(settings.update.current_version, env!("CARGO_PKG_VERSION"));
         let degraded: Vec<&str> = settings.degraded.iter().map(|(s, _)| s.as_str()).collect();
@@ -599,11 +600,15 @@ mod tests {
             }
             "plugins.list" => (200, json!({ "plugins": [{ "id": "usage", "name": "用量" }] })),
             "remote.status" => (200, json!({ "output": "{\"enabled\":true,\"peers\":[{\"id\":\"p1\",\"name\":\"工作室\"}]}" })),
+            "mcp.list" => {
+                assert_eq!(request["workspace"], "/work/current");
+                (200, json!({"mcp": {}}))
+            }
             "usage.summary" => (200, json!({ "output": "{\"threads\":2,\"totalTokens\":42}" })),
             "rd.status" => (500, json!({ "code": "internal_error", "message": "helper crashed" })),
             _ => api_error("invalid_command", "未知工作台操作"),
         }));
-        let settings = fx.bench.settings().await.unwrap();
+        let settings = fx.bench.settings("/work/current".into()).await.unwrap();
         assert_eq!(settings.models.thinking_levels, ["low", "high"]);
         assert_eq!(settings.plugins[0].id, "usage");
         assert_eq!(settings.peers[0].name, "工作室");

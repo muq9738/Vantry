@@ -17,6 +17,7 @@ use vantry_platform::{hostfs, workspace};
 use vantry_protocol::{ControlResponse, ProviderRequest, WorkspaceSpec};
 
 pub struct Provider {
+    pub core: vantry_core::Core,
     pub data: PathBuf,
     pub default_provider: String,
     pub model: String,
@@ -126,11 +127,14 @@ impl Provider {
             };
             let repo_root = repo.root().to_path_buf();
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = crate::workbench_git::capture_checkpoint(
+                if let Err(error) = crate::workbench_git::capture_with_index_timeout(
                     &repo_root,
                     &format!("run-{run_id}"),
                     &label,
-                );
+                    Duration::from_secs(2),
+                ) {
+                    tracing::warn!(%run_id, %error, "pre-run checkpoint skipped");
+                }
             })
             .await;
         }
@@ -201,6 +205,23 @@ impl Provider {
         });
         Ok(())
     }
+
+    fn schedule_initial_title(&self, request: &ProviderRequest, directory: &Path) {
+        if !self.core.needs_initial_title(request).unwrap_or(false) {
+            return;
+        }
+        let core = self.core.clone();
+        let path = directory.join("request.json");
+        tokio::spawn(async move {
+            let Ok(job) = File::open(path).and_then(|f| Ok(serde_json::from_reader::<_, JobRequest>(f)?)) else {
+                return;
+            };
+            let title = vantry_pi_runtime::summarize_title(&job).await;
+            if let Err(error) = core.set_initial_title(&job.request, &title) {
+                tracing::warn!(%error, "could not save session title");
+            }
+        });
+    }
 }
 fn live(dir: &Path) -> Result<bool> {
     let file = File::open(dir.join("worker.lock"))?;
@@ -242,6 +263,7 @@ impl DurableProvider for Provider {
         }
         let start = Instant::now();
         let checkpoint = dir.join("observer-cursor.json");
+        let mut title_pending = request.provider_id == "pi";
         let mut reader: Option<JobEvents> = None;
         loop {
             // Inspect the terminal marker before draining. The worker syncs all events first.
@@ -273,11 +295,16 @@ impl DurableProvider for Provider {
             if let Some(reader) = reader.as_mut() {
                 let before = reader.cursor();
                 while let Some(event) = reader.next_event().map_err(interrupted)? {
+                    let first_text = title_pending && !event.delta.is_empty();
                     emit(event).map_err(|error| match error.code() {
                         vantry_protocol::ErrorCode::Conflict
                         | vantry_protocol::ErrorCode::NotReady => ProviderError::Detached,
                         _ => interrupted(error),
                     })?;
+                    if first_text {
+                        title_pending = false;
+                        self.schedule_initial_title(&request, &dir);
+                    }
                 }
                 if reader.cursor() != before {
                     // SQLite's committed sequence is authoritative. An offset only accelerates Attach.
@@ -296,7 +323,10 @@ impl DurableProvider for Provider {
                     return Err(interrupted("inconsistent worker outcome"));
                 }
                 return match end.status.as_str() {
-                    "completed" => Ok(()),
+                    "completed" => {
+                        if title_pending { self.schedule_initial_title(&request, &dir); }
+                        Ok(())
+                    }
                     "cancelled" => Err(ProviderError::ExecutionCancelled),
                     "failed" => Err(failed(end.error)),
                     _ => Err(interrupted(end.error)),

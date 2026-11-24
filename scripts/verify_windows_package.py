@@ -161,12 +161,14 @@ def smoke_core(exe_path, env):
                 if not db_path.is_file():
                     raise AssertionError(f'未生成 SQLite 数据库文件: {db_path}')
             finally:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+                if process.poll() is None:
+                    try:
+                        subprocess.run([str(exe_path), 'ctl', '--data-dir', str(data_dir), 'shutdown-if-idle'],
+                                       env=env, check=True, capture_output=True, timeout=10)
+                        process.wait(timeout=10)
+                    except (subprocess.SubprocessError, OSError):
+                        subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)], env=env, capture_output=True, timeout=10)
+                        process.wait(timeout=5)
 
 
 def verify(package, arch='amd64', require_helper=False, skip_installer=False):

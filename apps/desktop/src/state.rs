@@ -18,6 +18,7 @@ mod draft;
 pub use draft::{Draft, DraftMention};
 pub mod approval;
 pub mod markdown;
+pub(crate) mod thread_links;
 pub mod language;
 pub mod persist;
 pub mod sidebar;
@@ -331,7 +332,7 @@ pub struct AppState {
     pub drafts: BTreeMap<String, Draft>,
     /// Unsent sessions in the v0.1.42 sidebar, separate from Core thread ids.
     pub local_order: Vec<String>,
-    pub attachment_imports: BTreeSet<String>,
+    pub attachment_imports: BTreeMap<String, usize>,
     pub local_selected: Option<String>,
     local_serial: u64,
     pub running_action: RunningAction,
@@ -370,7 +371,7 @@ impl Default for AppState {
             selected: None,
             drafts: BTreeMap::new(),
             local_order: Vec::new(),
-            attachment_imports: BTreeSet::new(),
+            attachment_imports: BTreeMap::new(),
             local_selected: None,
             local_serial: 0,
             running_action: RunningAction::default(),
@@ -670,7 +671,7 @@ impl AppState {
             can_submit: has_content
                 && (editing || pending.is_none())
                 && self.snapshot_loaded
-                && !self.attachment_imports.contains(&self.draft_key()),
+                && !self.attachment_imports.contains_key(&self.draft_key()),
             primary,
             can_stop: active.is_some_and(|run| !self.in_flight(&format!("stop:{}", run.id))),
             sending: !editing && pending.is_some_and(|p| p.in_flight),
@@ -1339,7 +1340,9 @@ impl AppState {
             send.interaction_mode = draft.mode.wire().to_owned();
             send.attachments = draft.attachments.clone();
             let mut create = Command::new(new_command_id("thread"), CommandKind::CreateThread);
-            create.title = title_from_message(&text);
+            if self.new_thread.provider_id == "controlled" {
+                create.title = title_from_message(&text);
+            }
             create.provider_id = self.new_thread.provider_id.clone();
             create.model = self.new_thread.model.clone();
             create.approval_policy = self.new_thread.approval_policy.clone();

@@ -539,7 +539,7 @@ fn the_first_message_creates_the_thread_then_sends() {
     state.toggle_mode();
     let create = state.submit().unwrap();
     assert_eq!(create.kind, CommandKind::CreateThread);
-    assert_eq!(create.title, "帮我看看这个仓库");
+    assert!(create.title.is_empty(), "Pi generates the title from the first task");
     assert_eq!(create.interaction_mode, "plan");
     assert!(state.draft().text.is_empty());
     assert!(state.composer_status().sending);

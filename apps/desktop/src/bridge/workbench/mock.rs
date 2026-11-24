@@ -344,7 +344,7 @@ impl WorkbenchBridge for MockWorkbench {
         ok(())
     }
 
-    fn settings(&self) -> BridgeFuture<SettingsData> {
+    fn settings(&self, _workspace: String) -> BridgeFuture<SettingsData> {
         ok(self.repo.lock().unwrap().settings.clone())
     }
 
@@ -919,7 +919,7 @@ mod tests {
     async fn demo_actions_change_what_settings_show() {
         let bench = MockWorkbench::demo();
         let run = |r| bench.workbench(r);
-        let mut data = bench.settings().await.unwrap();
+        let mut data = bench.settings(String::new()).await.unwrap();
         // MCP: switch off, add, probe, remove.
         let response = run(actions::mcp_set_enabled("magpie", false)).await.unwrap();
         data.absorb(names::MCP_UPSERT, &response);

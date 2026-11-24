@@ -155,6 +155,32 @@ impl Core {
             Ok(receipt)
         })
     }
+    pub fn needs_initial_title(&self, request: &ProviderRequest) -> Result<bool> {
+        self.read(|db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1 AND title='' AND
+                 (SELECT id FROM runs WHERE thread_id=?1 AND status NOT IN ('cancelled','failed','interrupted')
+                  ORDER BY created_at,id LIMIT 1)=?2)",
+                params![request.thread_id, request.run_id],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    pub fn set_initial_title(&self, request: &ProviderRequest, title: &str) -> Result<()> {
+        self.write(|db| {
+            if db.execute(
+                "UPDATE threads SET title=?3 WHERE id=?1 AND title='' AND
+                 (SELECT id FROM runs WHERE thread_id=?1 AND status NOT IN ('cancelled','failed','interrupted')
+                  ORDER BY created_at,id LIMIT 1)=?2",
+                params![request.thread_id, request.run_id, title],
+            )? > 0 {
+                thread_event(db, &request.thread_id, "thread.updated")?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.read(snapshot)
     }

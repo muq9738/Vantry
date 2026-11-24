@@ -20,6 +20,7 @@ use crate::{
     icons::{Icon, icon},
     state::{
         APPROVAL_POLICIES, InteractionMode, NoticeLevel, PrimaryAction, QueueItem, QueueItemKind,
+        thread_links::{compose, draft_parts, with_body},
         RunningAction, ui::SettingsPage, workbench::DockTab,
     },
     theme::{metrics, palette},
@@ -124,6 +125,7 @@ fn replace_trigger(draft: &str, trigger: &CompletionTrigger, insert: &str) -> (S
 
 fn slash_suggestions(query: &str) -> Vec<Suggestion> {
     const COMMANDS: &[(&str, &str)] = &[
+        ("/skills", "选择这台机器上的 Pi 技能"),
         ("/plan", "切换规划模式（只分析不改代码）"),
         ("/new", "新建空白会话"),
         ("/fork", "从当前会话分叉"),
@@ -151,55 +153,10 @@ fn slash_suggestions(query: &str) -> Vec<Suggestion> {
         .collect()
 }
 
-fn discover_skills(workspace: &str, query: &str) -> Vec<Suggestion> {
-    let mut roots = Vec::new();
-    if !workspace.is_empty() {
-        roots.push(Path::new(workspace).join(".pi/skills"));
-        roots.push(Path::new(workspace).join(".agents/skills"));
-    }
-    if let Ok(agent_dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        if !agent_dir.trim().is_empty() {
-            roots.push(Path::new(&agent_dir).join("skills"));
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        roots.push(Path::new(&home).join(".pi/agent/skills"));
-        roots.push(Path::new(&home).join(".gemini/config/skills"));
-    }
-    let q = query.trim().to_ascii_lowercase();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || !path.join("SKILL.md").is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !seen.insert(name.to_owned()) {
-                continue;
-            }
-            if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
-                continue;
-            }
-            out.push(Suggestion {
-                key: format!("skill:{name}"),
-                label: format!("${name}"),
-                detail: root.display().to_string(),
-                insert: format!("/{name} "),
-                kind: TriggerKind::Skill,
-            });
-            if out.len() >= 10 {
-                return out;
-            }
-        }
-    }
-    out
+fn skill_suggestions(skills: &[(String, String)], query: &str) -> Vec<Suggestion> {
+    let query = query.trim_start_matches("skill:").to_lowercase();
+    skills.iter().filter(|(name, desc)| name.to_lowercase().contains(&query) || desc.to_lowercase().contains(&query))
+        .map(|(name, desc)| Suggestion { key: format!("skill:{name}"), label: name.clone(), detail: desc.clone(), insert: name.clone(), kind: TriggerKind::Skill }).collect()
 }
 
 fn discover_files(workspace: &str, query: &str) -> Vec<Suggestion> {
@@ -266,13 +223,20 @@ fn choose_suggestion(state: Memo<Completions>, index: usize, editor: ElementRef)
     };
     let Some(item) = items.get(index) else { return };
     let slash = item.kind == TriggerKind::Slash;
-    let (text, caret) = replace_trigger(&draft, &trigger, if slash { "" } else { &item.insert });
-    if item.kind == TriggerKind::Skill {
-        let name = item.insert.trim().trim_start_matches('/');
-        controller::state().update(|s| s.set_skill_mention(&text, name));
-    } else {
-        controller::set_draft(&text);
-    }
+    let insert = match item.kind {
+        TriggerKind::Slash if item.insert == "/skills" => "/skill:",
+        TriggerKind::Slash | TriggerKind::Skill => "",
+        TriggerKind::File => &item.insert,
+    };
+    let (text, caret) = replace_trigger(&draft, &trigger, insert);
+    let source = controller::state().with_untracked(|s| {
+        let source = s.draft().text;
+        if item.kind == TriggerKind::Skill {
+            let (_, refs, _) = draft_parts(&source);
+            compose(Some(&item.insert), refs.iter().map(|r| r.source), &text)
+        } else { with_body(&source, &text) }
+    });
+    controller::set_draft(&source);
     editor.focus();
     editor.set_selection(caret, caret);
     if slash {
@@ -294,9 +258,58 @@ fn choose_suggestion(state: Memo<Completions>, index: usize, editor: ElementRef)
     }
 }
 
+fn reference_chips(links: Vec<(String, String)>) -> impl IntoElement {
+    let mut row = view().flex_row().flex_wrap().gap_2();
+    for (index, (title, url)) in links.into_iter().enumerate() {
+        let open = nsh_base::button()
+            .accessibility_label(title.clone())
+            .on_press(move || controller::open_link(url.clone()))
+            .child(text(title).underline().text_color(palette().info_ink));
+        let remove = super::small_icon_button(Icon::X, "移除会话引用", move || {
+            let source = controller::state().with_untracked(|s| s.draft().text);
+            let (skill, mut links, body) = draft_parts(&source);
+            if index < links.len() {
+                links.remove(index);
+                controller::set_draft(&compose(skill, links.iter().map(|link| link.source), body));
+            }
+        });
+        row = row.child(view().flex_row().items_center().gap_1().child(open).child(remove));
+    }
+    row
+}
+
+fn paste_into_composer(paste: &PasteEvent, editor: ElementRef, selection: Option<(u32, u32)>) {
+    if paste.files.iter().any(|f| f.mime.starts_with("image/")) {
+        controller::paste_images(paste);
+        return;
+    }
+    let copied = paste.text.trim();
+    if let Some(link) = vantry_protocol::ThreadLink::parse(copied)
+        && link.source == copied
+    {
+        let source = controller::state().with_untracked(|s| s.draft().text);
+        let (skill, mut links, body) = draft_parts(&source);
+        let (start, end) = selection.unwrap_or_default();
+        let mut body = body.to_owned();
+        if let (Some(a), Some(b)) = (caret_byte(&body, Some((start, start))), caret_byte(&body, Some((end, end)))) {
+            body.replace_range(a.min(b)..a.max(b), "");
+        }
+        links.push(link);
+        controller::set_draft(&compose(skill, links.iter().map(|link| link.source), &body));
+        if start != end { editor.set_selection(start.min(end), start.min(end)); }
+    } else if !paste.text.is_empty() {
+        editor.insert_text(paste.text.clone());
+    }
+}
+
 pub(crate) fn composer() -> impl IntoElement {
     let colors = palette();
     let draft = computed(|| controller::state().with(|s| s.draft()));
+    let body = computed(move || draft.with(|d| draft_parts(&d.text).2.to_owned()));
+    let selected_skill = computed(move || draft.with(|d| draft_parts(&d.text).0.map(str::to_owned)));
+    let references = computed(move || draft.with(|d| {
+        draft_parts(&d.text).1.into_iter().map(|link| (link.title, link.url.to_owned())).collect::<Vec<_>>()
+    }));
     let status = computed(|| controller::state().with(|s| s.composer_status()));
     let notice = computed(|| controller::state().with(|s| s.notice.clone()));
     let running_action = computed(|| controller::state().with(|s| s.running_action));
@@ -304,7 +317,7 @@ pub(crate) fn composer() -> impl IntoElement {
     let plan = computed(move || draft.with(|d| d.mode == InteractionMode::Plan));
     let attachments = computed(move || draft.with(|d| d.attachments.clone()));
     let importing =
-        computed(|| controller::state().with(|s| s.attachment_imports.contains(&s.draft_key())));
+        computed(|| controller::state().with(|s| s.attachment_imports.contains_key(&s.draft_key())));
     let running = computed(move || status.with(|s| s.can_stop));
     let editing = computed(move || status.with(|s| s.editing));
     let workspace = computed(|| controller::state().with(|s| s.current_project_key()));
@@ -358,21 +371,35 @@ pub(crate) fn composer() -> impl IntoElement {
             }
         }
     });
+    let skill_context = computed(move || {
+        let trigger = active_trigger(&body.get(), selection.get())?;
+        if matches!(trigger.kind, TriggerKind::File) { return None; }
+        Some(controller::state().with(|s| (s.selected.clone().unwrap_or_default(), s.current_workspace().map(|w| w.path.clone()).unwrap_or_default())))
+    });
+    let skills = signal(Vec::<(String,String)>::new());
+    effect(move || {
+        let ctx = skill_context.get();
+        skills.set(Vec::new());
+        if let Some((id, workspace)) = ctx.clone() {
+            spawn(async move {
+                let result = controller::composer_skills(id, workspace).await;
+                if skill_context.get_untracked() == ctx { skills.set(result); }
+            });
+        }
+    });
     let completion = computed(move || {
         if dismissed.get() || composing.get() {
             return None;
         }
-        let text = draft.with(|d| d.text.clone());
+        let text = body.get();
         let trigger = active_trigger(&text, selection.get())?;
         let items = match trigger.kind {
             TriggerKind::Slash => {
                 let mut choices = slash_suggestions(&trigger.query);
-                if let Some(path) = root.get() {
-                    choices.extend(discover_skills(&path, &trigger.query));
-                }
+                choices.extend(skill_suggestions(&skills.get(), &trigger.query));
                 choices
             }
-            TriggerKind::Skill => discover_skills(&root.get()?, &trigger.query),
+            TriggerKind::Skill => skill_suggestions(&skills.get(), &trigger.query),
             TriggerKind::File => discover_files(&root.get()?, &trigger.query),
         };
         (!items.is_empty()).then_some((text, trigger, items))
@@ -494,6 +521,19 @@ pub(crate) fn composer() -> impl IntoElement {
                             move || importing.get(),
                             move || super::caption("正在添加附件…"),
                         ))
+                        .child(when(move || selected_skill.with(Option::is_some), move || {
+                            view().flex_row().items_center().gap_1()
+                                .child(icon(Icon::Sparkles, 13.0, colors.info_ink))
+                                .child(text(move || selected_skill.get().unwrap_or_default()).text_color(colors.info_ink))
+                                .child(super::small_icon_button(Icon::X, "移除技能", || {
+                                    let source = controller::state().with_untracked(|s| s.draft().text);
+                                    controller::set_draft(crate::state::thread_links::skill_prefix(&source).1);
+                                }))
+                        }))
+                        .child(when(
+                            move || references.with(|links| !links.is_empty()),
+                            move || dynamic(move || reference_chips(references.get())),
+                        ))
                         .child(
                             nsh_base::input()
                                 .element_ref(&editor)
@@ -513,11 +553,16 @@ pub(crate) fn composer() -> impl IntoElement {
                                 })
                                 .multiline(true)
                                 .submit_behavior(move || if send_with_enter.get() { SubmitBehavior::Submit } else { SubmitBehavior::Newline })
-                                .value(move || draft.with(|d| d.text.clone()))
+                                .value(move || body.get())
+                                .paste_behavior(PasteBehavior::Report)
+                                .on_paste(move |paste: &PasteEvent| {
+                                    paste_into_composer(paste, editor, selection.get_untracked());
+                                })
                                 .on_change(move |text: &str| {
                                     dismissed.set(false);
                                     active.set(0);
-                                    controller::set_draft(text);
+                                    let source = controller::state().with_untracked(|s| with_body(&s.draft().text, text));
+                                    controller::set_draft(&source);
                                 })
                                 .on_submit(move |_: &str| {
                                     if composing.get_untracked() {
@@ -1217,7 +1262,7 @@ fn running_action_switch(action: Memo<RunningAction>) -> impl IntoElement {
         ))
 }
 
-fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
+pub(super) fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
     let colors = palette();
     let preview = signal(None::<String>);
     let source = controller::state().with_untracked(|s| {
@@ -1279,13 +1324,13 @@ fn attachment_chips(attachments: Memo<Vec<Attachment>>) -> impl IntoElement {
                         icon(Icon::Paperclip, 12.0, colors.muted).into_element()
                     }
                 }))
-                .child(
+                .child(when(move || attachment.with(|a| !a.mime.starts_with("image/")), move ||
                     text(move || attachment.with(|a| a.name.clone()))
                         .number_of_lines(1u32)
                         .max_w(px(220.0))
                         .text_size(px(11.5))
-                        .text_color(colors.ink),
-                )
+                        .text_color(colors.ink)
+                ))
                 .child(
                     nsh_base::button()
                         .accessibility_label("移除附件")

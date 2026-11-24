@@ -7,6 +7,8 @@ pub mod mcp;
 mod pdf;
 mod sandbox;
 mod session;
+mod title;
+pub use title::summarize_title;
 pub use attachments::attachment_payload;
 pub use catalog::{
     MagpieSelection, ResolvedModelCatalog, SkillInfo, discover_skills, model_catalog,

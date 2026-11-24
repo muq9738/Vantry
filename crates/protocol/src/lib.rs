@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 mod api;
 mod provider;
+mod thread_link;
+pub use thread_link::{THREAD_SCHEME, ThreadLink, thread_markdown};
 pub use api::*;
 pub use provider::*;
 

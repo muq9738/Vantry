@@ -63,7 +63,7 @@ pub enum TimelineItem {
         run_id: String,
         text: Arc<str>,
         plan: bool,
-        attachments: Vec<String>,
+        attachments: Vec<vantry_protocol::Attachment>,
     },
     /// The model's thinking (collapsible).
     Reasoning {
@@ -407,13 +407,13 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
     let run = parts.run;
     let active = !run.status.terminal();
     let mut items = Vec::new();
-    if !run.input.is_empty() {
+    if !run.input.is_empty() || !run.attachments.is_empty() {
         items.push(TimelineItem::User {
             id: format!("user:{}", run.id),
             run_id: run.id.clone(),
             text: Arc::from(run.input.as_str()),
             plan: run.interaction_mode == "plan",
-            attachments: run.attachments.iter().map(|a| a.name.clone()).collect(),
+            attachments: run.attachments.clone(),
         });
     }
     if !run.reasoning.is_empty() {

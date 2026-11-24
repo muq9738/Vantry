@@ -178,7 +178,17 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     });
     let text_of = move || user.with(|u| u.as_ref().map(|u| u.1.to_string()).unwrap_or_default());
     let plan = move || user.with(|u| u.as_ref().is_some_and(|u| u.2));
-    let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.join("、")).unwrap_or_default());
+    let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.clone()).unwrap_or_default());
+    let visible_text = computed(move || {
+        let text = text_of();
+        let mut body = text.as_str();
+        let files = attachments();
+        while let Some(after) = files.iter().filter(|a| a.mime.starts_with("image/") && a.name.starts_with("pasted-image-"))
+            .find_map(|a| body.strip_prefix(&format!("@{}", a.name))) {
+            body = after.trim_start();
+        }
+        body.to_owned()
+    });
     let run_id = move || user.with_untracked(|u| u.as_ref().map(|u| u.0.clone()).unwrap_or_default());
     // Rewind and fork need the run finished and the thread idle.
     let settled = computed(move || {
@@ -212,20 +222,27 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                         .flex_row()
                         .items_end()
                         .gap_1p5()
-                        .child(
+                        .child(when(move || !visible_text.get().trim().is_empty(), move ||
                             view()
                                 .px_4()
                                 .py_2p5()
                                 .rounded(px(16.0))
                                 .bg(colors.user)
-                                .child(
-                                    text(text_of)
+                                .child(dynamic(move || {
+                                    let text = visible_text.get();
+                                    let (skill, body) = crate::state::thread_links::skill_prefix(&text);
+                                    let mut inlines = crate::state::thread_links::message_inlines(body);
+                                    if let Some(name) = skill {
+                                        inlines.insert(0, crate::state::markdown::Inline::Text(" ".into()));
+                                        inlines.insert(0, crate::state::markdown::Inline::Code(name.to_owned()));
+                                    }
+                                    markdown::inline_text(&inlines)
                                         .select_text()
                                         .text_size(px(metrics::BODY))
                                         .line_height(LineHeight::Multiple(1.55))
-                                        .text_color(colors.ink),
-                                ),
-                        )
+                                        .text_color(colors.ink)
+                                }))
+                        ))
                         .child(
                             view()
                                 .pb_1()
@@ -237,18 +254,16 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                 )
                 .child(when(
                     move || !attachments().is_empty(),
-                    move || {
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(icon(Icon::Paperclip, 12.0, colors.muted))
-                            .child(
-                                text(attachments)
-                                    .text_size(px(11.5))
-                                    .text_color(colors.muted),
-                            )
-                    },
+                    move || view().flex_row().flex_wrap().items_center().gap_1().child(each(
+                        attachments,
+                        |item: &vantry_protocol::Attachment| item.id.clone(),
+                        |item, _| dynamic(move || {
+                            let item = item.get();
+                            if item.mime.starts_with("image/") {
+                                super::composer::attachment_thumbnail(item).into_element()
+                            } else { super::caption(item.name).into_element() }
+                        }),
+                    )),
                 ))
                 .child(when(
                     move || hovered.get() && settled.get(),
@@ -427,7 +442,7 @@ fn tool_status_color(status: ToolStatus) -> AdaptiveColor {
         ToolStatus::Running => colors.accent,
         ToolStatus::AwaitingApproval => colors.warning,
         ToolStatus::Completed => colors.success,
-        ToolStatus::Failed | ToolStatus::Interrupted => colors.danger,
+        ToolStatus::Failed | ToolStatus::Interrupted => colors.muted,
     }
 }
 
@@ -491,11 +506,9 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
                         .text_size(px(12.0))
                         .text_color(colors.muted),
                 )
-                .child(
-                    text(move || status().label())
-                        .text_size(px(11.0))
-                        .text_color(move || tool_status_color(status())),
-                )
+                .child(when(move || open.get() || matches!(status(), ToolStatus::Running | ToolStatus::AwaitingApproval), move ||
+                    text(move || status().label()).text_size(px(11.0)).text_color(move || tool_status_color(status()))
+                ))
                 .child(dynamic(move || {
                     icon(
                         if open.get() {
@@ -523,7 +536,7 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || tool.with(|t| t.as_ref().is_some_and(|t| !t.4.is_empty())),
+            move || open.get() && tool.with(|t| t.as_ref().is_some_and(|t| !t.4.is_empty())),
             move || {
                 view().px_3().py_2().bg(colors.code).child(
                     text(field(|t| t.4.clone()))

@@ -143,7 +143,11 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
                 let href = url.clone();
                 text(label.clone())
                     .underline()
-                    .text_color(colors.accent)
+                    .text_color(if url.starts_with(vantry_protocol::THREAD_SCHEME) {
+                        colors.info_ink
+                    } else {
+                        colors.accent
+                    })
                     .cursor(Cursor::Pointer)
                     .tooltip(text(url.clone()).text_size(px(11.5)))
                     .on_press(move || controller::open_link(href.clone()))

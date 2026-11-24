@@ -32,13 +32,7 @@ fn link(t: &Thread) -> String {
     } else {
         t.title.trim()
     };
-    format!(
-        "[{}](vantry-thread://{})",
-        name.replace('[', "(")
-            .replace(']', ")")
-            .replace(['\n', '\r'], " "),
-        t.id
-    )
+    thread_markdown(name, &format!("{THREAD_SCHEME}{}", t.id))
 }
 fn status(s: RunStatus) -> String {
     json!(s).as_str().unwrap_or_default().into()

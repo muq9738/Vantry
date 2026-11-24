@@ -60,6 +60,7 @@ struct Bridges {
     core: Option<Arc<dyn CoreBridge>>,
     workbench: Option<Arc<dyn WorkbenchBridge>>,
     core_socket: Option<PathBuf>,
+    peer_id: Option<String>,
     state_path: Option<PathBuf>,
     mock: bool,
 }
@@ -164,6 +165,10 @@ pub(crate) fn start(config: &LaunchConfig) {
         core: Some(core.clone()),
         workbench: Some(workbench.clone()),
         core_socket,
+        peer_id: match &config.endpoint {
+            Endpoint::Peer { id, .. } => Some(id.clone()),
+            _ => None,
+        },
         state_path: state_path.clone(),
         mock,
     });
@@ -489,8 +494,22 @@ pub(crate) fn open_link(url: String) {
     let trimmed = url.trim();
     if let Some(rest) = trimmed.strip_prefix("vantry-thread://") {
         let thread_id = rest.split(['?', '#']).next().unwrap_or("").trim();
-        if !thread_id.is_empty() {
+        let environment = rest.split_once('?').and_then(|(_, query)| {
+            query.split('&').find_map(|p| p.strip_prefix("environmentId="))
+        });
+        if let Some(env) = environment.filter(|v| !v.is_empty())
+            && !bridges(|b| match &b.peer_id {
+                Some(peer) => peer == env,
+                None => env == "local" || b.core_socket.as_deref().and_then(|p| p.parent())
+                    .and_then(|p| std::fs::read_to_string(p.join("environment-id")).ok())
+                    .is_some_and(|id| id.trim() == env),
+            })
+        {
+            warn("请在链接所属的机器中打开会话。");
+        } else if state().with_untracked(|s| s.thread(thread_id).is_some()) {
             select_thread(thread_id.to_owned());
+        } else {
+            warn("找不到链接中的会话。");
         }
         return;
     }
@@ -703,6 +722,22 @@ pub(crate) fn reopen_request(id: String) {
     state().update(move |s| s.reopen_request(&id));
 }
 
+pub(crate) fn copy_thread_link(id: String) {
+    let title = state().with_untracked(|s| s.thread(&id).map(crate::state::sidebar::display_title));
+    let Some(title) = title else { return };
+    let mut url = format!("{}{id}", vantry_protocol::THREAD_SCHEME);
+    if let Some(peer) = bridges(|b| b.peer_id.clone()) {
+        url.push_str(&format!("?environmentId={peer}"));
+    }
+    let escape = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let mut item = ClipboardItem::default();
+    item.text = vantry_protocol::thread_markdown(&title, &url);
+    item.html = Some(format!("<a href=\"{}\">{}</a>", escape(&url), escape(&title)));
+    set_clipboard_item(item);
+}
+
 /// Copies `text` to the clipboard and says so.
 pub(crate) fn copy(text: String) {
     set_clipboard(text);
@@ -875,17 +910,59 @@ pub(crate) fn cancel_queued(id: String) {
 
 // ------------------------------------------------------------- attachments
 
+pub(crate) async fn composer_skills(thread_id: String, workspace: String) -> Vec<(String,String)> {
+    let Some(bridge) = workbench() else { return Vec::new() };
+    let request = WorkbenchRequest { action: "skills.list".into(), thread_id, workspace, ..Default::default() };
+    let result = call(bridge.workbench(request)).await;
+    let result = match result {
+        Ok(value) => value,
+        Err(err) => { warn(format!("读取 Pi 技能失败：{}", err.message)); return Vec::new(); }
+    };
+    let catalog = serde_json::from_str::<serde_json::Value>(&result.output).unwrap_or_default();
+    catalog["skills"].as_array().into_iter().flatten().filter_map(|skill| {
+        Some((skill["name"].as_str()?.to_owned(), skill["description"].as_str().unwrap_or_default().to_owned()))
+    }).collect()
+}
+
+pub(crate) fn paste_images(paste: &PasteEvent) {
+    use base64::Engine;
+    let Some(bridge) = workbench() else { return };
+    let key = state().with_untracked(|s| s.draft_key());
+    let mut images = Vec::new();
+    for file in paste.files.iter().filter(|f| f.mime.starts_with("image/")) {
+        if !(1..=8 << 20).contains(&file.data.len()) { warn("图片须在 8 MB 以内。"); continue; }
+        images.push((file.name.clone(),file.data.clone()));
+    }
+    if images.is_empty() { return; }
+    state().update(|s| s.begin_attachment_import(&key));
+    spawn_for_window(async move {
+        for (name, bytes) in images {
+            let mut req = actions::request(names::ATTACHMENT_IMPORT);
+            req.name = name;
+            req.data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            match call(bridge.workbench(req)).await {
+                Ok(response) => match response.attachment {
+                    Some(item) => state().update(|s| s.add_attachment_to(key.clone(), item, None)),
+                    None => warn("Core 没有返回图片附件。"),
+                },
+                Err(err) => warn(format!("无法粘贴图片：{}", err.message)),
+            }
+        }
+        state().update(|s| s.finish_attachment_import(&key));
+    });
+}
+
 /// Picks files and attaches them to the shown draft.
 pub(crate) fn pick_attachments() {
     let Some(workbench) = workbench() else {
         return;
     };
-    if state().with_untracked(|s| s.attachment_imports.contains(&s.draft_key())) {
+    if state().with_untracked(|s| s.attachment_imports.contains_key(&s.draft_key())) {
         return;
     }
     let key = state().with_untracked(|s| s.draft_key());
     state().update(|s| {
-        s.attachment_imports.insert(key.clone());
+        s.begin_attachment_import(&key);
     });
     spawn_for_window(async move {
         let picked = pick_paths(
@@ -908,7 +985,7 @@ pub(crate) fn pick_attachments() {
             Err(error) => warn(format!("无法打开文件选择器：{error}")),
         }
         state().update(|s| {
-            s.attachment_imports.remove(&key);
+            s.finish_attachment_import(&key);
         });
     });
 }
@@ -1055,8 +1132,9 @@ fn load_catalogs(already_marked: bool) {
     let Some(workbench) = workbench() else {
         return;
     };
+    let workspace = bench().with_untracked(|b| b.root.clone());
     spawn_for_window(async move {
-        let result = call(workbench.settings()).await.map_err(|e| e.message);
+        let result = call(workbench.settings(workspace)).await.map_err(|e| e.message);
         ui().update(move |u| u.on_catalogs(result));
     });
 }

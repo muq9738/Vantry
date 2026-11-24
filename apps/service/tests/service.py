@@ -267,7 +267,7 @@ for line in sys.stdin:
             try:
                 wb('pi.setup.save',input={'providerId':'isolated','models':['fixture'],'apiKey':'fixture',
                    'baseUrl':f'http://127.0.0.1:{server.server_port}/v1','setDefault':True})
-                pi_thread=ctl('create','--provider','pi','--model','isolated/fixture')['threadId']
+                pi_thread=ctl('create','--title','Worker recovery','--provider','pi','--model','isolated/fixture')['threadId']
                 pi_run=ctl('send','--thread',pi_thread,'--message','stream once')['runId']
                 def first_output():
                     run=next(r for r in ctl('snapshot')['runs'] if r['id']==pi_run)

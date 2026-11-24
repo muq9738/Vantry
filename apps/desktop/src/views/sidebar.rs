@@ -587,6 +587,7 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
     let until = if row.snoozed { None } else { Some(24) };
     let snooze_id = row.id.clone();
     vec![
+        action("复制会话链接", controller::copy_thread_link),
         action("重命名", controller::begin_rename),
         action(
             if row.pinned { "取消置顶" } else { "置顶" },

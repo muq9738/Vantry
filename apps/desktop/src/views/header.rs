@@ -418,6 +418,10 @@ pub(crate) fn header() -> impl IntoElement {
                                     view()
                                         .flex_col()
                                         .gap_0p5()
+                                        .child(menu_item(Icon::Copy, "复制会话链接", move || {
+                                            more_open.set(false);
+                                            controller::copy_thread_link(thread_id());
+                                        }))
                                         .child(menu_item(
                                             Icon::Pencil,
                                             "重命名会话",

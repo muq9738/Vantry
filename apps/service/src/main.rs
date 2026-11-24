@@ -245,6 +245,7 @@ async fn serve(args: CoreArgs) -> Result<()> {
         args.magpie_settings.clone(),
     )?);
     let provider = Arc::new(provider::Provider {
+        core: core.clone(),
         data: data.clone(),
         default_provider: provider_id,
         model,
