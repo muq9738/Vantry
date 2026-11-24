@@ -50,13 +50,23 @@ def verify_pe_architecture(binary_path, expected_arch='amd64'):
             )
 
 
+def resolve_service_exe(folder):
+    for rel in ['libexec/vantry-service.exe', 'vantry-service.exe']:
+        candidate = folder / rel
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        f'缺少随包服务程序: {folder / "libexec" / "vantry-service.exe"} (或 {folder / "vantry-service.exe"})'
+    )
+
+
 def check_layout(folder, expected_arch='amd64', require_helper=False):
-    for rel in ['Vantry.exe', 'vantry-service.exe', 'LICENSE', 'THIRD_PARTY_NOTICES.md']:
+    for rel in ['Vantry.exe', 'LICENSE', 'THIRD_PARTY_NOTICES.md']:
         target = folder / rel
         if not target.is_file():
             raise AssertionError(f'缺少随包文件: {target}')
     verify_pe_architecture(folder / 'Vantry.exe', expected_arch)
-    verify_pe_architecture(folder / 'vantry-service.exe', expected_arch)
+    verify_pe_architecture(resolve_service_exe(folder), expected_arch)
 
     licenses_dir = folder / 'third_party' / 'licenses'
     if not licenses_dir.is_dir():

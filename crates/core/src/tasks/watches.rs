@@ -1,4 +1,43 @@
 use super::*;
+
+/// Register a durable v11 watch inside a write transaction. If the target run
+/// has already reached a terminal state, deliver immediately so callers never
+/// miss a completion that raced registration.
+pub(crate) fn register(
+    db: &Connection,
+    watcher_thread_id: &str,
+    target_thread_id: &str,
+    target_run_id: &str,
+) -> Result<String> {
+    if watcher_thread_id.trim().is_empty() || target_thread_id.trim().is_empty() {
+        return Err(invalid("watcher and target thread IDs are required"));
+    }
+    if watcher_thread_id == target_thread_id {
+        return Err(invalid("a thread cannot watch itself"));
+    }
+    let _ = thread(db, watcher_thread_id)?;
+    let _ = thread(db, target_thread_id)?;
+    if !target_run_id.is_empty() {
+        let r = run(db, target_run_id)?;
+        if r.thread_id != target_thread_id {
+            return Err(invalid("targetRunId does not belong to targetThreadId"));
+        }
+    }
+    let watch_id = id("watch");
+    let ts = now();
+    db.execute(
+        "INSERT INTO thread_watches(id,watcher_thread_id,target_thread_id,target_run_id,status,created_at,updated_at) VALUES(?,?,?,?,'pending',?,?)",
+        params![watch_id, watcher_thread_id, target_thread_id, target_run_id, ts, ts],
+    )?;
+    if !target_run_id.is_empty() {
+        let r = run(db, target_run_id)?;
+        if r.status.terminal() {
+            deliver(db, &r)?;
+        }
+    }
+    Ok(watch_id)
+}
+
 /// A pending v11 watch and its wake-up input transition in the same transaction.
 pub(crate) fn deliver(db: &Connection, r: &Run) -> Result<()> {
     if !r.status.terminal() {

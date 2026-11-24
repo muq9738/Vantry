@@ -150,8 +150,16 @@ pub(crate) fn remote_desktop() -> impl IntoElement {
         )
 }
 
-/// The canvas container: a 16:10 frame that the media stream fills.
+/// The live remote desktop canvas: renders incoming frames via NSH [`image`]
+/// and forwards normalized pointer, wheel and keyboard events when `control`
+/// is enabled.
 fn canvas_view(remote: Memo<crate::state::ui::RemoteDesktopState>) -> impl IntoElement {
+    let normalize = |x: f32, y: f32| -> (f64, f64) {
+        let (w, h) = controller::ui().with_untracked(|u| u.remote.canvas_size);
+        let w = if w > 1 { w as f64 } else { 960.0 };
+        let h = if h > 1 { h as f64 } else { 600.0 };
+        ((x as f64 / w).clamp(0.0, 1.0), (y as f64 / h).clamp(0.0, 1.0))
+    };
     view()
         .test_id(CANVAS_ID)
         .w_full()
@@ -159,26 +167,119 @@ fn canvas_view(remote: Memo<crate::state::ui::RemoteDesktopState>) -> impl IntoE
         .aspect_ratio(1.6)
         .items_center()
         .justify_center()
+        .overflow_hidden()
         .rounded(px(10.0))
         .bg(AdaptiveColor::rgb(0x0F1012, 0x0B0C0E))
         .border_1()
         .border_color(move || if remote.with(|r| r.control) { PALETTE.accent } else { PALETTE.line })
-        .child(
-            text(move || {
-                remote.with(|r| {
-                    format!(
-                        "{} · {} · {} · {}{}",
-                        r.peer().unwrap_or("远程主机"),
-                        r.resolution.label(),
-                        r.quality.label(),
-                        if r.fit { "适应窗口" } else { "1:1" },
-                        if r.control { " · 键鼠已接管" } else { "" }
-                    )
+        .on_layout(|bounds: &Bounds<Points>| {
+            let w = bounds.size.width.0.max(0.0).round() as u32;
+            let h = bounds.size.height.0.max(0.0).round() as u32;
+            controller::remote_update(move |r| r.canvas_size = (w, h));
+        })
+        .on_mouse_move(move |e: &MouseEvent| {
+            let (x, y) = normalize(e.position.x.0, e.position.y.0);
+            controller::remote_send_input(serde_json::json!({
+                "kind": "mouse_move",
+                "x": x,
+                "y": y,
+                "shift": e.modifiers.shift,
+                "ctrl": e.modifiers.ctrl,
+                "alt": e.modifiers.alt,
+                "meta": e.modifiers.cmd,
+            }));
+        })
+        .on_press_down(move |e: &PressEvent| {
+            let (x, y) = normalize(e.position.x.0, e.position.y.0);
+            controller::remote_send_input(serde_json::json!({
+                "kind": "mouse_down",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "shift": e.modifiers.shift,
+                "ctrl": e.modifiers.ctrl,
+                "alt": e.modifiers.alt,
+                "meta": e.modifiers.cmd,
+            }));
+        })
+        .on_press_up(move |e: &PressEvent| {
+            let (x, y) = normalize(e.position.x.0, e.position.y.0);
+            controller::remote_send_input(serde_json::json!({
+                "kind": "mouse_up",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "shift": e.modifiers.shift,
+                "ctrl": e.modifiers.ctrl,
+                "alt": e.modifiers.alt,
+                "meta": e.modifiers.cmd,
+            }));
+        })
+        .on_wheel(move |e: &WheelEvent| {
+            let (x, y) = normalize(e.position.x.0, e.position.y.0);
+            let (dx, dy) = match e.delta {
+                WheelDelta::Points(p) => (p.x.0 as f64, p.y.0 as f64),
+                WheelDelta::Lines(p) => (p.x as f64 * 24.0, p.y as f64 * 24.0),
+            };
+            controller::remote_send_input(serde_json::json!({
+                "kind": "wheel",
+                "x": x,
+                "y": y,
+                "dx": dx,
+                "dy": dy,
+                "shift": e.modifiers.shift,
+                "ctrl": e.modifiers.ctrl,
+                "alt": e.modifiers.alt,
+                "meta": e.modifiers.cmd,
+            }));
+        })
+        .on_key_down(|e: &KeyEvent| {
+            controller::remote_send_input(serde_json::json!({
+                "kind": "key_down",
+                "key": e.key.as_ref(),
+                "code": e.code.as_ref(),
+                "shift": e.modifiers.shift,
+                "ctrl": e.modifiers.ctrl,
+                "alt": e.modifiers.alt,
+                "meta": e.modifiers.cmd,
+            }));
+        })
+        .on_key_up(|e: &KeyEvent| {
+            controller::remote_send_input(serde_json::json!({
+                "kind": "key_up",
+                "key": e.key.as_ref(),
+                "code": e.code.as_ref(),
+                "shift": e.modifiers.shift,
+                "ctrl": e.modifiers.ctrl,
+                "alt": e.modifiers.alt,
+                "meta": e.modifiers.cmd,
+            }));
+        })
+        .child(dynamic(move || {
+            let uri = remote.with(|r| r.frame_uri.clone());
+            if let Some(src) = uri {
+                image(src)
+                    .w_full()
+                    .h_full()
+                    .into_element()
+            } else {
+                text(move || {
+                    remote.with(|r| {
+                        format!(
+                            "{} · {} · {} · {} · 等待首帧…{}",
+                            r.peer().unwrap_or("远程主机"),
+                            r.resolution.label(),
+                            r.quality.label(),
+                            if r.fit { "适应窗口" } else { "1:1" },
+                            if r.control { " · 键鼠已接管" } else { "" }
+                        )
+                    })
                 })
-            })
-            .text_size(px(13.0))
-            .text_color(AdaptiveColor::rgb(0xA9A6A1, 0xA9A6A1)),
-        )
+                .text_size(px(13.0))
+                .text_color(AdaptiveColor::rgb(0xA9A6A1, 0xA9A6A1))
+                .into_element()
+            }
+        }))
 }
 
 fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Copy + 'static) -> impl IntoElement {
@@ -233,6 +334,79 @@ fn peer_picker(peers: Memo<Vec<(String, String)>>, busy: impl Fn() -> bool + Cop
                     .text_color(PALETTE.faint)
             },
         ))
+        .child(
+            view()
+                .flex_col()
+                .gap_1p5()
+                .pt_2()
+                .border_t_1()
+                .border_t_color(PALETTE.line_soft)
+                .child(caption("局域网直连（vantry-lan://）"))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            nsh_base::input()
+                                .value(|| controller::ui().with(|u| u.remote.direct_link.clone()))
+                                .on_change(|t: &str| {
+                                    let val = t.to_owned();
+                                    controller::remote_update(move |r| r.direct_link = val);
+                                })
+                                .placeholder("粘贴 vantry-lan:// 连接地址")
+                                .placeholder_color(move || color(PALETTE.faint))
+                                .flex_1()
+                                .text_size(px(12.0))
+                                .text_color(PALETTE.ink),
+                        )
+                        .child(
+                            primary_button("直连", || {
+                                let target = controller::ui()
+                                    .with_untracked(|u| u.remote.direct_link.trim().to_owned());
+                                if !target.is_empty() {
+                                    controller::remote_connect(target);
+                                }
+                            })
+                            .disabled(busy),
+                        ),
+                ),
+        )
+        .child(
+            view()
+                .flex_col()
+                .gap_1p5()
+                .pt_2()
+                .border_t_1()
+                .border_t_color(PALETTE.line_soft)
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(caption("本机共享"))
+                        .child(view().flex_1())
+                        .child(ghost_button(
+                            || {
+                                if controller::ui().with(|u| u.remote.host_lan_link.is_empty()) {
+                                    "允许此电脑被控制"
+                                } else {
+                                    "停止共享"
+                                }
+                            },
+                            controller::remote_host_toggle,
+                        )),
+                )
+                .child(when(
+                    || controller::ui().with(|u| !u.remote.host_lan_link.is_empty()),
+                    || {
+                        text(|| controller::ui().with(|u| u.remote.host_lan_link.clone()))
+                            .select_text()
+                            .text_size(px(11.0))
+                            .text_color(PALETTE.muted)
+                    },
+                )),
+        )
         .child(each(
             move || peers.get(),
             |p: &(String, String)| p.0.clone(),

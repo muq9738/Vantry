@@ -13,6 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use vantry_connectivity::{
     desktop_client::DesktopClient,
+    desktop_media::{DesktopFrame, DesktopHost, DesktopViewer, InputEvent, LanTicket},
     identity::{IdentityStore, Pair},
     peer::{self, Route},
 };
@@ -29,8 +30,16 @@ pub struct Workbench {
     updater: AsyncMutex<UpdateManager>,
     plugins: Mutex<plugins::Host>,
     desktop: AsyncMutex<Option<(DesktopClient, String, String)>>,
-    environment: String,
+    desktop_host: AsyncMutex<Option<Arc<DesktopHost>>>,
+    desktop_viewer: AsyncMutex<Option<Arc<DesktopViewer>>>,
+    pub environment: String,
 }
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 pub fn api_error(e: anyhow::Error) -> vantry_core::Error {
     match e.downcast::<vantry_core::Error>() {
         Ok(e) => e,
@@ -69,6 +78,8 @@ impl Workbench {
             updater,
             plugins,
             desktop: AsyncMutex::new(None),
+            desktop_host: AsyncMutex::new(None),
+            desktop_viewer: AsyncMutex::new(None),
             environment,
         })
     }
@@ -147,7 +158,7 @@ impl Workbench {
                 out.output = json!({
                     "id": self.environment, "name": host.name,
                     "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
-                    "home": std::env::var_os("HOME").map(PathBuf::from),
+                    "home": user_home_dir(),
                     "providerId": self.options.provider_id, "defaultModel": self.options.model,
                     "workspace": self.options.workspace
                 })
@@ -156,7 +167,7 @@ impl Workbench {
             "environment.directories" => return self.directories(r),
             "ssh.hosts" => {
                 out.ssh_hosts = vantry_platform::sshconfig::discover(
-                    &PathBuf::from(std::env::var_os("HOME").context("missing home")?),
+                    &user_home_dir().context("missing home")?,
                     false,
                 )?
             }
@@ -167,7 +178,14 @@ impl Workbench {
             "remote.pair.create" => return self.pair().await,
             "remote.pair.redeem" => return self.redeem(r).await,
             "remote.peers.revoke" => return self.revoke(r),
-            "rd.status" | "rd.session.status" | "rd.session.start" | "rd.session.stop" => {
+            "rd.status"
+            | "rd.session.status"
+            | "rd.session.start"
+            | "rd.session.stop"
+            | "rd.viewer.connect"
+            | "rd.viewer.frame"
+            | "rd.viewer.input"
+            | "rd.viewer.disconnect" => {
                 return self.desktop(r).await;
             }
             "update.status" | "update.check" | "update.download" | "update.install" => {
@@ -207,6 +225,12 @@ impl Workbench {
                     v[key] = val.into();
                 }
             }
+            if let Some(enabled) = parsed.enable_user_extensions {
+                v["enableUserExtensions"] = enabled.into();
+            }
+            if let Some(enabled) = parsed.enable_user_mcp {
+                v["enableUserMCP"] = enabled.into();
+            }
             hostfs::atomic_write(&path, &serde_json::to_vec(&v)?)?;
         }
         let config = settings::document(&path)?;
@@ -225,6 +249,8 @@ impl Workbench {
             mirror_mode: config["mirrorMode"].as_str().unwrap_or("auto").into(),
             custom_path: config["customPath"].as_str().unwrap_or_default().into(),
             npm_registry: config["npmRegistry"].as_str().unwrap_or_default().into(),
+            enable_user_extensions: Some(config["enableUserExtensions"].as_bool().unwrap_or(true)),
+            enable_user_mcp: Some(config["enableUserMCP"].as_bool().unwrap_or(true)),
             ..Default::default()
         });
 
@@ -275,6 +301,10 @@ impl Workbench {
                 let mut c = if cfg!(target_os = "macos") {
                     let mut c = Command::new("open");
                     c.args(["-a", "Terminal"]).arg(&root);
+                    c
+                } else if cfg!(windows) {
+                    let mut c = Command::new("cmd");
+                    c.args(["/C", "start", "cmd"]).current_dir(&root);
                     c
                 } else {
                     let mut c = Command::new("x-terminal-emulator");
@@ -523,7 +553,7 @@ impl Workbench {
         let mut out = WorkbenchResponse::default();
 
         let dir = if r.workspace.is_empty() {
-            PathBuf::from(std::env::var_os("HOME").context("HOME required")?)
+            user_home_dir().context("HOME required")?
         } else {
             PathBuf::from(r.workspace)
         };
@@ -701,43 +731,230 @@ impl Workbench {
         let input = r.input.as_ref().unwrap_or(&Value::Null);
         let action = r.action.as_str();
 
-        let mut session = self.desktop.lock().await;
-        if action == "rd.session.start" {
-            ensure!(session.is_none(), "desktop session active");
-            let client = DesktopClient::new(input["relay"].as_str().unwrap_or(&r.name))?;
-            let v = client
-                .create(
-                    input["registrationKey"].as_str().unwrap_or(""),
-                    input["video"].clone(),
-                )
-                .await?;
-            *session = Some((
-                client,
-                v["sessionId"]
-                    .as_str()
-                    .context("missing session ID")?
-                    .into(),
-                v["hostToken"]
-                    .as_str()
-                    .context("missing host token")?
-                    .into(),
-            ));
-            out.output = v.to_string();
-        } else if let Some((client, id, token)) = session.as_ref() {
-            if action == "rd.session.stop" {
-                client.delete(id, token).await?;
-                *session = None;
-                out.output = json!({
-                "active":false}
-                )
-                .to_string();
+        if action == "rd.viewer.frame" {
+            let viewer = self.desktop_viewer.lock().await;
+            if let Some(v) = viewer.as_ref() {
+                if let Some(frame) = v.latest_frame() {
+                    out.output = json!({
+                        "connected": true,
+                        "target": v.target(),
+                        "seq": frame.seq,
+                        "width": frame.width,
+                        "height": frame.height,
+                        "mime": frame.mime,
+                        "dataUri": frame.data_uri(),
+                    })
+                    .to_string();
+                } else {
+                    out.output = json!({"connected": true, "target": v.target(), "seq": 0}).to_string();
+                }
             } else {
-                out.output = client.status(id, token).await?.to_string();
+                out.output = json!({"connected": false, "seq": 0}).to_string();
             }
+            return Ok(out);
+        }
+
+        if action == "rd.viewer.input" {
+            let viewer = self.desktop_viewer.lock().await;
+            let v = viewer
+                .as_ref()
+                .context("no active remote desktop viewer session")?;
+            let event: InputEvent = serde_json::from_value(input.clone())
+                .context("invalid remote desktop input event")?;
+            v.send_input(event).await?;
+            out.output = json!({"ok": true}).to_string();
+            return Ok(out);
+        }
+
+        if action == "rd.viewer.disconnect" {
+            if let Some(v) = self.desktop_viewer.lock().await.take() {
+                v.disconnect();
+            }
+            out.output = json!({"connected": false}).to_string();
+            return Ok(out);
+        }
+
+        if action == "rd.viewer.connect" {
+            let target = input["link"]
+                .as_str()
+                .or_else(|| input["target"].as_str())
+                .or_else(|| input["peer"].as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&r.name);
+            let ticket = LanTicket::parse(target)?;
+            let viewer = Arc::new(DesktopViewer::connect_lan(&ticket).await?);
+            let label = viewer.target().to_owned();
+            if let Some(prev) = self.desktop_viewer.lock().await.replace(viewer) {
+                prev.disconnect();
+            }
+            out.output = json!({"connected": true, "target": label, "active": true}).to_string();
+            return Ok(out);
+        }
+
+        let mut session = self.desktop.lock().await;
+        let mut host_guard = self.desktop_host.lock().await;
+        if action == "rd.session.start" {
+            // If caller passed a vantry-lan:// link as peer/target, connect as viewer!
+            let candidate = input["link"]
+                .as_str()
+                .or_else(|| input["peer"].as_str())
+                .or_else(|| input["target"].as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&r.name);
+            if candidate.trim().starts_with("vantry-lan://") {
+                let ticket = LanTicket::parse(candidate)?;
+                let viewer = Arc::new(DesktopViewer::connect_lan(&ticket).await?);
+                let label = viewer.target().to_owned();
+                if let Some(prev) = self.desktop_viewer.lock().await.replace(viewer) {
+                    prev.disconnect();
+                }
+                out.output = json!({
+                    "active": true,
+                    "connected": true,
+                    "target": label,
+                    "sharing": host_guard.is_some(),
+                })
+                .to_string();
+                return Ok(out);
+            }
+
+            let relay_url = input["relay"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let s = r.name.trim();
+                    (s.starts_with("http://") || s.starts_with("https://")).then_some(s)
+                });
+            let mut relay_info = Value::Null;
+            if let Some(relay) = relay_url {
+                ensure!(session.is_none(), "desktop session active");
+                let client = DesktopClient::new(relay)?;
+                let v = client
+                    .create(
+                        input["registrationKey"].as_str().unwrap_or(""),
+                        input["video"].clone(),
+                    )
+                    .await?;
+                *session = Some((
+                    client,
+                    v["sessionId"]
+                        .as_str()
+                        .context("missing session ID")?
+                        .into(),
+                    v["hostToken"]
+                        .as_str()
+                        .context("missing host token")?
+                        .into(),
+                ));
+                relay_info = v;
+            }
+            if host_guard.is_none() {
+                let bind = if std::env::var("VANTRY_RD_LOOPBACK").as_deref() == Ok("1") {
+                    "127.0.0.1:0"
+                } else {
+                    "0.0.0.0:0"
+                };
+                let host_name = self.identity.snapshot().host.name;
+                let host = Arc::new(
+                    DesktopHost::start(
+                        bind,
+                        &host_name,
+                        Arc::new(|ev| {
+                            tracing::debug!(kind = %ev.kind, x = ev.x, y = ev.y, "rd input");
+                        }),
+                    )
+                    .await?,
+                );
+                #[cfg(target_os = "macos")]
+                if input["capture"].as_bool().unwrap_or(false) {
+                    let cap_host = host.clone();
+                    tokio::spawn(async move {
+                        let mut seq = 0u64;
+                        let tmp = std::env::temp_dir().join(format!(
+                            "vantry-rd-{}.png",
+                            uuid::Uuid::new_v4().simple()
+                        ));
+                        while Arc::strong_count(&cap_host) > 1 {
+                            if cap_host.viewer_count() > 0 {
+                                let out_path = tmp.clone();
+                                let ok = tokio::task::spawn_blocking(move || {
+                                    Command::new("/usr/sbin/screencapture")
+                                        .args(["-x", "-t", "png"])
+                                        .arg(&out_path)
+                                        .status()
+                                        .is_ok_and(|s| s.success())
+                                })
+                                .await
+                                .unwrap_or(false);
+                                if ok && let Ok(bytes) = fs::read(&tmp) {
+                                    seq += 1;
+                                    cap_host.publish_frame(DesktopFrame {
+                                        seq,
+                                        width: 1280,
+                                        height: 800,
+                                        mime: "image/png".into(),
+                                        data_b64: STANDARD.encode(bytes),
+                                    });
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                        let _ = fs::remove_file(&tmp);
+                    });
+                }
+                *host_guard = Some(host);
+            }
+            let lan_link = host_guard
+                .as_ref()
+                .map(|h| h.ticket().link())
+                .unwrap_or_default();
+            if relay_info.is_object() {
+                relay_info["lanLink"] = json!(lan_link);
+                relay_info["active"] = json!(true);
+                out.output = relay_info.to_string();
+            } else {
+                out.output = json!({
+                    "active": true,
+                    "sharing": true,
+                    "lanLink": lan_link,
+                    "viewerCount": host_guard.as_ref().map_or(0, |h| h.viewer_count()),
+                })
+                .to_string();
+            }
+        } else if action == "rd.session.stop" {
+            if let Some((client, id, token)) = session.take() {
+                let _ = client.delete(&id, &token).await;
+            }
+            if let Some(h) = host_guard.take() {
+                h.stop();
+            }
+            if let Some(v) = self.desktop_viewer.lock().await.take() {
+                v.disconnect();
+            }
+            out.output = json!({"active": false, "sharing": false, "connected": false}).to_string();
+        } else if let Some((client, id, token)) = session.as_ref() {
+            let mut status = client.status(id, token).await?;
+            if let Some(h) = host_guard.as_ref() {
+                status["lanLink"] = json!(h.ticket().link());
+                status["viewerCount"] = json!(h.viewer_count());
+                status["sharing"] = json!(true);
+            }
+            out.output = status.to_string();
+        } else if let Some(h) = host_guard.as_ref() {
+            out.output = json!({
+                "active": true,
+                "sharing": true,
+                "lanLink": h.ticket().link(),
+                "viewerCount": h.viewer_count(),
+                "connected": self.desktop_viewer.lock().await.is_some(),
+            })
+            .to_string();
         } else {
             out.output = json!({
-            "active":false}
-            )
+                "active": self.desktop_viewer.lock().await.is_some(),
+                "sharing": false,
+                "connected": self.desktop_viewer.lock().await.is_some(),
+            })
             .to_string();
         }
 
@@ -746,14 +963,30 @@ impl Workbench {
     async fn update(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
         let mut out = WorkbenchResponse::default();
         let action = r.action.as_str();
+        let input = r.input.as_ref().unwrap_or(&Value::Null);
 
         let mut mgr = self.updater.lock().await;
         match action {
             "update.check" => {
                 mgr.check().await?;
             }
-            "update.download" | "update.install" => {
+            "update.download" => {
                 mgr.download_and_stage(|_, _| {}).await?;
+            }
+            "update.install" => {
+                if !matches!(
+                    *mgr.subscribe().borrow(),
+                    vantry_updater::UpdateState::ReadyToInstall
+                ) {
+                    mgr.download_and_stage(|_, _| {}).await?;
+                }
+                let version = input["version"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&r.name);
+                let desktop_pid = input["desktopPid"].as_u64().unwrap_or(0) as u32;
+                mgr.launch_apply(version, desktop_pid)?;
+                out.output = json!({"applying": true, "version": version}).to_string();
             }
             _ => {}
         }

@@ -1143,6 +1143,14 @@ pub struct PiRuntimeStatus {
     pub default_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_user_extensions: Option<bool>,
+    #[serde(
+        rename = "enableUserMCP",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_user_mcp: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1154,6 +1162,14 @@ pub struct PiRuntimeSettingsInput {
     pub mirror_mode: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub npm_registry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_user_extensions: Option<bool>,
+    #[serde(
+        rename = "enableUserMCP",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_user_mcp: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

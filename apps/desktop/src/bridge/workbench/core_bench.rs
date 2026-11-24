@@ -67,17 +67,11 @@ impl CoreWorkbench {
     }
 
     /// One action on the Core, without fallbacks.
-    #[cfg(unix)]
     async fn ask(socket: PathBuf, request: WorkbenchRequest) -> Result<WorkbenchResponse, BridgeError> {
         vantry_client::CoreClient::new(socket)
             .workbench(&request)
             .await
             .map_err(BridgeError::from)
-    }
-
-    #[cfg(not(unix))]
-    async fn ask(_socket: PathBuf, _request: WorkbenchRequest) -> Result<WorkbenchResponse, BridgeError> {
-        Err(BridgeError::unavailable("此平台的本机 Core 客户端尚未接入"))
     }
 
     /// One action with its fallbacks (alias, then local).
@@ -154,6 +148,14 @@ impl WorkbenchBridge for CoreWorkbench {
 
     fn terminal_interrupt(&self, session: String) -> BridgeFuture<()> {
         self.local.terminal_interrupt(session)
+    }
+
+    fn terminal_write(&self, session: String, data: String) -> BridgeFuture<()> {
+        self.local.terminal_write(session, data)
+    }
+
+    fn terminal_resize(&self, session: String, rows: u16, cols: u16) -> BridgeFuture<()> {
+        self.local.terminal_resize(session, rows, cols)
     }
 
     fn git_checkout(&self, branch: String) -> BridgeFuture<()> {

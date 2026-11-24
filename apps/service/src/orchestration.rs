@@ -519,7 +519,12 @@ fn launch(w: &Workbench, s: &Snapshot, q: ThreadLaunchRequest) -> Result<Launche
     }
     let id = broker_id("launch", &q.caller_thread_id, &q.client_request_id);
     let mut spec = q.spec;
-    ensure!(spec.environment_id.is_empty(), "local workspace required");
+    ensure!(
+        spec.environment_id.is_empty()
+            || spec.environment_id == "local"
+            || spec.environment_id == w.environment,
+        "remote environment launch must be routed via environmentId"
+    );
     let mut workspace = spec.workspace.take();
     if spec.scratch {
         ensure!(
@@ -589,7 +594,7 @@ fn launch(w: &Workbench, s: &Snapshot, q: ThreadLaunchRequest) -> Result<Launche
     } else {
         Some(w.core.dispatch(&Command {
             thread_id: receipt.thread_id.clone(),
-            sender_thread_id: q.caller_thread_id,
+            sender_thread_id: q.caller_thread_id.clone(),
             message: spec.message,
             ..command(CommandKind::SendMessage, format!("{id}:message"))
         })?)
@@ -599,6 +604,13 @@ fn launch(w: &Workbench, s: &Snapshot, q: ThreadLaunchRequest) -> Result<Launche
     let run = sent
         .as_ref()
         .and_then(|sent| snapshot.runs.iter().flatten().find(|r| r.id == sent.run_id));
+    if q.notify_on_complete && !q.caller_thread_id.is_empty() {
+        w.core.register_watch(
+            &q.caller_thread_id,
+            &t.id,
+            run.map(|r| r.id.as_str()).unwrap_or(""),
+        )?;
+    }
     Ok(LaunchedThread {
         thread_id: t.id.clone(),
         title: t.title.clone(),
@@ -617,17 +629,91 @@ fn command(kind: CommandKind, id: String) -> Command {
         ..Default::default()
     }
 }
+async fn forward_remote_orchestration(
+    w: &Workbench,
+    env_id: &str,
+    path: &str,
+    mut payload: Value,
+) -> Result<Value> {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("environmentId");
+        if let Some(spec) = obj.get_mut("spec").and_then(Value::as_object_mut) {
+            spec.remove("environmentId");
+        }
+    }
+    let cfg = w.identity.snapshot();
+    let stop = tokio_util::sync::CancellationToken::new();
+    if let Some(peer) = cfg
+        .peers
+        .iter()
+        .find(|p| p.id == env_id || p.pair.name == env_id)
+    {
+        let conn = vantry_connectivity::peer::PeerConnection::connect(
+            &peer.pair,
+            Some(&cfg),
+            vantry_connectivity::peer::Route::Auto,
+            stop,
+        )
+        .await?;
+        return conn
+            .post_json(&format!("/v1/orchestration/{path}"), payload)
+            .await;
+    }
+    let catalog = vantry_platform::environments::Catalog::open(w.core.directory())?;
+    let envs = catalog.load()?;
+    if let Some(env) = envs.iter().find(|e| e.id == env_id || e.name == env_id) {
+        if let Some(peer) = cfg
+            .peers
+            .iter()
+            .find(|p| p.id == env.id || p.pair.name == env.name || p.id == env.host)
+        {
+            let conn = vantry_connectivity::peer::PeerConnection::connect(
+                &peer.pair,
+                Some(&cfg),
+                vantry_connectivity::peer::Route::Auto,
+                stop,
+            )
+            .await?;
+            return conn
+                .post_json(&format!("/v1/orchestration/{path}"), payload)
+                .await;
+        }
+        if !env.host.is_empty() {
+            let remote_sock = std::path::PathBuf::from(env.socket());
+            let forward = vantry_connectivity::ssh::SshForward::connect(
+                &env.host,
+                &remote_sock,
+                stop.clone(),
+            )
+            .await?;
+            let client = vantry_client::CoreClient::new(forward.socket());
+            let result: Value = client
+                .post_json(&format!("/v1/orchestration/{path}"), &payload)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let _ = forward.close().await;
+            return Ok(result);
+        }
+    }
+    bail!("unknown execution environment: {env_id}");
+}
+
 pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
     let payload: Value = serde_json::from_slice(body)?;
     ensure!(payload.is_object(), "expected request object");
-    ensure!(
-        payload["environmentId"].as_str().unwrap_or("").is_empty(),
-        "local execution environment required"
-    );
-    ensure!(
-        !payload["notifyOnComplete"].as_bool().unwrap_or(false),
-        "this Core does not expose durable peer watch registration"
-    );
+    let env_id = payload["environmentId"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            payload["spec"]["environmentId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_owned();
+    if !env_id.is_empty() && env_id != "local" && env_id != w.environment {
+        return forward_remote_orchestration(w, &env_id, path, payload).await;
+    }
     let core = &w.core;
     let s = core.snapshot()?;
     match path {
@@ -735,11 +821,14 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 delivery_mode: q.mode,
                 fallback_to_queue: true,
                 command_id: broker_id("send", &q.caller_thread_id, &q.client_request_id),
-                sender_thread_id: q.caller_thread_id,
+                sender_thread_id: q.caller_thread_id.clone(),
                 version: 1,
                 kind: CommandKind::InterThreadSend,
                 ..Default::default()
             })?;
+            if q.notify_on_complete && !q.caller_thread_id.is_empty() {
+                core.register_watch(&q.caller_thread_id, &t.id, &r.run_id)?;
+            }
             Ok(json!(InterThreadSendResult {
                 thread_id: t.id.clone(),
                 link: link(t),

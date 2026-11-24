@@ -367,6 +367,21 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                         let reason = pi.compat_reason.clone();
                         move || hint(reason.clone())
                     }))
+                    .child({
+                        let ext_on = pi.enable_user_extensions.unwrap_or(true);
+                        let mcp_on = pi.enable_user_mcp.unwrap_or(true);
+                        row()
+                            .child(pill(
+                                if ext_on { "用户扩展：开" } else { "用户扩展：关" },
+                                move || ext_on,
+                                move || controller::toggle_pi_setting(Some(!ext_on), None),
+                            ))
+                            .child(pill(
+                                if mcp_on { "用户 MCP：开" } else { "用户 MCP：关" },
+                                move || mcp_on,
+                                move || controller::toggle_pi_setting(None, Some(!mcp_on)),
+                            ))
+                    })
                     .into_element(),
                 None => hint("Pi 运行时状态由 Core 提供；连接后在此显示。").into_element(),
             }

@@ -83,19 +83,31 @@ fn workbench() -> Option<Arc<dyn WorkbenchBridge>> {
 /// Connects to the Core `config` names, restores `desktop-state.json` and
 /// keeps the states in step for as long as the calling component lives.
 pub(crate) fn start(config: &LaunchConfig) {
-    let core = bridge::connect(&config.endpoint);
     let mock = config.endpoint == Endpoint::Mock;
     let local = LocalWorkbench::new(config.workspace_root(), config.model.clone());
-    let workbench: Arc<dyn WorkbenchBridge> = match &config.endpoint {
-        Endpoint::Mock => Arc::new(MockWorkbench::demo()),
+    let (core, workbench): (Arc<dyn CoreBridge>, Arc<dyn WorkbenchBridge>) = match &config.endpoint {
+        Endpoint::Mock => (
+            bridge::connect(&config.endpoint),
+            Arc::new(MockWorkbench::demo()),
+        ),
         // Settings, plugins, remote access … from the Core; files, Git and
         // the terminal on this machine's workspace.
-        Endpoint::Local { socket } => Arc::new(CoreWorkbench::new(
-            socket.clone(),
-            local,
-            config.model.clone(),
-        )),
-        Endpoint::Ssh { .. } | Endpoint::Peer { .. } => Arc::new(local),
+        Endpoint::Local { socket } => (
+            bridge::connect(&config.endpoint),
+            Arc::new(CoreWorkbench::new(
+                socket.clone(),
+                local,
+                config.model.clone(),
+            )),
+        ),
+        Endpoint::Ssh { .. } | Endpoint::Peer { .. } => {
+            let remote = bridge::RemoteBridge::new(config.endpoint.clone());
+            let sock = remote.socket();
+            (
+                Arc::new(remote),
+                Arc::new(CoreWorkbench::new(sock, local, config.model.clone())),
+            )
+        }
     };
     let state_path = config.state_path();
     global::<Bridges>().set(Bridges {
@@ -980,6 +992,19 @@ pub(crate) fn set_pi_field(field: u8, text: &str) {
 
 /// Saves the Pi quick setup; the key leaves the desktop's memory as it is
 /// sent.
+pub(crate) fn toggle_pi_setting(enable_user_extensions: Option<bool>, enable_user_mcp: Option<bool>) {
+    let mut input = serde_json::Map::new();
+    if let Some(v) = enable_user_extensions {
+        input.insert("enableUserExtensions".into(), v.into());
+    }
+    if let Some(v) = enable_user_mcp {
+        input.insert("enableUserMCP".into(), v.into());
+    }
+    let mut request = actions::request("pi.settings.set");
+    request.input = Some(serde_json::Value::Object(input));
+    settings_op("pi.settings", request, "Pi 运行时开关已更新");
+}
+
 pub(crate) fn pi_setup_save() {
     let mut request = None;
     ui().update(|u| {
@@ -1093,6 +1118,11 @@ pub(crate) fn remote_connect(peer: String) {
     };
     spawn(async move {
         let result = call(workbench.workbench(actions::rd_session_start(&options))).await;
+        let connected_ok = result.as_ref().is_ok_and(|response| {
+            actions::RdStatus::read(response)
+                .map(|s| s.session_error.is_empty())
+                .unwrap_or(true)
+        });
         ui().update(move |u| match result {
             Ok(response) => {
                 let status = actions::RdStatus::read(&response).unwrap_or_default();
@@ -1106,6 +1136,85 @@ pub(crate) fn remote_connect(peer: String) {
             }
             Err(error) => u.remote.on_result(&peer, Err(error.message)),
         });
+        if connected_ok {
+            start_rd_frame_loop(workbench);
+        }
+    });
+}
+
+fn start_rd_frame_loop(workbench: Arc<dyn WorkbenchBridge>) {
+    spawn(async move {
+        loop {
+            let active = ui().with_untracked(|u| {
+                matches!(u.remote.link, crate::state::ui::RemoteLink::Connected { .. })
+            });
+            if !active {
+                break;
+            }
+            if let Ok(resp) = call(workbench.workbench(actions::request("rd.viewer.frame"))).await
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&resp.output)
+            {
+                let seq = val["seq"].as_u64().unwrap_or(0);
+                if seq > 0
+                    && let Some(uri) = val["dataUri"].as_str()
+                {
+                    let uri = uri.to_owned();
+                    let w = val["width"].as_u64().unwrap_or(1280) as u32;
+                    let h = val["height"].as_u64().unwrap_or(800) as u32;
+                    ui().update(move |u| {
+                        if seq > u.remote.frame_seq {
+                            u.remote.frame_seq = seq;
+                            u.remote.frame_size = (w, h);
+                            u.remote.frame_uri = Some(uri);
+                        }
+                    });
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    });
+}
+
+pub(crate) fn remote_send_input(event: serde_json::Value) {
+    let allow = ui().with_untracked(|u| {
+        u.remote.control && matches!(u.remote.link, crate::state::ui::RemoteLink::Connected { .. })
+    });
+    if !allow {
+        return;
+    }
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let mut req = actions::request("rd.viewer.input");
+    req.input = Some(event);
+    spawn(async move {
+        let _ = call(workbench.workbench(req)).await;
+    });
+}
+
+pub(crate) fn remote_host_toggle() {
+    let Some(workbench) = workbench() else {
+        return;
+    };
+    let sharing = ui().with_untracked(|u| !u.remote.host_lan_link.is_empty());
+    spawn(async move {
+        if sharing {
+            let _ = call(workbench.workbench(actions::request(names::RD_SESSION_STOP))).await;
+            ui().update(|u| {
+                u.remote.host_lan_link.clear();
+            });
+        } else {
+            let mut req = actions::request(names::RD_SESSION_START);
+            req.input = Some(serde_json::json!({"capture": true}));
+            if let Ok(resp) = call(workbench.workbench(req)).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.output)
+            {
+                let link = v["lanLink"].as_str().unwrap_or("").to_owned();
+                ui().update(move |u| {
+                    u.remote.host_lan_link = link;
+                });
+            }
+        }
     });
 }
 
@@ -1113,7 +1222,11 @@ pub(crate) fn remote_connect(peer: String) {
 /// whatever the Core answers.
 pub(crate) fn remote_disconnect() {
     let peer = ui().with_untracked(|u| u.remote.peer().map(str::to_owned));
-    ui().update(|u| u.remote.disconnect());
+    ui().update(|u| {
+        u.remote.disconnect();
+        u.remote.frame_uri = None;
+        u.remote.frame_seq = 0;
+    });
     let (Some(peer), Some(workbench)) = (peer, workbench()) else {
         return;
     };
@@ -1370,6 +1483,25 @@ pub(crate) fn run_terminal() {
     let Some(workbench) = workbench() else {
         return;
     };
+    // If the active tab is already running a PTY process, send the typed line
+    // directly to its stdin instead of starting a second command.
+    let mut interactive: Option<(String, String)> = None;
+    bench().update(|b| {
+        if let Some(cur) = b.terminal.current_mut()
+            && cur.running
+            && !cur.input.is_empty()
+        {
+            let text = std::mem::take(&mut cur.input);
+            cur.output.push_str(&format!("{text}\n"));
+            interactive = Some((cur.id.clone(), format!("{text}\n")));
+        }
+    });
+    if let Some((session, line)) = interactive {
+        spawn(async move {
+            let _ = call(workbench.terminal_write(session, line)).await;
+        });
+        return;
+    }
     let mut run = None;
     bench().update(|b| run = b.terminal.submit());
     let Some((session, command)) = run else {

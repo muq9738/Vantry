@@ -1,3 +1,4 @@
+#[cfg(unix)]
 #[test]
 fn service_socket_cli_and_worker_recovery() {
     let status = std::process::Command::new("python3")

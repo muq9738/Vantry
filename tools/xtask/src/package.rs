@@ -66,6 +66,17 @@ fn host() -> String {
     };
     format!("{arch}-{suffix}")
 }
+fn normalize_target(raw: &str) -> String {
+    match raw {
+        "darwin-arm64" | "macos-arm64" | "darwin-aarch64" => "aarch64-apple-darwin".into(),
+        "darwin-amd64" | "darwin-x86_64" | "macos-x86_64" => "x86_64-apple-darwin".into(),
+        "linux-amd64" | "linux-x86_64" => "x86_64-unknown-linux-gnu".into(),
+        "linux-arm64" | "linux-aarch64" => "aarch64-unknown-linux-gnu".into(),
+        "windows-amd64" | "windows-x86_64" => "x86_64-pc-windows-msvc".into(),
+        "windows-arm64" | "windows-aarch64" => "aarch64-pc-windows-msvc".into(),
+        other => other.into(),
+    }
+}
 struct Platform<'a> {
     os: &'a str,
     arch: &'a str,
@@ -273,7 +284,11 @@ pub fn run(o: Options) -> Result<()> {
         .ancestors()
         .nth(2)
         .unwrap();
-    let target = o.target.clone().unwrap_or_else(host);
+    let target = o
+        .target
+        .as_deref()
+        .map(normalize_target)
+        .unwrap_or_else(host);
     let p = Platform::parse(&target)?;
     ensure!(
         !o.profile.is_empty()

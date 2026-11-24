@@ -6,8 +6,9 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
-    net::UnixStream,
     process::Command,
     sync::watch,
     task::JoinHandle,
@@ -57,7 +58,20 @@ impl SshForward {
         ensure!(!parent.is_cancelled(), "forward cancelled");
         let dir = tempfile::Builder::new().prefix("vantry-relay-").tempdir()?;
         let socket = dir.path().join("core.sock");
+        #[cfg(unix)]
         let spec = format!("{}:{remote}", socket.display());
+        #[cfg(not(unix))]
+        let spec = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            let ep = vantry_protocol::LocalTcpEndpoint::new(
+                addr.to_string(),
+                format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
+            );
+            std::fs::write(&socket, serde_json::to_vec(&ep)?)?;
+            format!("{addr}:{remote}")
+        };
         let host = host.to_owned();
         let exe = executable.to_owned();
         let local = socket.clone();
@@ -132,7 +146,7 @@ impl Drop for SshForward {
         self.stop.cancel()
     }
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -203,15 +217,34 @@ mod tests {
 async fn probe(path: &Path) -> Result<Value> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Empty, Limited};
-    let io = UnixStream::connect(path).await?;
+    let (io, token): (crate::transport::Stream, Option<String>) =
+        if let Ok(bytes) = std::fs::read(path)
+            && let Some(ep) = vantry_protocol::LocalTcpEndpoint::parse_bytes(&bytes)
+        {
+            (
+                Box::new(tokio::net::TcpStream::connect(&ep.addr).await?),
+                Some(ep.token),
+            )
+        } else {
+            #[cfg(unix)]
+            {
+                (Box::new(UnixStream::connect(path).await?), None)
+            }
+            #[cfg(not(unix))]
+            {
+                bail!("local SSH forward endpoint unavailable")
+            }
+        };
     let (mut tx, conn) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await?;
     let request = async move {
-        let req = http::Request::get("/v1/health")
+        let mut req = http::Request::get("/v1/health")
             .header("Host", "vantry.local")
-            .header("Connection", "close")
-            .body(Empty::<Bytes>::new())?;
-        let res = tx.send_request(req).await?;
+            .header("Connection", "close");
+        if let Some(t) = token {
+            req = req.header(vantry_protocol::LOCAL_TOKEN_HEADER, t);
+        }
+        let res = tx.send_request(req.body(Empty::<Bytes>::new())?).await?;
         ensure!(res.status().is_success(), "Core unavailable");
         let data = Limited::new(res.into_body(), 4096)
             .collect()

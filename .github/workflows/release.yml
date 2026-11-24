@@ -25,6 +25,24 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build macOS remote-desktop helper (when plugin source provided)
+        env:
+          VANTRY_REMOTE_PLUGIN_ROOT: ${{ vars.VANTRY_REMOTE_PLUGIN_ROOT }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -n "${VANTRY_REMOTE_PLUGIN_ROOT:-}" ] && [ -d "${VANTRY_REMOTE_PLUGIN_ROOT}" ]; then
+            python3 scripts/build_remote_helper.py --platform darwin/arm64 --plugin-root "${VANTRY_REMOTE_PLUGIN_ROOT}"
+          elif [ -n "${PRIVATE_REPO_TOKEN:-}" ]; then
+            git clone --depth 1 "https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/muq9738/vantry-plugin-remote-desktop.git" /tmp/vantry-remote-plugin
+            python3 scripts/build_remote_helper.py --platform darwin/arm64 --plugin-root /tmp/vantry-remote-plugin
+          else
+            echo "No remote-desktop plugin source configured; packaging without optional native helper."
+          fi
+
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
@@ -33,9 +51,10 @@ jobs:
 
       - name: Package macOS desktop, service and relay bundles
         run: |
-          cargo run --locked -p xtask -- package desktop --profile release --target darwin-arm64 --out-dir dist/desktop
-          cargo run --locked -p xtask -- package service --profile release --target darwin-arm64 --out-dir dist/service
-          cargo run --locked -p xtask -- package relay --profile release --target darwin-arm64 --out-dir dist/relay
+          cargo run --locked -p xtask -- package desktop --skip-build --profile release --target aarch64-apple-darwin --out-dir dist/desktop
+          cargo run --locked -p xtask -- package service --skip-build --profile release --target aarch64-apple-darwin --out-dir dist/service
+          cargo run --locked -p xtask -- package relay --skip-build --profile release --target aarch64-apple-darwin --out-dir dist/relay
+          codesign --verify --deep --strict dist/desktop/Vantry.app
           ls -lh dist/desktop dist/service dist/relay
 
       - name: Upload macOS release artifacts
@@ -61,8 +80,8 @@ jobs:
 
       - name: Package Linux service and relay bundles
         run: |
-          cargo run --locked -p xtask -- package service --profile release --target linux-x86_64 --out-dir dist/service
-          cargo run --locked -p xtask -- package relay --profile release --target linux-x86_64 --out-dir dist/relay
+          cargo run --locked -p xtask -- package service --skip-build --profile release --target x86_64-unknown-linux-gnu --out-dir dist/service
+          cargo run --locked -p xtask -- package relay --skip-build --profile release --target x86_64-unknown-linux-gnu --out-dir dist/relay
           ls -lh dist/service dist/relay
 
       - name: Upload Linux release artifacts
@@ -70,8 +89,8 @@ jobs:
         with:
           name: release-linux-x86_64
           path: |
-            dist/service/vantry-service-*-linux-x86_64.tar.gz
-            dist/relay/vantry-relay-*-linux-x86_64.tar.gz
+            dist/service/vantry-service-*-linux-amd64.tar.gz
+            dist/relay/vantry-relay-*-linux-amd64.tar.gz
             dist/*/*.json
           if-no-files-found: error
 
@@ -82,6 +101,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Build release workspace
         shell: bash
         run: cargo build --workspace --release --locked
@@ -89,8 +112,9 @@ jobs:
       - name: Package Windows desktop and service bundles
         shell: bash
         run: |
-          cargo run --locked -p xtask -- package desktop --profile release --target windows-x86_64 --out-dir dist/desktop
-          cargo run --locked -p xtask -- package service --profile release --target windows-x86_64 --out-dir dist/service
+          cargo run --locked -p xtask -- package desktop --skip-build --profile release --target x86_64-pc-windows-msvc --out-dir dist/desktop
+          cargo run --locked -p xtask -- package service --skip-build --profile release --target x86_64-pc-windows-msvc --out-dir dist/service
+          python scripts/verify_windows_package.py --package dist/desktop/Vantry --skip-installer
           ls -lh dist/desktop dist/service
 
       - name: Upload Windows release artifacts
@@ -98,8 +122,8 @@ jobs:
         with:
           name: release-windows-amd64
           path: |
-            dist/desktop/vantry-*-windows-x86_64.zip
-            dist/service/vantry-service-*-windows-x86_64.zip
+            dist/desktop/vantry-*-windows-amd64.zip
+            dist/service/vantry-service-*-windows-amd64.zip
             dist/*/*.json
           if-no-files-found: error
 

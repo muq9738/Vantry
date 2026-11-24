@@ -16,14 +16,14 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     fs, io,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::PathBuf,
     sync::Arc,
 };
-use tokio::{
-    net::{UnixListener, UnixStream},
-    task::JoinSet,
-};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use vantry_protocol::*;
 
@@ -49,10 +49,20 @@ pub trait ServiceExtension: Send + Sync + 'static {
 }
 
 type Body = UnsyncBoxBody<Bytes, Infallible>;
+enum Listener {
+    #[cfg(unix)]
+    Unix {
+        listener: UnixListener,
+        identity: (u64, u64),
+    },
+    Tcp {
+        listener: TcpListener,
+        endpoint: Arc<LocalTcpEndpoint>,
+    },
+}
 pub struct Server {
-    listener: UnixListener,
+    listener: Listener,
     path: PathBuf,
-    identity: (u64, u64),
     core: Core,
     extension: Option<Arc<dyn ServiceExtension>>,
 }
@@ -68,6 +78,21 @@ impl Server {
         Self::bind_inner(core, Some(extension)).await
     }
 
+    /// Bind on a private loopback TCP port and publish a token-authenticated
+    /// `LocalTcpEndpoint` descriptor at `<data_dir>/core.sock`. Used on Windows
+    /// and for cross-platform loopback transport verification.
+    pub async fn bind_tcp(core: Core) -> Result<Self> {
+        Self::bind_tcp_inner(core, None).await
+    }
+
+    pub async fn bind_tcp_with_extension(
+        core: Core,
+        extension: Arc<dyn ServiceExtension>,
+    ) -> Result<Self> {
+        Self::bind_tcp_inner(core, Some(extension)).await
+    }
+
+    #[cfg(unix)]
     async fn bind_inner(
         core: Core,
         extension: Option<Arc<dyn ServiceExtension>>,
@@ -95,44 +120,148 @@ impl Server {
         let listener = UnixListener::bind(&path)?;
         let info = fs::symlink_metadata(&path)?;
         let server = Self {
-            listener,
+            listener: Listener::Unix {
+                listener,
+                identity: (info.dev(), info.ino()),
+            },
             path,
-            identity: (info.dev(), info.ino()),
             core,
             extension,
         };
         fs::set_permissions(&server.path, fs::Permissions::from_mode(0o600))?;
         Ok(server)
     }
+
+    #[cfg(not(unix))]
+    async fn bind_inner(
+        core: Core,
+        extension: Option<Arc<dyn ServiceExtension>>,
+    ) -> Result<Self> {
+        Self::bind_tcp_inner(core, extension).await
+    }
+
+    async fn bind_tcp_inner(
+        core: Core,
+        extension: Option<Arc<dyn ServiceExtension>>,
+    ) -> Result<Self> {
+        let path = core.directory().join("core.sock");
+        if let Ok(existing) = fs::read(&path) {
+            if let Some(ep) = LocalTcpEndpoint::parse_bytes(&existing) {
+                if tokio::net::TcpStream::connect(&ep.addr).await.is_ok() {
+                    return Err(conflict("socket is in use"));
+                }
+                let _ = fs::remove_file(&path);
+            } else {
+                return Err(conflict("core.sock path is occupied"));
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?.to_string();
+        let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let endpoint = Arc::new(LocalTcpEndpoint::new(addr, token));
+        let payload = serde_json::to_vec(endpoint.as_ref())?;
+        let tmp = core
+            .directory()
+            .join(format!(".core-sock-{}", uuid::Uuid::new_v4().simple()));
+        {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts.open(&tmp)?;
+            io::Write::write_all(&mut f, &payload)?;
+            f.sync_all()?;
+        }
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(Self {
+            listener: Listener::Tcp { listener, endpoint },
+            path,
+            core,
+            extension,
+        })
+    }
+
     pub async fn serve(self, stop: CancellationToken) -> Result<()> {
         let mut conns = JoinSet::new();
         let closing = CancellationToken::new();
         loop {
-            tokio::select! {
-                _=stop.cancelled()=>break,
-                _=self.core.0.shutdown.cancelled()=>break,
-                Some(_)=conns.join_next(),if !conns.is_empty()=>{},
-                conn=self.listener.accept()=>{
-                    let (conn,_)=conn?;
-                    let core=self.core.clone();
-                    let extension=self.extension.clone();
-                    let done=closing.clone();
-                    conns.spawn(async move {
-                        let service=service_fn(move|req|{
-                            let core=core.clone();
-                            let extension=extension.clone();
-                            async move { Ok::<_,Infallible>(route(core,extension,req).await.unwrap_or_else(error_response)) }
-                        });
-                        let connection=http1::Builder::new().serve_connection(TokioIo::new(conn),service);
-                        tokio::pin!(connection);
-                        tokio::select! {
-                            _=&mut connection=>{},
-                            _=done.cancelled()=>{
-                                connection.as_mut().graceful_shutdown();
-                                let _=tokio::time::timeout(std::time::Duration::from_secs(1),connection).await;
-                            }
+            match &self.listener {
+                #[cfg(unix)]
+                Listener::Unix { listener, .. } => {
+                    tokio::select! {
+                        _=stop.cancelled()=>break,
+                        _=self.core.0.shutdown.cancelled()=>break,
+                        Some(_)=conns.join_next(),if !conns.is_empty()=>{},
+                        conn=listener.accept()=>{
+                            let (conn,_)=conn?;
+                            let core=self.core.clone();
+                            let extension=self.extension.clone();
+                            let done=closing.clone();
+                            conns.spawn(async move {
+                                let service=service_fn(move|req|{
+                                    let core=core.clone();
+                                    let extension=extension.clone();
+                                    async move { Ok::<_,Infallible>(route(core,extension,req).await.unwrap_or_else(error_response)) }
+                                });
+                                let connection=http1::Builder::new().serve_connection(TokioIo::new(conn),service);
+                                tokio::pin!(connection);
+                                tokio::select! {
+                                    _=&mut connection=>{},
+                                    _=done.cancelled()=>{
+                                        connection.as_mut().graceful_shutdown();
+                                        let _=tokio::time::timeout(std::time::Duration::from_secs(1),connection).await;
+                                    }
+                                }
+                            });
                         }
-                    });
+                    }
+                }
+                Listener::Tcp { listener, endpoint } => {
+                    tokio::select! {
+                        _=stop.cancelled()=>break,
+                        _=self.core.0.shutdown.cancelled()=>break,
+                        Some(_)=conns.join_next(),if !conns.is_empty()=>{},
+                        conn=listener.accept()=>{
+                            let (conn,_)=conn?;
+                            let core=self.core.clone();
+                            let extension=self.extension.clone();
+                            let endpoint=endpoint.clone();
+                            let done=closing.clone();
+                            conns.spawn(async move {
+                                let service=service_fn(move|req|{
+                                    let core=core.clone();
+                                    let extension=extension.clone();
+                                    let endpoint=endpoint.clone();
+                                    async move {
+                                        let authorized = req
+                                            .headers()
+                                            .get(LOCAL_TOKEN_HEADER)
+                                            .and_then(|v| v.to_str().ok())
+                                            .is_some_and(|t| endpoint.verify_token(t));
+                                        if !authorized {
+                                            return Ok::<_,Infallible>(response(
+                                                StatusCode::UNAUTHORIZED,
+                                                api_error(Error::Api(ErrorCode::NotReady, "missing or invalid local token".into())),
+                                            ));
+                                        }
+                                        Ok::<_,Infallible>(route(core,extension,req).await.unwrap_or_else(error_response))
+                                    }
+                                });
+                                let connection=http1::Builder::new().serve_connection(TokioIo::new(conn),service);
+                                tokio::pin!(connection);
+                                tokio::select! {
+                                    _=&mut connection=>{},
+                                    _=done.cancelled()=>{
+                                        connection.as_mut().graceful_shutdown();
+                                        let _=tokio::time::timeout(std::time::Duration::from_secs(1),connection).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -143,9 +272,21 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        if let Ok(m) = fs::symlink_metadata(&self.path) {
-            if (m.dev(), m.ino()) == self.identity {
-                let _ = fs::remove_file(&self.path);
+        match &self.listener {
+            #[cfg(unix)]
+            Listener::Unix { identity, .. } => {
+                if let Ok(m) = fs::symlink_metadata(&self.path) {
+                    if (m.dev(), m.ino()) == *identity {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                }
+            }
+            Listener::Tcp { endpoint, .. } => {
+                if let Ok(bytes) = fs::read(&self.path)
+                    && LocalTcpEndpoint::parse_bytes(&bytes).as_ref() == Some(endpoint.as_ref())
+                {
+                    let _ = fs::remove_file(&self.path);
+                }
             }
         }
     }

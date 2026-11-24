@@ -269,23 +269,216 @@ pub fn connect(endpoint: &Endpoint) -> Arc<dyn CoreBridge> {
     }
 }
 
-/// The `--remote` / `--peer` route. The remote transport (SSH forwarding,
-/// pairing, relay) is not in the desktop yet: every call answers
-/// `not_ready` with what it would connect to, so the window opens, shows
-/// the target and keeps retrying instead of exiting.
-#[derive(Debug, Clone)]
+struct TunnelHandle {
+    dir: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    child: std::sync::Mutex<Option<std::process::Child>>,
+}
+
+impl Drop for TunnelHandle {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Real remote Core bridge for `--remote` (OpenSSH StreamLocal forward) and
+/// `--peer` (`vantry-service peer-proxy` mTLS/Relay tunnel).
+///
+/// The tunnel child is started lazily on first contact, automatically
+/// restarted if it exits, and cleanly terminated when the bridge drops.
+#[derive(Clone)]
 pub struct RemoteBridge {
     endpoint: Endpoint,
+    tunnel: Arc<TunnelHandle>,
+}
+
+impl std::fmt::Debug for RemoteBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBridge")
+            .field("endpoint", &self.endpoint)
+            .field("socket", &self.tunnel.socket)
+            .finish()
+    }
 }
 
 impl RemoteBridge {
     pub fn new(endpoint: Endpoint) -> Self {
-        RemoteBridge { endpoint }
+        let dir = std::env::temp_dir().join(format!(
+            "vantry-remote-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let socket = dir.join("core.sock");
+        RemoteBridge {
+            endpoint,
+            tunnel: Arc::new(TunnelHandle {
+                dir,
+                socket,
+                child: std::sync::Mutex::new(None),
+            }),
+        }
     }
 
-    fn not_ready<T: Send + 'static>(&self) -> BridgeFuture<T> {
-        let message = format!("{} 的远程传输尚未接入 NSH 桌面", self.label());
-        Box::pin(async move { Err(BridgeError::new(ErrorCode::NotReady, message)) })
+    /// Local proxy socket path forwarded to the remote Core.
+    pub fn socket(&self) -> std::path::PathBuf {
+        self.tunnel.socket.clone()
+    }
+
+    async fn ensure_tunnel(&self) -> Result<std::path::PathBuf, BridgeError> {
+        let socket = self.tunnel.socket.clone();
+        // Fast path: child already alive and socket exists.
+        {
+            let mut guard = self.tunnel.child.lock().unwrap();
+            if let Some(child) = guard.as_mut() {
+                match child.try_wait() {
+                    Ok(None) if socket.exists() => return Ok(socket),
+                    Ok(None) => {}
+                    _ => {
+                        *guard = None;
+                    }
+                }
+            }
+        }
+
+        std::fs::create_dir_all(&self.tunnel.dir)
+            .map_err(|e| BridgeError::unavailable(format!("无法创建远程转发目录：{e}")))?;
+
+        let mut needs_spawn = false;
+        {
+            let guard = self.tunnel.child.lock().unwrap();
+            if guard.is_none() {
+                needs_spawn = true;
+            }
+        }
+
+        if needs_spawn {
+            let child = match &self.endpoint {
+                Endpoint::Ssh {
+                    host,
+                    remote_socket,
+                } => {
+                    if host.is_empty()
+                        || host.starts_with('-')
+                        || host.chars().any(|c| c.is_control() || c.is_whitespace())
+                    {
+                        return Err(BridgeError::new(
+                            ErrorCode::InvalidCommand,
+                            format!("无效的 SSH 主机：{host}"),
+                        ));
+                    }
+                    let remote = remote_socket
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("/tmp/vantry-core.sock");
+                    if remote.contains([':', '\n', '\r', '\0']) {
+                        return Err(BridgeError::new(
+                            ErrorCode::InvalidCommand,
+                            format!("无效的远程 socket 路径：{remote}"),
+                        ));
+                    }
+                    let _ = std::fs::remove_file(&socket);
+                    let spec = format!("{}:{remote}", socket.display());
+                    std::process::Command::new("ssh")
+                        .args([
+                            "-N",
+                            "-T",
+                            "-S",
+                            "none",
+                            "-o",
+                            "BatchMode=yes",
+                            "-o",
+                            "StrictHostKeyChecking=yes",
+                            "-o",
+                            "ExitOnForwardFailure=yes",
+                            "-o",
+                            "StreamLocalBindUnlink=yes",
+                            "-o",
+                            "ConnectTimeout=8",
+                            "-o",
+                            "ServerAliveInterval=15",
+                            "-o",
+                            "ServerAliveCountMax=3",
+                            "-L",
+                            &spec,
+                            "--",
+                            host,
+                        ])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|e| {
+                            BridgeError::unavailable(format!("无法启动 ssh 转发进程：{e}"))
+                        })?
+                }
+                Endpoint::Peer { id, mode } => {
+                    let locator = crate::service::Locator::from_env();
+                    let exe = locator.find("vantry-service").ok_or_else(|| {
+                        BridgeError::new(
+                            ErrorCode::NotReady,
+                            "找不到 vantry-service 可执行文件，无法建立配对主机代理",
+                        )
+                    })?;
+                    let _ = std::fs::remove_file(&socket);
+                    std::process::Command::new(exe)
+                        .args([
+                            "peer-proxy",
+                            "--peer",
+                            id,
+                            "--mode",
+                            mode,
+                            "--socket",
+                        ])
+                        .arg(&socket)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|e| {
+                            BridgeError::unavailable(format!("无法启动 peer-proxy：{e}"))
+                        })?
+                }
+                _ => {
+                    return Err(BridgeError::new(
+                        ErrorCode::NotReady,
+                        "当前配置不是远程端点",
+                    ));
+                }
+            };
+            *self.tunnel.child.lock().unwrap() = Some(child);
+        }
+
+        // Wait briefly for the tunnel socket to appear (or child to exit early).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if socket.exists() {
+                return Ok(socket);
+            }
+            {
+                let mut guard = self.tunnel.child.lock().unwrap();
+                if let Some(child) = guard.as_mut()
+                    && let Ok(Some(status)) = child.try_wait()
+                {
+                    *guard = None;
+                    return Err(BridgeError::unavailable(format!(
+                        "{} 连接进程提前退出（{status}）",
+                        self.label()
+                    )));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BridgeError::unavailable(format!(
+                    "等待 {} 隧道就绪超时",
+                    self.label()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -306,19 +499,60 @@ impl CoreBridge for RemoteBridge {
     }
 
     fn health(&self) -> BridgeFuture<Health> {
-        self.not_ready()
+        let this = self.clone();
+        Box::pin(async move {
+            let sock = this.ensure_tunnel().await?;
+            vantry_client::CoreClient::new(sock)
+                .health()
+                .await
+                .map_err(BridgeError::from)
+        })
     }
 
     fn snapshot(&self) -> BridgeFuture<Snapshot> {
-        self.not_ready()
+        let this = self.clone();
+        Box::pin(async move {
+            let sock = this.ensure_tunnel().await?;
+            vantry_client::CoreClient::new(sock)
+                .snapshot()
+                .await
+                .map_err(BridgeError::from)
+        })
     }
 
-    fn dispatch(&self, _command: Command) -> BridgeFuture<Receipt> {
-        self.not_ready()
+    fn dispatch(&self, command: Command) -> BridgeFuture<Receipt> {
+        let this = self.clone();
+        Box::pin(async move {
+            let sock = this.ensure_tunnel().await?;
+            vantry_client::CoreClient::new(sock)
+                .dispatch(&command)
+                .await
+                .map_err(BridgeError::from)
+        })
     }
 
-    fn subscribe(&self, _after: i64, _sink: EventSink) -> BridgeFuture<()> {
-        self.not_ready()
+    fn subscribe(&self, after: i64, sink: EventSink) -> BridgeFuture<()> {
+        let this = self.clone();
+        Box::pin(async move {
+            let sock = this.ensure_tunnel().await?;
+            let mut stream = vantry_client::CoreClient::new(sock)
+                .subscribe(after.max(0))
+                .await
+                .map_err(BridgeError::from)?;
+            loop {
+                tokio::select! {
+                    () = sink.closed() => return Ok(()),
+                    next = stream.next_event() => match next.map_err(BridgeError::from)? {
+                        Some(event) => {
+                            if sink.send(event).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        None => return Ok(()),
+                    },
+                }
+            }
+        })
     }
 }
 
@@ -410,15 +644,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_endpoints_route_to_a_not_ready_bridge() {
+    async fn remote_endpoints_validate_and_label_tunnels() {
         let bridge = connect(&Endpoint::Ssh {
             host: "build-box".into(),
             remote_socket: Some("/run/vantry/core.sock".into()),
         });
         assert_eq!(bridge.label(), "SSH · build-box:/run/vantry/core.sock");
-        let err = bridge.snapshot().await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotReady);
-        assert!(!err.outcome_unknown());
+
+        let bad = connect(&Endpoint::Ssh {
+            host: "-oProxyCommand=bad".into(),
+            remote_socket: Some("/run/vantry/core.sock".into()),
+        });
+        let err = bad.snapshot().await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidCommand);
+
         let peer = connect(&Endpoint::Peer {
             id: "peer-7".into(),
             mode: "relay".into(),

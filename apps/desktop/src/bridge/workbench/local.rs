@@ -22,14 +22,22 @@ use super::{
 };
 use crate::bridge::{BridgeError, BridgeFuture, ErrorCode};
 
+struct ActiveTerminal {
+    kill: Option<oneshot::Sender<()>>,
+    #[cfg(unix)]
+    master: Arc<Mutex<std::fs::File>>,
+    #[cfg(not(unix))]
+    stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
+}
+
 /// The local workspace at `root`.
 #[derive(Clone)]
 pub struct LocalWorkbench {
     root: PathBuf,
     /// The model the command line named (the catalog's default).
     model: Option<String>,
-    /// Running terminal commands' kill switches, by session.
-    running: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    /// Active PTY/terminal sessions, by session id.
+    running: Arc<Mutex<HashMap<String, ActiveTerminal>>>,
 }
 
 impl LocalWorkbench {
@@ -242,66 +250,289 @@ impl WorkbenchBridge for LocalWorkbench {
         let root = self.root.clone();
         let running = self.running.clone();
         Box::pin(async move {
-            let mut child = shell(&command)
-                .current_dir(&root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| BridgeError::unavailable(format!("无法启动 shell：{e}")))?;
-            let (kill, killed) = oneshot::channel();
-            if let Some(previous) = running.lock().unwrap().insert(session.clone(), kill) {
-                let _ = previous.send(());
+            #[cfg(unix)]
+            {
+                use std::io::{Read, Write};
+                use std::os::fd::{AsRawFd, FromRawFd};
+                use std::os::unix::process::CommandExt;
+
+                let mut master_fd: libc::c_int = -1;
+                let mut slave_fd: libc::c_int = -1;
+                let mut ws = libc::winsize {
+                    ws_row: 24,
+                    ws_col: 100,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                if unsafe {
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut ws,
+                    )
+                } < 0
+                {
+                    return Err(BridgeError::unavailable(format!(
+                        "无法创建 PTY：{}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                let (master, slave) = unsafe {
+                    (
+                        std::fs::File::from_raw_fd(master_fd),
+                        std::fs::File::from_raw_fd(slave_fd),
+                    )
+                };
+                unsafe {
+                    let _ = libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                    let _ = libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                    let mut term: libc::termios = std::mem::zeroed();
+                    if libc::tcgetattr(slave.as_raw_fd(), &mut term) == 0 {
+                        // Disable local echo and ONLCR so streamed output stays clean
+                        // while preserving full TTY/interactive semantics (isatty == 1).
+                        term.c_lflag &= !(libc::ECHO);
+                        term.c_oflag &= !(libc::ONLCR);
+                        let _ = libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &term);
+                    }
+                }
+                let slave_in = slave
+                    .try_clone()
+                    .map_err(|e| BridgeError::unavailable(format!("PTY 复制失败：{e}")))?;
+                let slave_out = slave
+                    .try_clone()
+                    .map_err(|e| BridgeError::unavailable(format!("PTY 复制失败：{e}")))?;
+                let mut std_cmd = std::process::Command::new("/bin/sh");
+                std_cmd
+                    .args(["-c", &command])
+                    .current_dir(&root)
+                    .env("TERM", "xterm-256color")
+                    .stdin(Stdio::from(slave_in))
+                    .stdout(Stdio::from(slave_out))
+                    .stderr(Stdio::from(slave));
+                unsafe {
+                    std_cmd.pre_exec(|| {
+                        if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut child = Command::from(std_cmd)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|e| BridgeError::unavailable(format!("无法启动 PTY shell：{e}")))?;
+                let child_pid = child.id().unwrap_or(0) as libc::pid_t;
+                let mut reader = master
+                    .try_clone()
+                    .map_err(|e| BridgeError::unavailable(format!("PTY 读取端初始化失败：{e}")))?;
+                let master_handle = Arc::new(Mutex::new(master));
+                let (kill, killed) = oneshot::channel();
+                if let Some(mut previous) = running.lock().unwrap().insert(
+                    session.clone(),
+                    ActiveTerminal {
+                        kill: Some(kill),
+                        master: master_handle.clone(),
+                    },
+                ) {
+                    if let Some(prev_kill) = previous.kill.take() {
+                        let _ = prev_kill.send(());
+                    }
+                }
+                let pump_sink = sink.clone();
+                let pump = tokio::task::spawn_blocking(move || {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                                if pump_sink.send(text).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                            Err(_) => break,
+                        }
+                    }
+                });
+                let wait = async {
+                    let status = child.wait().await;
+                    let _ = pump.await;
+                    status
+                };
+                let code = tokio::select! {
+                    status = wait => status.ok().and_then(|s| s.code()).unwrap_or(-1),
+                    _ = killed => {
+                        if let Ok(mut m) = master_handle.lock() {
+                            let _ = m.write_all(b"\x03");
+                            let fg = unsafe { libc::tcgetpgrp(m.as_raw_fd()) };
+                            if fg > 1 {
+                                unsafe { libc::kill(-fg, libc::SIGKILL) };
+                            }
+                        }
+                        if child_pid > 1 {
+                            unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                        }
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = sink.send("^C\n".to_owned());
+                        -1
+                    }
+                };
+                running.lock().unwrap().remove(&session);
+                Ok(code)
             }
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-            let pump = |pipe: Option<tokio::process::ChildStdout>, sink: TerminalSink| async move {
-                if let Some(mut pipe) = pipe {
-                    let mut buf = [0u8; 4096];
-                    while let Ok(n) = pipe.read(&mut buf).await {
-                        if n == 0 || sink.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
-                            break;
-                        }
+            #[cfg(not(unix))]
+            {
+                let mut child = shell(&command)
+                    .current_dir(&root)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|e| BridgeError::unavailable(format!("无法启动 shell：{e}")))?;
+                let child_stdin = Arc::new(Mutex::new(child.stdin.take()));
+                let (kill, killed) = oneshot::channel();
+                if let Some(mut previous) = running.lock().unwrap().insert(
+                    session.clone(),
+                    ActiveTerminal {
+                        kill: Some(kill),
+                        stdin: child_stdin.clone(),
+                    },
+                ) {
+                    if let Some(prev_kill) = previous.kill.take() {
+                        let _ = prev_kill.send(());
                     }
                 }
-            };
-            let pump_err = |pipe: Option<tokio::process::ChildStderr>, sink: TerminalSink| async move {
-                if let Some(mut pipe) = pipe {
-                    let mut buf = [0u8; 4096];
-                    while let Ok(n) = pipe.read(&mut buf).await {
-                        if n == 0 || sink.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
-                            break;
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let pump = |pipe: Option<tokio::process::ChildStdout>, sink: TerminalSink| async move {
+                    if let Some(mut pipe) = pipe {
+                        let mut buf = [0u8; 4096];
+                        while let Ok(n) = pipe.read(&mut buf).await {
+                            if n == 0 || sink.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
+                                break;
+                            }
                         }
                     }
-                }
-            };
-            let out = pump(stdout, sink.clone());
-            let err = pump_err(stderr, sink.clone());
-            let wait = async {
-                let ((), (), status) = tokio::join!(out, err, child.wait());
-                status
-            };
-            let code = tokio::select! {
-                status = wait => status.ok().and_then(|s| s.code()).unwrap_or(-1),
-                _ = killed => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = sink.send("^C\n".to_owned());
-                    -1
-                }
-            };
-            running.lock().unwrap().remove(&session);
-            Ok(code)
+                };
+                let pump_err = |pipe: Option<tokio::process::ChildStderr>, sink: TerminalSink| async move {
+                    if let Some(mut pipe) = pipe {
+                        let mut buf = [0u8; 4096];
+                        while let Ok(n) = pipe.read(&mut buf).await {
+                            if n == 0 || sink.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                };
+                let out = pump(stdout, sink.clone());
+                let err = pump_err(stderr, sink.clone());
+                let wait = async {
+                    let ((), (), status) = tokio::join!(out, err, child.wait());
+                    status
+                };
+                let code = tokio::select! {
+                    status = wait => status.ok().and_then(|s| s.code()).unwrap_or(-1),
+                    _ = killed => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = sink.send("^C\n".to_owned());
+                        -1
+                    }
+                };
+                running.lock().unwrap().remove(&session);
+                Ok(code)
+            }
         })
     }
 
     fn terminal_interrupt(&self, session: String) -> BridgeFuture<()> {
-        let kill = self.running.lock().unwrap().remove(&session);
+        let kill = self
+            .running
+            .lock()
+            .unwrap()
+            .remove(&session)
+            .and_then(|mut a| a.kill.take());
         Box::pin(async move {
             if let Some(kill) = kill {
                 let _ = kill.send(());
             }
+            Ok(())
+        })
+    }
+
+    fn terminal_write(&self, session: String, data: String) -> BridgeFuture<()> {
+        let running = self.running.clone();
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                let master = running
+                    .lock()
+                    .unwrap()
+                    .get(&session)
+                    .map(|a| a.master.clone());
+                if let Some(master) = master {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut f) = master.lock() {
+                            let _ = f.write_all(data.as_bytes());
+                            let _ = f.flush();
+                        }
+                    })
+                    .await
+                    .map_err(|e| BridgeError::unavailable(e.to_string()))?;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                use tokio::io::AsyncWriteExt;
+                let stdin = running
+                    .lock()
+                    .unwrap()
+                    .get(&session)
+                    .and_then(|a| a.stdin.lock().unwrap().take());
+                if let Some(mut s) = stdin {
+                    let _ = s.write_all(data.as_bytes()).await;
+                    let _ = s.flush().await;
+                    if let Some(active) = running.lock().unwrap().get(&session) {
+                        *active.stdin.lock().unwrap() = Some(s);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn terminal_resize(&self, session: String, rows: u16, cols: u16) -> BridgeFuture<()> {
+        let running = self.running.clone();
+        Box::pin(async move {
+            #[cfg(unix)]
+            if rows > 0 && cols > 0 {
+                use std::os::fd::AsRawFd;
+                let master = running
+                    .lock()
+                    .unwrap()
+                    .get(&session)
+                    .map(|a| a.master.clone());
+                if let Some(master) = master {
+                    if let Ok(f) = master.lock() {
+                        let ws = libc::winsize {
+                            ws_row: rows,
+                            ws_col: cols,
+                            ws_xpixel: 0,
+                            ws_ypixel: 0,
+                        };
+                        unsafe {
+                            let _ = libc::ioctl(f.as_raw_fd(), libc::TIOCSWINSZ as _, &ws);
+                        }
+                    }
+                }
+            }
+            let _ = (session, rows, cols, running);
             Ok(())
         })
     }
@@ -521,6 +752,7 @@ pub(crate) fn search_tree(root: &std::path::Path, query: &str) -> Vec<SearchHit>
 }
 
 /// The platform's shell running `command`.
+#[cfg(not(unix))]
 fn shell(command: &str) -> Command {
     if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -668,6 +900,34 @@ mod tests {
             .unwrap();
         assert_eq!(code, -1);
         assert!(bench.running.lock().unwrap().is_empty());
+
+        // Real PTY: interactive stdin write and TTY detection work end-to-end.
+        let (sink, mut out) = tokio::sync::mpsc::unbounded_channel();
+        let interactive = tokio::spawn(bench.terminal_run(
+            "s3".into(),
+            "test -t 0 && read reply && printf 'got:%s\\n' \"$reply\"".into(),
+            sink,
+        ));
+        for _ in 0..200 {
+            if bench.running.lock().unwrap().contains_key("s3") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        bench.terminal_resize("s3".into(), 30, 120).await.unwrap();
+        bench.terminal_write("s3".into(), "pty-ok\n".into()).await.unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(5), interactive)
+            .await
+            .expect("interactive PTY command completes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0);
+        let mut reply = String::new();
+        while let Ok(chunk) = out.try_recv() {
+            reply.push_str(&chunk);
+        }
+        assert!(reply.contains("got:pty-ok"), "unexpected PTY output: {reply:?}");
+
         drop(bench);
         dir.close().unwrap();
     }

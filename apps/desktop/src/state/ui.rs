@@ -391,6 +391,16 @@ pub struct RemoteDesktopState {
     pub clipboard: bool,
     /// Scale the picture to the view (else 1:1 with scrolling).
     pub fit: bool,
+    /// Latest live frame data URI received from the viewer channel.
+    pub frame_uri: Option<String>,
+    pub frame_seq: u64,
+    pub frame_size: (u32, u32),
+    /// Rendered canvas dimensions in points for normalizing pointer coordinates.
+    pub canvas_size: (u32, u32),
+    /// Direct `vantry-lan://...` link input.
+    pub direct_link: String,
+    /// Active host sharing LAN link when this machine is sharing.
+    pub host_lan_link: String,
 }
 
 impl RemoteDesktopState {

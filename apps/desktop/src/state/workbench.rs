@@ -483,6 +483,10 @@ impl TerminalState {
         self.sessions.get(self.active)
     }
 
+    pub fn current_mut(&mut self) -> Option<&mut TerminalSession> {
+        self.sessions.get_mut(self.active)
+    }
+
     fn session_mut(&mut self, id: &str) -> Option<&mut TerminalSession> {
         self.sessions.iter_mut().find(|s| s.id == id)
     }

@@ -370,6 +370,33 @@ impl PeerConnection {
                 .to_bytes(),
         )?)
     }
+    pub async fn post_json(self, path: &str, value: Value) -> Result<Value> {
+        let res = self.request(Method::POST, path, Some(value)).await?;
+        ensure!(
+            res.status().is_success(),
+            "Core rejected request (HTTP {})",
+            res.status()
+        );
+        Ok(serde_json::from_slice(
+            &Limited::new(res.into_body(), 16 << 20)
+                .collect()
+                .await
+                .map_err(|_| anyhow!("invalid Core response body"))?
+                .to_bytes(),
+        )?)
+    }
+    pub async fn proxy_http(self, mut req: Request<Incoming>) -> Result<Reply> {
+        if !self.secret.is_empty() {
+            req.headers_mut().insert(
+                "authorization",
+                http::HeaderValue::from_str(&format!("Bearer {}", self.secret))?,
+            );
+        }
+        req.headers_mut()
+            .insert("host", http::HeaderValue::from_static("vantry.remote"));
+        let req = req.map(|b| b.map_err(Into::into).boxed_unsync());
+        proxy(req, self.stream, &self.tasks).await
+    }
     pub async fn check_update(self) -> Result<Value> {
         let response = self
             .request(
@@ -424,7 +451,107 @@ pub async fn redeem(
     local.save_peer(p)
 }
 
-#[cfg(unix)]
+/// Expose a local Core endpoint (`socket`: Unix socket on Unix, token-authenticated
+/// loopback TCP descriptor on Windows) that proxies all HTTP/NDJSON calls to a paired peer.
+pub async fn serve_peer_proxy(
+    socket: PathBuf,
+    cfg: Configuration,
+    pair: Pair,
+    route: Route,
+    stop: CancellationToken,
+) -> Result<()> {
+    let handle_conn = move |req: Request<Incoming>,
+                            cfg: Configuration,
+                            pair: Pair,
+                            route: Route,
+                            stop: CancellationToken| async move {
+        let reply = match PeerConnection::connect(&pair, Some(&cfg), route, stop).await {
+            Ok(conn) => conn.proxy_http(req).await.unwrap_or_else(|e| {
+                json(502, json!({"code":"not_ready","message":e.to_string()}))
+            }),
+            Err(e) => json(503, json!({"code":"not_ready","message":e.to_string()})),
+        };
+        Ok::<_, Infallible>(reply)
+    };
+
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        loop {
+            let (conn, _) = tokio::select! {
+                _ = stop.cancelled() => break,
+                r = listener.accept() => r?,
+            };
+            let cfg = cfg.clone();
+            let pair = pair.clone();
+            let route = route.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| {
+                    handle_conn(req, cfg.clone(), pair.clone(), route.clone(), stop.clone())
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(conn), svc)
+                    .await;
+            });
+        }
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let tok = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let ep = Arc::new(vantry_protocol::LocalTcpEndpoint::new(
+            listener.local_addr()?.to_string(),
+            tok,
+        ));
+        std::fs::write(&socket, serde_json::to_vec(ep.as_ref())?)?;
+        loop {
+            let (conn, _) = tokio::select! {
+                _ = stop.cancelled() => break,
+                r = listener.accept() => r?,
+            };
+            let cfg = cfg.clone();
+            let pair = pair.clone();
+            let route = route.clone();
+            let stop = stop.clone();
+            let ep = ep.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| {
+                    let authorized = req
+                        .headers()
+                        .get(vantry_protocol::LOCAL_TOKEN_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|t| ep.verify_token(t));
+                    let cfg = cfg.clone();
+                    let pair = pair.clone();
+                    let route = route.clone();
+                    let stop = stop.clone();
+                    async move {
+                        if !authorized {
+                            return Ok::<_, Infallible>(response(401, Bytes::new()));
+                        }
+                        handle_conn(req, cfg, pair, route, stop).await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(conn), svc)
+                    .await;
+            });
+        }
+        let _ = std::fs::remove_file(&socket);
+    }
+    Ok(())
+}
+
 pub async fn serve_gateway(
     listener: TcpListener,
     identity: Arc<IdentityStore>,
@@ -435,7 +562,6 @@ pub async fn serve_gateway(
     serve_gateway_with_t3(listener, identity, core, mtls, None, stop).await
 }
 /// The optional loopback T3 adapter enforces its own device and WebSocket ticket authentication.
-#[cfg(unix)]
 pub async fn serve_gateway_with_t3(
     listener: TcpListener,
     identity: Arc<IdentityStore>,
@@ -556,7 +682,7 @@ async fn gateway_request(
         return Ok(json(200, identity.public_identity()));
     }
     req.headers_mut().remove("authorization");
-    let request = if path == "/v1/workbench" {
+    let mut request = if path == "/v1/workbench" {
         let (parts, b) = req.into_parts();
         let data = Limited::new(b, 16 << 20)
             .collect()
@@ -580,10 +706,40 @@ async fn gateway_request(
     } else {
         req.map(|b| b.map_err(Into::into).boxed_unsync())
     };
-    let io = tokio::net::UnixStream::connect(core)
-        .await
-        .map_err(|_| 502u16)?;
+    let io: crate::transport::Stream = if let Ok(bytes) = std::fs::read(&core)
+        && let Some(ep) = vantry_protocol::LocalTcpEndpoint::parse_bytes(&bytes)
+    {
+        if let Ok(val) = http::HeaderValue::from_str(&ep.token) {
+            request
+                .headers_mut()
+                .insert(vantry_protocol::LOCAL_TOKEN_HEADER, val);
+        }
+        Box::new(
+            tokio::net::TcpStream::connect(&ep.addr)
+                .await
+                .map_err(|_| 502u16)?,
+        )
+    } else {
+        #[cfg(unix)]
+        {
+            Box::new(
+                tokio::net::UnixStream::connect(core)
+                    .await
+                    .map_err(|_| 502u16)?,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(502);
+        }
+    };
     let (a, mut b) = tokio::io::duplex(64 << 10);
-    group.spawn(async move{let mut io=io;tokio::select!{_=revoke.cancelled()=>{},_=tokio::io::copy_bidirectional(&mut b,&mut io)=>{}}});
+    group.spawn(async move {
+        let mut io = io;
+        tokio::select! {
+            _ = revoke.cancelled() => {},
+            _ = tokio::io::copy_bidirectional(&mut b, &mut io) => {}
+        }
+    });
     proxy(request, Box::new(a), &group).await.map_err(|_| 502)
 }

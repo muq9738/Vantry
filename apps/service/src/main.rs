@@ -48,6 +48,19 @@ enum Role {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Expose a local Core socket proxying a paired remote peer over mTLS/relay.
+    PeerProxy(PeerProxyArgs),
+}
+#[derive(Args)]
+struct PeerProxyArgs {
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long)]
+    peer: String,
+    #[arg(long, default_value = "auto")]
+    mode: String,
+    #[arg(long)]
+    socket: PathBuf,
 }
 #[derive(Args)]
 struct JobDir {
@@ -169,12 +182,34 @@ fn data_dir(path: Option<&Path>) -> Result<PathBuf> {
         None => Ok(Paths::discover()?.data),
     }
 }
+pub(crate) fn detach_tokio_command(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+#[cfg(unix)]
 fn signal() -> Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     Ok(async move {
         tokio::select! {_=term.recv()=>{},_=int.recv()=>{}}
+    })
+}
+
+#[cfg(not(unix))]
+fn signal() -> Result<impl Future<Output = ()>> {
+    Ok(async move {
+        let _ = tokio::signal::ctrl_c().await;
     })
 }
 async fn serve(args: CoreArgs) -> Result<()> {
@@ -226,14 +261,33 @@ async fn serve(args: CoreArgs) -> Result<()> {
     };
     let remote = async {
         if let Some(listener) = listener {
-            vantry_connectivity::peer::serve_gateway(
+            let t3 = vantry_connectivity::t3compat::T3Server::open(
+                vantry_connectivity::t3compat::T3Options {
+                    data_dir: data.clone(),
+                    core_socket: data.join("core.sock"),
+                    environment_id: ext.environment.clone(),
+                    name: ext.identity.snapshot().host.name,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    provider: ext.options.provider_id.clone(),
+                    model: ext.options.model.clone(),
+                },
+            )?;
+            let (t3_listener, t3_addr) = t3.bind_loopback().await?;
+            let t3_stop = stop.clone();
+            let t3_task = tokio::spawn(async move {
+                let _ = t3.serve(t3_listener, t3_stop).await;
+            });
+            let res = vantry_connectivity::peer::serve_gateway_with_t3(
                 listener,
                 ext.identity.clone(),
                 data.join("core.sock"),
                 false,
+                Some(t3_addr),
                 stop.clone(),
             )
-            .await
+            .await;
+            t3_task.abort();
+            res
         } else {
             stop.cancelled().await;
             Ok(())
@@ -287,14 +341,14 @@ async fn ensure_core(args: CoreArgs, raw: &[OsString]) -> Result<()> {
         return ctl::print(&health);
     }
     hostfs::ensure_private_dir(&data)?;
-    let mut child = tokio::process::Command::new(std::env::current_exe()?)
-        .arg("core")
+    let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
+    cmd.arg("core")
         .args(raw)
-        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    detach_tokio_command(&mut cmd);
+    let mut child = cmd.spawn()?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(health) = ready().await {
@@ -370,6 +424,46 @@ async fn main() -> Result<()> {
         )?,
         Role::ApplyUpdate { args } => {
             vantry_updater::run_apply(&args, std::io::stdout()).context("apply-update")?
+        }
+        Role::PeerProxy(p) => peer_proxy(p).await?,
+    }
+    Ok(())
+}
+
+async fn peer_proxy(args: PeerProxyArgs) -> Result<()> {
+    let data = data_dir(args.data_dir.as_deref())?;
+    let store = vantry_connectivity::identity::IdentityStore::open(&data, "Vantry")?;
+    let cfg = store.snapshot();
+    let peer = cfg
+        .peers
+        .iter()
+        .find(|p| p.id == args.peer || p.pair.name == args.peer)
+        .cloned()
+        .context("unknown paired peer")?;
+    let route = match args.mode.as_str() {
+        "direct" => vantry_connectivity::peer::Route::Direct,
+        "relay" => vantry_connectivity::peer::Route::Relay,
+        _ => vantry_connectivity::peer::Route::Auto,
+    };
+    if let Some(parent) = args.socket.parent() {
+        hostfs::ensure_private_dir(parent)?;
+    }
+    let stop = CancellationToken::new();
+    let shutdown = signal()?;
+    let proxy_stop = stop.clone();
+    let proxy = vantry_connectivity::peer::serve_peer_proxy(
+        args.socket,
+        cfg,
+        peer.pair,
+        route,
+        proxy_stop,
+    );
+    tokio::pin!(proxy, shutdown);
+    tokio::select! {
+        r = &mut proxy => r?,
+        _ = &mut shutdown => {
+            stop.cancel();
+            proxy.await?;
         }
     }
     Ok(())

@@ -1,6 +1,7 @@
 #[test]
 fn embedded_worker_round_trips_real_tools_and_controls() {
-    let result = std::process::Command::new("python3")
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let result = std::process::Command::new(python)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/worker_smoke.py"

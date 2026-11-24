@@ -238,6 +238,19 @@ impl Core {
     pub fn scheduler_running(&self) -> bool {
         self.0.scheduler.load(Ordering::Acquire)
     }
+    /// Register a durable completion watch so `watcher_thread_id` is woken with
+    /// an inter-thread message when `target_thread_id` (optionally filtered to
+    /// `target_run_id`) reaches a terminal run state.
+    pub fn register_watch(
+        &self,
+        watcher_thread_id: &str,
+        target_thread_id: &str,
+        target_run_id: &str,
+    ) -> Result<String> {
+        self.write(|db| {
+            tasks::watches::register(db, watcher_thread_id, target_thread_id, target_run_id)
+        })
+    }
 }
 fn prune(db: &Connection, cut: i64) -> Result<usize> {
     let n = db.execute("DELETE FROM events WHERE sequence<=?", [cut])?;

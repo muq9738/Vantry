@@ -5,8 +5,17 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
-use tokio::{net::UnixStream, task::JoinHandle};
+use tokio::{net::TcpStream, task::JoinHandle};
 use vantry_protocol::*;
+
+fn read_tcp_endpoint(path: &Path) -> Option<LocalTcpEndpoint> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > 4096 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    LocalTcpEndpoint::parse_bytes(&bytes)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -58,20 +67,46 @@ impl CoreClient {
         path: &str,
         body: Vec<u8>,
     ) -> Result<(Incoming, Driver)> {
-        let request = Request::builder()
+        let tcp_endpoint = read_tcp_endpoint(&self.socket);
+        let mut builder = Request::builder()
             .method(method)
             .uri(path)
             .header("host", "vantry.local")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(ep) = &tcp_endpoint {
+            builder = builder.header(LOCAL_TOKEN_HEADER, &ep.token);
+        }
+        let request = builder
             .body(Full::new(Bytes::from(body)))
             .map_err(anyhow::Error::from)?;
-        let io = UnixStream::connect(&self.socket)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let (mut sender, conn) = http1::handshake(TokioIo::new(io))
-            .await
-            .map_err(anyhow::Error::from)?;
-        let driver = Driver(tokio::spawn(conn));
+        let (mut sender, driver) = if let Some(ep) = tcp_endpoint {
+            let io = TcpStream::connect(&ep.addr)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let (sender, conn) = http1::handshake(TokioIo::new(io))
+                .await
+                .map_err(anyhow::Error::from)?;
+            (sender, Driver(tokio::spawn(conn)))
+        } else {
+            #[cfg(unix)]
+            {
+                let io = tokio::net::UnixStream::connect(&self.socket)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                let (sender, conn) = http1::handshake(TokioIo::new(io))
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                (sender, Driver(tokio::spawn(conn)))
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(anyhow::anyhow!(
+                    "local Core endpoint descriptor missing or invalid at {}",
+                    self.socket.display()
+                )
+                .into());
+            }
+        };
         let response = sender
             .send_request(request)
             .await

@@ -6171,6 +6171,7 @@ dependencies = [
  "chrono",
  "clap",
  "env_logger",
+ "libc",
  "nsh-base",
  "nsh-core",
  "nsh-platform-linux",

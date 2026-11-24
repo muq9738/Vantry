@@ -9,6 +9,49 @@ pub use provider::*;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const EMBEDDED_PI_CAPABILITY: &str = "provider.pi.embedded.v1";
 pub const LEGACY_PI_RUNTIME_CAPABILITY: &str = "provider.pi.runtime.v1";
+pub const LOCAL_TOKEN_HEADER: &str = "x-vantry-local-token";
+
+/// Loopback TCP descriptor written to `core.sock` on platforms without Unix
+/// domain sockets in Rust's async runtime (Windows) or for TCP-forwarded cores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTcpEndpoint {
+    pub transport: String,
+    pub addr: String,
+    pub token: String,
+}
+
+impl LocalTcpEndpoint {
+    pub fn new(addr: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            transport: "tcp".into(),
+            addr: addr.into(),
+            token: token.into(),
+        }
+    }
+
+    pub fn parse_bytes(bytes: &[u8]) -> Option<Self> {
+        let ep: Self = serde_json::from_slice(bytes).ok()?;
+        if ep.transport == "tcp" && !ep.addr.is_empty() && ep.token.len() >= 16 {
+            Some(ep)
+        } else {
+            None
+        }
+    }
+
+    pub fn verify_token(&self, candidate: &str) -> bool {
+        let a = self.token.as_bytes();
+        let b = candidate.as_bytes();
+        if a.len() != b.len() || a.is_empty() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+}
 
 pub type Capabilities = ServerStatus;
 pub type Message = QueuedMessage;

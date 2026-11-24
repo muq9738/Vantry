@@ -33,13 +33,16 @@ fn change(path: &Path, edit: impl FnOnce(&mut Value) -> Result<()>) -> Result<()
     edit(&mut v)?;
     let bytes = serde_json::to_vec_pretty(&v)?;
     // Existing project .pi directories need not have a private mode. Replace the file atomically.
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    use std::io::Write;
     let tmp = dir.join(format!(".settings-{}", uuid::Uuid::new_v4()));
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
     let result = (|| {
         f.write_all(&bytes)?;
         f.sync_all()?;

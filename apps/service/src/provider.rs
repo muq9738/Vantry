@@ -85,6 +85,10 @@ impl Provider {
             },
         });
         let exe = std::env::current_exe()?;
+        let pi_settings = crate::settings::document(&self.data.join("pi-runtime.json"))
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let enable_user_extensions = pi_settings["enableUserExtensions"].as_bool().unwrap_or(true);
+        let enable_user_mcp = pi_settings["enableUserMCP"].as_bool().unwrap_or(true);
         let job = JobRequest {
             data_dir: self.data.clone(),
             socket_path: self.data.join("core.sock"),
@@ -94,8 +98,8 @@ impl Provider {
             interaction_mode: request.interaction_mode.clone(),
             request,
             enable_native_subagents: false,
-            enable_user_extensions: true,
-            enable_user_mcp: true,
+            enable_user_extensions,
+            enable_user_mcp,
             sandbox_mode: String::new(),
         };
         let dir = if controlled {
@@ -133,14 +137,14 @@ impl Provider {
         } else {
             vantry_pi_runtime::prepare_job(&job)?
         };
-        let mut child = tokio::process::Command::new(exe)
-            .args(["provider-worker", "--job-dir"])
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.args(["provider-worker", "--job-dir"])
             .arg(dir)
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        crate::detach_tokio_command(&mut cmd);
+        let mut child = cmd.spawn()?;
         tokio::spawn(async move {
             let _ = child.wait().await;
         });

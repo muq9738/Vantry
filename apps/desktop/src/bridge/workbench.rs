@@ -215,6 +215,14 @@ pub trait WorkbenchBridge: Send + Sync + 'static {
     -> BridgeFuture<i32>;
     /// Interrupts what session `session` runs (nothing when it runs nothing).
     fn terminal_interrupt(&self, session: String) -> BridgeFuture<()>;
+    /// Sends interactive input bytes to a running terminal session's PTY.
+    fn terminal_write(&self, _session: String, _data: String) -> BridgeFuture<()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Resizes a running terminal session's PTY window.
+    fn terminal_resize(&self, _session: String, _rows: u16, _cols: u16) -> BridgeFuture<()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Models, plugins, MCP servers, the update, peers, SSH hosts.
     fn settings(&self) -> BridgeFuture<SettingsData>;
     /// Makes file `path` an attachment for the next message.

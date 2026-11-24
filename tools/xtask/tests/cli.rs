@@ -284,6 +284,29 @@ fn offline_packages_contain_reported_files() -> Result<()> {
     ] {
         package_case(tmp.path(), kind, target, &helper, &bin)?;
     }
+    // Shorthand platform aliases used by CI/scripts normalize to Cargo triples.
+    for (alias, expected_triple) in [
+        ("linux-x86_64", "x86_64-unknown-linux-gnu"),
+        ("windows-x86_64", "x86_64-pc-windows-msvc"),
+    ] {
+        let out = tmp.path().join(format!("alias-{alias}"));
+        cli(&[
+            "package",
+            "service",
+            "--skip-build",
+            "--profile",
+            "dev",
+            "--target",
+            alias,
+            "--service",
+            s(&bin),
+            "--out",
+            s(&out),
+        ])?;
+        let report: serde_json::Value =
+            serde_json::from_reader(File::open(out.join("size-report.json"))?)?;
+        assert_eq!(report["target"], expected_triple);
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let native = Path::new(env!("CARGO_BIN_EXE_xtask"));

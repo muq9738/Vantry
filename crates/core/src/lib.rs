@@ -5,7 +5,6 @@ pub mod engine;
 pub mod lock;
 pub mod runner;
 pub mod scheduler;
-#[cfg(unix)]
 pub mod server;
 mod session;
 pub mod store;

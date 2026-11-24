@@ -26,13 +26,11 @@ impl ClientBridge {
         &self.socket
     }
 
-    #[cfg(unix)]
     fn client(&self) -> vantry_client::CoreClient {
         vantry_client::CoreClient::new(self.socket.clone())
     }
 }
 
-#[cfg(unix)]
 impl CoreBridge for ClientBridge {
     fn label(&self) -> String {
         "本机 Core".to_owned()
@@ -76,39 +74,6 @@ impl CoreBridge for ClientBridge {
             }
         })
     }
-}
-
-/// Windows has no Unix-socket client yet: every call is unavailable.
-#[cfg(not(unix))]
-impl CoreBridge for ClientBridge {
-    fn label(&self) -> String {
-        "本机 Core".to_owned()
-    }
-
-    fn health(&self) -> BridgeFuture<Health> {
-        unsupported()
-    }
-
-    fn snapshot(&self) -> BridgeFuture<Snapshot> {
-        unsupported()
-    }
-
-    fn dispatch(&self, _command: Command) -> BridgeFuture<Receipt> {
-        unsupported()
-    }
-
-    fn subscribe(&self, _after: i64, _sink: EventSink) -> BridgeFuture<()> {
-        unsupported()
-    }
-}
-
-#[cfg(not(unix))]
-fn unsupported<T: Send + 'static>() -> BridgeFuture<T> {
-    Box::pin(async {
-        Err(BridgeError::unavailable(
-            "此平台的本机 Core 客户端尚未接入",
-        ))
-    })
 }
 
 #[cfg(all(test, unix))]
