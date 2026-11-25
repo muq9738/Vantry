@@ -739,7 +739,7 @@ impl AppState {
         if detail_id != thread_id || *detail_sequence < summary_sequence {
             return false;
         }
-        if !truncated {
+        if !truncated || matches!(self.connection, Connection::Live) {
             return true;
         }
         *detail_sequence == summary_sequence
@@ -988,7 +988,13 @@ impl AppState {
         self.requests.extend(requests.unwrap_or_default());
         self.inputs.extend(inputs.unwrap_or_default());
         self.tasks.extend(tasks.unwrap_or_default());
-        self.sequence = self.sequence.max(sequence);
+        // Keep `self.sequence` anchored to `summary_sequence` when summaries
+        // already established the event stream cursor, so subscribing after
+        // `self.sequence` will not skip events for other threads that landed
+        // between `/v1/threads/summaries` and `/v1/threads/detail`.
+        if self.summary_sequence.is_none() {
+            self.sequence = self.sequence.max(sequence);
+        }
         if self.notice.as_ref().is_some_and(|notice| {
             notice.text == "正在加载完整会话…" || notice.text == "正在加载会话内容…"
         }) {
@@ -1077,6 +1083,14 @@ impl AppState {
         // The cursor follows every committed event, shown or not, so a
         // resubscription never replays what was already seen.
         self.sequence = event.sequence;
+        if !event.thread_id.is_empty() {
+            self.awaiting_refresh.remove(&event.thread_id);
+            if let Some((detail_id, detail_seq, _)) = &mut self.detail_readiness
+                && detail_id == &event.thread_id
+            {
+                *detail_seq = (*detail_seq).max(event.sequence);
+            }
+        }
         let kind = event.r#type.as_str();
         let changed = match kind {
             events::RUN_OUTPUT => self.fold_output(event),
@@ -1872,6 +1886,9 @@ impl AppState {
                     return None;
                 }
                 self.show_new_thread(&thread_id, &pending.command);
+                if !self.snapshot_loaded {
+                    self.detail_readiness = Some((thread_id.clone(), self.sequence, false));
+                }
                 if self.selected.is_none() && self.draft_key() == draft_key {
                     self.select_thread(Some(thread_id.clone()));
                 }

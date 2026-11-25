@@ -346,41 +346,54 @@ async fn call<T: Send + 'static>(future: bridge::BridgeFuture<T>) -> Result<T, B
 /// `resync_required`, backing off between attempts.
 async fn run_connection(core: Arc<dyn CoreBridge>) {
     let mut need_snapshot = true;
-    let mut initial_painted = false;
     loop {
         if need_snapshot {
-            // Paint the cheap sidebar projection and one bounded conversation
-            // first. On subsequent snapshot retries keep the already-loaded
-            // conversation on screen instead of wiping it back to a loading state.
-            let should_paint =
-                !initial_painted || state().with_untracked(|s| s.threads.is_empty());
-            if should_paint && let Ok(summaries) = call(core.thread_summaries()).await {
-                let mut selected = None;
-                state().update(|s| {
-                    s.apply_summaries(summaries);
-                    selected = s.selected.clone();
-                });
-                initial_painted = true;
-                catalogs_after_connect();
-                if let Some(id) = selected {
-                    let mut request = 0;
-                    state().update(|s| request = s.begin_detail_load(&id));
-                    if let Ok(detail) = call(core.thread_detail(id, 20)).await {
-                        state().update(|s| {
-                            s.apply_thread_detail(request, detail);
-                        });
-                    }
-                }
-            }
-            match call(core.snapshot()).await {
-                Ok(snapshot) => {
+            // Fast path: load cheap sidebar summaries + bounded detail for the
+            // active thread, then subscribe directly to `/v1/events` without
+            // downloading the multi-megabyte full `/v1/snapshot`. Fall back to
+            // `/v1/snapshot` only on older Cores that do not serve summaries.
+            match call(core.thread_summaries()).await {
+                Ok(summaries) => {
+                    let mut selected = None;
                     state().update(|s| {
-                        s.apply_snapshot(snapshot);
-                        s.on_live();
+                        s.apply_summaries(summaries);
+                        selected = s.selected.clone();
                     });
+                    if let Some(id) = selected {
+                        let mut request = 0;
+                        state().update(|s| request = s.begin_detail_load(&id));
+                        if let Ok(detail) = call(core.thread_detail(id, 20)).await {
+                            state().update(|s| {
+                                s.apply_thread_detail(request, detail);
+                            });
+                        }
+                    }
+                    state().update(AppState::on_live);
                     need_snapshot = false;
-                    initial_painted = true;
                     catalogs_after_connect();
+                }
+                Err(error) if error.code == ErrorCode::NotFound => {
+                    match call(core.snapshot()).await {
+                        Ok(snapshot) => {
+                            state().update(|s| {
+                                s.apply_snapshot(snapshot);
+                                s.on_live();
+                            });
+                            need_snapshot = false;
+                            catalogs_after_connect();
+                        }
+                        Err(error) => {
+                            let mut recovery = None;
+                            state().update(|s| recovery = Some(s.on_snapshot_failed(&error)));
+                            if let Some(
+                                Recovery::Resync { delay } | Recovery::Resubscribe { delay, .. },
+                            ) = recovery
+                            {
+                                timer(delay).await;
+                            }
+                            continue;
+                        }
+                    }
                 }
                 Err(error) => {
                     let mut recovery = None;

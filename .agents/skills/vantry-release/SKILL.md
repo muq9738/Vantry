@@ -5,7 +5,7 @@ description: Use when packaging Vantry for Apple Silicon Macs running macOS 14 o
 
 # Vantry releases
 
-Build macOS packages on the local Mac. The `Release` workflow builds Windows packages on a GitHub-hosted `windows-2022` runner. A macOS-only packaging request ends with the local artifacts. For a public release, assemble both platforms on the Mac and publish them together.
+Build macOS packages on the local Mac. The `Release` workflow builds Windows packages on a GitHub-hosted `windows-2022` runner. A macOS-only packaging request ends with the local artifacts. For a public release, assemble both platforms on the Mac and publish them together. The companion relay service for sessions and remote desktop is `linkd` (deployed separately); Vantry releases ship only `desktop` and `service` packages.
 
 ## Prepare the release
 
@@ -33,7 +33,7 @@ fi
 test -x resources/darwin-arm64/remote-desktop/vantry-remote-helper
 
 cargo test --workspace --locked
-for product in desktop service relay; do
+for product in desktop service; do
   cargo run --locked -p xtask -- package "$product" \
     --target aarch64-apple-darwin --out-dir "$release_dir/$product"
 done
@@ -59,7 +59,7 @@ gh run download "$run_id" --name release-windows-amd64 --dir "$release_dir/windo
 
 ## Publish the GitHub Release
 
-When publication is requested, upload the six versioned files from the same release tag. Use the English notes from the tagged checkout.
+When publication is requested, upload the five versioned files from the same release tag. Use the English notes from the tagged checkout.
 
 ```bash
 gh release create "$tag" --verify-tag --title "Vantry $version" \
@@ -67,7 +67,6 @@ gh release create "$tag" --verify-tag --title "Vantry $version" \
   "$release_dir/desktop/Vantry-$version-macos-arm64.dmg" \
   "$release_dir/desktop/vantry-$version-darwin-arm64.zip" \
   "$release_dir/service/vantry-service-$version-darwin-arm64.zip" \
-  "$release_dir/relay/vantry-relay-$version-darwin-arm64.zip" \
   "$release_dir/windows/desktop/vantry-$version-windows-amd64.zip" \
   "$release_dir/windows/service/vantry-service-$version-windows-amd64.zip"
 ```

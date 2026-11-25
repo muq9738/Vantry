@@ -183,6 +183,17 @@ impl PeerConnection {
         route: Route,
         stop: CancellationToken,
     ) -> Result<Self> {
+        Self::connect_with_relay_delay(pair, identity, route, Duration::from_millis(450), stop)
+            .await
+    }
+
+    pub(crate) async fn connect_with_relay_delay(
+        pair: &Pair,
+        identity: Option<&Configuration>,
+        route: Route,
+        auto_relay_delay: Duration,
+        stop: CancellationToken,
+    ) -> Result<Self> {
         let tls = TlsConnector::from(client_tls(pair, identity)?);
         let tasks = Tasks::new(stop.child_token());
         let client = transport::http_client()?;
@@ -196,7 +207,11 @@ impl PeerConnection {
                 }
             }
             if !matches!(route, Route::Direct) {
-                let delay = if matches!(route, Route::Auto) && !pair.direct.is_empty() { 450 } else { 0 };
+                let delay = if matches!(route, Route::Auto) && !pair.direct.is_empty() {
+                    auto_relay_delay.as_millis() as u64
+                } else {
+                    0
+                };
                 for (i, url) in std::iter::once(&pair.relay).chain(&pair.relays).filter(|url| !url.is_empty()).take(8).enumerate() {
                     if !targets.iter().any(|(mode, target, _)| *mode == "relay" && target == url) {
                         targets.push(("relay", url.clone(), delay + i as u64 * 150));
@@ -466,6 +481,160 @@ pub async fn redeem(
     local.save_peer(p)
 }
 
+struct PeerProxyPool {
+    cfg: Configuration,
+    pair: Pair,
+    route: Route,
+    stop: CancellationToken,
+    idle: Mutex<std::collections::VecDeque<(Instant, Sender, Tasks)>>,
+    relay_fast_until: Mutex<Option<Instant>>,
+}
+
+impl PeerProxyPool {
+    fn new(cfg: Configuration, pair: Pair, route: Route, stop: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            cfg,
+            pair,
+            route,
+            stop,
+            idle: Mutex::default(),
+            relay_fast_until: Mutex::default(),
+        })
+    }
+
+    fn relay_delay(&self) -> Duration {
+        let fast = self
+            .relay_fast_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| Instant::now() < until);
+        if fast {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(450)
+        }
+    }
+
+    async fn dial(&self) -> Result<PeerConnection> {
+        let conn = PeerConnection::connect_with_relay_delay(
+            &self.pair,
+            Some(&self.cfg),
+            self.route.clone(),
+            self.relay_delay(),
+            self.stop.clone(),
+        )
+        .await?;
+        if conn.mode == "relay" {
+            *self.relay_fast_until.lock().unwrap() =
+                Some(Instant::now() + Duration::from_secs(60));
+        } else {
+            *self.relay_fast_until.lock().unwrap() = None;
+        }
+        Ok(conn)
+    }
+
+    fn pop_idle(&self) -> Option<(Sender, Tasks)> {
+        let mut idle = self.idle.lock().unwrap();
+        while let Some((at, tx, tasks)) = idle.pop_front() {
+            if at.elapsed() < Duration::from_secs(45) && !tx.is_closed() {
+                return Some((tx, tasks));
+            }
+        }
+        None
+    }
+
+    fn recycle(self: &Arc<Self>, mut tx: Sender, tasks: Tasks) {
+        let pool = Arc::clone(self);
+        let stop = self.stop.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = stop.cancelled() => {}
+                ready = tx.ready() => {
+                    if ready.is_ok() {
+                        let mut idle = pool.idle.lock().unwrap();
+                        idle.retain(|(at, s, _)| at.elapsed() < Duration::from_secs(45) && !s.is_closed());
+                        if idle.len() >= 4 {
+                            idle.pop_front();
+                        }
+                        idle.push_back((Instant::now(), tx, tasks));
+                    }
+                }
+            }
+        });
+    }
+
+    async fn handle(self: Arc<Self>, mut req: Request<Incoming>) -> Reply {
+        let is_stream = req.uri().path() == "/v1/events"
+            || req.headers().contains_key("upgrade");
+        if is_stream {
+            return match self.dial().await {
+                Ok(conn) => conn.proxy_http(req).await.unwrap_or_else(|e| {
+                    json(502, json!({"code":"not_ready","message":e.to_string()}))
+                }),
+                Err(e) => json(503, json!({"code":"not_ready","message":e.to_string()})),
+            };
+        }
+
+        if !self.pair.secret.is_empty()
+            && let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {}", self.pair.secret))
+        {
+            req.headers_mut().insert("authorization", val);
+        }
+        req.headers_mut()
+            .insert("host", http::HeaderValue::from_static("vantry.remote"));
+
+        let (parts, body) = req.into_parts();
+        let body_bytes = match Limited::new(body, 16 << 20).collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => {
+                return json(
+                    413,
+                    json!({"code":"invalid_command","message":"request body too large"}),
+                );
+            }
+        };
+
+        let build = |parts: &http::request::Parts, bytes: &Bytes| {
+            let mut builder = Request::builder()
+                .method(parts.method.clone())
+                .uri(parts.uri.clone())
+                .version(parts.version);
+            if let Some(headers) = builder.headers_mut() {
+                *headers = parts.headers.clone();
+            }
+            builder.body(full(bytes.clone())).unwrap()
+        };
+
+        if let Some((mut tx, tasks)) = self.pop_idle() {
+            if let Ok(reply) = forward(build(&parts, &body_bytes), &mut tx, &tasks).await {
+                if reply.status() != 101 {
+                    self.recycle(tx, tasks);
+                }
+                return reply;
+            }
+        }
+
+        let conn = match self.dial().await {
+            Ok(conn) => conn,
+            Err(e) => return json(503, json!({"code":"not_ready","message":e.to_string()})),
+        };
+        let tasks = conn.tasks;
+        let mut tx = match sender(conn.stream, &tasks).await {
+            Ok(tx) => tx,
+            Err(e) => return json(502, json!({"code":"not_ready","message":e.to_string()})),
+        };
+        match forward(build(&parts, &body_bytes), &mut tx, &tasks).await {
+            Ok(reply) => {
+                if reply.status() != 101 {
+                    self.recycle(tx, tasks);
+                }
+                reply
+            }
+            Err(e) => json(502, json!({"code":"not_ready","message":e.to_string()})),
+        }
+    }
+}
+
 /// Expose a local Core endpoint (`socket`: Unix socket on Unix, token-authenticated
 /// loopback TCP descriptor on Windows) that proxies all HTTP/NDJSON calls to a paired peer.
 pub async fn serve_peer_proxy(
@@ -475,19 +644,7 @@ pub async fn serve_peer_proxy(
     route: Route,
     stop: CancellationToken,
 ) -> Result<()> {
-    let handle_conn = move |req: Request<Incoming>,
-                            cfg: Configuration,
-                            pair: Pair,
-                            route: Route,
-                            stop: CancellationToken| async move {
-        let reply = match PeerConnection::connect(&pair, Some(&cfg), route, stop).await {
-            Ok(conn) => conn.proxy_http(req).await.unwrap_or_else(|e| {
-                json(502, json!({"code":"not_ready","message":e.to_string()}))
-            }),
-            Err(e) => json(503, json!({"code":"not_ready","message":e.to_string()})),
-        };
-        Ok::<_, Infallible>(reply)
-    };
+    let pool = PeerProxyPool::new(cfg, pair, route, stop.clone());
 
     #[cfg(unix)]
     {
@@ -500,13 +657,11 @@ pub async fn serve_peer_proxy(
                 _ = stop.cancelled() => break,
                 r = listener.accept() => r?,
             };
-            let cfg = cfg.clone();
-            let pair = pair.clone();
-            let route = route.clone();
-            let stop = stop.clone();
+            let pool = Arc::clone(&pool);
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
-                    handle_conn(req, cfg.clone(), pair.clone(), route.clone(), stop.clone())
+                    let pool = Arc::clone(&pool);
+                    async move { Ok::<_, Infallible>(pool.handle(req).await) }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(conn), svc)
@@ -534,10 +689,7 @@ pub async fn serve_peer_proxy(
                 _ = stop.cancelled() => break,
                 r = listener.accept() => r?,
             };
-            let cfg = cfg.clone();
-            let pair = pair.clone();
-            let route = route.clone();
-            let stop = stop.clone();
+            let pool = Arc::clone(&pool);
             let ep = ep.clone();
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
@@ -546,15 +698,12 @@ pub async fn serve_peer_proxy(
                         .get(vantry_protocol::LOCAL_TOKEN_HEADER)
                         .and_then(|v| v.to_str().ok())
                         .is_some_and(|t| ep.verify_token(t));
-                    let cfg = cfg.clone();
-                    let pair = pair.clone();
-                    let route = route.clone();
-                    let stop = stop.clone();
+                    let pool = Arc::clone(&pool);
                     async move {
                         if !authorized {
                             return Ok::<_, Infallible>(response(401, Bytes::new()));
                         }
-                        handle_conn(req, cfg, pair, route, stop).await
+                        Ok::<_, Infallible>(pool.handle(req).await)
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
