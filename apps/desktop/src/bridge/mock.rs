@@ -20,7 +20,8 @@ use serde_json::json;
 use tokio::sync::{Notify, oneshot};
 use vantry_protocol::{
     Command, CommandKind, CoreEvent, DeliveryStatus, Health, Input, PendingRequest,
-    PROTOCOL_VERSION, Receipt, Run, RunStatus, Snapshot, Task, Thread, ToolCall,
+    PROTOCOL_VERSION, Receipt, Run, RunStatus, Snapshot, Task, Thread, ThreadDetail,
+    ThreadSummary, ThreadSummaries, ToolCall,
 };
 
 use super::{BridgeError, BridgeFuture, CoreBridge, ErrorCode, EventSink, events};
@@ -295,6 +296,151 @@ impl MockCore {
             inputs: self.inputs.clone(),
             ..Snapshot::default()
         }
+    }
+
+    fn thread_summaries(&self) -> ThreadSummaries {
+        let threads = self
+            .threads
+            .iter()
+            .map(|thread| {
+                let runs = self.runs.iter().filter(|run| run.thread_id == thread.id);
+                let latest = runs.clone().max_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then(a.id.cmp(&b.id))
+                });
+                let (latest_run_id, latest_status, updated_at) = latest.map_or_else(
+                    || (String::new(), None, thread.created_at.clone()),
+                    |run| {
+                        (
+                            run.id.clone(),
+                            Some(run.status),
+                            if run.updated_at.is_empty() {
+                                run.created_at.clone()
+                            } else {
+                                run.updated_at.clone()
+                            },
+                        )
+                    },
+                );
+                let run_count = runs.clone().count() as i64;
+                let active_runs = runs
+                    .clone()
+                    .filter(|run| {
+                        matches!(
+                            run.status,
+                            RunStatus::Queued | RunStatus::Running | RunStatus::Waiting
+                        )
+                    })
+                    .count() as i64;
+                let pending_inputs = self
+                    .inputs
+                    .iter()
+                    .filter(|input| {
+                        input.thread_id == thread.id
+                            && matches!(input.status.as_str(), "queued" | "pending" | "")
+                    })
+                    .count() as i64;
+                let pending_requests = self
+                    .requests
+                    .iter()
+                    .filter(|request| {
+                        request.thread_id == thread.id
+                            && matches!(request.status.as_str(), "pending" | "responding" | "")
+                    })
+                    .count() as i64;
+                ThreadSummary {
+                    unread_sequence: thread.unread_sequence,
+                    project_path: thread.project_path.clone(),
+                    id: thread.id.clone(),
+                    title: thread.title.clone(),
+                    provider_id: thread.provider_id.clone(),
+                    model: thread.model.clone(),
+                    workspace: thread.workspace.clone(),
+                    parent_thread_id: thread.parent_thread_id.clone(),
+                    parent_task_id: thread.parent_task_id.clone(),
+                    created_by_thread_id: thread.created_by_thread_id.clone(),
+                    pinned: thread.pinned,
+                    archived: thread.archived,
+                    snoozed_until: thread.snoozed_until.clone(),
+                    approval_policy: thread.approval_policy.clone(),
+                    created_at: thread.created_at.clone(),
+                    updated_at,
+                    run_count,
+                    active_runs,
+                    pending_inputs,
+                    pending_requests,
+                    latest_run_id,
+                    latest_status,
+                }
+            })
+            .collect();
+        ThreadSummaries {
+            sequence: self.sequence,
+            threads: Some(threads),
+        }
+    }
+
+    fn thread_detail(&self, thread_id: &str, limit_runs: i64) -> Result<ThreadDetail, BridgeError> {
+        let thread = self
+            .thread(thread_id)
+            .cloned()
+            .ok_or_else(|| not_found("thread"))?;
+        let all_runs: Vec<Run> = self
+            .runs
+            .iter()
+            .filter(|run| run.thread_id == thread_id)
+            .cloned()
+            .collect();
+        let run_count = all_runs.len() as i64;
+        let truncated_runs = limit_runs > 0 && run_count > limit_runs;
+        let runs = if truncated_runs {
+            all_runs
+                .iter()
+                .skip(all_runs.len() - limit_runs as usize)
+                .cloned()
+                .collect()
+        } else {
+            all_runs
+        };
+        Ok(ThreadDetail {
+            sequence: self.sequence,
+            thread,
+            runs: Some(runs),
+            tasks: Some(
+                self.tasks
+                    .iter()
+                    .filter(|task| {
+                        task.parent_thread_id == thread_id || task.child_thread_id == thread_id
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+            inputs: Some(
+                self.inputs
+                    .iter()
+                    .filter(|input| input.thread_id == thread_id)
+                    .cloned()
+                    .collect(),
+            ),
+            tools: Some(
+                self.tools
+                    .iter()
+                    .filter(|tool| tool.thread_id == thread_id)
+                    .cloned()
+                    .collect(),
+            ),
+            requests: Some(
+                self.requests
+                    .iter()
+                    .filter(|request| request.thread_id == thread_id)
+                    .cloned()
+                    .collect(),
+            ),
+            run_count,
+            truncated_runs,
+            ..ThreadDetail::default()
+        })
     }
 }
 
@@ -1074,6 +1220,20 @@ impl CoreBridge for MockBridge {
     fn snapshot(&self) -> BridgeFuture<Snapshot> {
         let core = self.core.clone();
         Box::pin(async move { Ok(core.lock().unwrap().snapshot()) })
+    }
+
+    fn thread_summaries(&self) -> BridgeFuture<ThreadSummaries> {
+        let core = self.core.clone();
+        Box::pin(async move { Ok(core.lock().unwrap().thread_summaries()) })
+    }
+
+    fn thread_detail(&self, thread_id: String, limit_runs: i64) -> BridgeFuture<ThreadDetail> {
+        let core = self.core.clone();
+        Box::pin(async move {
+            core.lock()
+                .unwrap()
+                .thread_detail(&thread_id, limit_runs)
+        })
     }
 
     fn dispatch(&self, command: Command) -> BridgeFuture<Receipt> {

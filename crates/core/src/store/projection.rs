@@ -360,6 +360,7 @@ pub(crate) fn thread_summaries(db: &Connection) -> Result<ThreadSummaries> {
             let pi = pending_inputs.remove(&thread.id).unwrap_or(0);
             let pr = pending_requests.remove(&thread.id).unwrap_or(0);
             ThreadSummary {
+                unread_sequence: thread.unread_sequence,
                 project_path: thread.project_path,
                 id: thread.id,
                 title: thread.title,

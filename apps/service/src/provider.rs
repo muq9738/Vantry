@@ -39,6 +39,30 @@ fn failed(e: impl std::fmt::Display) -> ProviderError {
 fn interrupted(e: impl std::fmt::Display) -> ProviderError {
     ProviderError::Interrupted(e.to_string())
 }
+fn open_journal_after(dir: &Path, checkpoint: &Path, after: i64) -> Result<JobEvents> {
+    // The Core cursor is authoritative; a live observer may have checkpointed
+    // events that are still buffered in an uncommitted batch.
+    let cursor = File::open(checkpoint)
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, JournalCursor>(f).ok())
+        .filter(|c| c.sequence <= after);
+    if let Some(cursor) = cursor
+        && let Ok(reader) = JobEvents::resume(dir, cursor)
+        && let Ok(reader) = catch_up(reader, after)
+    {
+        return Ok(reader);
+    }
+    JobEvents::open(dir, after)
+}
+fn catch_up(mut reader: JobEvents, after: i64) -> Result<JobEvents> {
+    while reader.cursor() < after {
+        ensure!(
+            reader.next_event()?.is_some(),
+            "cursor beyond committed journal"
+        );
+    }
+    Ok(reader)
+}
 impl Provider {
     fn directory(&self, request: &ProviderRequest) -> Result<PathBuf> {
         let id = &request.attempt_id;
@@ -294,19 +318,7 @@ impl DurableProvider for Provider {
                 None
             };
             if reader.is_none() && dir.join("events.jsonl").is_file() {
-                let cursor = File::open(&checkpoint)
-                    .ok()
-                    .and_then(|f| serde_json::from_reader::<_, JournalCursor>(f).ok())
-                    .filter(|c| c.sequence == after);
-                reader = Some(
-                    match cursor {
-                        Some(c) => {
-                            JobEvents::resume(&dir, c).or_else(|_| JobEvents::open(&dir, after))
-                        }
-                        None => JobEvents::open(&dir, after),
-                    }
-                    .map_err(interrupted)?,
-                );
+                reader = Some(open_journal_after(&dir, &checkpoint, after).map_err(interrupted)?);
             }
             if let Some(reader) = reader.as_mut() {
                 let before = reader.cursor();
@@ -415,5 +427,55 @@ impl DurableProvider for Provider {
         }
         vantry_pi_runtime::deliver_control(&self.directory(request).map_err(failed)?, control)
             .map_err(failed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vantry_protocol::ProviderEvent;
+
+    #[test]
+    fn journal_checkpoint_can_catch_up_from_a_valid_older_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("events.jsonl");
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        for sequence in 1..=3 {
+            let mut line = serde_json::to_vec(&ProviderEvent {
+                sequence,
+                delta: sequence.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            line.push(b'\n');
+            if sequence == 1 {
+                offset = line.len() as u64;
+            }
+            bytes.extend(line);
+        }
+        std::fs::write(&journal, bytes).unwrap();
+        let checkpoint = dir.path().join("observer-cursor.json");
+        std::fs::write(
+            &checkpoint,
+            serde_json::to_vec(&JournalCursor { sequence: 1, offset }).unwrap(),
+        )
+        .unwrap();
+
+        let mut reader = open_journal_after(dir.path(), &checkpoint, 3).unwrap();
+        assert_eq!(reader.cursor(), 3);
+        assert!(reader.next_event().unwrap().is_none());
+
+        std::fs::write(
+            &checkpoint,
+            serde_json::to_vec(&JournalCursor {
+                sequence: 9,
+                offset: 9,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let reader = open_journal_after(dir.path(), &checkpoint, 2).unwrap();
+        assert_eq!(reader.cursor(), 2);
     }
 }

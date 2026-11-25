@@ -476,6 +476,9 @@ pub struct ServerStatus {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
+    /// Zero means read. Older Cores omit the shared marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sequence: Option<i64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub project_path: String,
     pub id: String,

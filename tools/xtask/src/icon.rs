@@ -1,12 +1,13 @@
 use anyhow::{Result, ensure};
 use clap::Args;
 use image::{
-    ImageFormat, Rgba, RgbaImage,
+    ImageEncoder, ImageFormat, Rgba, RgbaImage,
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
     imageops::{self, FilterType},
 };
 use std::{
     fs,
-    io::{Cursor, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 #[derive(Debug, Args)]
@@ -22,10 +23,27 @@ pub struct Options {
     #[arg(long)]
     icns: Option<PathBuf>,
 }
-fn png(image: &RgbaImage, path: &Path) -> Result<()> {
+/// Write a lossless PNG with the strongest encoder settings supported by the
+/// bundled `image` version.  Packaging re-encodes the checked-in icon through
+/// this path so the bundle does not inherit a fast, unnecessarily large PNG.
+/// The source is already RGBA8, so this changes only the PNG representation,
+/// never dimensions or pixel values.
+fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    PngEncoder::new_with_quality(&mut data, CompressionType::Best, PngFilterType::Adaptive)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )?;
+    Ok(data)
+}
+
+pub(crate) fn png(image: &RgbaImage, path: &Path) -> Result<()> {
     fs::create_dir_all(crate::parent(path))?;
     let mut tmp = tempfile::NamedTempFile::new_in(crate::parent(path))?;
-    image.write_to(&mut tmp, ImageFormat::Png)?;
+    tmp.write_all(&encode_png(image)?)?;
     tmp.persist(path)?;
     Ok(())
 }
@@ -105,9 +123,7 @@ pub(crate) fn icns(icon: &RgbaImage, path: &Path) -> Result<()> {
         (b"ic09", 512),
         (b"ic10", 1024),
     ] {
-        let mut data = Cursor::new(Vec::new());
-        resize(icon, n).write_to(&mut data, ImageFormat::Png)?;
-        let data = data.into_inner();
+        let data = encode_png(&resize(icon, n))?;
         body.extend(code);
         body.extend(((8 + data.len()) as u32).to_be_bytes());
         body.extend(data);
@@ -153,4 +169,29 @@ pub fn run(opts: Options) -> Result<()> {
         opts.out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_png_preserves_dimensions_and_pixels() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("icon.png");
+        let image = RgbaImage::from_fn(7, 5, |x, y| {
+            Rgba([
+                (x * 31) as u8,
+                (y * 47) as u8,
+                (x * 11 + y * 13) as u8,
+                if (x + y) % 3 == 0 { 0 } else { 255 },
+            ])
+        });
+
+        png(&image, &path)?;
+        let decoded = image::open(&path)?.to_rgba8();
+        assert_eq!(decoded.dimensions(), image.dimensions());
+        assert_eq!(decoded.as_raw(), image.as_raw());
+        Ok(())
+    }
 }

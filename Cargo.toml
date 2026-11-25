@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -35,6 +35,7 @@ vantry-updater = { path = "crates/updater" }
 pi-coding-agent = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 pi-agent = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 pi-ai = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
+pi-mcp = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 
 # Upstream NSH UI (v0.6.1)
 nsh-core = { git = "https://github.com/longbridge/nsh", tag = "v0.6.1" }
@@ -88,6 +89,20 @@ zip = { version = "7.4", default-features = false, features = ["deflate"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Release profiles used by the release workflow.  Core keeps a little more
+# speed headroom for the embedded Pi runtime while the desktop is optimized
+# for the smallest signed application bundle.  Both profiles retain the
+# single-codegen-unit and symbol stripping settings from `release`.
+[profile.release-core]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+
+[profile.release-desktop]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
 
 [profile.dev]
 debug = "line-tables-only"

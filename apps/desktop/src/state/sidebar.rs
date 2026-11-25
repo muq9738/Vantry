@@ -507,9 +507,16 @@ impl AppState {
 
     /// Every thread's status in one pass.
     pub fn thread_statuses(&self) -> HashMap<&str, ThreadStatus> {
-        let mut out: HashMap<&str, ThreadStatus> = HashMap::new();
+        let mut out: HashMap<&str, ThreadStatus> = self
+            .summary_statuses
+            .iter()
+            .map(|(id, status)| (id.as_str(), *status))
+            .collect();
         for run in &self.runs {
             let id = run.thread_id.as_str();
+            // A real row supersedes its fast-summary projection, including a
+            // completed run that no longer has an active status.
+            out.remove(id);
             if !run.status.terminal() {
                 out.insert(id, ThreadStatus::Running);
             } else if matches!(run.status, RunStatus::Failed | RunStatus::Interrupted)
@@ -519,6 +526,7 @@ impl AppState {
             }
         }
         for request in self.requests.iter().filter(|r| r.status == "pending") {
+            out.remove(request.thread_id.as_str());
             out.insert(request.thread_id.as_str(), ThreadStatus::NeedsApproval);
         }
         out
@@ -559,6 +567,9 @@ impl AppState {
             .iter()
             .map(|t| (t.id.as_str(), timestamp(&t.created_at)))
             .collect();
+        for (id, at) in &self.summary_activity {
+            activity.insert(id.as_str(), timestamp(at));
+        }
         for (id, at) in self
             .runs
             .iter()

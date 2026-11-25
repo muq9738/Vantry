@@ -7,7 +7,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -50,11 +53,26 @@ async fn request(stream: &mut (impl AsyncRead + Unpin)) -> Result<(String, Value
         },
     ))
 }
-async fn serve_mcp(listener: TcpListener) -> Result<()> {
+#[derive(Default)]
+struct DiscoveryCounts {
+    initialize: AtomicUsize,
+    list: AtomicUsize,
+}
+async fn serve_mcp(listener: TcpListener, counts: Arc<DiscoveryCounts>) -> Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let (_, body) = request(&mut stream).await?;
-        let (status, result) = match body["method"].as_str() {
+        let method = body["method"].as_str();
+        match method {
+            Some("initialize") => {
+                counts.initialize.fetch_add(1, Ordering::Relaxed);
+            }
+            Some("tools/list") => {
+                counts.list.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let (status, result) = match method {
             Some("initialize") => (
                 "200 OK",
                 json!({"protocolVersion":body["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
@@ -105,13 +123,35 @@ async fn fixture(root: &Path) -> Result<()> {
         )?,
     )?;
     let mcp = TcpListener::bind("127.0.0.1:0").await?;
+    let local = TcpListener::bind("127.0.0.1:0").await?;
     fs::write(
         agent.join("mcp.json"),
-        serde_json::to_vec(
-            &json!({"mcpServers":{"fixture":{"url":format!("http://{}/mcp", mcp.local_addr()?),"exposure":"direct"}}}),
-        )?,
+        serde_json::to_vec(&json!({"mcpServers":{
+            "fixture":{"url":format!("http://{}/mcp", mcp.local_addr()?),"exposure":"direct"},
+            "local":{"url":format!("http://{}/mcp", local.local_addr()?)}
+        }}))?,
     )?;
-    let mcp = tokio::spawn(serve_mcp(mcp));
+    let direct_counts = Arc::new(DiscoveryCounts::default());
+    let local_counts = Arc::new(DiscoveryCounts::default());
+    let mcp = tokio::spawn(serve_mcp(mcp, direct_counts.clone()));
+    let local = tokio::spawn(serve_mcp(local, local_counts.clone()));
+    mcp::warm_local_discovery(&agent, true, Default::default()).await;
+    ensure!(
+        direct_counts.initialize.load(Ordering::Relaxed) == 0,
+        "warmed a direct server"
+    );
+    let config = pi_mcp::load_mcp_config(&agent, &cwd, false);
+    let entry = config
+        .servers
+        .iter()
+        .find(|e| e.name == "local")
+        .context("missing local MCP")?;
+    let cached =
+        pi_mcp::tool_cache::read_cached_tools(&agent, entry).context("missing warmed catalog")?;
+    ensure!(
+        cached.tools.iter().any(|tool| tool.name == "ping"),
+        "missing cached tool"
+    );
     let socket = root.join("core.sock");
     let core = UnixListener::bind(&socket)?;
     let callback = tokio::spawn(async move {
@@ -318,6 +358,15 @@ async fn fixture(root: &Path) -> Result<()> {
     if let Ok(result) = mcp.await {
         result?;
     }
+    local.abort();
+    if let Ok(result) = local.await {
+        result?;
+    }
+    ensure!(
+        local_counts.initialize.load(Ordering::Relaxed) == 1
+            && local_counts.list.load(Ordering::Relaxed) == 1,
+        "worker repeated Core's local MCP discovery"
+    );
     let history = fs::read_to_string(data.join("sessions/thread.jsonl"))?;
     ensure!(history.contains("peer-receipt"), "missing peer delivery");
     ensure!(
@@ -337,6 +386,21 @@ async fn fixture(root: &Path) -> Result<()> {
         "approval effects mismatch"
     );
     let observed = requests.lock().unwrap();
+    let tools = observed[0]["tools"]
+        .as_array()
+        .context("missing tool declarations")?;
+    let retrieval: Vec<_> = tools
+        .iter()
+        .map(|tool| &tool["function"])
+        .filter(|tool| matches!(tool["name"].as_str(), Some("read" | "grep" | "find" | "ls")))
+        .collect();
+    ensure!(
+        retrieval.iter().any(|tool| tool["name"] == "read")
+            && retrieval.iter().all(|tool| tool["description"]
+                .as_str()
+                .is_some_and(|d| !d.contains("\n\nCodemode:"))),
+        "native retrieval declarations changed"
+    );
     let initial_system = observed[0]["messages"].to_string();
     ensure!(
         initial_system.contains("Run sandboxed JavaScript to filter large payloads, call codemode MCP/Vantry tools")

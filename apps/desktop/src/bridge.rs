@@ -24,7 +24,9 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 pub use client::ClientBridge;
 pub use mock::MockBridge;
 pub use vantry_protocol as protocol;
-use vantry_protocol::{Command, CoreEvent, Health, Receipt, Snapshot};
+use vantry_protocol::{
+    Command, CoreEvent, Health, Receipt, Snapshot, ThreadDetail, ThreadSummaries,
+};
 pub use workbench::{CoreWorkbench, LocalWorkbench, MockWorkbench, WorkbenchBridge};
 
 /// A bridge call's future: `Send`, so it runs on the runtime's threads.
@@ -41,6 +43,10 @@ pub trait CoreBridge: Send + Sync + 'static {
     fn health(&self) -> BridgeFuture<Health>;
     /// `GET /v1/snapshot`.
     fn snapshot(&self) -> BridgeFuture<Snapshot>;
+    /// `GET /v1/threads/summaries`: a cheap projection for the first sidebar.
+    fn thread_summaries(&self) -> BridgeFuture<ThreadSummaries>;
+    /// `GET /v1/threads/detail`: the selected conversation's bounded detail.
+    fn thread_detail(&self, thread_id: String, limit_runs: i64) -> BridgeFuture<ThreadDetail>;
     /// `POST /v1/commands`: one command, its receipt. A retry must reuse the
     /// same command (same `commandId`, same content).
     fn dispatch(&self, command: Command) -> BridgeFuture<Receipt>;
@@ -445,6 +451,28 @@ impl CoreBridge for RemoteBridge {
             let sock = this.ensure_tunnel().await?;
             vantry_client::CoreClient::new(sock)
                 .snapshot()
+                .await
+                .map_err(BridgeError::from)
+        })
+    }
+
+    fn thread_summaries(&self) -> BridgeFuture<ThreadSummaries> {
+        let this = self.clone();
+        Box::pin(async move {
+            let sock = this.ensure_tunnel().await?;
+            vantry_client::CoreClient::new(sock)
+                .thread_summaries()
+                .await
+                .map_err(BridgeError::from)
+        })
+    }
+
+    fn thread_detail(&self, thread_id: String, limit_runs: i64) -> BridgeFuture<ThreadDetail> {
+        let this = self.clone();
+        Box::pin(async move {
+            let sock = this.ensure_tunnel().await?;
+            vantry_client::CoreClient::new(sock)
+                .thread_detail(&thread_id, limit_runs)
                 .await
                 .map_err(BridgeError::from)
         })

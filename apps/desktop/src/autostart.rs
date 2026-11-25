@@ -104,7 +104,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use vantry_protocol::{Command, Health, Receipt, Snapshot};
+    use vantry_protocol::{Command, Health, Receipt, Snapshot, ThreadDetail, ThreadSummaries};
 
     use super::*;
     use crate::bridge::{BridgeError, BridgeFuture, EventSink};
@@ -131,6 +131,12 @@ mod tests {
             })
         }
         fn snapshot(&self) -> BridgeFuture<Snapshot> {
+            Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+        }
+        fn thread_summaries(&self) -> BridgeFuture<ThreadSummaries> {
+            Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+        }
+        fn thread_detail(&self, _: String, _: i64) -> BridgeFuture<ThreadDetail> {
             Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
         }
         fn dispatch(&self, _: Command) -> BridgeFuture<Receipt> {

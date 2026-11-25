@@ -3,6 +3,7 @@ mod attachments;
 mod catalog;
 mod controlled;
 mod instructions;
+mod secret_tool;
 pub mod mcp;
 mod pdf;
 mod sandbox;

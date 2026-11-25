@@ -5,8 +5,8 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -73,6 +73,186 @@ struct Claim {
     request: ProviderRequest,
     mode: StartMode,
 }
+
+const STREAM_BATCH_MAX_EVENTS: usize = 32;
+const STREAM_BATCH_MAX_BYTES: usize = 64 * 1024;
+const STREAM_BATCH_WINDOW: Duration = Duration::from_millis(8);
+
+struct PendingEvents {
+    events: Vec<ProviderEvent>,
+    bytes: usize,
+    started: Option<Instant>,
+    next_sequence: i64,
+    first_delta: bool,
+    first_text: bool,
+    timer: Option<tokio::task::AbortHandle>,
+    error: Option<(ErrorCode, String)>,
+}
+
+impl PendingEvents {
+    fn new(after: i64) -> Self {
+        Self {
+            events: Vec::new(),
+            bytes: 0,
+            started: None,
+            next_sequence: after.saturating_add(1),
+            first_delta: false,
+            first_text: false,
+            timer: None,
+            error: None,
+        }
+    }
+    fn take(&mut self) -> Vec<ProviderEvent> {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+        self.bytes = 0;
+        self.started = None;
+        std::mem::take(&mut self.events)
+    }
+}
+
+struct EventBatch {
+    core: Core,
+    claim: Arc<Claim>,
+    pending: Mutex<PendingEvents>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl EventBatch {
+    fn new(core: Core, claim: Arc<Claim>) -> Self {
+        let after = claim.request.after_sequence;
+        Self {
+            core,
+            claim,
+            pending: Mutex::new(PendingEvents::new(after)),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn push(self: &Arc<Self>, event: ProviderEvent) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        self.check_error(&pending)?;
+        if event.sequence <= 0 {
+            return Err(invalid("provider sequence must be positive"));
+        }
+        if event.sequence > pending.next_sequence {
+            return Err(conflict("gap in provider event sequence"));
+        }
+        let duplicate = event.sequence < pending.next_sequence;
+        if event.sequence == pending.next_sequence {
+            pending.next_sequence = pending.next_sequence.saturating_add(1);
+        }
+
+        let delta = stream_delta(&event);
+        let urgent = !delta;
+        let due = pending
+            .started
+            .is_some_and(|started| started.elapsed() >= STREAM_BATCH_WINDOW);
+
+        if urgent {
+            pending.events.push(event);
+            return self.flush_locked(&mut pending);
+        }
+
+        // Commit the first delta immediately. Keep first text separate from
+        // first thinking so reasoning cannot delay the first visible answer.
+        if !pending.first_delta && !duplicate {
+            pending.first_delta = true;
+            if is_text_delta(&event) {
+                pending.first_text = true;
+            }
+            pending.events.push(event);
+            return self.flush_locked(&mut pending);
+        }
+
+        if is_text_delta(&event) && !pending.first_text && !duplicate {
+            pending.first_text = true;
+            pending.events.push(event);
+            return self.flush_locked(&mut pending);
+        }
+
+        if due && !pending.events.is_empty() {
+            self.flush_locked(&mut pending)?;
+        }
+        if pending.started.is_none() {
+            pending.started = Some(Instant::now());
+        }
+        pending.bytes = pending
+            .bytes
+            .saturating_add(event.delta.len().saturating_add(128));
+        pending.events.push(event);
+        if pending.events.len() >= STREAM_BATCH_MAX_EVENTS
+            || pending.bytes >= STREAM_BATCH_MAX_BYTES
+        {
+            self.flush_locked(&mut pending)?;
+        } else if pending.timer.is_none() {
+            let batch = Arc::downgrade(self);
+            let timer = self.runtime.spawn(async move {
+                tokio::time::sleep(STREAM_BATCH_WINDOW).await;
+                if let Some(batch) = batch.upgrade() {
+                    let _ = batch.flush();
+                }
+            });
+            pending.timer = Some(timer.abort_handle());
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        self.check_error(&pending)?;
+        self.flush_locked(&mut pending)
+    }
+
+    fn discard(&self) {
+        let mut pending = self.pending.lock().unwrap();
+        // Detached providers leave the claim for recovery. Nothing in this
+        // batch was committed, so replay starts at the durable Core cursor.
+        pending.take();
+        pending.error = None;
+    }
+
+    fn check_error(&self, pending: &PendingEvents) -> Result<()> {
+        if let Some((code, error)) = &pending.error {
+            return Err(crate::Error::Api(*code, error.clone()));
+        }
+        Ok(())
+    }
+
+    fn flush_locked(&self, pending: &mut PendingEvents) -> Result<()> {
+        if pending.events.is_empty() {
+            return Ok(());
+        }
+        let events = pending.take();
+        match self.core.ingest_batch(&self.claim, &events) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Keep the batch attached to its failed state. The cursor and
+                // projections remain rolled back, and a later recovery can
+                // replay the source journal from that cursor.
+                pending.bytes = events
+                    .iter()
+                    .map(|event| event.delta.len().saturating_add(128))
+                    .sum();
+                pending.started = Some(Instant::now());
+                pending.events = events;
+                pending.error = Some((error.code(), error.to_string()));
+                Err(error)
+            }
+        }
+    }
+}
+
+fn stream_delta(event: &ProviderEvent) -> bool {
+    matches!(event.r#type.as_str(), "text_delta" | "thinking_delta")
+        || (event.r#type.is_empty() && !event.delta.is_empty())
+}
+
+fn is_text_delta(event: &ProviderEvent) -> bool {
+    event.r#type == "text_delta" || (event.r#type.is_empty() && !event.delta.is_empty())
+}
+
 impl Core {
     fn own_scheduler(&self) -> Result<Owner> {
         self.0
@@ -269,16 +449,21 @@ impl Core {
     }
     async fn execute(&self, p: &dyn DurableProvider, claim: Claim) -> Result<()> {
         let claim = Arc::new(claim);
-        let core = self.clone();
-        let observer = claim.clone();
-        let emit: Emit = Arc::new(move |e| core.ingest(&observer, e));
+        let batch = Arc::new(EventBatch::new(self.clone(), claim.clone()));
+        let observer = batch.clone();
+        let emit: Emit = Arc::new(move |e| observer.push(e));
         if !self.read(|db| current(db, &claim))? {
             return Ok(());
         }
         let result = p.run_events(claim.request.clone(), claim.mode, emit).await;
-        if matches!(result, Err(ProviderError::Detached)) {
+        if matches!(&result, Err(ProviderError::Detached)) {
+            batch.discard();
             return Ok(());
         }
+        let result = match batch.flush() {
+            Ok(()) => result,
+            Err(error) => Err(ProviderError::Interrupted(error.to_string())),
+        };
         self.write(|db| {
             if !current(db, &claim)? {
                 return Ok(());
@@ -297,32 +482,38 @@ impl Core {
             finish(db, &run(db, &claim.request.run_id)?, status, &reason)
         })
     }
-    fn ingest(&self, claim: &Claim, e: ProviderEvent) -> Result<()> {
+    fn ingest_batch(&self, claim: &Claim, events: &[ProviderEvent]) -> Result<()> {
         self.write(|db| {
             if !current(db, claim)? {
                 return Err(conflict("stale attempt claim"));
             }
             let r = &claim.request;
-            let cursor: i64 = db.query_row(
+            let mut cursor: i64 = db.query_row(
                 "SELECT provider_cursor FROM attempts WHERE id=?",
                 [&r.attempt_id],
                 |r| r.get(0),
             )?;
-            if e.sequence <= 0 {
-                return Err(invalid("provider sequence must be positive"));
+            let initial = cursor;
+            for e in events {
+                if e.sequence <= 0 {
+                    return Err(invalid("provider sequence must be positive"));
+                }
+                if e.sequence <= cursor {
+                    continue;
+                }
+                if e.sequence != cursor + 1 {
+                    return Err(conflict("gap in provider event sequence"));
+                }
+                ingest::project(db, r, &e)?;
+                telemetry::observe(db, r, &e)?;
+                cursor = e.sequence;
             }
-            if e.sequence <= cursor {
-                return Ok(());
+            if cursor != initial {
+                db.execute(
+                    "UPDATE attempts SET provider_cursor=?,updated_at=? WHERE id=?",
+                    params![cursor, now(), r.attempt_id],
+                )?;
             }
-            if e.sequence != cursor + 1 {
-                return Err(conflict("gap in provider event sequence"));
-            }
-            ingest::project(db, r, &e)?;
-            telemetry::observe(db, r, &e)?;
-            db.execute(
-                "UPDATE attempts SET provider_cursor=?,updated_at=? WHERE id=?",
-                params![e.sequence, now(), r.attempt_id],
-            )?;
             Ok(())
         })
     }

@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vantry_protocol::{Command, Health, Receipt, Snapshot};
+use vantry_protocol::{Command, Health, Receipt, Snapshot, ThreadDetail, ThreadSummaries};
 
 use super::{BridgeError, BridgeFuture, CoreBridge, EventSink};
 
@@ -44,6 +44,21 @@ impl CoreBridge for ClientBridge {
     fn snapshot(&self) -> BridgeFuture<Snapshot> {
         let client = self.client();
         Box::pin(async move { client.snapshot().await.map_err(BridgeError::from) })
+    }
+
+    fn thread_summaries(&self) -> BridgeFuture<ThreadSummaries> {
+        let client = self.client();
+        Box::pin(async move { client.thread_summaries().await.map_err(BridgeError::from) })
+    }
+
+    fn thread_detail(&self, thread_id: String, limit_runs: i64) -> BridgeFuture<ThreadDetail> {
+        let client = self.client();
+        Box::pin(async move {
+            client
+                .thread_detail(&thread_id, limit_runs)
+                .await
+                .map_err(BridgeError::from)
+        })
     }
 
     fn dispatch(&self, command: Command) -> BridgeFuture<Receipt> {

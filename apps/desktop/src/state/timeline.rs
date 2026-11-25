@@ -184,7 +184,8 @@ pub struct TimelineIndex {
     pub rebuilds: u64,
 }
 
-/// What a run's rows are built from.
+/// What a run's rows are built from. `tools` and `requests` are already
+/// grouped by `run.id`; callers must not pass rows belonging to another run.
 pub struct RunParts<'a> {
     pub run: &'a Run,
     pub tools: Vec<&'a ToolCall>,
@@ -458,7 +459,7 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         .requests
         .iter()
         .copied()
-        .filter(|r| r.run_id == run.id && shown_request(r))
+        .filter(|r| shown_request(r))
         .collect();
 
     // Tools sit at the reply's byte offset where they started; unknown
@@ -467,7 +468,6 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         .tools
         .iter()
         .copied()
-        .filter(|t| t.run_id == run.id)
         .enumerate()
         .collect();
     let offset_of = |tool: &ToolCall| -> usize {

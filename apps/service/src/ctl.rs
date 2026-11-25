@@ -110,7 +110,7 @@ pub struct Ctl {
     json: Option<String>,
     #[arg(long = "action")]
     named_action: Option<String>,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
     name: String,
     #[arg(long = "path")]
     paths: Vec<String>,

@@ -59,7 +59,7 @@ enum Role {
 struct PeerProxyArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     peer: String,
     #[arg(long, default_value = "auto")]
     mode: String,
@@ -71,6 +71,7 @@ struct JobDir {
     #[arg(long)]
     job_dir: PathBuf,
 }
+
 #[derive(Args, Clone, Default)]
 pub struct WorkspaceArgs {
     #[arg(long)]
@@ -354,10 +355,26 @@ async fn serve(args: CoreArgs) -> Result<()> {
         let _ = t3_task.await;
         res
     };
+    let warm_pi = provider.default_provider == "pi";
     let scheduler = core.run_scheduler(provider, stop.clone());
     let server = Server::bind_with_extension(core.clone(), ext.clone())
         .await?
         .serve(stop.clone());
+    if warm_pi {
+        let stop = stop.clone();
+        let settings = data.join("pi-runtime.json");
+        tokio::spawn(async move {
+            if let Ok(settings) = crate::settings::document(&settings) {
+                let enabled = settings["enableUserMCP"].as_bool().unwrap_or(true);
+                vantry_pi_runtime::mcp::warm_local_discovery(
+                    &vantry_pi_runtime::agent_dir(),
+                    enabled,
+                    stop,
+                )
+                .await;
+            }
+        });
+    }
     tokio::pin!(remote, scheduler, server);
     tokio::select! {
     biased;
@@ -528,4 +545,32 @@ async fn peer_proxy(args: PeerProxyArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn accepts_peer_ids_starting_with_a_dash() {
+    let peer = "-fixture_peer";
+    assert!(
+        Cli::try_parse_from([
+            "vantry-service",
+            "ctl",
+            "workbench",
+            "remote.peers.revoke",
+            "--name",
+            peer
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "vantry-service",
+            "peer-proxy",
+            "--peer",
+            peer,
+            "--socket",
+            "peer.sock"
+        ])
+        .is_ok()
+    );
 }

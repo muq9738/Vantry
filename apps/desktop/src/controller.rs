@@ -344,6 +344,26 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
     let mut need_snapshot = true;
     loop {
         if need_snapshot {
+            // Paint the cheap sidebar projection and one bounded conversation
+            // first. The event stream still starts only after the full
+            // snapshot, so its sequence remains a safe cursor and no event
+            // buffering/race is needed.
+            if let Ok(summaries) = call(core.thread_summaries()).await {
+                let mut selected = None;
+                state().update(|s| {
+                    s.apply_summaries(summaries);
+                    selected = s.selected.clone();
+                });
+                if let Some(id) = selected {
+                    let mut request = 0;
+                    state().update(|s| request = s.begin_detail_load(&id));
+                    if let Ok(detail) = call(core.thread_detail(id, 20)).await {
+                        state().update(|s| {
+                            s.apply_thread_detail(request, detail);
+                        });
+                    }
+                }
+            }
             match call(core.snapshot()).await {
                 Ok(snapshot) => {
                     state().update(|s| {
@@ -706,7 +726,26 @@ pub(crate) fn select_thread(id: String) {
     set_thread_read_state(&id, false);
     if state().with_untracked(|s|s.tasks.iter().any(|t|Some(&t.parent_thread_id)==s.selected.as_ref() && t.child_thread_id==id)) { open_child(id); return; }
     if ui().with_untracked(|u|u.child_panel.is_some()){close_dock();}
-    state().update(move |s| s.select_thread(Some(id)));
+    let mut request = None;
+    state().update(|s| {
+        if s.snapshot_loaded {
+            s.select_thread(Some(id.clone()));
+        } else {
+            request = Some(s.begin_detail_load(&id));
+        }
+    });
+    if let Some(request) = request
+        && let Some(core) = core()
+    {
+        let thread_id = id.clone();
+        spawn_for_window(async move {
+            if let Ok(detail) = call(core.thread_detail(thread_id, 20)).await {
+                state().update(|s| {
+                    s.apply_thread_detail(request, detail);
+                });
+            }
+        });
+    }
     ui().update(|u| {
         u.mobile_nav = false;
         if u.view != MainView::Conversation {

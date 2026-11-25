@@ -29,8 +29,13 @@ pub struct Options {
     /// Cargo target triple (defaults to the host).
     #[arg(long)]
     target: Option<String>,
-    #[arg(long, default_value = "release")]
-    profile: String,
+    /// Cargo profile for the primary product binary.  When omitted, desktop
+    /// uses `release-desktop` and service/relay use `release-core`.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Cargo profile for the service embedded in a desktop bundle.
+    #[arg(long)]
+    service_profile: Option<String>,
     /// Use artifacts already present in CARGO_TARGET_DIR or explicit binary paths.
     #[arg(long)]
     skip_build: bool,
@@ -133,6 +138,8 @@ struct Report<'a> {
     zip_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_image: Option<DiskImage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_budget_bytes: Option<u64>,
     budget_bytes: u64,
     within_budget: bool,
 }
@@ -181,6 +188,8 @@ fn disk_image(stage: &Path, app: &Path, name: String) -> Result<DiskImage> {
         budget_bytes: LIMIT,
     })
 }
+
+const MACOS_APP_LIMIT: u64 = 50_000_000;
 
 struct Bundle {
     root: PathBuf,
@@ -338,11 +347,27 @@ pub fn run(o: Options) -> Result<()> {
         .map(normalize_target)
         .unwrap_or_else(host);
     let p = Platform::parse(&target)?;
-    ensure!(
-        !o.profile.is_empty()
-            && o.profile
+    let default_profile = if kind == Kind::Desktop {
+        "release-desktop"
+    } else {
+        "release-core"
+    };
+    let profile = o.profile.unwrap_or_else(|| default_profile.to_owned());
+    let service_profile = o.service_profile.unwrap_or_else(|| {
+        if kind == Kind::Desktop && matches!(profile.as_str(), "release-desktop") {
+            "release-core".to_owned()
+        } else {
+            profile.clone()
+        }
+    });
+    let valid_profile = |name: &str| {
+        !name.is_empty()
+            && name
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    };
+    ensure!(
+        valid_profile(&profile) && valid_profile(&service_profile),
         "invalid Cargo profile"
     );
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
@@ -351,6 +376,7 @@ pub fn run(o: Options) -> Result<()> {
     let target_dir = std::path::absolute(target_dir)?;
     let platform = format!("{}-{}", p.os, p.arch);
     let mac = kind == Kind::Desktop && p.os == "darwin";
+    let enforce_macos_app_budget = mac && matches!(profile.as_str(), "release" | "release-desktop");
     let exe = if p.os == "windows" { ".exe" } else { "" };
     let slug = match kind {
         Kind::Desktop => "vantry",
@@ -379,14 +405,15 @@ pub fn run(o: Options) -> Result<()> {
         }),
         files: vec![],
     };
-    let profile_dir = match o.profile.as_str() {
-        "dev" | "test" => "debug",
-        "bench" => "release",
-        name => name,
-    };
     let mut binaries = Vec::new();
     if kind == Kind::Desktop {
-        binaries.push(("vantry-desktop", "vantry", "desktop", o.desktop.as_ref()));
+        binaries.push((
+            "vantry-desktop",
+            "vantry",
+            "desktop",
+            o.desktop.as_ref(),
+            profile.as_str(),
+        ));
     }
     if kind != Kind::Relay {
         binaries.push((
@@ -394,31 +421,49 @@ pub fn run(o: Options) -> Result<()> {
             "vantry-service",
             "service",
             o.service.as_ref(),
+            service_profile.as_str(),
         ));
     } else {
-        binaries.push(("vantry-relay", "vantry-relay", "relay", o.relay.as_ref()));
+        binaries.push((
+            "vantry-relay",
+            "vantry-relay",
+            "relay",
+            o.relay.as_ref(),
+            profile.as_str(),
+        ));
     }
-    if !o.skip_build && binaries.iter().any(|(_, _, _, src)| src.is_none()) {
-        let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-        cmd.current_dir(root)
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .args([
-                "build",
-                "--locked",
-                "--profile",
-                &o.profile,
-                "--target",
-                &target,
-            ]);
-        for (pkg, _, _, src) in &binaries {
+    if !o.skip_build {
+        let mut builds = BTreeMap::<&str, Vec<&str>>::new();
+        for (pkg, _, _, src, binary_profile) in &binaries {
             if src.is_none() {
-                cmd.args(["-p", pkg]);
+                builds.entry(binary_profile).or_default().push(*pkg);
             }
         }
-        ensure!(cmd.status()?.success(), "Cargo build failed");
+        for (build_profile, packages) in builds {
+            let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+            cmd.current_dir(root)
+                .env("CARGO_TARGET_DIR", &target_dir)
+                .args([
+                    "build",
+                    "--locked",
+                    "--profile",
+                    build_profile,
+                    "--target",
+                    &target,
+                ]);
+            for pkg in packages {
+                cmd.args(["-p", pkg]);
+            }
+            ensure!(cmd.status()?.success(), "Cargo build failed");
+        }
     }
-    for (pkg, bin, component, explicit) in binaries {
+    for (pkg, bin, component, explicit, binary_profile) in binaries {
         let name = format!("{bin}{exe}");
+        let profile_dir = match binary_profile {
+            "dev" | "test" => "debug",
+            "bench" => "release",
+            name => name,
+        };
         let mut src = target_dir.join(&target).join(profile_dir).join(&name);
         if !src.is_file() && target == host() {
             src = target_dir.join(profile_dir).join(&name);
@@ -443,7 +488,7 @@ pub fn run(o: Options) -> Result<()> {
         } else {
             format!(
                 "cargo {pkg}/{bin} ({target}, {}): {}",
-                o.profile,
+                binary_profile,
                 src.display()
             )
         };
@@ -468,11 +513,14 @@ pub fn run(o: Options) -> Result<()> {
     }
     if kind == Kind::Desktop {
         let icon = "resources/icon.png";
-        bundle.copy(
-            &root.join(icon),
-            &resources.join("icon.png"),
-            "resources",
-            icon,
+        let icon_image = image::open(root.join(icon))?.to_rgba8();
+        crate::icon::png(&icon_image, &bundle.root.join(resources.join("icon.png")))?;
+        bundle.generated(
+            resources
+                .join("icon.png")
+                .to_str()
+                .context("non-UTF-8 icon path")?,
+            "xtask lossless compact PNG from resources/icon.png",
         )?;
         if root.join("resources/update-token").is_file() {
             bundle.copy(
@@ -564,7 +612,7 @@ pub fn run(o: Options) -> Result<()> {
         )?;
     }
     #[cfg(target_os = "macos")]
-    let disk_image = if mac && o.profile == "release" {
+    let disk_image = if enforce_macos_app_budget {
         let name = format!("Vantry-{}-macos-{}.dmg", env!("CARGO_PKG_VERSION"), p.arch);
         Some(disk_image(stage.path(), &bundle.root, name)?)
     } else {
@@ -585,7 +633,7 @@ pub fn run(o: Options) -> Result<()> {
     }
     let report = Report {
         target: &target,
-        profile: &o.profile,
+        profile: &profile,
         product: kind,
         files: &bundle.files,
         installed_bytes: components.values().sum(),
@@ -594,9 +642,16 @@ pub fn run(o: Options) -> Result<()> {
         archive_bytes: bytes,
         zip_bytes: (ext == "zip").then_some(bytes),
         disk_image,
+        app_budget_bytes: enforce_macos_app_budget.then_some(MACOS_APP_LIMIT),
         budget_bytes: 25_000_000,
         within_budget: bytes <= 25_000_000,
     };
+    ensure!(
+        !enforce_macos_app_budget || report.installed_bytes < MACOS_APP_LIMIT,
+        "macOS app is {} bytes, limit is below {} bytes",
+        report.installed_bytes,
+        MACOS_APP_LIMIT
+    );
     let data = serde_json::to_vec_pretty(&report)?;
     for name in ["package-report.json", "size-report.json"] {
         fs::write(stage.path().join(name), &data)?;
@@ -604,7 +659,7 @@ pub fn run(o: Options) -> Result<()> {
     fs::write(
         stage.path().join("provenance.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"target":target,"product":kind,"profile":o.profile,"files":bundle.files}),
+            &serde_json::json!({"target":target,"product":kind,"profile":profile,"files":bundle.files}),
         )?,
     )?;
     fs::rename(stage.path(), &out)
@@ -618,6 +673,12 @@ pub fn run(o: Options) -> Result<()> {
     println!("{:<16} {:>14}", "Component", "Bytes");
     for (name, bytes) in report.component_bytes {
         println!("{name:<16} {bytes:>14}");
+    }
+    if let Some(limit) = report.app_budget_bytes {
+        println!(
+            "{:<16} {:>14} (must be below {})",
+            "App budget", limit, limit
+        );
     }
     println!(
         "{:<16} {:>14}\n{:<16} {:>14}\n{:<16} {:>14} ({})\n{}",

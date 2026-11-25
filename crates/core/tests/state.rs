@@ -159,6 +159,70 @@ fn status(s: &Snapshot, key: &str) -> RunStatus {
         .status
 }
 #[tokio::test]
+async fn streaming_batches_ready_deltas_but_flushes_before_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let thread = cmd(&h.core, "thread.create", json!({})).thread_id;
+    let run = cmd(
+        &h.core,
+        "message.send",
+        json!({"threadId":thread,"message":"stream"}),
+    )
+    .run_id;
+    let e = h.next().await;
+
+    emit(
+        &e,
+        1,
+        "thinking_delta",
+        json!({"assistantMessageEvent":{"delta":"thought"}}),
+        "",
+    );
+    let snapshot = h.core.snapshot().unwrap();
+    assert_eq!(snapshot.runs.as_ref().unwrap()[0].reasoning, "thought");
+    emit(&e, 2, "text_delta", Value::Null, "a");
+    assert_eq!(h.core.snapshot().unwrap().runs.unwrap()[0].output, "a");
+    emit(&e, 3, "text_delta", Value::Null, "b");
+    emit(&e, 4, "text_delta", Value::Null, "c");
+
+    emit(
+        &e,
+        5,
+        "tool_execution_start",
+        json!({"toolCallId":"tool-1","toolName":"read","args":{"path":"note.txt"}}),
+        "",
+    );
+    let snapshot = h.core.snapshot().unwrap();
+    assert_eq!(snapshot.runs.unwrap()[0].output, "abc");
+    assert_eq!(snapshot.tools[0].status, "running");
+
+    e.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &run).terminal()).await;
+    h.close().await;
+}
+#[tokio::test]
+async fn sparse_stream_delta_flushes_without_a_following_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let thread = cmd(&h.core, "thread.create", json!({})).thread_id;
+    let run = cmd(
+        &h.core,
+        "message.send",
+        json!({"threadId":thread,"message":"sparse"}),
+    )
+    .run_id;
+    let e = h.next().await;
+
+    emit(&e, 1, "text_delta", Value::Null, "a");
+    emit(&e, 2, "text_delta", Value::Null, "b");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(h.core.snapshot().unwrap().runs.unwrap()[0].output, "ab");
+
+    e.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &run).terminal()).await;
+    h.close().await;
+}
+#[tokio::test]
 async fn read_receipts_follow_results_and_ignore_a_stale_device() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open(dir.path(), true);
@@ -564,10 +628,11 @@ async fn restart_preserves_cursor_and_handles_unknown_submission() {
         let old = first.next().await;
         assert_eq!(old.mode, StartMode::Submit);
         emit(&old, 1, "", Value::Null, "a");
+        emit(&old, 2, "text_delta", Value::Null, "buffered");
         let att = old.req.attempt_id.clone();
         assert!(
             (old.emit)(ProviderEvent {
-                sequence: 3,
+                sequence: 4,
                 delta: "gap".into(),
                 ..Default::default()
             })

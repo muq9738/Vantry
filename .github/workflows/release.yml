@@ -22,6 +22,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -29,7 +31,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build macOS remote-desktop helper (when plugin source provided)
+      - name: Build macOS remote-desktop helper
         env:
           VANTRY_REMOTE_PLUGIN_ROOT: ${{ vars.VANTRY_REMOTE_PLUGIN_ROOT }}
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
@@ -40,20 +42,28 @@ jobs:
             git clone --depth 1 "https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/muq9738/vantry-plugin-remote-desktop.git" /tmp/vantry-remote-plugin
             python3 scripts/build_remote_helper.py --platform darwin/arm64 --plugin-root /tmp/vantry-remote-plugin
           else
-            echo "No remote-desktop plugin source configured; packaging without optional native helper."
+            git clone --depth 1 https://github.com/muq9738/vantry-plugin-remote-desktop.git /tmp/vantry-remote-plugin
+            python3 scripts/build_remote_helper.py --platform darwin/arm64 --plugin-root /tmp/vantry-remote-plugin
           fi
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
-      - name: Build release workspace
-        run: cargo build --workspace --release --locked
+      - name: Build optimized macOS arm64 binaries
+        run: |
+          cargo build --locked --profile release-core --target aarch64-apple-darwin \
+            -p vantry-service -p vantry-relay
+          cargo build --locked --profile release-desktop --target aarch64-apple-darwin \
+            -p vantry-desktop
 
       - name: Package macOS desktop, service and relay bundles
         run: |
-          cargo run --locked -p xtask -- package desktop --skip-build --profile release --target aarch64-apple-darwin --out-dir dist/desktop
-          cargo run --locked -p xtask -- package service --skip-build --profile release --target aarch64-apple-darwin --out-dir dist/service
-          cargo run --locked -p xtask -- package relay --skip-build --profile release --target aarch64-apple-darwin --out-dir dist/relay
+          cargo run --locked -p xtask -- package desktop --skip-build \
+            --target aarch64-apple-darwin --out-dir dist/desktop
+          cargo run --locked -p xtask -- package service --skip-build \
+            --target aarch64-apple-darwin --out-dir dist/service
+          cargo run --locked -p xtask -- package relay --skip-build \
+            --target aarch64-apple-darwin --out-dir dist/relay
           codesign --verify --deep --strict dist/desktop/Vantry.app
           ls -lh dist/desktop dist/service dist/relay
 
@@ -73,16 +83,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build service and relay release binaries
-        run: cargo build --release --locked -p vantry-service -p vantry-relay
+        run: |
+          cargo build --locked --profile release-core --target x86_64-unknown-linux-gnu \
+            -p vantry-service -p vantry-relay
 
       - name: Package Linux service and relay bundles
         run: |
-          cargo run --locked -p xtask -- package service --skip-build --profile release --target x86_64-unknown-linux-gnu --out-dir dist/service
-          cargo run --locked -p xtask -- package relay --skip-build --profile release --target x86_64-unknown-linux-gnu --out-dir dist/relay
+          cargo run --locked -p xtask -- package service --skip-build \
+            --target x86_64-unknown-linux-gnu --out-dir dist/service
+          cargo run --locked -p xtask -- package relay --skip-build \
+            --target x86_64-unknown-linux-gnu --out-dir dist/relay
           ls -lh dist/service dist/relay
 
       - name: Upload Linux release artifacts
@@ -99,6 +115,8 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -106,15 +124,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build release workspace
+      - name: Build optimized Windows amd64 binaries
         shell: bash
-        run: cargo build --workspace --release --locked
+        run: |
+          cargo build --locked --profile release-core --target x86_64-pc-windows-msvc \
+            -p vantry-service
+          cargo build --locked --profile release-desktop --target x86_64-pc-windows-msvc \
+            -p vantry-desktop
 
       - name: Package Windows desktop and service bundles
         shell: bash
         run: |
-          cargo run --locked -p xtask -- package desktop --skip-build --profile release --target x86_64-pc-windows-msvc --out-dir dist/desktop
-          cargo run --locked -p xtask -- package service --skip-build --profile release --target x86_64-pc-windows-msvc --out-dir dist/service
+          cargo run --locked -p xtask -- package desktop --skip-build \
+            --target x86_64-pc-windows-msvc --out-dir dist/desktop
+          cargo run --locked -p xtask -- package service --skip-build \
+            --target x86_64-pc-windows-msvc --out-dir dist/service
           python scripts/verify_windows_package.py --package dist/desktop/Vantry --skip-installer
           ls -lh dist/desktop dist/service
 
@@ -135,6 +159,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -145,16 +170,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           mkdir -p staging
           find release-assets -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.tar.gz' -o -name '*.delta' \) -exec mv {} staging/ \;
-          cp "docs/releases/${VERSION}.md" release-notes.md
+          PACKAGE_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          test "$TAG" = "v$PACKAGE_VERSION"
+          NOTES="docs/releases/${VERSION}.md"
+          if [[ -f "$NOTES" ]]; then
+            cp "$NOTES" release-notes.md
+          elif [[ -n "$INPUT_TAG" ]]; then
+            git show "origin/$DEFAULT_BRANCH:$NOTES" > release-notes.md
+          else
+            echo "Release notes missing from tag $TAG" >&2
+            exit 1
+          fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" staging/* --clobber
             gh release edit "$TAG" --title "Vantry ${VERSION}" --notes-file release-notes.md
           else
-            gh release create "$TAG" staging/* --title "Vantry ${VERSION}" --notes-file release-notes.md --latest
+            gh release create "$TAG" staging/* --verify-tag --title "Vantry ${VERSION}" --notes-file release-notes.md --latest
           fi

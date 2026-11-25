@@ -504,6 +504,10 @@ async fn execute(
                 ..Default::default()
             })
             .await;
+        session.register_tool(
+            Arc::new(crate::secret_tool::RequestSecret::new(ui.clone(), dir)),
+            pi_coding_agent::agent_session::ToolSource::sdk("vantry_request_secret"),
+        );
         ensure!(
             ui.approval_ready(),
             "approval extension failed to initialize"

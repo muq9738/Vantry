@@ -2,9 +2,13 @@
 //! local Core's start, the dock's search, branch switch and discard, and
 //! the thinking level riding on the model.
 
-use vantry_protocol::{GitFile, GitState, PendingRequest, Run, RunStatus, Snapshot, Thread, ToolCall};
+use vantry_protocol::{
+    GitFile, GitState, PendingRequest, Receipt, Run, RunStatus, Snapshot, Thread, ThreadDetail,
+    ThreadSummary, ThreadSummaries, ToolCall,
+};
 
 use super::{
+    sidebar::SidebarFilter,
     workbench::{FileSearch, GitPanel},
     *,
 };
@@ -46,6 +50,180 @@ fn with_requests(requests: Vec<PendingRequest>, tools: Vec<ToolCall>) -> AppStat
     state.on_live();
     state.select_thread(Some("t1".into()));
     state
+}
+
+fn bounded_detail(thread_id: &str, run_id: &str) -> ThreadDetail {
+    ThreadDetail {
+        sequence: 7,
+        thread: Thread {
+            id: thread_id.into(),
+            title: format!("会话 {thread_id}"),
+            created_at: "2026-11-23T08:00:00Z".into(),
+            unread_sequence: Some(7),
+            ..Thread::default()
+        },
+        runs: Some(vec![Run {
+            id: run_id.into(),
+            thread_id: thread_id.into(),
+            status: RunStatus::Completed,
+            input: "首条消息".into(),
+            output: "已完成".into(),
+            created_at: "2026-11-23T08:00:01Z".into(),
+            ..Run::default()
+        }]),
+        ..ThreadDetail::default()
+    }
+}
+
+fn detail_variant(thread_id: &str, run_id: &str, sequence: i64, truncated: bool) -> ThreadDetail {
+    let mut detail = bounded_detail(thread_id, run_id);
+    detail.sequence = sequence;
+    detail.truncated_runs = truncated;
+    detail
+}
+
+fn summary(thread_id: &str, active_runs: i64) -> ThreadSummary {
+    ThreadSummary {
+        id: thread_id.into(),
+        title: format!("会话 {thread_id}"),
+        created_at: "2026-11-23T08:00:00Z".into(),
+        updated_at: "2026-11-23T08:00:00Z".into(),
+        active_runs,
+        ..ThreadSummary::default()
+    }
+}
+
+#[test]
+fn summaries_paint_sidebar_before_authoritative_snapshot() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 7,
+        threads: Some(vec![ThreadSummary {
+            id: "t1".into(),
+            title: "首屏会话".into(),
+            created_at: "2026-11-23T08:00:00Z".into(),
+            updated_at: "2026-11-23T08:00:02Z".into(),
+            unread_sequence: Some(7),
+            active_runs: 1,
+            pending_requests: 1,
+            latest_status: Some(RunStatus::Running),
+            ..ThreadSummary::default()
+        }]),
+    });
+
+    assert!(!state.snapshot_loaded);
+    assert_eq!(state.selected.as_deref(), Some("t1"));
+    assert!(state.unread.contains("t1"));
+    assert_eq!(state.thread_status("t1"), ThreadStatus::NeedsApproval);
+    assert_eq!(
+        state.sidebar_sections(&SidebarFilter::default(), chrono::Utc::now())[0].rows[0].title,
+        "首屏会话"
+    );
+    state.set_draft_text("提前输入");
+    assert!(!state.composer_status().can_submit);
+
+    let token = state.begin_detail_load("t1");
+    assert!(state.apply_thread_detail(token, bounded_detail("t1", "r1")));
+    assert!(state.has_conversation());
+    assert_eq!(state.timeline().len(), 2);
+    assert!(!state.snapshot_loaded, "full snapshot still owns global actions");
+}
+
+#[test]
+fn late_detail_from_an_old_selection_is_discarded() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 1,
+        threads: Some(vec![
+            ThreadSummary {
+                id: "t1".into(),
+                title: "一".into(),
+                created_at: "2026-11-23T08:00:00Z".into(),
+                ..ThreadSummary::default()
+            },
+            ThreadSummary {
+                id: "t2".into(),
+                title: "二".into(),
+                created_at: "2026-11-23T08:00:01Z".into(),
+                ..ThreadSummary::default()
+            },
+        ]),
+    });
+    let first = state.begin_detail_load("t1");
+    let second = state.begin_detail_load("t2");
+    assert!(!state.apply_thread_detail(first, bounded_detail("t1", "r1")));
+    assert!(state.runs.is_empty());
+    assert!(state.apply_thread_detail(second, bounded_detail("t2", "r2")));
+    assert_eq!(state.selected.as_deref(), Some("t2"));
+    assert_eq!(state.runs[0].thread_id, "t2");
+}
+
+#[test]
+fn summary_stage_allows_a_local_draft_but_blocks_before_summary() {
+    let mut state = AppState::default();
+    state.set_draft_text("先发一条");
+    assert!(!state.composer_status().can_submit);
+
+    state.apply_summaries(ThreadSummaries {
+        sequence: 9,
+        threads: Some(vec![summary("t1", 0)]),
+    });
+    assert!(state.selected.is_none(), "the non-blank local draft stays shown");
+    assert!(state.composer_status().can_submit);
+    let create = state.submit().expect("summary is enough for a new thread");
+    assert_eq!(create.kind, CommandKind::CreateThread);
+    assert!(state.submit().is_none(), "the pending receipt prevents a duplicate");
+}
+
+#[test]
+fn complete_detail_can_send_early_but_waits_after_an_accepted_receipt() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 7,
+        threads: Some(vec![summary("t1", 0)]),
+    });
+    let token = state.begin_detail_load("t1");
+    assert!(state.apply_thread_detail(token, detail_variant("t1", "r1", 7, false)));
+    state.set_draft_text("早发消息");
+    let send = state.submit().expect("complete detail is authoritative enough");
+    assert_eq!(send.kind, CommandKind::SendMessage);
+    assert!(state.submit().is_none(), "the in-flight receipt is single-shot");
+
+    assert!(state
+        .on_command_result(
+            &send.command_id,
+            Ok(Receipt {
+                accepted: true,
+                thread_id: "t1".into(),
+                ..Receipt::default()
+            }),
+        )
+        .is_none());
+    state.set_draft_text("不要重复发");
+    assert!(!state.composer_status().can_submit);
+    assert!(state.submit().is_none(), "wait for detail/snapshot after receipt");
+}
+
+#[test]
+fn truncated_detail_stays_blocked_unless_same_sequence_proves_idle() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 7,
+        threads: Some(vec![summary("t1", 1)]),
+    });
+    let token = state.begin_detail_load("t1");
+    assert!(state.apply_thread_detail(token, detail_variant("t1", "r1", 7, true)));
+    state.set_draft_text("活跃未知");
+    assert!(!state.composer_status().can_submit);
+
+    state.apply_summaries(ThreadSummaries {
+        sequence: 8,
+        threads: Some(vec![summary("t1", 0)]),
+    });
+    let token = state.begin_detail_load("t1");
+    assert!(state.apply_thread_detail(token, detail_variant("t1", "r2", 8, true)));
+    state.set_draft_text("摘要确认空闲");
+    assert!(state.composer_status().can_submit);
 }
 
 #[test]

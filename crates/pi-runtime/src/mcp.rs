@@ -1,4 +1,7 @@
 //! Read-only MCP settings projection. The embedded Pi manager owns transport and trust at execution time.
+mod discovery;
+pub use discovery::warm_local_discovery;
+
 use anyhow::{Context, Result, ensure};
 use pi_coding_agent::{
     app::AppOptions,
@@ -53,6 +56,12 @@ pub(crate) fn configure(options: &mut AppOptions, job: &crate::JobRequest) {
         // Cap first-prompt MCP wait to 800ms instead of Pi's 10s default so slow
         // or unreachable MCP servers never stall turn startup.
         options.mcp.startup_wait = Some(std::time::Duration::from_millis(800));
+        if let Some(settings) = options.settings.clone() {
+            let agent = options.agent_dir.clone();
+            options.mcp.load_config = Some(Arc::new(move |cwd| {
+                discovery::worker_config(&agent, cwd, settings.is_project_trusted())
+            }));
+        }
     } else {
         options
             .resources

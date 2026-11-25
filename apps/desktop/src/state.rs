@@ -42,7 +42,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use vantry_protocol::{
     Command, CommandKind, CoreEvent, Input, PendingRequest, Receipt, Run, RunStatus,
-    RunTelemetry, Snapshot, Task, Thread, ToolCall, WorkspaceSpec,
+    RunTelemetry, Snapshot, Task, Thread, ThreadDetail, ThreadSummary, ThreadSummaries, ToolCall,
+    WorkspaceSpec,
 };
 
 pub use self::{
@@ -354,6 +355,23 @@ pub struct AppState {
     /// Bumped when what the sidebar shows may have changed (not on output
     /// deltas), so its rows are not rebuilt per streamed character.
     pub sidebar_revision: u64,
+    /// Statuses projected by the fast summaries response until the full
+    /// snapshot/detail replaces them with authoritative rows.
+    summary_statuses: BTreeMap<String, ThreadStatus>,
+    /// Updated-at timestamps projected by the fast summaries response.
+    summary_activity: BTreeMap<String, String>,
+    /// Invalidates a late bounded-detail response after another selection or
+    /// an authoritative snapshot wins the race.
+    detail_request: u64,
+    /// The summary cursor and active-run counts used to decide whether a
+    /// truncated detail is safe to submit against.
+    summary_sequence: Option<i64>,
+    summary_active_runs: BTreeMap<String, i64>,
+    /// `(thread_id, detail_sequence, truncated_runs)` for the selected detail.
+    detail_readiness: Option<(String, i64, bool)>,
+    /// A receipt was accepted, but no authoritative snapshot/event has
+    /// arrived yet. Keep the composer blocked so a second send cannot race it.
+    awaiting_refresh: BTreeSet<String>,
     pub stats: FoldStats,
 }
 
@@ -389,6 +407,13 @@ impl Default for AppState {
             endpoint_label: String::new(),
             workspace_label: String::new(),
             sidebar_revision: 0,
+            summary_statuses: BTreeMap::new(),
+            summary_activity: BTreeMap::new(),
+            detail_request: 0,
+            summary_sequence: None,
+            summary_active_runs: BTreeMap::new(),
+            detail_readiness: None,
+            awaiting_refresh: BTreeSet::new(),
             stats: FoldStats::default(),
         }
     }
@@ -451,6 +476,39 @@ pub(crate) fn decode<T: DeserializeOwned + Serialize + Default>(value: &Value) -
 fn clear_zero_time(time: &mut String) {
     if time.starts_with("0001-01-01") {
         time.clear();
+    }
+}
+
+fn thread_from_summary(summary: ThreadSummary) -> Thread {
+    Thread {
+        unread_sequence: summary.unread_sequence,
+        project_path: summary.project_path,
+        id: summary.id,
+        title: summary.title,
+        created_at: summary.created_at,
+        provider_id: summary.provider_id,
+        model: summary.model,
+        workspace: summary.workspace,
+        parent_thread_id: summary.parent_thread_id,
+        parent_task_id: summary.parent_task_id,
+        created_by_thread_id: summary.created_by_thread_id,
+        pinned: summary.pinned,
+        archived: summary.archived,
+        snoozed_until: summary.snoozed_until,
+        approval_policy: summary.approval_policy,
+        ..Thread::default()
+    }
+}
+
+fn status_from_summary(summary: &ThreadSummary) -> ThreadStatus {
+    if summary.pending_requests > 0 {
+        ThreadStatus::NeedsApproval
+    } else if summary.active_runs > 0 {
+        ThreadStatus::Running
+    } else if matches!(summary.latest_status, Some(RunStatus::Failed | RunStatus::Interrupted)) {
+        ThreadStatus::Failed
+    } else {
+        ThreadStatus::Idle
     }
 }
 
@@ -579,7 +637,11 @@ impl AppState {
             Some(run) if matches!(run.status, RunStatus::Failed | RunStatus::Interrupted) => {
                 ThreadStatus::Failed
             }
-            _ => ThreadStatus::Idle,
+            _ => self
+                .summary_statuses
+                .get(thread_id)
+                .copied()
+                .unwrap_or(ThreadStatus::Idle),
         }
     }
 
@@ -649,6 +711,48 @@ impl AppState {
         self.pending.iter().any(|p| p.key.starts_with(prefix))
     }
 
+    /// Whether a selected existing thread has enough projection/detail data
+    /// to accept an early command while the full snapshot is still loading.
+    /// Complete detail is always safe; truncated detail is safe only when its
+    /// sequence is exactly the summary sequence and both sources say no run is
+    /// active.
+    fn early_ready_for(&self, thread_id: &str) -> bool {
+        if self.snapshot_loaded {
+            return true;
+        }
+        if self.awaiting_refresh.contains(thread_id) {
+            return false;
+        }
+        let Some(summary_sequence) = self.summary_sequence else {
+            return false;
+        };
+        let Some((detail_id, detail_sequence, truncated)) = &self.detail_readiness else {
+            return false;
+        };
+        if detail_id != thread_id || *detail_sequence < summary_sequence {
+            return false;
+        }
+        if !truncated {
+            return true;
+        }
+        *detail_sequence == summary_sequence
+            && self.summary_active_runs.get(thread_id) == Some(&0)
+            && self.active_run(thread_id).is_none()
+    }
+
+    fn early_submit_ready(&self) -> bool {
+        if self.snapshot_loaded {
+            return true;
+        }
+        match self.selected.as_deref() {
+            Some(thread_id) => self.early_ready_for(thread_id),
+            // A local draft has no Core thread/run state to race. It becomes
+            // safe as soon as the summaries response established the Core
+            // sequence; `apply_summaries` preserves a non-blank new draft.
+            None => self.summary_sequence.is_some(),
+        }
+    }
+
     /// Pending commands whose outcome is unknown (retry / give up).
     pub fn unconfirmed(&self) -> Vec<&PendingCommand> {
         self.pending
@@ -683,7 +787,7 @@ impl AppState {
         ComposerStatus {
             can_submit: has_content
                 && (editing || pending.is_none())
-                && self.snapshot_loaded
+                && self.early_submit_ready()
                 && !self.attachment_imports.contains_key(&self.draft_key()),
             primary,
             can_stop: active.is_some_and(|run| !self.in_flight(&format!("stop:{}", run.id))),
@@ -712,19 +816,6 @@ impl AppState {
         }
     }
 
-    /// The run parts of `run` for the timeline.
-    fn parts<'a>(&'a self, run: &'a Run) -> RunParts<'a> {
-        RunParts {
-            run,
-            tools: self.tools.iter().filter(|t| t.run_id == run.id).collect(),
-            requests: self
-                .requests
-                .iter()
-                .filter(|r| r.run_id == run.id)
-                .collect(),
-        }
-    }
-
     /// Rebuilds run `run_id`'s rows.
     fn refresh_run(&mut self, run_id: &str) {
         let Some(run) = self.runs.iter().find(|r| r.id == run_id) else {
@@ -744,7 +835,26 @@ impl AppState {
 
     fn rebuild_timeline(&mut self) {
         let mut timeline = std::mem::take(&mut self.timeline);
-        timeline.rebuild_all(self.runs.iter().map(|run| self.parts(run)));
+        let mut tools_by_run = std::collections::HashMap::<&str, Vec<&ToolCall>>::new();
+        for tool in &self.tools {
+            tools_by_run
+                .entry(tool.run_id.as_str())
+                .or_default()
+                .push(tool);
+        }
+        let mut requests_by_run =
+            std::collections::HashMap::<&str, Vec<&PendingRequest>>::new();
+        for request in &self.requests {
+            requests_by_run
+                .entry(request.run_id.as_str())
+                .or_default()
+                .push(request);
+        }
+        timeline.rebuild_all(self.runs.iter().map(|run| RunParts {
+            run,
+            tools: tools_by_run.remove(run.id.as_str()).unwrap_or_default(),
+            requests: requests_by_run.remove(run.id.as_str()).unwrap_or_default(),
+        }));
         self.timeline = timeline;
     }
 }
@@ -754,6 +864,123 @@ impl AppState {
 impl AppState {
     /// Replaces the Core's entities with `snapshot`: the first load and every
     /// resync. Local intents (drafts, pending commands) stay.
+    pub fn apply_summaries(&mut self, summaries: ThreadSummaries) {
+        self.sequence = summaries.sequence;
+        let summaries = summaries.threads.unwrap_or_default();
+        self.threads = summaries.iter().cloned().map(thread_from_summary).collect();
+        self.runs.clear();
+        self.tools.clear();
+        self.requests.clear();
+        self.inputs.clear();
+        self.tasks.clear();
+        self.timeline = TimelineIndex::default();
+        self.summary_statuses = summaries
+            .iter()
+            .map(|summary| (summary.id.clone(), status_from_summary(summary)))
+            .collect();
+        self.summary_activity = summaries
+            .iter()
+            .map(|summary| (summary.id.clone(), summary.updated_at.clone()))
+            .collect();
+        self.detail_request = self.detail_request.wrapping_add(1);
+        self.summary_sequence = Some(self.sequence);
+        self.summary_active_runs = summaries
+            .iter()
+            .map(|summary| (summary.id.clone(), summary.active_runs))
+            .collect();
+        self.detail_readiness = None;
+        for thread in &mut self.threads {
+            clear_zero_time(&mut thread.created_at);
+            if let Some(seq) = thread.unread_sequence {
+                if seq > 0 {
+                    self.unread.insert(thread.id.clone());
+                } else {
+                    self.unread.remove(&thread.id);
+                }
+            }
+        }
+        let existing: HashSet<_> = self.threads.iter().map(|thread| thread.id.as_str()).collect();
+        self.unread.retain(|id| existing.contains(id.as_str()));
+        if let Some(id) = &self.selected
+            && !existing.contains(id.as_str())
+        {
+            self.selected = None;
+        }
+        if self.selected.is_none()
+            && self.local_selected.is_none()
+            && self
+                .drafts
+                .get(NEW_THREAD)
+                .is_none_or(|draft| draft.is_blank() && draft.mode == InteractionMode::Default)
+        {
+            self.selected = self.visible_threads().first().map(|t| t.id.clone());
+        }
+        self.snapshot_loaded = false;
+        self.sidebar_revision += 1;
+        self.notice = Some(Notice::new(NoticeLevel::Info, "正在加载完整会话…"));
+    }
+
+    /// Starts a bounded-detail request for a selected summary. The token is
+    /// checked when the response returns, so switching away and back cannot
+    /// let an older response overwrite the newer selection.
+    pub fn begin_detail_load(&mut self, id: &str) -> u64 {
+        self.detail_request = self.detail_request.wrapping_add(1);
+        let request = self.detail_request;
+        self.detail_readiness = None;
+        self.select_thread(Some(id.to_owned()));
+        self.notice = Some(Notice::new(NoticeLevel::Info, "正在加载会话内容…"));
+        request
+    }
+
+    /// Applies bounded detail only when it still belongs to the current
+    /// selection. The later full snapshot remains the authoritative source.
+    pub fn apply_thread_detail(&mut self, request: u64, detail: ThreadDetail) -> bool {
+        if request != self.detail_request
+            || self.selected.as_deref() != Some(detail.thread.id.as_str())
+        {
+            return false;
+        }
+        let ThreadDetail {
+            sequence,
+            mut thread,
+            runs,
+            tasks,
+            inputs,
+            tools,
+            requests,
+            truncated_runs,
+            ..
+        } = detail;
+        clear_zero_time(&mut thread.created_at);
+        if let Some(existing) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+            *existing = thread.clone();
+        } else {
+            self.threads.push(thread.clone());
+        }
+        let id = thread.id;
+        self.detail_readiness = Some((id.clone(), sequence, truncated_runs));
+        self.summary_statuses.remove(&id);
+        self.summary_activity.remove(&id);
+        self.runs.retain(|run| run.thread_id != id);
+        self.tools.retain(|tool| tool.thread_id != id);
+        self.requests.retain(|request| request.thread_id != id);
+        self.inputs.retain(|input| input.thread_id != id);
+        self.tasks.retain(|task| task.parent_thread_id != id && task.child_thread_id != id);
+        let mut runs = runs.unwrap_or_default();
+        for run in &mut runs {
+            clear_zero_time(&mut run.created_at);
+        }
+        self.runs.extend(runs);
+        self.tools.extend(tools.unwrap_or_default());
+        self.requests.extend(requests.unwrap_or_default());
+        self.inputs.extend(inputs.unwrap_or_default());
+        self.tasks.extend(tasks.unwrap_or_default());
+        self.sequence = self.sequence.max(sequence);
+        self.rebuild_timeline();
+        self.sidebar_revision += 1;
+        true
+    }
+
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
         self.sequence = snapshot.sequence;
         self.threads = snapshot.threads.unwrap_or_default();
@@ -762,6 +989,13 @@ impl AppState {
         self.tools = snapshot.tools;
         self.requests = snapshot.requests;
         self.inputs = snapshot.inputs;
+        self.summary_statuses.clear();
+        self.summary_activity.clear();
+        self.detail_request = self.detail_request.wrapping_add(1);
+        self.summary_sequence = None;
+        self.summary_active_runs.clear();
+        self.detail_readiness = None;
+        self.awaiting_refresh.clear();
         for thread in &mut self.threads {
             clear_zero_time(&mut thread.created_at);
             if let Some(seq) = thread.unread_sequence {
@@ -778,6 +1012,11 @@ impl AppState {
             clear_zero_time(&mut run.created_at);
         }
         self.snapshot_loaded = true;
+        if self.notice.as_ref().is_some_and(|notice| {
+            notice.text == "正在加载完整会话…" || notice.text == "正在加载会话内容…"
+        }) {
+            self.notice = None;
+        }
         self.rebuild_timeline();
         self.sidebar_revision += 1;
         if let Some(id) = &self.selected
@@ -1256,11 +1495,15 @@ fn merge_run(existing: &mut Run, incoming: Run) {
 
 impl AppState {
     pub fn select_thread(&mut self, id: Option<String>) {
+        let previous = self.selected.clone();
         self.local_selected = id
             .as_ref()
             .filter(|id| self.local_order.contains(id))
             .cloned();
         self.selected = id.filter(|id| self.thread(id).is_some());
+        if self.selected != previous {
+            self.detail_readiness = None;
+        }
         let local_read_state = self.selected_thread().is_some_and(|t| t.unread_sequence.is_none());
         if local_read_state && self.selected.as_ref().is_some_and(|id| self.unread.remove(id)) {
             self.sidebar_revision += 1;
@@ -1271,6 +1514,7 @@ impl AppState {
     /// Opens the new thread's draft.
     pub fn new_thread(&mut self) {
         self.selected = None;
+        self.detail_readiness = None;
         if let Some(previous) = self.drafts.remove(NEW_THREAD) {
             let id = self.allocate_local_draft();
             self.drafts.insert(id.clone(), previous);
@@ -1396,6 +1640,7 @@ impl AppState {
     pub fn submit_child(&mut self, child: &str) -> Option<Command> {
         let parent=self.selected.as_deref()?;
         if !self.tasks.iter().any(|t| t.parent_thread_id==parent && t.child_thread_id==child) {return None;}
+        if !self.early_ready_for(child) {return None;}
         let key=format!("submit:{child}");
         if self.pending_by_key(&key).is_some() || self.drafts.get(child)?.is_blank() {return None;}
         let draft=self.drafts.remove(child)?;
@@ -1628,6 +1873,16 @@ impl AppState {
                 ))
             }
             Purpose::Message { .. } => {
+                if !self.snapshot_loaded {
+                    let thread_id = if receipt.thread_id.is_empty() {
+                        pending.command.thread_id.clone()
+                    } else {
+                        receipt.thread_id.clone()
+                    };
+                    if !thread_id.is_empty() {
+                        self.awaiting_refresh.insert(thread_id);
+                    }
+                }
                 if receipt.delivery == "queued"
                     || pending.command.kind == CommandKind::QueueMessage
                 {

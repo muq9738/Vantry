@@ -20,7 +20,6 @@ const ENV_PARENT_TASK_ID = "VANTRY_PARENT_TASK_ID";
 const ENV_DIRECT_ORCHESTRATION = "VANTRY_DIRECT_ORCHESTRATION";
 const ENV_INTERACTION_MODE = "VANTRY_INTERACTION_MODE";
 const VANTRY_TERMINAL_REQUEST_KIND = "vantry_terminal_run";
-const MODEL_ONLY_UI_TOOLS = new Set(["vantry_request_secret", "vantry_terminal_run"]);
 
 const DIRECT_RETRIEVAL_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const DEFAULT_CODEMODE_MAX_OUTPUT_TOKENS = 10_000;
@@ -47,7 +46,6 @@ const VANTRY_CODEMODE_GUIDELINES = [
 
 const MAX_RESULT_PREVIEW_CHARS = 4_000;
 const MAX_BATCH_THREADS = 20;
-const ENV_VAR_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 const DELEGATE_ROLES = ["implementation", "research", "review", "design", "test", "general"] as const;
@@ -73,7 +71,6 @@ const THREAD_MANAGE_ACTIONS = [
   "respond_request",
 ] as const;
 
-let secretSequence = 0;
 let commandSequence = 0;
 let toolSpillSequence = 0;
 
@@ -436,39 +433,6 @@ function truncateText(value: unknown, limit: number): { text?: string; truncated
   };
 }
 
-function shellSingleQuote(value: string): string {
-  return "'" + value.replaceAll("'", "'\\''") + "'";
-}
-
-async function writeOneTimeSecretFile(jobDir: string, secretValue: string): Promise<string> {
-  const secretsDir = path.join(jobDir, "secrets");
-  await fs.mkdir(secretsDir, { recursive: true, mode: 0o700 });
-  await fs.chmod(secretsDir, 0o700);
-
-  for (let attempt = 0; attempt < 16; attempt++) {
-    secretSequence += 1;
-    const fileName = `secret-${process.pid}-${Date.now()}-${secretSequence}.secret`;
-    const secretFilePath = path.join(secretsDir, fileName);
-    try {
-      const handle = await fs.open(secretFilePath, "wx", 0o600);
-      try {
-        await handle.chmod(0o600);
-        await handle.writeFile(secretValue, "utf8");
-      } finally {
-        await handle.close();
-      }
-      return secretFilePath;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      if (code === "EEXIST") {
-        continue;
-      }
-      throw new Error("Failed to create one-time secret file");
-    }
-  }
-  throw new Error("Failed to allocate unique secret file path");
-}
-
 const targetEnvironmentProperty = Type.Optional(Type.String({ description: "Linked target environment ID from vantry_environment_list; omit for the local Core" }));
 const remoteWorkspaceSchema = Type.Object({
   kind: StringEnum(WORKSPACE_KINDS),
@@ -731,18 +695,6 @@ const threadManageSchema = Type.Object({
   clientRequestId: Type.Optional(Type.String({ description: "Optional idempotency key" })),
 });
 type ThreadManageInput = Static<typeof threadManageSchema>;
-
-const requestSecretSchema = Type.Object({
-  prompt: Type.String({
-    description: "Prompt shown in Vantry's native dialog explaining what secret is requested",
-  }),
-  envVarName: Type.Optional(
-    Type.String({
-      description: "Optional environment variable name hint (e.g. OPENAI_API_KEY)",
-    }),
-  ),
-});
-type RequestSecretInput = Static<typeof requestSecretSchema>;
 
 const terminalRunSchema = Type.Object({
   command: Type.String({
@@ -2082,7 +2034,7 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
   const registerTool: ExtensionAPI["registerTool"] = (tool) => {
     pi.registerTool({
       ...tool,
-      exposure: MODEL_ONLY_UI_TOOLS.has(tool.name) ? "model-only" : directTools.has(tool.name) ? "direct" : "deferred",
+      exposure: tool.name === "vantry_terminal_run" ? "model-only" : directTools.has(tool.name) ? "direct" : "deferred",
       namespace: {
         name: "vantry",
         description: "Delegated child tasks, peer threads, and remote machines",
@@ -2939,63 +2891,6 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
           return toolJsonResult(receipt);
         }
       }
-    },
-  });
-
-  registerTool({
-    name: "vantry_request_secret",
-    label: "Vantry Request Secret",
-    description:
-      "Collect a sensitive secret (API key, token, password, or sudo password) through Vantry's native input dialog and store it in a 0600 one-time file without exposing plaintext in chat, logs, or session history.",
-    promptSnippet: "Request a secret via Vantry's native dialog and write it to a 0600 file",
-    promptGuidelines: [
-      "Use vantry_request_secret for user secrets (0600 file); never ask for plaintext secrets or print secret-file contents.",
-    ],
-    // Strip Pi codemode's "Codemode: tools.<name>(args)..." description suffix from
-    // routine retrieval tools so the model invokes read/grep/find/ls directly in parallel,
-    // while keeping them callable inside codemode when scripts genuinely need them.
-    prepareLoadout(loadout) {
-      const descriptions: Record<string, string> = {};
-      for (const declared of loadout.declared) {
-        if (DIRECT_RETRIEVAL_TOOLS.has(declared.name)) {
-          descriptions[declared.name] = declared.description;
-        }
-      }
-      return Object.keys(descriptions).length > 0 ? { descriptions } : undefined;
-    },
-    parameters: requestSecretSchema,
-    async execute(_toolCallId, params: RequestSecretInput, signal, _onUpdate, ctx) {
-      const prompt = params.prompt?.trim();
-      if (!prompt) {
-        throw new Error("vantry_request_secret requires a non-empty prompt");
-      }
-      const envVarName = params.envVarName?.trim();
-      if (envVarName !== undefined && envVarName.length > 0 && !ENV_VAR_NAME_PATTERN.test(envVarName)) {
-        throw new Error(`Invalid envVarName ${JSON.stringify(envVarName)}; expected [A-Za-z_][A-Za-z0-9_]*`);
-      }
-      if (!ctx.hasUI) {
-        throw new Error("Vantry secret input dialog UI is unavailable");
-      }
-
-      const jobDir = resolveJobDir();
-      const activeSignal = signal ?? ctx.signal;
-      const secretValue = activeSignal
-        ? await ctx.ui.input(prompt, "", { signal: activeSignal })
-        : await ctx.ui.input(prompt, "");
-
-      if (secretValue === undefined || secretValue.length === 0) {
-        throw new Error("Secret input was cancelled or empty");
-      }
-
-      const secretFilePath = await writeOneTimeSecretFile(jobDir, secretValue);
-      const quotedPath = shellSingleQuote(secretFilePath);
-      const usageHint =
-        envVarName && envVarName.length > 0
-          ? `Pass via environment without printing: ${envVarName}="$(cat ${quotedPath})" <command>, then remove with rm -f ${quotedPath}. Never echo or log the secret.`
-          : `Consume from file without printing (e.g. sudo -S -p '' <command> < ${quotedPath} or SECRET="$(cat ${quotedPath})" <command>), then remove with rm -f ${quotedPath}. Never echo or log the secret.`;
-
-      const result = { secretFilePath, usageHint };
-      return toolJsonResult(result);
     },
   });
 
