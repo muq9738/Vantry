@@ -509,6 +509,16 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
         })
     });
     let thread_id = move || controller::state().with_untracked(|s| s.selected.clone().unwrap_or_default());
+    // Only the reply's last text carries the actions, and they act on the
+    // whole reply, as Claude's desktop does: text between tool calls stays
+    // quiet instead of repeating a bar after every step.
+    let last = computed(move || {
+        let Some(TimelineItem::Text { run_id, end, .. }) = item.get() else {
+            return false;
+        };
+        controller::state().with(|s| s.run(&run_id).is_some_and(|r| r.output.len() == end))
+    });
+    let reply = move || range().map(|(run, _, end)| (run, 0, end));
     let hovered = signal(false);
     view()
         .flex_col()
@@ -527,7 +537,7 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
         }))
         // Quiet v0.1.42 reply action bar: copy / quote / fork / rewind / preview
         .child(when(
-            move || !streaming(),
+            move || !streaming() && last.get(),
             move || {
                 view()
                     .flex_row()
@@ -535,12 +545,12 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
                     .gap_1()
                     .opacity(move || if hovered.get() { 1.0_f32 } else { 0.55_f32 })
                     .child(small_icon_button(Icon::Copy, "复制回复", move || {
-                        if let Some((run, start, end)) = range() {
+                        if let Some((run, start, end)) = reply() {
                             controller::copy_reply(run, start, end);
                         }
                     }))
                     .child(small_icon_button(Icon::Quote, "引用到输入框", move || {
-                        if let Some((run, start, end)) = range() {
+                        if let Some((run, start, end)) = reply() {
                             let snippet = controller::state()
                                 .with_untracked(|s| s.text_of(&run, start, end));
                             controller::quote_to_draft(snippet);
@@ -563,7 +573,7 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
                         .disabled(move || !settled.get()),
                     )
                     .child(small_icon_button(Icon::Eye, "在预览中打开", move || {
-                        if let Some((run, start, end)) = range() {
+                        if let Some((run, start, end)) = reply() {
                             let text = controller::state()
                                 .with_untracked(|s| s.text_of(&run, start, end));
                             controller::preview_text(String::new(), text);
@@ -698,92 +708,88 @@ fn tools_row(item: ItemMemo) -> impl IntoElement {
     });
     let headline = computed(move || calls.with(|c| tools_headline(c, lang)));
     let ink = move || if hovered.get() || open.get() { colors.ink } else { colors.muted };
+    // A single call or a running group names its (current) call; a finished
+    // group sums itself up.
+    let named = move || single.get() || running.get();
+    let primary = move || {
+        if !named() {
+            return headline.get();
+        }
+        let name = current.with(|(name, _)| name.clone());
+        if single.get() {
+            name
+        } else {
+            let word = match lang {
+                Language::En => "Running",
+                Language::Ja => "実行中",
+                Language::Zh => "正在运行",
+            };
+            format!("{word} · {name}")
+        }
+    };
+    let secondary = move || {
+        if named() {
+            current.with(|(_, summary)| summary.clone())
+        } else {
+            String::new()
+        }
+    };
+    // The line is as wide as its text (its chevron right after it) and
+    // shrinks inside the row, so a long command ends in an ellipsis.
+    let line = nsh_base::button()
+        .accessibility_label(match lang {
+            Language::En => "Show tool calls",
+            Language::Ja => "ツール呼び出しを表示",
+            Language::Zh => "展开工具调用",
+        })
+        .on_press(move || open.set(!open.get_untracked()))
+        .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
+        .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
+        .flex_shrink(1.0)
+        .min_w(px(0.0))
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .py_0p5()
+        .child(dynamic(move || {
+            if awaiting.get() {
+                dot(colors.warning).into_element()
+            } else if running.get() {
+                dot(colors.accent).animate_pulse().into_element()
+            } else {
+                let glyph = current.with(|(name, _)| tool_glyph(name));
+                icon(glyph, 13.0, colors.faint).into_element()
+            }
+        }))
+        // Plain texts (no `dynamic` box around them), so a long
+        // command shrinks with an ellipsis inside the column.
+        .child(
+            text(primary)
+                .flex_shrink_0()
+                .text_size(px(12.5))
+                .text_color(ink),
+        )
+        .child(
+            text(secondary)
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
+                .number_of_lines(1u32)
+                .font_family("Menlo")
+                .text_size(px(11.5))
+                .text_color(colors.faint),
+        )
+        .child(dynamic(move || {
+            icon(
+                if open.get() { Icon::ChevronDown } else { Icon::ChevronRight },
+                12.0,
+                colors.faint,
+            )
+            .into_element()
+        }));
     view()
         .flex_col()
         .gap_1()
-        .child(
-            nsh_base::button()
-                .accessibility_label(match lang {
-                    Language::En => "Show tool calls",
-                    Language::Ja => "ツール呼び出しを表示",
-                    Language::Zh => "展开工具调用",
-                })
-                .on_press(move || open.set(!open.get_untracked()))
-                .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
-                .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
-                .self_start()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .py_0p5()
-                .min_w(px(0.0))
-                .child(dynamic(move || {
-                    if awaiting.get() {
-                        dot(colors.warning).into_element()
-                    } else if running.get() {
-                        dot(colors.accent).animate_pulse().into_element()
-                    } else {
-                        let glyph = current.with(|(name, _)| tool_glyph(name));
-                        icon(glyph, 13.0, colors.faint).into_element()
-                    }
-                }))
-                .child(dynamic(move || {
-                    if single.get() || running.get() {
-                        let (name, summary) = current.get();
-                        let label = if single.get() {
-                            name
-                        } else {
-                            format!(
-                                "{} · {name}",
-                                match lang {
-                                    Language::En => "Running",
-                                    Language::Ja => "実行中",
-                                    Language::Zh => "正在运行",
-                                }
-                            )
-                        };
-                        view()
-                            .flex_shrink(1.0)
-                            .min_w(px(0.0))
-                            .flex_row()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                text(label)
-                                    .flex_shrink_0()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_size(px(12.5))
-                                    .text_color(ink),
-                            )
-                            .child(
-                                text(summary)
-                                    .flex_shrink(1.0)
-                                    .min_w(px(0.0))
-                                    .number_of_lines(1u32)
-                                    .font_family("Menlo")
-                                    .text_size(px(11.5))
-                                    .text_color(colors.faint),
-                            )
-                            .into_element()
-                    } else {
-                        text(move || headline.get())
-                            .flex_shrink(1.0)
-                            .min_w(px(0.0))
-                            .number_of_lines(1u32)
-                            .text_size(px(12.5))
-                            .text_color(ink)
-                            .into_element()
-                    }
-                }))
-                .child(dynamic(move || {
-                    icon(
-                        if open.get() { Icon::ChevronDown } else { Icon::ChevronRight },
-                        12.0,
-                        colors.faint,
-                    )
-                    .into_element()
-                })),
-        )
+        .child(view().w_full().min_w(px(0.0)).flex_row().child(line))
         .child(when(
             move || open.get(),
             move || dynamic(move || {
