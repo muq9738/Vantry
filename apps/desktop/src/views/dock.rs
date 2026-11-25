@@ -1687,7 +1687,20 @@ fn terminal_panel() -> impl IntoElement {
                     .into_element()
             })
         }))
-        .child(when(controller::native_shell,move || dynamic(move || active.get().map(|id| shell_screen(id).into_element()))))
+        .child(when(controller::native_shell, move || {
+            dynamic(move || match active.get() {
+                Some(id) => shell_screen(id).into_element(),
+                None => view()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .bg(colors.code)
+                    .child(super::caption("没有打开的终端"))
+                    .child(ghost_button("新建终端", controller::new_terminal))
+                    .into_element(),
+            })
+        }))
         .child(when(|| !controller::native_shell(),move || scroll()
                 .element_ref(&list)
                 .flex_1()
@@ -1753,8 +1766,21 @@ fn shell_screen(id: String) -> impl IntoElement {
                 .unwrap_or_default()
         })
     });
+    // The terminal's API exists once it is mounted: output that came
+    // before then is written when it is (it reports its first size).
+    let mounted = signal(false);
+    spawn(async move {
+        for _ in 0..20 {
+            timer(std::time::Duration::from_millis(50)).await;
+            if term.api::<nsh_base::TerminalApi>().is_some() {
+                mounted.set(true);
+                return;
+            }
+        }
+    });
     effect(move || {
         let output = output.get();
+        mounted.get();
         if let Some(api) = term.api::<nsh_base::TerminalApi>() {
             let previous = last.replace(output.clone());
             if let Some(delta) = output.strip_prefix(&previous) {
@@ -1768,15 +1794,23 @@ fn shell_screen(id: String) -> impl IntoElement {
         }
     });
     let resize = id.clone();
+    let colors = palette();
     nsh_base::terminal()
         .component_ref(&term)
         .flex_1()
+        .min_h_0()
+        .bg(colors.code)
+        .px_2p5()
+        .py_2()
         .font_family(MONO)
         .font_size(px(12.0))
+        .line_height(px(17.0))
+        .cursor_class("bg-primary/70")
         .accessibility_label("终端输入")
         .on_data(move |s: &SharedString| controller::shell_write(&id, s.to_string()))
         .on_resize(move |e: &nsh_base::TerminalEvent| {
             if let nsh_base::TerminalEvent::Resize(cols, rows) = e {
+                mounted.set(true);
                 controller::shell_resize(&resize, *rows as u16, *cols as u16);
             }
         })

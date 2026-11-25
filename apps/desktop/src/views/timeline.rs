@@ -320,6 +320,45 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                         .text_size(px(10.5))
                         .text_color(colors.accent)
                 }))
+                .child(when(
+                    move || !attachments().is_empty(),
+                    move || {
+                        let numbered = computed(move || {
+                            let lang = controller::ui().with(|u| u.locale);
+                            let mut img_seq = 0usize;
+                            attachments()
+                                .into_iter()
+                                .map(|item| {
+                                    let lbl = if item.mime.starts_with("image/") {
+                                        img_seq += 1;
+                                        attachment_short_name(&item, img_seq, lang)
+                                    } else {
+                                        attachment_short_name(&item, 0, lang)
+                                    };
+                                    (item, lbl)
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        view().flex_row().flex_wrap().justify_end().items_center().gap_1p5().pr(px(30.0)).child(each(
+                            move || numbered.get(),
+                            |(item, _): &(vantry_protocol::Attachment, String)| item.id.clone(),
+                            |entry, _| {
+                                dynamic(move || {
+                                    let (item, label) = entry.get();
+                                    if item.mime.starts_with("image/") {
+                                        super::composer::attachment_thumbnail_labeled(
+                                            item,
+                                            Some(label),
+                                        )
+                                        .into_element()
+                                    } else {
+                                        super::caption(format!("@{label}")).into_element()
+                                    }
+                                })
+                            },
+                        ))
+                    },
+                ))
                 .child(
                     view()
                         .w_full()
@@ -371,45 +410,6 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                                 })),
                         ),
                 )
-                .child(when(
-                    move || !attachments().is_empty(),
-                    move || {
-                        let numbered = computed(move || {
-                            let lang = controller::ui().with(|u| u.locale);
-                            let mut img_seq = 0usize;
-                            attachments()
-                                .into_iter()
-                                .map(|item| {
-                                    let lbl = if item.mime.starts_with("image/") {
-                                        img_seq += 1;
-                                        attachment_short_name(&item, img_seq, lang)
-                                    } else {
-                                        attachment_short_name(&item, 0, lang)
-                                    };
-                                    (item, lbl)
-                                })
-                                .collect::<Vec<_>>()
-                        });
-                        view().flex_row().flex_wrap().items_center().gap_1p5().child(each(
-                            move || numbered.get(),
-                            |(item, _): &(vantry_protocol::Attachment, String)| item.id.clone(),
-                            |entry, _| {
-                                dynamic(move || {
-                                    let (item, label) = entry.get();
-                                    if item.mime.starts_with("image/") {
-                                        super::composer::attachment_thumbnail_labeled(
-                                            item,
-                                            Some(label),
-                                        )
-                                        .into_element()
-                                    } else {
-                                        super::caption(format!("@{label}")).into_element()
-                                    }
-                                })
-                            },
-                        ))
-                    },
-                ))
                 .child(each(move || inserted.get(), |i| i.0.clone(), |item, _| {
                     view().flex_col().items_end().gap_1().child(super::caption(move || item.with(|(_, _, ok, error)| {
                         if *ok { "已插入本轮".to_owned() } else { format!("插入失败 · {error}") }

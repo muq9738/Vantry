@@ -306,13 +306,17 @@ fn splice_text_at_selection(
 }
 
 pub(super) fn paste_into_composer(paste: &PasteEvent, editor: InputRef, selection: Option<(u32, u32)>) {
-    if let Some(text) = super::reference_input::restore_selection(&paste.html) {
+    let has_images = paste.files.iter().any(|f| f.mime.starts_with("image/"));
+    // Vantry's own copy: its text with every image where it was referenced.
+    if paste.uris.is_empty()
+        && let Some(text) =
+            super::reference_input::restore_selection(&paste.html, &paste.text, has_images)
+    {
         let mut restored = PasteEvent::default();
         restored.text = text;
         paste_into_composer(&restored, editor, selection);
         return;
     }
-    let has_images = paste.files.iter().any(|f| f.mime.starts_with("image/"));
     // Pasted files put their `@` reference where the caret is.
     if let Some((_, end)) = selection {
         controller::note_composer_caret(end);
@@ -403,6 +407,11 @@ pub(crate) fn composer() -> impl IntoElement {
         })
     });
     let effort_open = signal(false);
+    // The card's width: a narrow column (the dock open beside it) folds the
+    // toolbar's labels so its buttons stay inside the card.
+    let card_width = signal(metrics::READING_WIDTH);
+    let compact = computed(move || card_width.get() < 560.0);
+    let tight = computed(move || card_width.get() < 430.0);
 
     let editor = InputRef::new();
     let card = element_ref();
@@ -561,6 +570,13 @@ pub(crate) fn composer() -> impl IntoElement {
                 .child(
                     view()
                         .element_ref(&card)
+                        .on_layout(move |b: &Bounds<Points>| {
+                            let w = b.size.width.0.floor();
+                            if (card_width.get_untracked() - w).abs() >= 1.0 {
+                                card_width.set(w);
+                            }
+                        })
+                        .min_w(px(0.0))
                         .flex_col()
                         .gap_2()
                         .px_3p5()
@@ -701,116 +717,13 @@ pub(crate) fn composer() -> impl IntoElement {
                             effort_open,
                             model_anchor,
                             effort_anchor,
+                            compact,
+                            tight,
                         )),
                 )
                 // Quiet host / workspace context strip + turn indicator below the card (matches v0.1.42)
-                .child(context_strip(endpoint, workspace, branch, turn_count)),
+                .child(super::pickers::context_strip(endpoint, workspace, branch, turn_count, compact)),
         )
-}
-
-fn context_strip(
-    endpoint: Memo<String>,
-    workspace: Memo<String>,
-    branch: Memo<String>,
-    turn_count: Memo<usize>,
-) -> impl IntoElement {
-    let colors = palette();
-    view()
-        .flex_col()
-        .gap_1()
-        .px_1()
-        .child(
-            view()
-                .h(px(26.0))
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(view().flex_row().items_center().gap_1()
-                    .child(icon(Icon::Server, 12.0, colors.faint))
-                    .child(text(move || endpoint.get()).number_of_lines(1u32).text_size(px(11.0)).text_color(colors.faint)))
-                .child(text("|").text_size(px(11.0)).text_color(colors.line))
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(icon(Icon::Folder, 12.0, colors.faint))
-                        .child(
-                            text(move || {
-                                let ws = workspace.get();
-                                if ws.is_empty() {
-                                    "无项目".to_owned()
-                                } else {
-                                    crate::state::sidebar::project_name(&ws).to_owned()
-                                }
-                            })
-                            .text_size(px(11.0))
-                            .text_color(colors.faint),
-                        ),
-                )
-                .child(when(
-                    move || !workspace.with(String::is_empty),
-                    move || {
-                        text(|| {
-                            controller::state().with(|s| {
-                                if s.current_workspace().is_some_and(|w| {
-                                    w.kind == "worktree" || !w.repository.is_empty()
-                                }) {
-                                    "· 隔离分支"
-                                } else {
-                                    "· 本地目录"
-                                }
-                            })
-                        })
-                        .text_size(px(11.0))
-                        .text_color(colors.faint)
-                    },
-                ))
-                .child(view().flex_1())
-                .child(when(
-                    move || branch.with(|b| !b.is_empty()),
-                    move || {
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(icon(Icon::GitBranch, 12.0, colors.faint))
-                            .child(
-                                text(move || branch.get())
-                                    .number_of_lines(1u32)
-                                    .text_size(px(11.0))
-                                    .text_color(colors.faint),
-                            )
-                    },
-                )),
-        )
-        .child(when(
-            move || turn_count.get() > 0,
-            move || {
-                view()
-                    .w_full()
-                    .h(px(26.0))
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2p5()
-                            .py_0p5()
-                            .rounded_full()
-                            .bg(colors.soft)
-                            .child(dot(colors.success))
-                            .child(
-                                text(move || format!("第 {} 轮", turn_count.get()))
-                                    .text_size(px(11.0))
-                                    .text_color(colors.muted),
-                            ),
-                    )
-            },
-        ))
 }
 
 fn toolbar(
@@ -821,6 +734,8 @@ fn toolbar(
     effort_open: Signal<bool>,
     model_anchor: ElementRef,
     effort_anchor: ElementRef,
+    compact: Memo<bool>,
+    tight: Memo<bool>,
 ) -> impl IntoElement {
     let colors = palette();
     let policy = computed(|| controller::state().with(|s| s.current_policy()));
@@ -837,13 +752,15 @@ fn toolbar(
     view()
         .flex_row()
         .items_center()
-        .gap_1p5()
+        .gap(move || px(if tight.get() { 2.0 } else { 6.0 }))
+        .min_w(px(0.0))
         .pt_0p5()
         // Left: clean `+` attach & quiet `规划` toggle
         .child(
             nsh_base::button()
                 .accessibility_label("添加附件")
                 .on_press(controller::pick_attachments)
+                .flex_shrink_0()
                 .w(px(28.0))
                 .h(px(28.0))
                 .items_center()
@@ -858,11 +775,12 @@ fn toolbar(
                 .accessibility_label("规划模式")
                 .selected(move || plan.get())
                 .on_press(controller::toggle_mode)
+                .flex_shrink_0()
                 .flex_row()
                 .items_center()
                 .gap_1p5()
                 .h(px(28.0))
-                .px_2p5()
+                .px(move || px(if compact.get() { 7.0 } else { 10.0 }))
                 .rounded(px(7.0))
                 .bg(move || {
                     if plan.get() {
@@ -880,21 +798,23 @@ fn toolbar(
                         colors.muted
                     }
                 }))
-                .child(text("规划").text_size(px(12.0)).text_color(move || {
-                    if plan.get() {
-                        colors.accent
-                    } else {
-                        colors.muted
-                    }
+                .child(when(move || !compact.get(), move || {
+                    text("规划").text_size(px(12.0)).text_color(move || {
+                        if plan.get() {
+                            colors.accent
+                        } else {
+                            colors.muted
+                        }
+                    })
                 })),
         )
         .child(when(
             move || running.get(),
-            move || running_action_switch(running_action),
+            move || running_action_switch(running_action, tight),
         ))
-        .child(view().flex_1())
+        .child(view().flex_1().min_w(px(0.0)))
         // Right: quiet permission toggle, Claude-style model + effort triggers, send button
-        .child(policy_switch(policy))
+        .child(policy_switch(policy, compact))
         .child(
             nsh_base::button()
                 .element_ref(&model_anchor)
@@ -907,7 +827,9 @@ fn toolbar(
                 .items_center()
                 .gap_1()
                 .h(px(28.0))
-                .max_w(px(200.0))
+                .flex_shrink(1.0)
+                .min_w(px(36.0))
+                .max_w(move || px(if tight.get() { 96.0 } else if compact.get() { 140.0 } else { 200.0 }))
                 .px_2()
                 .rounded(px(7.0))
                 .hover(|s| s.bg(colors.soft))
@@ -925,11 +847,13 @@ fn toolbar(
                         }
                     })
                     .number_of_lines(1u32)
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
                     .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(colors.muted),
                 )
-                .child(icon(Icon::ChevronDown, 12.0, colors.faint)),
+                .child(view().flex_shrink_0().child(icon(Icon::ChevronDown, 12.0, colors.faint))),
         )
         .child(
             nsh_base::button()
@@ -939,11 +863,12 @@ fn toolbar(
                     controller::ui().update(|u| u.model_picker = false);
                     effort_open.set(!effort_open.get_untracked());
                 })
+                .flex_shrink_0()
                 .flex_row()
                 .items_center()
                 .gap_1()
                 .h(px(28.0))
-                .px_2()
+                .px(move || px(if compact.get() { 6.0 } else { 8.0 }))
                 .rounded(px(7.0))
                 .hover(|s| s.bg(colors.soft))
                 .active(|s| s.opacity(0.7))
@@ -951,7 +876,7 @@ fn toolbar(
                     effort_dot_color(&thinking.with(|t| t.1.clone()))
                 }))
                 .child(when(
-                    move || !thinking.with(|t| t.1.is_empty()),
+                    move || !compact.get() && !thinking.with(|t| t.1.is_empty()),
                     move || {
                         text(move || thinking_label(&thinking.with(|t| t.1.clone())))
                             .text_size(px(11.5))
@@ -996,6 +921,7 @@ fn toolbar(
                     }
                 })
                 .disabled(move || !show_stop() && !can_submit())
+                .flex_shrink_0()
                 .w(px(30.0))
                 .h(px(30.0))
                 .items_center()
@@ -1260,7 +1186,7 @@ fn completion_popover(
 }
 
 /// Quiet permission toggle aligned with Claude Desktop's subtle toolbar buttons.
-fn policy_switch(policy: Memo<String>) -> impl IntoElement {
+fn policy_switch(policy: Memo<String>, compact: Memo<bool>) -> impl IntoElement {
     let colors = palette();
     let style = move || match policy.get().as_str() {
         "auto" => (colors.muted, Icon::ShieldCheck, "自动"),
@@ -1277,11 +1203,12 @@ fn policy_switch(policy: Memo<String>) -> impl IntoElement {
                 .map_or(0, |i| (i + 1) % APPROVAL_POLICIES.len());
             controller::set_policy(APPROVAL_POLICIES[at].0.to_owned());
         })
+        .flex_shrink_0()
         .flex_row()
         .items_center()
         .gap_1()
         .h(px(28.0))
-        .px_2()
+        .px(move || px(if compact.get() { 6.0 } else { 8.0 }))
         .rounded(px(7.0))
         .hover(|s| s.bg(colors.soft))
         .active(|s| s.opacity(0.75))
@@ -1289,17 +1216,50 @@ fn policy_switch(policy: Memo<String>) -> impl IntoElement {
             let (fg, glyph, _) = style();
             icon(glyph, 13.0, fg).into_element()
         }))
-        .child(
+        .child(when(move || !compact.get(), move || {
             text(move || style().2)
                 .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(move || style().0),
-        )
+                .text_color(move || style().0)
+        }))
 }
 
-fn running_action_switch(action: Memo<RunningAction>) -> impl IntoElement {
+fn running_action_switch(action: Memo<RunningAction>, tight: Memo<bool>) -> impl IntoElement {
+    let colors = palette();
+    // Too narrow for both: one pill names the current choice and flips it.
+    let single = move || {
+        pill(
+            move || match action.get() {
+                RunningAction::Steer => PrimaryAction::Steer.label(),
+                RunningAction::Queue => PrimaryAction::Queue.label(),
+            },
+            || true,
+            move || {
+                controller::set_running_action(match action.get_untracked() {
+                    RunningAction::Steer => RunningAction::Queue,
+                    RunningAction::Queue => RunningAction::Steer,
+                })
+            },
+        )
+    };
+    dynamic(move || {
+        if tight.get() {
+            return view()
+                .flex_shrink_0()
+                .p_0p5()
+                .rounded_full()
+                .bg(colors.soft)
+                .child(single())
+                .into_element();
+        }
+        both(action).into_element()
+    })
+}
+
+fn both(action: Memo<RunningAction>) -> impl IntoElement {
     let colors = palette();
     view()
+        .flex_shrink_0()
         .flex_row()
         .items_center()
         .p_0p5()

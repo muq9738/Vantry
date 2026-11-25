@@ -1064,68 +1064,75 @@ fn ensure_image_data_uri(src: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_macos_text_and_image_pasteboard(text: &str, html: &str, image_data_uri: &str) -> bool {
-    let Some((_, png_bytes)) = nsh_core::platform::clipboard::decode_data_uri(image_data_uri) else {
-        return false;
-    };
-    let tmp = std::env::temp_dir().join(format!("vantry-clip-{}", uuid::Uuid::new_v4().simple()));
-    let img_path = tmp.with_extension("img");
-    let txt_path = tmp.with_extension("txt");
-    let html_path = tmp.with_extension("html");
-    if std::fs::write(&img_path, &png_bytes).is_err()
-        || std::fs::write(&txt_path, text.as_bytes()).is_err()
-        || std::fs::write(&html_path, html.as_bytes()).is_err()
-    {
-        let _ = std::fs::remove_file(&img_path);
-        let _ = std::fs::remove_file(&txt_path);
-        let _ = std::fs::remove_file(&html_path);
-        return false;
-    }
-    let script = r#"
+const MACOS_PASTEBOARD_SCRIPT: &str = r#"
 ObjC.import('AppKit');
 ObjC.import('Foundation');
 function run(argv) {
   var pb = $.NSPasteboard.generalPasteboard;
-  pb.clearContents;
   var txt = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, $());
   var html = $.NSString.stringWithContentsOfFileEncodingError(argv[1], $.NSUTF8StringEncoding, $());
-  var imgData = $.NSData.dataWithContentsOfFile(argv[2]);
-  var types = [];
-  if (txt && txt.js) types.push($.NSPasteboardTypeString);
-  if (html && html.js) types.push($.NSPasteboardTypeHTML);
-  if (imgData && imgData.length > 0) {
-    types.push($.NSPasteboardTypePNG);
-    types.push($.NSPasteboardTypeTIFF);
-  }
-  pb.declareTypesOwner($(types), $());
-  if (txt && txt.js) pb.setStringForType(txt, $.NSPasteboardTypeString);
-  if (html && html.js) pb.setStringForType(html, $.NSPasteboardTypeHTML);
-  if (imgData && imgData.length > 0) {
-    var img = $.NSImage.alloc.initWithData(imgData);
+  var items = [];
+  var first = $.NSPasteboardItem.alloc.init;
+  if (txt && txt.js) first.setStringForType(txt, $.NSPasteboardTypeString);
+  if (html && html.js) first.setStringForType(html, $.NSPasteboardTypeHTML);
+  items.push(first);
+  for (var i = 2; i < argv.length; i++) {
+    var data = $.NSData.dataWithContentsOfFile(argv[i]);
+    if (!data || data.length == 0) continue;
+    var item = (i == 2) ? first : $.NSPasteboardItem.alloc.init;
+    var img = $.NSImage.alloc.initWithData(data);
     var tiff = img ? img.TIFFRepresentation : $();
-    var pngData = imgData;
+    var png = data;
     if (tiff && tiff.length > 0) {
       var rep = $.NSBitmapImageRep.imageRepWithData(tiff);
       if (rep) {
         var encoded = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
-        if (encoded && encoded.length > 0) pngData = encoded;
+        if (encoded && encoded.length > 0) png = encoded;
       }
-      pb.setDataForType(tiff, $.NSPasteboardTypeTIFF);
+      item.setDataForType(tiff, $.NSPasteboardTypeTIFF);
     }
-    pb.setDataForType(pngData, $.NSPasteboardTypePNG);
+    item.setDataForType(png, $.NSPasteboardTypePNG);
+    if (i != 2) items.push(item);
   }
+  pb.clearContents;
+  if (!pb.writeObjects($(items))) throw new Error('pasteboard refused the items');
 }
 "#;
-    let ok = std::process::Command::new("osascript")
-        .args(["-l", "JavaScript", "-e", script, "--"])
-        .arg(&txt_path)
-        .arg(&html_path)
-        .arg(&img_path)
-        .status()
-        .is_ok_and(|s| s.success());
-    let _ = std::fs::remove_file(&img_path);
-    let _ = std::fs::remove_file(&txt_path);
-    let _ = std::fs::remove_file(&html_path);
+
+/// Puts `text`, its `html` and every image on the macOS pasteboard: the
+/// text, HTML and first image as one item (a chat app pastes them
+/// together), each further image as an item of its own, so a paste keeps
+/// all of them.
+#[cfg(target_os = "macos")]
+fn write_macos_text_and_image_pasteboard(text: &str, html: &str, image_data_uris: &[String]) -> bool {
+    let tmp = std::env::temp_dir().join(format!("vantry-clip-{}", uuid::Uuid::new_v4().simple()));
+    let txt_path = tmp.with_extension("txt");
+    let html_path = tmp.with_extension("html");
+    let mut files = vec![txt_path.clone(), html_path.clone()];
+    let mut ok = std::fs::write(&txt_path, text.as_bytes()).is_ok()
+        && std::fs::write(&html_path, html.as_bytes()).is_ok();
+    for (i, uri) in image_data_uris.iter().enumerate() {
+        let Some((_, bytes)) = nsh_core::platform::clipboard::decode_data_uri(uri) else {
+            continue;
+        };
+        let path = tmp.with_extension(format!("{i}.img"));
+        ok &= std::fs::write(&path, &bytes).is_ok();
+        files.push(path);
+    }
+    if ok && files.len() > 2 {
+        ok = std::process::Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", MACOS_PASTEBOARD_SCRIPT, "--"])
+            .args(&files)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    } else {
+        ok = false;
+    }
+    for file in files {
+        let _ = std::fs::remove_file(file);
+    }
     ok
 }
 
@@ -1133,7 +1140,35 @@ function run(argv) {
 /// attachments, writes native image data (`PNG`/`TIFF`) alongside plain text & HTML
 /// so pasting into chat apps, rich editors, image apps, or Vantry itself keeps both.
 pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attachment>) {
-    copy_with_images(text, attachments, None);
+    let lang = ui().with_untracked(|u| u.locale);
+    // The message names its images `@图1`, `@图2`… in their order: a paste
+    // back into a composer puts each image where its name was.
+    let images: Vec<(vantry_protocol::Attachment, Vec<String>)> = attachments
+        .iter()
+        .filter(|a| a.mime.starts_with("image/"))
+        .enumerate()
+        .map(|(i, item)| {
+            let n = i + 1;
+            let mut names = vec![
+                format!("@{}", lang.image_label(n)),
+                format!("@图{n}"),
+                format!("@圖{n}"),
+                format!("@Image {n}"),
+                format!("@画像{n}"),
+            ];
+            if !item.name.is_empty() {
+                names.push(format!("@{}", item.name));
+            }
+            names.dedup();
+            (item.clone(), names)
+        })
+        .collect();
+    if images.is_empty() {
+        copy_with_images(text, attachments, None);
+        return;
+    }
+    let id = crate::views::remember_copy(&text, &images, Default::default());
+    copy_with_images(text, attachments, Some(id));
 }
 
 pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::Attachment>, selection_id: Option<String>) {
@@ -1181,25 +1216,21 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
             html.push_str(&escape(&text).replace('\n', "<br>"));
             html.push_str("</p>");
         }
-        let mut first_data_uri: Option<String> = None;
-        let mut embedded = 0usize;
+        let mut uris: Vec<String> = Vec::new();
         for (item, path) in sources {
             if let Some(src) = attachment_preview(item.clone(), path).await
                 && let Some(data_uri) = ensure_image_data_uri(&src)
             {
-                if first_data_uri.is_none() {
-                    first_data_uri = Some(data_uri.clone());
-                }
+                uris.push(data_uri.clone());
                 html.push_str(&format!(
                     "<p><img src=\"{}\" alt=\"{}\" /></p>",
                     escape(&data_uri),
                     escape(&item.name)
                 ));
-                embedded += 1;
             }
         }
         html.push_str("</div>");
-        let Some(first_uri) = first_data_uri else {
+        let Some(first_uri) = uris.first().cloned() else {
             warn("无法读取所选图片，剪贴板已保留文字。");
             return;
         };
@@ -1209,7 +1240,7 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
                 return;
             }
         }
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && uris.len() == 1 {
             set_clipboard_image(first_uri);
             return;
         }
@@ -1217,9 +1248,9 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
         {
             let text_clone = text.clone();
             let html_clone = html.clone();
-            let uri_clone = first_uri.clone();
+            let all = uris.clone();
             let wrote = tokio::task::spawn_blocking(move || {
-                write_macos_text_and_image_pasteboard(&text_clone, &html_clone, &uri_clone)
+                write_macos_text_and_image_pasteboard(&text_clone, &html_clone, &all)
             })
             .await
             .unwrap_or(false);
@@ -1227,7 +1258,7 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
                 return;
             }
         }
-        if embedded > 0 {
+        if !uris.is_empty() {
             let mut clip = ClipboardItem::default();
             clip.text = text;
             clip.html = Some(html);
@@ -2573,6 +2604,8 @@ pub(crate) fn refresh_files() {
 
 mod shell;
 pub(crate) use shell::*;
+mod pickers;
+pub(crate) use pickers::*;
 mod git_history;
 pub(crate) use git_history::*;
 
@@ -2902,7 +2935,11 @@ pub(crate) fn escape() {
     let (picker, modal_ui) = ui().with_untracked(|u| {
         (
             u.model_picker,
-            u.settings.is_some() || u.rename.is_some() || u.confirm.is_some(),
+            u.settings.is_some()
+                || u.rename.is_some()
+                || u.confirm.is_some()
+                || u.machine_picker
+                || u.folder_picker,
         )
     });
     if picker {

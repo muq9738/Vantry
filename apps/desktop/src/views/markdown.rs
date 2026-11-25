@@ -147,14 +147,12 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
             Inline::Link { text: label, url } => {
                 let href = url.clone();
                 if url.starts_with("vantry-attachment://") {
-                    let chip_fg = AdaptiveColor::rgb(0x0369A1, 0x7DD3FC);
-                    let chip_bg = AdaptiveColor::new(rgb(0xE0F2FE), rgba(0x0EA5E938));
+                    // The reference reads in the theme's tint, as the composer draws it.
                     text(format!(" {label} "))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(chip_fg)
-                        .bg(chip_bg)
+                        .text_color(colors.info_ink)
+                        .bg(colors.info_bg)
                         .rounded(px(4.0))
-                        .underline()
                         .cursor(Cursor::Pointer)
                         .tooltip(super::tip(format!("点击预览 {label}")))
                         .on_press(move || controller::open_link(href.clone()))

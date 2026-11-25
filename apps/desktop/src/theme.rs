@@ -105,6 +105,8 @@ const OCEAN: Palette = Palette {
     warning: AdaptiveColor::rgb(0xB45309, 0xF5A524),
     danger: AdaptiveColor::rgb(0xC9252C, 0xFB7185),
     on_accent: AdaptiveColor::rgb(0xFFFFFF, 0x0E1116),
+    info_bg: AdaptiveColor::rgb(0xDCEFF0, 0x183740),
+    info_ink: AdaptiveColor::rgb(0x0A6F75, 0x7FDDE2),
     ..PALETTE
 };
 
@@ -126,6 +128,8 @@ const EMBER: Palette = Palette {
     warning: AdaptiveColor::rgb(0xB25E00, 0xFBBF24),
     danger: AdaptiveColor::rgb(0xC9252C, 0xFB7185),
     on_accent: AdaptiveColor::rgb(0xFFFFFF, 0x0E1116),
+    info_bg: AdaptiveColor::rgb(0xF7E3DE, 0x4A2B22),
+    info_ink: AdaptiveColor::rgb(0xB0402E, 0xF9A497),
     ..PALETTE
 };
 
@@ -147,6 +151,8 @@ const IRIS: Palette = Palette {
     warning: AdaptiveColor::rgb(0xB25E00, 0xF5A524),
     danger: AdaptiveColor::rgb(0xC9252C, 0xFB7185),
     on_accent: AdaptiveColor::rgb(0xFFFFFF, 0x0E1116),
+    info_bg: AdaptiveColor::rgb(0xECE4F8, 0x342950),
+    info_ink: AdaptiveColor::rgb(0x6236B0, 0xC6A8F5),
     ..PALETTE
 };
 

@@ -14,8 +14,14 @@ pub(crate) fn native_shell() -> bool {
     cfg!(unix) && !bridges(|b| b.mock) && !remote_project()
 }
 
+/// The registry key of session `id` on the shown machine: what writes,
+/// resizes and interrupts look the shell up by.
+fn shell_key(id: &str) -> String {
+    format!("{}\x1f{id}", current_machine().unwrap_or_default())
+}
+
 pub(crate) fn shell_start(id: String) {
-    let key = format!("{}\x1f{id}", current_machine().unwrap_or_default());
+    let key = shell_key(&id);
     if id.starts_with("task-") || SHELLS.with(|all| all.borrow().contains_key(&key)) {
         return;
     }
@@ -77,7 +83,7 @@ pub(crate) fn shell_start(id: String) {
 fn send(id: &str, event: Input) -> bool {
     SHELLS.with(|all| {
         all.borrow()
-            .get(&format!("{}\x1f{id}", current_machine().unwrap_or_default()))
+            .get(&shell_key(id))
             .is_some_and(|tx| tx.send(event).is_ok())
     })
 }
@@ -126,7 +132,10 @@ pub(crate) fn start_terminal_task(
     super::select_dock_tab(DockTab::Terminal);
     super::defer_request(request_id.clone());
 
-    if SHELLS.with(|all| all.borrow().contains_key(&session_id)) {
+    // Registered under the same key the terminal's keystrokes and resizes
+    // look it up by, or they never reach the PTY.
+    let key = shell_key(&session_id);
+    if SHELLS.with(|all| all.borrow().contains_key(&key)) {
         return;
     }
 
@@ -138,7 +147,7 @@ pub(crate) fn start_terminal_task(
     };
 
     let (input, mut events) = unbounded_channel();
-    SHELLS.with(|all| all.borrow_mut().insert(session_id.clone(), input));
+    SHELLS.with(|all| all.borrow_mut().insert(key.clone(), input));
     let (sink, mut output) = unbounded_channel();
     bench().update(|b| {
         if let Some(s) = b.terminal.sessions.iter_mut().find(|s| s.id == session_id) {
@@ -186,7 +195,7 @@ pub(crate) fn start_terminal_task(
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r.map_err(|e| e.message));
-        SHELLS.with(|all| all.borrow_mut().remove(&session_id));
+        SHELLS.with(|all| all.borrow_mut().remove(&key));
         match &result {
             Ok(code) => {
                 bench().update(|b| {

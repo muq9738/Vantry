@@ -807,6 +807,14 @@ impl Workbench {
     fn directories(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
         let mut out = WorkbenchResponse::default();
 
+        // Hidden folders only for a client that asks (its folder palette
+        // shows them once the filter starts with `.`).
+        let hidden = r
+            .input
+            .as_ref()
+            .and_then(|v| v.get("hidden"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let dir = if r.workspace.is_empty() {
             user_home_dir().context("HOME required")?
         } else {
@@ -817,7 +825,7 @@ impl Workbench {
         for e in fs::read_dir(&dir)? {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('.') && e.file_type()?.is_dir() {
+            if (hidden || !name.starts_with('.')) && e.path().is_dir() {
                 entries.push(json!({
                 "name":name,"path":e.path()}
                 ));

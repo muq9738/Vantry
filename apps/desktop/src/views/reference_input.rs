@@ -203,15 +203,67 @@ impl CopiedSelection {
     }
 }
 
-pub(super) fn restore_selection(html: &str) -> Option<String> {
-    let id = html
-        .split_once("data-vantry-selection=\"")?
-        .1
-        .split_once('"')?
-        .0;
+/// Remembers a copy of `text` whose references name `images` (each with
+/// the labels it is written as, `@图1`), so a paste back into a composer
+/// brings the images with the text, each where it was referenced. The
+/// copy's id marks its HTML on the clipboard.
+pub(crate) fn remember_copy(
+    text: &str,
+    images: &[(vantry_protocol::Attachment, Vec<String>)],
+    paths: BTreeMap<String, std::path::PathBuf>,
+) -> String {
+    let mut refs: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut labels: Vec<(&str, &str)> = images
+        .iter()
+        .flat_map(|(image, names)| names.iter().map(move |n| (n.as_str(), image.id.as_str())))
+        .filter(|(label, _)| !label.is_empty())
+        .collect();
+    // The longest label first: `@图12` is not `@图1`.
+    labels.sort_by_key(|(label, _)| std::cmp::Reverse(label.len()));
+    for (label, id) in labels {
+        let mut from = 0;
+        while let Some(at) = crate::state::draft::mention_at(&text[from..], label) {
+            let range = from + at..from + at + label.len();
+            if !refs.iter().any(|(r, _)| r.start < range.end && range.start < r.end) {
+                refs.push((range.clone(), id.to_owned()));
+            }
+            from = range.end;
+        }
+    }
+    refs.sort_by_key(|(range, _)| range.start);
+    let id = uuid::Uuid::new_v4().to_string();
+    LAST_SELECTION.replace(Some(CopiedSelection {
+        id: id.clone(),
+        machine: controller::current_machine(),
+        text: text.to_owned(),
+        refs,
+        images: images.iter().map(|(image, _)| image.clone()).collect(),
+        paths,
+    }));
+    id
+}
+
+fn same_text(a: &str, b: &str) -> bool {
+    let clean = |s: &str| s.replace("\r\n", "\n").trim().to_owned();
+    clean(a) == clean(b)
+}
+
+/// The text of the last copy with images, its images added to the shown
+/// draft, when what is pasted is that copy: its HTML carries the copy's
+/// mark, or (an app that kept only the text and the images) the same text
+/// comes with images.
+pub(super) fn restore_selection(html: &str, text: &str, with_files: bool) -> Option<String> {
+    let marked = html
+        .split_once("data-vantry-selection=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(id, _)| id.to_owned());
     LAST_SELECTION.with_borrow(|last| {
         let clip = last.as_ref()?;
-        if clip.id != id || clip.machine != controller::current_machine() {
+        let same = match &marked {
+            Some(id) => clip.id == *id,
+            None => with_files && !text.trim().is_empty() && same_text(text, &clip.text),
+        };
+        if !same || clip.machine != controller::current_machine() {
             return None;
         }
         let lang = controller::ui().with_untracked(|u| u.locale);
@@ -226,7 +278,7 @@ pub(super) fn restore_selection(html: &str) -> Option<String> {
 
 impl PluginSpec for References {
     fn transform_pasted_html(&self, _: &EditorState, html: String) -> String {
-        match restore_selection(&html) {
+        match restore_selection(&html, "", false) {
             Some(text) => text
                 .split('\n')
                 .map(|line| {
@@ -242,7 +294,11 @@ impl PluginSpec for References {
         }
     }
     fn decorations(&self, state: &EditorState) -> Option<DecorationSet> {
-        let attrs = BTreeMap::from([("class".into(), json!("text-blue-500 underline"))]);
+        // Theme tokens, so the reference follows the chosen preset.
+        let attrs = BTreeMap::from([(
+            "class".into(),
+            json!("text-primary bg-primary/15 font-semibold rounded-sm"),
+        )]);
         let marks = self
             .spans(state.doc())
             .into_iter()
@@ -295,7 +351,7 @@ impl PluginSpec for References {
                     text: text.clone(),
                     refs,
                     images: images.clone(),
-                    paths: draft.image_paths,
+                    paths: draft.image_paths.into_iter().collect(),
                 }));
                 controller::copy_with_images(text, images, Some(id));
                 return true;
@@ -447,29 +503,23 @@ pub(super) fn reference_input(
             }
         })
         .on_paste_files(move |p: &RichEditorPastedFiles| {
-            // nsh reports only the file flavors here, dropping the HTML of a mixed paste.
-            if !p.files.is_empty()
-                && LAST_SELECTION.with_borrow(Option::is_some)
-                && let Ok(html) = arboard::Clipboard::new().and_then(|mut c| c.get().html())
-                && let Some(text) = restore_selection(&html)
+            // nsh reports only the file flavors of a mixed paste: the text and
+            // HTML that came with the images are read back from the clipboard,
+            // so a copied message keeps its words as well as its pictures.
+            let mut paste = PasteEvent::default();
+            paste.uris = p.uris.clone();
+            paste.files = p
+                .files
+                .iter()
+                .map(|f| nsh_core::PastedFile::new(&f.name, &f.mime, f.data.clone()))
+                .collect();
+            if p.uris.is_empty()
+                && let Ok(mut clipboard) = arboard::Clipboard::new()
             {
-                let mut paste = PasteEvent::default();
-                paste.text = text;
-                super::composer::paste_into_composer(&paste, input, selection.get_untracked());
-                return;
+                paste.text = clipboard.get_text().unwrap_or_default();
+                paste.html = clipboard.get().html().unwrap_or_default();
             }
-            if !p.uris.is_empty() {
-                controller::paste_file_uris(&p.uris);
-            }
-            if !p.files.is_empty() {
-                let mut paste = PasteEvent::default();
-                paste.files = p
-                    .files
-                    .iter()
-                    .map(|f| nsh_core::PastedFile::new(&f.name, &f.mime, f.data.clone()))
-                    .collect();
-                controller::paste_images(&paste);
-            }
+            super::composer::paste_into_composer(&paste, input, selection.get_untracked());
         })
 }
 

@@ -273,6 +273,8 @@ fn workbench() -> impl IntoElement {
         .child(views::dialogs::rename_dialog())
         .child(views::dialogs::confirm_dialog())
         .child(views::dialogs::attachment_preview_dialog())
+        .child(views::pickers::machine_picker())
+        .child(views::pickers::folder_picker())
 }
 
 /// The desktop links NSH, the protocol and the client only: never the Core

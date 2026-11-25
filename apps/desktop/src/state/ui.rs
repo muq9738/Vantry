@@ -545,6 +545,10 @@ pub struct UiState {
     pub confirm: Option<Confirm>,
     pub attachment_preview: Option<(vantry_protocol::Attachment, String)>,
     pub model_picker: bool,
+    /// The composer's machine picker (`本机` under the card) is open.
+    pub machine_picker: bool,
+    /// The composer's project folder palette is open.
+    pub folder_picker: bool,
     /// The model picker's search (and free entry).
     pub model_query: String,
     /// Default policy for new threads.
@@ -585,6 +589,8 @@ impl Default for UiState {
             confirm: None,
             attachment_preview: None,
             model_picker: false,
+            machine_picker: false,
+            folder_picker: false,
             model_query: String::new(),
             default_policy: "ask".to_owned(),
             extensions_enabled: true,
