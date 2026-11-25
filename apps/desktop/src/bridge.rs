@@ -19,7 +19,15 @@ mod client;
 mod mock;
 pub mod workbench;
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 pub use client::ClientBridge;
 pub use mock::MockBridge;
@@ -273,14 +281,36 @@ pub fn connect(endpoint: &Endpoint) -> Arc<dyn CoreBridge> {
     }
 }
 
+static TUNNELS_STOPPING: AtomicBool = AtomicBool::new(false);
+static TUNNELS: OnceLock<Mutex<Vec<Weak<TunnelHandle>>>> = OnceLock::new();
+
+fn tunnel_registry() -> &'static Mutex<Vec<Weak<TunnelHandle>>> {
+    TUNNELS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Terminates every live `peer-proxy` child process synchronously and prevents
+/// background reconnect loops from spawning new ones while the desktop exits.
+pub fn stop_all_tunnels() {
+    TUNNELS_STOPPING.store(true, Ordering::Release);
+    let handles: Vec<Arc<TunnelHandle>> = {
+        let mut reg = tunnel_registry().lock().unwrap();
+        let live: Vec<_> = reg.iter().filter_map(Weak::upgrade).collect();
+        reg.clear();
+        live
+    };
+    for handle in handles {
+        handle.stop();
+    }
+}
+
 struct TunnelHandle {
     dir: std::path::PathBuf,
     socket: std::path::PathBuf,
     child: std::sync::Mutex<Option<std::process::Child>>,
 }
 
-impl Drop for TunnelHandle {
-    fn drop(&mut self) {
+impl TunnelHandle {
+    fn stop(&self) {
         if let Ok(mut guard) = self.child.lock()
             && let Some(mut child) = guard.take()
         {
@@ -288,6 +318,12 @@ impl Drop for TunnelHandle {
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Drop for TunnelHandle {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -323,14 +359,19 @@ impl RemoteBridge {
             dir
         };
         let socket = dir.join("core.sock");
+        let tunnel = Arc::new(TunnelHandle {
+            dir,
+            socket,
+            child: std::sync::Mutex::new(None),
+        });
+        if let Ok(mut reg) = tunnel_registry().lock() {
+            reg.retain(|w| w.strong_count() > 0);
+            reg.push(Arc::downgrade(&tunnel));
+        }
         RemoteBridge {
             endpoint,
             data_dir,
-            tunnel: Arc::new(TunnelHandle {
-                dir,
-                socket,
-                child: std::sync::Mutex::new(None),
-            }),
+            tunnel,
         }
     }
 
@@ -340,6 +381,9 @@ impl RemoteBridge {
     }
 
     async fn ensure_tunnel(&self) -> Result<std::path::PathBuf, BridgeError> {
+        if TUNNELS_STOPPING.load(Ordering::Acquire) {
+            return Err(BridgeError::unavailable("应用正在退出"));
+        }
         let socket = self.tunnel.socket.clone();
         // Fast path: child already alive and socket exists.
         {

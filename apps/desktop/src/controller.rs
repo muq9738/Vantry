@@ -97,6 +97,18 @@ fn workbench() -> Option<Arc<dyn WorkbenchBridge>> {
     bridges(|b| b.workbench.clone())
 }
 
+/// The local machine's workbench, even when the user is currently viewing a
+/// paired remote machine (desktop app updates always apply to this machine).
+fn local_workbench() -> Option<(Arc<dyn WorkbenchBridge>, bool)> {
+    machines::by_id("")
+        .and_then(|m| {
+            m.session
+                .bridges
+                .with_untracked(|b| b.workbench.clone().map(|w| (w, b.mock)))
+        })
+        .or_else(|| bridges(|b| b.workbench.clone().map(|w| (w, b.mock))))
+}
+
 pub(crate) fn remote_project() -> bool {
     ui().with(|u| u.remote_target.is_some())
         || state().with(|s| {
@@ -1783,9 +1795,18 @@ fn load_catalogs(already_marked: bool) {
     let Some(workbench) = workbench() else {
         return;
     };
+    let local_update_bench = current_machine()
+        .is_some()
+        .then(|| local_workbench().map(|(w, _)| w))
+        .flatten();
     let workspace = bench().with_untracked(|b| b.root.clone());
     spawn_for_window(async move {
-        let result = call(workbench.settings(workspace)).await.map_err(|e| e.message);
+        let mut result = call(workbench.settings(workspace)).await.map_err(|e| e.message);
+        if let (Ok(data), Some(local_wb)) = (&mut result, local_update_bench)
+            && let Ok(resp) = call(local_wb.workbench(actions::request(names::UPDATE_STATUS))).await
+        {
+            data.absorb(names::UPDATE_STATUS, &resp);
+        }
         if current_machine().is_none() && !bridges(|b| b.mock)
             && let Ok(data) = &result && let Some(remote) = &data.remote && remote.error.is_empty() {
             machines::sync(remote.peers());
@@ -2028,12 +2049,70 @@ pub(crate) fn project_add() {
 }
 
 pub(crate) fn update_op(action: &'static str) {
+    let Some((workbench, is_mock)) = local_workbench() else {
+        return;
+    };
+    let mut go = false;
+    ui().update(|u| go = u.begin_op("update"));
+    if !go {
+        return;
+    }
+    let staged_version = ui().with_untracked(|u| {
+        u.data()
+            .map(|d| d.update.staged_version.clone())
+            .unwrap_or_default()
+    });
+    let mut request = actions::request(action);
+    if action == names::UPDATE_INSTALL {
+        request.input = Some(serde_json::json!({
+            "version": staged_version,
+            "desktopPid": std::process::id(),
+            "allowBusyCore": true,
+        }));
+    }
     let done = match action {
         names::UPDATE_CHECK => "检查完成",
         names::UPDATE_DOWNLOAD => "更新已下载",
-        _ => "正在安装更新",
+        _ => "重启更新",
     };
-    settings_op("update", actions::request(action), done);
+    let active_ui = ui();
+    let local_ui = machines::by_id("").map(|m| m.session.ui);
+    spawn_for_window(async move {
+        let result = call(workbench.workbench(request)).await.map_err(|e| e.message);
+        if action == names::UPDATE_INSTALL && !is_mock {
+            match result {
+                Ok(_) => {
+                    // Keep the button disabled and show clear progress while quitting so
+                    // apply-update can swap the bundle and reopen the new version.
+                    active_ui.update(|u| {
+                        u.forms.feedback = Some(crate::state::ui::Feedback {
+                            ok: true,
+                            text: "正在重启并安装更新…".into(),
+                        });
+                    });
+                    timer(Duration::from_millis(120)).await;
+                    bridge::stop_all_tunnels();
+                    nsh_core::element::desktop::quit();
+                }
+                Err(error) => {
+                    active_ui.update(move |u| u.end_op("update", action, Err(error), done));
+                }
+            }
+            return;
+        }
+        if let Ok(resp) = &result
+            && let Some(local_ui) = local_ui
+            && local_ui != active_ui
+        {
+            let resp = resp.clone();
+            local_ui.update(move |u| {
+                if let crate::state::ui::Catalogs::Loaded(data) = &mut u.catalogs {
+                    std::sync::Arc::make_mut(data).absorb(action, &resp);
+                }
+            });
+        }
+        active_ui.update(move |u| u.end_op("update", action, result, done));
+    });
 }
 
 pub(crate) fn usage_refresh() {

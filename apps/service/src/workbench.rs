@@ -1254,8 +1254,14 @@ impl Workbench {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&r.name);
                 let desktop_pid = input["desktopPid"].as_u64().unwrap_or(0) as u32;
-                mgr.launch_apply(version, desktop_pid)?;
-                out.output = json!({"applying": true, "version": version}).to_string();
+                let allow_busy_core = input["allowBusyCore"].as_bool().unwrap_or(desktop_pid > 0);
+                mgr.launch_apply(version, desktop_pid, allow_busy_core)?;
+                out.output = json!({
+                    "applying": true,
+                    "version": version,
+                    "allowBusyCore": allow_busy_core,
+                })
+                .to_string();
             }
             _ => {}
         }

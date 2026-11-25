@@ -17,8 +17,28 @@ pub struct ApplyOptions {
     pub data_dir: Option<PathBuf>,
     pub wait_pid: Option<u32>,
     pub wait_timeout: Duration,
+    /// When true, leave a busy local Core (and its active `provider-worker`
+    /// subprocesses) running untouched while replacing the `.app` bundle after
+    /// the desktop GUI exits. An idle Core is still drained and replaced.
+    pub allow_busy_core: bool,
 }
-fn processes(target: &Path) -> Result<Vec<u32>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveProcess {
+    pid: u32,
+    kind: ProcessKind,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessKind {
+    CoreWorker,
+    Other,
+}
+fn service_subcommand<'a>(comm: &str, args: &'a str) -> Option<&'a str> {
+    let rest = args
+        .strip_prefix(comm)
+        .or_else(|| args.split_once(char::is_whitespace).map(|(_, rest)| rest))?;
+    rest.split_whitespace().next()
+}
+fn processes(target: &Path) -> Result<Vec<LiveProcess>> {
     let output = Command::new("/bin/ps")
         .args(["-ww", "-axo", "pid=,comm="])
         .output()?;
@@ -26,15 +46,48 @@ fn processes(target: &Path) -> Result<Vec<u32>> {
         output.status.success(),
         "could not inspect running application processes"
     );
-    let mut live = Vec::new();
+    let mut matched: Vec<(u32, String)> = Vec::new();
     for line in std::str::from_utf8(&output.stdout)?.lines() {
-        if let Some((pid, path)) = line.trim().split_once(char::is_whitespace)
-            && Path::new(path.trim()).starts_with(target)
-        {
-            live.push(pid.parse()?);
+        if let Some((pid, path)) = line.trim().split_once(char::is_whitespace) {
+            let comm = path.trim();
+            if Path::new(comm).starts_with(target) {
+                matched.push((pid.parse()?, comm.to_owned()));
+            }
         }
     }
-    Ok(live)
+    let service_pids: Vec<String> = matched
+        .iter()
+        .filter(|(_, comm)| Path::new(comm).file_name().is_some_and(|n| n == "vantry-service"))
+        .map(|(pid, _)| pid.to_string())
+        .collect();
+    let mut worker_pids = std::collections::HashSet::new();
+    if !service_pids.is_empty() {
+        let args_out = Command::new("/bin/ps")
+            .args(["-ww", "-p", &service_pids.join(","), "-o", "pid=,args="])
+            .output()?;
+        if args_out.status.success() {
+            for line in std::str::from_utf8(&args_out.stdout)?.lines() {
+                if let Some((pid_str, args)) = line.trim().split_once(char::is_whitespace)
+                    && let Ok(pid) = pid_str.parse::<u32>()
+                    && let Some((_, comm)) = matched.iter().find(|(p, _)| *p == pid)
+                    && service_subcommand(comm, args.trim()) == Some("provider-worker")
+                {
+                    worker_pids.insert(pid);
+                }
+            }
+        }
+    }
+    Ok(matched
+        .into_iter()
+        .map(|(pid, _)| LiveProcess {
+            pid,
+            kind: if worker_pids.contains(&pid) {
+                ProcessKind::CoreWorker
+            } else {
+                ProcessKind::Other
+            },
+        })
+        .collect())
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,9 +131,9 @@ fn core(_: &Path, _: bool) -> Result<Option<Status>> {
 }
 fn wait_for_exit(
     opts: &ApplyOptions,
-    mut processes: impl FnMut() -> Result<Vec<u32>>,
+    mut processes: impl FnMut() -> Result<Vec<LiveProcess>>,
     mut core: impl FnMut(&Path, bool) -> Result<Option<Status>>,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let timeout = if opts.wait_pid.is_some() && opts.wait_timeout.is_zero() {
         Duration::from_secs(20)
     } else {
@@ -90,27 +143,46 @@ fn wait_for_exit(
     loop {
         let live = processes()?;
         if live.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        if let Some(dir) = &opts.data_dir
+        let desktop_alive = opts
+            .wait_pid
+            .is_some_and(|wait| live.iter().any(|p| p.pid == wait));
+        if !desktop_alive
+            && let Some(dir) = &opts.data_dir
             && let Ok(Some(status)) = core(dir, false)
-            && live == [status.pid]
             && Some(status.pid) != opts.wait_pid
         {
-            ensure!(
-                status.state == "ready" && status.active_runs == 0,
-                "Core is busy"
-            );
-            core(dir, true)?;
-            let start = Instant::now();
-            while !processes()?.is_empty() {
-                ensure!(
-                    start.elapsed() < Duration::from_secs(10),
-                    "Core did not exit"
-                );
-                std::thread::sleep(Duration::from_millis(100));
+            let only_core = live.len() == 1 && live[0].pid == status.pid;
+            let only_core_or_workers = live
+                .iter()
+                .all(|p| p.pid == status.pid || p.kind == ProcessKind::CoreWorker);
+            if only_core && status.state == "ready" && status.active_runs == 0 {
+                match core(dir, true) {
+                    Ok(_) => {
+                        let start = Instant::now();
+                        while !processes()?.is_empty() {
+                            ensure!(
+                                start.elapsed() < Duration::from_secs(10),
+                                "Core did not exit"
+                            );
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        return Ok(None);
+                    }
+                    Err(_) if opts.allow_busy_core => return Ok(Some(status.pid)),
+                    Err(e) => return Err(e),
+                }
             }
-            return Ok(());
+            if only_core_or_workers {
+                if opts.allow_busy_core {
+                    return Ok(Some(status.pid));
+                }
+                ensure!(
+                    status.state == "ready" && status.active_runs == 0,
+                    "Core is busy"
+                );
+            }
         }
         ensure!(
             start.elapsed() < timeout,
@@ -121,34 +193,46 @@ fn wait_for_exit(
 }
 #[test]
 fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
+    let proc = |pid| LiveProcess {
+        pid,
+        kind: ProcessKind::Other,
+    };
+    let worker = |pid| LiveProcess {
+        pid,
+        kind: ProcessKind::CoreWorker,
+    };
     let opts = ApplyOptions {
         data_dir: Some("data".into()),
         wait_pid: Some(42),
         wait_timeout: Duration::from_millis(500),
+        allow_busy_core: false,
     };
-    let mut live = vec![vec![42, 13], vec![13], vec![]].into_iter();
+    let mut live = vec![vec![proc(42), proc(13)], vec![proc(13)], vec![]].into_iter();
     let mut drained = false;
-    wait_for_exit(
-        &opts,
-        || Ok(live.next().unwrap()),
-        |_, shutdown| {
-            if shutdown {
-                drained = true;
-                Ok(None)
-            } else {
-                Ok(Some(Status {
-                    pid: 13,
-                    state: "ready".into(),
-                    active_runs: 0,
-                }))
-            }
-        },
-    )?;
+    assert_eq!(
+        wait_for_exit(
+            &opts,
+            || Ok(live.next().unwrap()),
+            |_, shutdown| {
+                if shutdown {
+                    drained = true;
+                    Ok(None)
+                } else {
+                    Ok(Some(Status {
+                        pid: 13,
+                        state: "ready".into(),
+                        active_runs: 0,
+                    }))
+                }
+            },
+        )?,
+        None
+    );
     assert!(drained);
     for (pids, active, refuse) in [
-        (vec![42, 13], 0, false),
-        (vec![13], 1, false),
-        (vec![13], 0, true),
+        (vec![proc(42), proc(13)], 0, false),
+        (vec![proc(13)], 1, false),
+        (vec![proc(13)], 0, true),
     ] {
         let mut shutdown_calls = 0;
         let opts = ApplyOptions {
@@ -173,6 +257,90 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
         assert!(result.is_err());
         assert_eq!(shutdown_calls, usize::from(refuse));
     }
+    // With allow_busy_core: wait for desktop to exit, then leave busy Core + worker running.
+    let busy_opts = ApplyOptions {
+        data_dir: Some("data".into()),
+        wait_pid: Some(42),
+        wait_timeout: Duration::from_millis(500),
+        allow_busy_core: true,
+    };
+    let mut busy_live = vec![
+        vec![proc(42), proc(13), worker(99)],
+        vec![proc(13), worker(99)],
+    ]
+    .into_iter();
+    let mut busy_shutdown_calls = 0;
+    assert_eq!(
+        wait_for_exit(
+            &busy_opts,
+            || Ok(busy_live.next().unwrap()),
+            |_, shutdown| {
+                if shutdown {
+                    busy_shutdown_calls += 1;
+                }
+                Ok(Some(Status {
+                    pid: 13,
+                    state: "ready".into(),
+                    active_runs: 1,
+                }))
+            },
+        )?,
+        Some(13)
+    );
+    assert_eq!(busy_shutdown_calls, 0);
+    // With allow_busy_core, if Core reports active_runs==0 but refuses drain (e.g. pending approval),
+    // leave Core running instead of failing the restart.
+    let refused_opts = ApplyOptions {
+        data_dir: Some("data".into()),
+        allow_busy_core: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        wait_for_exit(
+            &refused_opts,
+            || Ok(vec![proc(13)]),
+            |_, shutdown| {
+                if shutdown {
+                    bail!("Core still has active work");
+                }
+                Ok(Some(Status {
+                    pid: 13,
+                    state: "ready".into(),
+                    active_runs: 0,
+                }))
+            },
+        )?,
+        Some(13)
+    );
+    // Non-worker bundle processes (e.g. peer-proxy) must still exit even with allow_busy_core.
+    assert!(
+        wait_for_exit(
+            &refused_opts,
+            || Ok(vec![proc(13), proc(88)]),
+            |_, _| {
+                Ok(Some(Status {
+                    pid: 13,
+                    state: "ready".into(),
+                    active_runs: 1,
+                }))
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(
+        service_subcommand(
+            "/Applications/Vantry.app/Contents/MacOS/vantry-service",
+            "/Applications/Vantry.app/Contents/MacOS/vantry-service provider-worker --job-dir /tmp/x"
+        ),
+        Some("provider-worker")
+    );
+    assert_eq!(
+        service_subcommand(
+            "/Applications/Vantry.app/Contents/MacOS/vantry-service",
+            "/Applications/Vantry.app/Contents/MacOS/vantry-service peer-proxy --peer p1"
+        ),
+        Some("peer-proxy")
+    );
     Ok(())
 }
 /// Verify the staged payload, drain an idle macOS Core and rename on the target volume.
@@ -201,8 +369,15 @@ pub fn apply_staged(staged: &Path, target: &Path, opts: &ApplyOptions) -> Result
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("app"))
     {
-        wait_for_exit(opts, || processes(&target), core)?;
-        ensure!(processes(&target)?.is_empty(), "application restarted");
+        let kept_core = wait_for_exit(opts, || processes(&target), core)?;
+        let remaining = processes(&target)?;
+        let blocking = match kept_core {
+            Some(core_pid) => remaining
+                .iter()
+                .any(|p| p.pid != core_pid && p.kind != ProcessKind::CoreWorker),
+            None => !remaining.is_empty(),
+        };
+        ensure!(!blocking, "application restarted");
     }
     swap(&staged, &target)
 }
@@ -248,7 +423,12 @@ pub(crate) fn installer(root: &Path, staged: &Path, target: &Path, data: &Path) 
     Ok(path)
 }
 /// Transfer ownership of the staging directory to a detached apply-update process.
-pub fn launch_apply(plan: &mut InstallPlan, data: &Path, pid: u32) -> Result<()> {
+pub fn launch_apply(
+    plan: &mut InstallPlan,
+    data: &Path,
+    pid: u32,
+    allow_busy_core: bool,
+) -> Result<()> {
     verify(plan.staged(), plan.target())?;
     ensure!(
         cfg!(target_os = "macos"),
@@ -275,6 +455,9 @@ pub fn launch_apply(plan: &mut InstallPlan, data: &Path, pid: u32) -> Result<()>
         cmd.arg("--wait-pid")
             .arg(pid.to_string())
             .args(["--wait-timeout", "20s"]);
+    }
+    if allow_busy_core {
+        cmd.arg("--allow-busy-core");
     }
     let log_path = if data.as_os_str().is_empty() {
         std::env::temp_dir().join("vantry-update-apply.log")
@@ -312,6 +495,10 @@ pub fn run_apply(args: &[String], mut output: impl Write) -> Result<()> {
     let (mut staged, mut target) = (None, None);
     let mut it = args.iter();
     while let Some(key) = it.next() {
+        if key == "--allow-busy-core" {
+            opts.allow_busy_core = true;
+            continue;
+        }
         let value = it.next().context("missing option value")?;
         match key.as_str() {
             "--staged" => staged = Some(Path::new(value)),

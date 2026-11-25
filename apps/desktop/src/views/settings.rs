@@ -1519,22 +1519,28 @@ fn update_page(data: Data) -> impl IntoElement {
                     )
                     .into_element();
             };
-            let current = if update.current_version.is_empty() {
-                env!("CARGO_PKG_VERSION").to_owned()
-            } else {
-                update.current_version.clone()
-            };
-            if !update.available {
+            let desktop_version = env!("CARGO_PKG_VERSION");
+            let core_version = update.current_version.trim();
+            let already_updated = !update.latest_version.is_empty()
+                && version_at_least(desktop_version, &update.latest_version);
+            let core_behind = !core_version.is_empty()
+                && core_version != desktop_version
+                && !version_at_least(core_version, desktop_version);
+            if !update.available || already_updated {
                 return card()
+                    .gap_2()
                     .child(
                         row()
                             .child(
-                                text(format!("Vantry {current}"))
+                                text(format!("Vantry {desktop_version}"))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_size(px(13.5))
                                     .text_color(colors.ink),
                             )
-                            .child(when(!update.latest_version.is_empty(), move || badge("已是最新", colors.success)))
+                            .child(when(
+                                !update.latest_version.is_empty(),
+                                move || badge("已是最新", colors.success),
+                            ))
                             .child(view().flex_1())
                             .child(when(working.clone(), || hint("检查中…")))
                             .child(
@@ -1542,8 +1548,17 @@ fn update_page(data: Data) -> impl IntoElement {
                                     .disabled(busy("update")),
                             ),
                     )
+                    .child(when(core_behind, {
+                        let core_version = core_version.to_owned();
+                        move || {
+                            hint(format!(
+                                "本机后台服务仍为 {core_version}（正在完成已有任务），任务结束后下次启动将自动切换至 {desktop_version}。"
+                            ))
+                        }
+                    }))
                     .into_element();
             }
+            let current = desktop_version;
             let size = if update.delta_available && (!update.staged || update.used_delta) {
                 let saved = update.asset_size.saturating_sub(update.delta_size);
                 let size = format!("增量 {:.1} MB", update.delta_size as f64 / 1_000_000.0);
@@ -1573,11 +1588,19 @@ fn update_page(data: Data) -> impl IntoElement {
                             let path = if update.installer_path.is_empty() { update.staged_path.clone() } else { update.installer_path.clone() };
                             ghost_button("复制安装路径", move || controller::copy(path.clone())).into_element()
                         } else if update.staged {
-                            primary_button("重启更新", || controller::update_op(names::UPDATE_INSTALL))
+                            let is_working = working.clone();
+                            primary_button(
+                                move || SharedString::from(if is_working() { "正在重启…" } else { "重启更新" }),
+                                || controller::update_op(names::UPDATE_INSTALL),
+                            )
                                 .disabled(busy("update"))
                                 .into_element()
                         } else {
-                            primary_button("下载更新", || controller::update_op(names::UPDATE_DOWNLOAD))
+                            let is_working = working.clone();
+                            primary_button(
+                                move || SharedString::from(if is_working() { "下载中…" } else { "下载更新" }),
+                                || controller::update_op(names::UPDATE_DOWNLOAD),
+                            )
                                 .disabled(busy("update"))
                                 .into_element()
                         }),
@@ -1588,6 +1611,37 @@ fn update_page(data: Data) -> impl IntoElement {
                 }))
                 .into_element()
         }))
+}
+
+/// True when `current` is at least `target` (numeric dot-separated prefix,
+/// stripping any leading `v` and build metadata).
+fn version_at_least(current: &str, target: &str) -> bool {
+    fn parse(v: &str) -> Option<(Vec<u64>, bool)> {
+        let v = v.trim().trim_start_matches(['v', 'V']);
+        let v = v.split('+').next().unwrap_or(v);
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, !p.is_empty()),
+            None => (v, false),
+        };
+        let parts: Vec<u64> = core
+            .split('.')
+            .map(|p| p.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        (!parts.is_empty()).then_some((parts, pre))
+    }
+    let (Some((a, a_pre)), Some((b, b_pre))) = (parse(current), parse(target)) else {
+        return current.trim().trim_start_matches(['v', 'V'])
+            == target.trim().trim_start_matches(['v', 'V']);
+    };
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let av = a.get(i).copied().unwrap_or(0);
+        let bv = b.get(i).copied().unwrap_or(0);
+        if av != bv {
+            return av > bv;
+        }
+    }
+    !a_pre || b_pre
 }
 
 fn usage_page(data: Data) -> impl IntoElement {
@@ -1768,4 +1822,18 @@ fn appearance_page() -> impl IntoElement {
                     }))),
             ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_at_least;
+
+    #[test]
+    fn version_comparison_handles_prefixes_and_prereleases() {
+        assert!(version_at_least("0.2.9", "0.2.9"));
+        assert!(version_at_least("v0.2.10", "0.2.9"));
+        assert!(!version_at_least("0.2.8", "0.2.9"));
+        assert!(version_at_least("0.2.9", "0.2.9-rc.1"));
+        assert!(!version_at_least("0.2.9-rc.1", "0.2.9"));
+    }
 }

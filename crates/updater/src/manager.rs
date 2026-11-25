@@ -489,7 +489,12 @@ impl UpdateManager {
             }
         }
     }
-    pub fn launch_apply(&mut self, version: &str, desktop_pid: u32) -> Result<()> {
+    pub fn launch_apply(
+        &mut self,
+        version: &str,
+        desktop_pid: u32,
+        allow_busy_core: bool,
+    ) -> Result<()> {
         let plan = self.plan.as_ref().context("download an update first")?;
         ensure!(
             version.is_empty() || normalize_version(version) == normalize_version(&plan.version),
@@ -497,9 +502,13 @@ impl UpdateManager {
         );
         let data = self.opts.data_dir.as_deref().unwrap_or(Path::new(""));
         self.set(UpdateState::Applying);
-        crate::launch_apply(self.plan.as_mut().unwrap(), data, desktop_pid)
-            .inspect_err(|e| self.set(UpdateState::Failed(e.to_string())))?;
-        self.plan = None;
+        crate::launch_apply(
+            self.plan.as_mut().unwrap(),
+            data,
+            desktop_pid,
+            allow_busy_core,
+        )
+        .inspect_err(|e| self.set(UpdateState::Failed(e.to_string())))?;
         Ok(())
     }
 }
