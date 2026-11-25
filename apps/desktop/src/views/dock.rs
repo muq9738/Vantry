@@ -330,7 +330,7 @@ fn session_summary() -> impl IntoElement {
                         .child(when(
                             move || expanded.get(),
                             move || {
-                                view().flex_col().child(each(
+                                view().flex_col().gap_1().pl_2().border_l_1().border_l_color(colors.line).child(each(
                                     move || tasks.get(),
                                     |t| t.0.clone(),
                                     move |task, _| {
@@ -360,8 +360,8 @@ fn session_summary() -> impl IntoElement {
                                             )
                                             .child(
                                                 text(move || task_badge(task.with(|t| t.2)))
-                                                    .text_size(px(11.0))
-                                                    .text_color(colors.muted),
+                                                    .text_size(px(12.0))
+                                                    .text_color(move || super::run_status_color(task.with(|t| t.2))),
                                             )
                                     },
                                 ))

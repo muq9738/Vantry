@@ -408,6 +408,11 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
                     }
                 }
                 Err(error) => {
+                    if error.code == ErrorCode::Unauthorized && let Some(peer) = bridges(|b| b.peer_id.clone()) {
+                        if machines::navigation().with_untracked(|n| n.active == peer) && ui().with_untracked(|u| u.forms.repair_peer != peer) {
+                            ui().update(|u| { u.forms.repair_peer = peer; u.forms.pair_dialog = true; });
+                        }
+                    }
                     let mut recovery = None;
                     state().update(|s| recovery = Some(s.on_snapshot_failed(&error)));
                     if let Some(Recovery::Resync { delay } | Recovery::Resubscribe { delay, .. }) =
@@ -685,19 +690,7 @@ pub(crate) fn open_link(url: String) {
 /// Render an offline `svg`/`html`/`artifact` block into a local temp HTML file
 /// (zero servers, zero external URLs) and open it when clicked.
 pub(crate) fn open_offline_artifact(kind: String, title: String, source: String) {
-    let doc = if kind == "svg" {
-        format!(
-            "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
-             <style>body{{margin:0;padding:24px;background:#111318;color:#e5e7eb;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui}}svg{{max-width:100%;height:auto}}</style>{source}"
-        )
-    } else if source.to_ascii_lowercase().contains("<html") {
-        source
-    } else {
-        format!(
-            "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
-             <style>:root{{--v-bg:#0f1117;--v-surface:#161a23;--v-surface-2:#1d2230;--v-ink:#e6e8ef;--v-muted:#9aa3b2;--v-line:rgba(255,255,255,.1);--v-accent:#60a5fa;--v-good:#34d399;--v-warn:#fbbf24;--v-bad:#f87171}}body{{margin:0;padding:20px;background:var(--v-bg);color:var(--v-ink);font-family:system-ui,-apple-system,sans-serif}}.tnum{{font-variant-numeric:tabular-nums}}</style>{source}"
-        )
-    };
+    let doc = crate::views::visuals::artifact_document(&kind, &title, &source, 1.0, nsh_core::element::dark());
     let path = std::env::temp_dir().join(format!(
         "vantry-artifact-{}.html",
         uuid::Uuid::new_v4().simple()
@@ -1981,6 +1974,20 @@ pub(crate) fn sandbox_set(mode: String) {
     settings_op("sandbox", actions::sandbox_set(&mode), "已切换沙盒模式");
 }
 
+pub(crate) async fn refresh_device_requests() {
+    let Some((bridge, _)) = local_workbench() else { return };
+    if let Ok(response) = call(bridge.workbench(actions::request(names::REMOTE_STATUS))).await
+        && let Ok(status) = actions::RemoteStatus::read(&response) {
+        ui().update(|u| {
+            if let crate::state::ui::Catalogs::Loaded(data) = &mut u.catalogs
+                && let Some(remote) = Arc::make_mut(data).remote.as_mut() {
+                remote.requests = status.requests;
+                remote.require_approval = status.require_approval;
+            }
+        });
+    }
+}
+
 pub(crate) fn pair_create() {
     settings_op("pair.create", actions::request(names::REMOTE_PAIR_CREATE), "已生成一次性配对码");
 }
@@ -2005,7 +2012,45 @@ pub(crate) fn pair_redeem() {
     }
     // The code is single use: it leaves the form as it is sent.
     ui().update(|u| u.forms.pair_code.clear());
-    settings_op("pair.redeem", actions::pair_redeem(&code, &name), "配对成功");
+    let Some((workbench, _)) = local_workbench() else { return };
+    if !ui().with_untracked(|u| !u.op_busy("pair.redeem")) { return; }
+    ui().update(|u| { u.begin_op("pair.redeem"); });
+    let mut request = actions::pair_redeem(&code, &name);
+    if !code.trim().starts_with("vantry://") {
+        request.input = Some(serde_json::json!({"code":code.trim()}));
+    }
+    spawn_for_window(async move {
+        let result = async {
+            loop {
+                let response = call(workbench.workbench(request)).await.map_err(|e| e.message)?;
+                let reply: serde_json::Value = serde_json::from_str(&response.output).map_err(|_| "配对响应无效".to_owned())?;
+                match reply["status"].as_str() {
+                    Some("pending") => {
+                        let handle = reply["handle"].as_str().filter(|h| !h.is_empty()).ok_or("缺少配对请求编号")?.to_owned();
+                        ui().update(|u| u.forms.pair_wait = format!("请在 {} 上核对并批准 {}", reply["hostName"].as_str().unwrap_or("主机"), reply["verificationCode"].as_str().unwrap_or("")));
+                        timer(Duration::from_secs(3)).await;
+                        if !ui().with_untracked(|u| u.forms.pair_dialog) { return Err("配对已取消".to_owned()); }
+                        request = actions::request("remote.pair.status");
+                        request.input = Some(serde_json::json!({"handle":handle}));
+                    }
+                    Some("denied") => return Err("主机已拒绝配对".into()),
+                    Some("expired") => return Err("请求已过期，请重新生成配对码".into()),
+                    Some("paired") | None => return Ok(response),
+                    _ => return Err("无法识别配对状态".into()),
+                }
+            }
+        }.await;
+        let success = result.is_ok();
+        if let Some(id) = result.as_ref().ok().and_then(|r| serde_json::from_str::<serde_json::Value>(&r.output).ok()).and_then(|v| v["id"].as_str().map(str::to_owned)) {
+            if let Some(m) = machines::by_id(&id) { m.owner.run(|| { if let Some(c) = core() { c.reload_credentials(); } ui().update(|u| u.forms.repair_peer.clear()); }); }
+        }
+        ui().update(|u| {
+            u.forms.pair_wait.clear();
+            if success { u.forms.pair_dialog = false; }
+            u.end_op("pair.redeem", "remote.pair.result", result, "配对");
+        });
+        if success { machines::run_on("", reload_catalogs); }
+    });
 }
 
 pub(crate) fn ask_revoke(id: Option<String>) {

@@ -4,6 +4,7 @@ mod catalog;
 mod controlled;
 mod instructions;
 mod secret_tool;
+mod todo_tool;
 pub mod mcp;
 mod pdf;
 mod sandbox;

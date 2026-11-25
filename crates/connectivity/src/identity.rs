@@ -187,6 +187,14 @@ impl Configuration {
             .map(str::trim)
             .unwrap_or("")
     }
+    /// New devices wait for approval after redeeming a code (T3 Code's
+    /// "Require approval for new devices").
+    pub fn require_approval(&self) -> bool {
+        self.extra
+            .get("requireApproval")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
     pub fn public_url(&self) -> &str {
         self.extra
             .get("publicUrl")
@@ -512,6 +520,74 @@ struct State {
     codes: Pairings,
     current: Option<Pairing>,
     sessions: HashMap<String, CancellationToken>,
+    /// New devices waiting for the host's approval (in memory, as one-time
+    /// pairing codes are).
+    requests: Vec<DeviceRequest>,
+}
+
+/// How long a new device may wait for approval (T3 Code: 10 minutes).
+pub const DEVICE_REQUEST_TTL_MINUTES: i64 = 10;
+const MAX_DEVICE_REQUESTS: usize = 16;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeviceRequestState {
+    Pending,
+    /// Approved: the issued credentials wait for the device to collect them.
+    Approved(Value),
+    Denied,
+}
+
+/// A device that redeemed a valid pairing code while the host requires
+/// approval of new devices. Both sides show `verification_code`; the user
+/// approves only when they match.
+#[derive(Clone, Debug)]
+pub struct DeviceRequest {
+    pub id: String,
+    pub name: String,
+    pub verification_code: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub state: DeviceRequestState,
+    claim: String,
+    certificate: String,
+}
+
+impl DeviceRequest {
+    pub fn summary(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "verificationCode": self.verification_code,
+            "createdAt": self.created_at,
+            "expiresAt": self.expires_at,
+            "status": match self.state {
+                DeviceRequestState::Pending => "pending",
+                DeviceRequestState::Approved(_) => "approved",
+                DeviceRequestState::Denied => "denied",
+            },
+        })
+    }
+}
+
+/// What a waiting device learns when it asks again.
+#[derive(Debug, PartialEq)]
+pub enum DeviceRequestPoll {
+    Pending(Value),
+    Approved(Value),
+    Denied,
+    /// Expired, unknown, or the claim does not match.
+    Gone,
+}
+
+fn verification_code() -> String {
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let mut bytes = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    let chars: String = bytes
+        .iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect();
+    format!("{}-{}", &chars[..4], &chars[4..])
 }
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<State>>>>> =
     LazyLock::new(Mutex::default);
@@ -613,6 +689,7 @@ impl IdentityStore {
             codes: Pairings::default(),
             current: None,
             sessions: HashMap::new(),
+            requests: Vec::new(),
         }));
         stores.insert(path.clone(), Arc::downgrade(&state));
         Ok(Self { path, state })
@@ -823,6 +900,20 @@ impl IdentityStore {
         }
     }
     pub fn redeem(&self, code: &str, name: &str, client_certificate: &str) -> Result<Value> {
+        self.redeem_with_claim(code, name, client_certificate, "")
+    }
+
+    /// Redeems a one-time code. When the host requires approval of new
+    /// devices, the code is spent and the device waits: the result is
+    /// `{"status":"pending","requestId","verificationCode","expiresAt"}` and
+    /// the credentials go only to a caller presenting `claim` later.
+    pub fn redeem_with_claim(
+        &self,
+        code: &str,
+        name: &str,
+        client_certificate: &str,
+        claim: &str,
+    ) -> Result<Value> {
         let mut s = self.state.lock().unwrap();
         let e = s
             .current
@@ -842,12 +933,42 @@ impl IdentityStore {
                 UnixTime::now(),
             )?;
         }
-        let mut cfg = s.cfg.clone();
         let name = short_label(if name.trim().is_empty() {
             "配对设备"
         } else {
             name.trim()
         });
+        if s.cfg.require_approval() {
+            ensure!(claim.len() >= 32, "this host requires approval; update Vantry to pair");
+            let now = Utc::now();
+            s.requests.retain(|r| r.expires_at > now);
+            ensure!(
+                s.requests.len() < MAX_DEVICE_REQUESTS,
+                "too many devices are waiting for approval"
+            );
+            let request = DeviceRequest {
+                id: token(),
+                name: name.clone(),
+                verification_code: verification_code(),
+                created_at: now,
+                expires_at: now + chrono::Duration::minutes(DEVICE_REQUEST_TTL_MINUTES),
+                state: DeviceRequestState::Pending,
+                claim: claim.to_owned(),
+                certificate: client_certificate.to_owned(),
+            };
+            let out = json!({
+                "status": "pending",
+                "requestId": request.id,
+                "verificationCode": request.verification_code,
+                "expiresAt": request.expires_at,
+                "name": s.cfg.host.name,
+            });
+            s.requests.push(request);
+            s.current = None;
+            s.codes.revoke(&e.id, "host");
+            return Ok(out);
+        }
+        let mut cfg = s.cfg.clone();
         let mut issued = cfg.host.clone();
         issued.relays = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
         issued.secret = token();
@@ -867,6 +988,117 @@ impl IdentityStore {
             json!({"id":e.id,"code":e.code,"scope":"session","name":issued.name,"expiresAt":e.expires_at,"payload":issued,"status":"paired","pairedWith":name}),
         )
     }
+    /// Whether new devices wait for the host's approval.
+    pub fn require_approval(&self) -> bool {
+        self.state.lock().unwrap().cfg.require_approval()
+    }
+
+    pub fn set_require_approval(&self, on: bool) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let mut cfg = s.cfg.clone();
+        cfg.extra.insert("requireApproval".into(), json!(on));
+        persist(&self.path, &cfg)?;
+        s.cfg = cfg;
+        if !on {
+            // Nobody is left to approve them.
+            s.requests.retain(|r| !matches!(r.state, DeviceRequestState::Pending));
+        }
+        Ok(())
+    }
+
+    /// Devices waiting for approval, oldest first.
+    pub fn device_requests(&self) -> Vec<DeviceRequest> {
+        let mut s = self.state.lock().unwrap();
+        let now = Utc::now();
+        s.requests.retain(|r| r.expires_at > now);
+        s.requests
+            .iter()
+            .filter(|r| r.state == DeviceRequestState::Pending)
+            .cloned()
+            .collect()
+    }
+
+    /// Approves a waiting device: it becomes an authorized client, and its
+    /// credentials wait for it to collect them with its claim.
+    pub fn approve_device(&self, id: &str) -> Result<bool> {
+        let mut s = self.state.lock().unwrap();
+        let now = Utc::now();
+        s.requests.retain(|r| r.expires_at > now);
+        let Some(index) = s
+            .requests
+            .iter()
+            .position(|r| r.id == id && r.state == DeviceRequestState::Pending)
+        else {
+            return Ok(false);
+        };
+        ensure!(s.cfg.clients.len() < 128, "paired device limit reached");
+        let request = s.requests[index].clone();
+        let mut cfg = s.cfg.clone();
+        let mut issued = cfg.host.clone();
+        issued.relays = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
+        issued.secret = token();
+        issued.next_certificate = cfg.next_certificate.clone();
+        cfg.clients.push(AccessClient {
+            id: token(),
+            name: request.name.clone(),
+            created_at: now,
+            secret: issued.secret.clone(),
+            certificate: request.certificate.clone(),
+        });
+        persist(&self.path, &cfg)?;
+        s.cfg = cfg;
+        let payload = json!({"id":request.id,"scope":"session","name":issued.name,"expiresAt":request.expires_at,"payload":issued,"status":"paired","pairedWith":request.name});
+        s.requests[index].state = DeviceRequestState::Approved(payload);
+        Ok(true)
+    }
+
+    /// Denies a waiting device; it stays out until its request expires.
+    pub fn deny_device(&self, id: &str) -> bool {
+        let mut s = self.state.lock().unwrap();
+        match s
+            .requests
+            .iter_mut()
+            .find(|r| r.id == id && r.state == DeviceRequestState::Pending)
+        {
+            Some(r) => {
+                r.state = DeviceRequestState::Denied;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The waiting device asks again. Approved credentials are handed out
+    /// once, and only for the matching claim.
+    pub fn poll_device_request(&self, id: &str, claim: &str) -> DeviceRequestPoll {
+        let mut s = self.state.lock().unwrap();
+        let now = Utc::now();
+        s.requests.retain(|r| r.expires_at > now);
+        let Some(index) = s
+            .requests
+            .iter()
+            .position(|r| r.id == id && !claim.is_empty() && matches_secret(&r.claim, claim))
+        else {
+            return DeviceRequestPoll::Gone;
+        };
+        match s.requests[index].state.clone() {
+            DeviceRequestState::Pending => {
+                let r = &s.requests[index];
+                DeviceRequestPoll::Pending(json!({
+                    "status": "pending",
+                    "requestId": r.id,
+                    "verificationCode": r.verification_code,
+                    "expiresAt": r.expires_at,
+                }))
+            }
+            DeviceRequestState::Approved(payload) => {
+                s.requests.remove(index);
+                DeviceRequestPoll::Approved(payload)
+            }
+            DeviceRequestState::Denied => DeviceRequestPoll::Denied,
+        }
+    }
+
     pub fn save_peer(&self, pair: Pair) -> Result<String> {
         pair.validate(std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1"))?;
         ensure!(pair.v != 2, "pairing redemption required");

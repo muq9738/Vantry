@@ -269,6 +269,7 @@ fn workbench() -> impl IntoElement {
         .child(views::dock::preview_dialog())
         .child(views::git::dialog())
         .child(views::settings::settings())
+        .child(views::settings::pairing_dialog())
         .child(views::dialogs::rename_dialog())
         .child(views::dialogs::confirm_dialog())
         .child(views::dialogs::attachment_preview_dialog())

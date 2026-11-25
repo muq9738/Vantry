@@ -450,6 +450,69 @@ struct Reply {
     message: String,
 }
 
+/// A demo reply with Vantry's visual blocks (charts, artifacts).
+const VISUAL_MARKDOWN: &str = r#"本周构建与延迟概览：
+
+```chart bar unit=ms title="接口延迟对比" ref=60 reflabel="SLA"
+           | p50 | p95
+* Redis    | 12  | 40
+Memcached  | 9   | 31
+Postgres   | 28  | 95
+Mongo      | 22  | 71
+```
+
+```chart line unit=% title="CPU 使用率"
+           | 桌面 | 服务
+2026-11-18 | 32 | 18
+2026-11-19 | 41 | 22
+2026-11-20 | 38 | 35
+2026-11-21 | 55 | 42
+2026-11-22 | 47 | 39
+2026-11-23 | 62 | 44
+2026-11-24 | 58 | 51
+```
+
+```chart
+{"type":"combo","title":"发布量与失败率","unit":"次","unitRight":"%","labels":["1月","2月","3月","4月","5月","6月"],"series":[{"name":"发布","data":[12,18,15,22,26,31]},{"name":"失败率","kind":"line","axis":"right","data":[8.5,6.1,7.4,4.2,3.6,2.9]}]}
+```
+
+```chart bar title="月度盈亏" unit=k
+     | 盈亏
+1月  | 12
+2月  | -8
+3月  | 5
+4月  | -14
+5月  | 20
+6月  | 9
+```
+
+```chart donut title="令牌占比" unit=k
+          | 用量
+Claude    | 420
+GPT       | 260
+Gemini    | 130
+DeepSeek  | 90
+Kimi      | 60
+Qwen      | 40
+GLM       | 30
+Grok      | 20
+Mistral   | 10
+Llama     | 8
+```
+
+```chart
+{"type":"stats","title":"运行指标","hero":"98.6%","heroLabel":"成功率","delta":"+1.2%","items":[{"label":"平均耗时","value":"3分12秒","delta":"-8%"},{"label":"今日运行","value":"128","delta":"+14"},{"label":"失败","value":"2","delta":"-3"}]}
+```
+
+```html title="交互式计数器"
+<div style="padding:16px;font-family:system-ui">
+  <h3 style="margin:0 0 8px">离线组件</h3>
+  <button onclick="this.nextElementSibling.textContent=+this.nextElementSibling.textContent+1" style="padding:6px 12px;border-radius:8px;border:1px solid var(--v-line);background:var(--v-surface);color:var(--v-ink)">+1</button>
+  <span class="tnum" style="margin-left:8px">0</span>
+</div>
+```
+"#;
+
 /// The demo reply's Markdown, streamed after the approval.
 const DEMO_MARKDOWN: &str = "## 检查结果\n\n工作区是一个 **Cargo** 工程，入口在 `src/main.rs`：\n\n1. 依赖已锁定\n2. 测试可直接运行\n\n```rust\nfn main() {\n    println!(\"hello, vantry\");\n}\n```\n\n建议的改动：\n\n```diff\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n fn main() {\n-    println!(\"hello\");\n+    println!(\"hello, vantry\");\n }\n```\n\n> 提示：改动尚未写入，确认后再执行。\n";
 
@@ -513,7 +576,8 @@ impl MockBridge {
                 archived: true,
                 ..thread("thread-archived", "已归档：旧方案讨论", "2026-11-20T10:00:00Z")
             };
-            for t in [&welcome, &child_ok, &child_failed, &snoozed, &archived] {
+            let visuals = thread("thread-visuals", "可视化回复（演示）", "2026-11-23T09:00:00Z");
+            for t in [&welcome, &child_ok, &child_failed, &snoozed, &archived, &visuals] {
                 core.threads.push(t.clone());
                 core.emit_thread(events::THREAD_CREATED, t);
             }
@@ -529,6 +593,34 @@ impl MockBridge {
                 reasoning: "用户想了解界面。".into(),
                 created_at: "2026-11-23T08:00:01Z".into(),
                 ..Run::default()
+            });
+            core.runs.push(Run {
+                id: "run-visuals".into(),
+                thread_id: visuals.id.clone(),
+                attempt_id: "run-visuals-a1".into(),
+                status: RunStatus::Completed,
+                input: "用图表总结一下本周的数据".into(),
+                output: VISUAL_MARKDOWN.into(),
+                created_at: "2026-11-23T09:00:01Z".into(),
+                ..Run::default()
+            });
+            core.tools.push(ToolCall {
+                id: "tool-visuals-todo".into(),
+                thread_id: visuals.id.clone(),
+                run_id: "run-visuals".into(),
+                attempt_id: "run-visuals-a1".into(),
+                name: "vantry_todo_write".into(),
+                arguments: Some(json!({"title": "周报可视化", "todos": [
+                    {"content": "收集本周构建与延迟数据", "status": "completed"},
+                    {"content": "生成延迟与 CPU 图表", "status": "completed"},
+                    {"content": "汇总发布量与失败率", "activeForm": "正在汇总发布量与失败率", "status": "in_progress"},
+                    {"content": "整理令牌占比与运行指标", "status": "pending"},
+                    {"content": "输出交互式组件", "status": "pending"}
+                ]})),
+                output: "Task list updated: 2/5 completed.".into(),
+                status: "completed".into(),
+                output_offset: 0,
+                ..ToolCall::default()
             });
             // Steps before the reply: one quiet, collapsible tool line.
             for (n, (name, args, output)) in [

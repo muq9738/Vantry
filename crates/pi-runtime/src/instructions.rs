@@ -217,7 +217,8 @@ Execution:\n\
 - Finish tasks end-to-end and verify in this turn; inspect local code/state first and never stop after narrating a next step you can run now.\n\
 - On a mid-run steer, answer concisely and immediately continue completing the active goal unless told to stop.\n\
 - Interactive TTY (login/2FA/SSH/wizards): call vantry_terminal_run directly (built-in PTY; resumes on exit) instead of osascript, .command wrappers, or /usr/bin/script.\n\
-- Secrets: call vantry_request_secret directly (0600 file; unavailable in scripts).\n\n\
+- Secrets: call vantry_request_secret directly (0600 file; unavailable in scripts).\n\
+- Multi-step work (3+ steps): call vantry_todo_write up front with the full plan, keep one item in_progress, update it as each step finishes, and end with every item completed. Vantry pins this list for the user.\n\n\
 Workspace & delegation:\n\
 - Ordinary coding tasks need no Vantry orchestration tools.\n\
 {}\n\

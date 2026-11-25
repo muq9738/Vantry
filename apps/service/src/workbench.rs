@@ -35,6 +35,8 @@ pub struct Workbench {
     desktop: AsyncMutex<Option<(DesktopClient, String, String)>>,
     desktop_host: AsyncMutex<Option<Arc<DesktopHost>>>,
     desktop_viewer: AsyncMutex<Option<Arc<DesktopViewer>>>,
+    /// This device waiting for another host's approval, by handle.
+    pending_pairings: Mutex<std::collections::HashMap<String, vantry_connectivity::peer::PendingPairing>>,
     pub environment: String,
 }
 fn user_home_dir() -> Option<PathBuf> {
@@ -90,6 +92,7 @@ impl Workbench {
             desktop: AsyncMutex::new(None),
             desktop_host: AsyncMutex::new(None),
             desktop_viewer: AsyncMutex::new(None),
+            pending_pairings: Mutex::new(Default::default()),
             environment,
         })
     }
@@ -258,6 +261,30 @@ impl Workbench {
             }
             "remote.pair.create" => return self.pair().await,
             "remote.pair.redeem" => return self.redeem(r).await,
+            "remote.pair.status" => return self.pairing_status(r).await,
+            "remote.pair.cancel" => {
+                let input = r.input.as_ref().unwrap_or(&Value::Null);
+                let handle = input["handle"].as_str().unwrap_or_default();
+                self.pending_pairings.lock().unwrap().remove(handle);
+                out.output = json!({"cancelled": true}).to_string();
+            }
+            "remote.access.approval" => {
+                let input = r.input.as_ref().unwrap_or(&Value::Null);
+                let on = input["enabled"].as_bool().context("missing enabled")?;
+                self.identity.set_require_approval(on)?;
+                return self.remote_status();
+            }
+            "remote.requests.approve" | "remote.requests.deny" => {
+                let input = r.input.as_ref().unwrap_or(&Value::Null);
+                let id = input["id"].as_str().unwrap_or(&r.name);
+                let done = if action.ends_with("approve") {
+                    self.identity.approve_device(id)?
+                } else {
+                    self.identity.deny_device(id)
+                };
+                ensure!(done, "该请求已处理或已过期");
+                return self.remote_status();
+            }
             "remote.peers.revoke" => return self.revoke(r),
             "rd.status"
             | "rd.session.status"
@@ -914,9 +941,16 @@ impl Workbench {
         if let Some(mobile) = self.mobile_server.borrow().as_ref() {
             clients.extend(mobile.paired_devices());
         }
+        let requests: Vec<Value> = self
+            .identity
+            .device_requests()
+            .iter()
+            .map(|r| r.summary())
+            .collect();
         out.output =
             json!({"enabled":cfg.enabled,"name":cfg.host.name,"direct":cfg.host.direct,
-                    "identity":self.identity.public_identity(),"peers":peers,"clients":clients})
+                    "identity":self.identity.public_identity(),"peers":peers,"clients":clients,
+                    "requireApproval":cfg.require_approval(),"requests":requests})
                 .to_string();
 
         Ok(out)
@@ -940,12 +974,15 @@ impl Workbench {
         Ok(out)
     }
     async fn redeem(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
-        let mut out = WorkbenchResponse::default();
+        use vantry_connectivity::peer::Redemption;
         let input = r.input.as_ref().unwrap_or(&Value::Null);
-
         let stop = CancellationToken::new();
-        let id = if let Some(relay) = input["relay"].as_str() {
-            vantry_connectivity::bootstrap::redeem_code(
+        let relay = input["relay"].as_str().map(str::to_owned).or_else(|| {
+            input["code"].as_str().and_then(|_| self.identity.snapshot().relay_endpoints().first().map(|e| e.url.clone()))
+        });
+        if input["code"].is_string() && relay.is_none() { anyhow::bail!("此设备未配置中继，请粘贴完整的电脑配对链接"); }
+        let state = if let Some(relay) = relay.as_deref() {
+            vantry_connectivity::bootstrap::redeem_code_start(
                 relay,
                 input["code"].as_str().unwrap_or(&r.message),
                 &self.identity,
@@ -959,15 +996,56 @@ impl Workbench {
                 std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1"),
             )?;
             match pair.v {
-                2 => peer::redeem(&pair, &self.identity, &r.name, Route::Auto, stop).await?,
-                _ => self.identity.save_peer(pair)?,
+                2 => peer::redeem_start(&pair, &self.identity, &r.name, Route::Auto, stop).await?,
+                _ => Redemption::Paired(self.identity.save_peer(pair)?),
             }
         };
-        out.output = json!({
-        "id":id}
-        )
+        self.redemption_output(state, None)
+    }
+    /// One more look at a device waiting for another host's approval.
+    async fn pairing_status(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
+        let input = r.input.as_ref().unwrap_or(&Value::Null);
+        let handle = input["handle"].as_str().unwrap_or_default().to_owned();
+        let pending = self.pending_pairings.lock().unwrap().get(&handle).cloned();
+        let Some(pending) = pending else {
+            let mut out = WorkbenchResponse::default();
+            out.output = json!({"status":"expired"}).to_string();
+            return Ok(out);
+        };
+        let state = peer::poll_redemption(&pending, &self.identity, Route::Auto, CancellationToken::new()).await?;
+        self.redemption_output(state, Some(handle))
+    }
+    fn redemption_output(
+        &self,
+        state: vantry_connectivity::peer::Redemption,
+        handle: Option<String>,
+    ) -> Result<WorkbenchResponse> {
+        use vantry_connectivity::peer::Redemption;
+        let mut out = WorkbenchResponse::default();
+        let mut pending = self.pending_pairings.lock().unwrap();
+        out.output = match state {
+            Redemption::Paired(id) => {
+                handle.map(|h| pending.remove(&h));
+                json!({"status":"paired","id":id})
+            }
+            Redemption::Pending(p) => {
+                let handle = handle.unwrap_or_else(vantry_connectivity::pairing::token);
+                let v = json!({"status":"pending","pending":true,"handle":handle,
+                    "verificationCode":p.verification_code,"expiresAt":p.expires_at,"hostName":p.host_name});
+                pending.retain(|_, p| p.expires_at > chrono::Utc::now());
+                pending.insert(handle, p);
+                v
+            }
+            Redemption::Denied => {
+                handle.map(|h| pending.remove(&h));
+                json!({"status":"denied"})
+            }
+            Redemption::Expired => {
+                handle.map(|h| pending.remove(&h));
+                json!({"status":"expired"})
+            }
+        }
         .to_string();
-
         Ok(out)
     }
     fn revoke(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {

@@ -23,6 +23,7 @@ pub mod language;
 pub mod persist;
 pub mod sidebar;
 pub mod timeline;
+pub mod todo;
 pub mod ui;
 pub mod workbench;
 

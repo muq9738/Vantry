@@ -45,6 +45,7 @@ pub type EventSink = tokio::sync::mpsc::UnboundedSender<CoreEvent>;
 
 /// The Core's protocol v1, as the desktop uses it.
 pub trait CoreBridge: Send + Sync + 'static {
+    fn reload_credentials(&self) {}
     /// What the header shows about the connection ("本机 Core", "演示数据").
     fn label(&self) -> String;
     /// `GET /v1/health`.
@@ -137,6 +138,8 @@ pub enum ErrorCode {
     Unavailable,
     /// The response was not protocol v1.
     Protocol,
+    /// A paired host rejected this device's credential: pair again.
+    Unauthorized,
     /// A code the desktop does not know (an empty one included).
     Other(String),
 }
@@ -152,6 +155,7 @@ impl ErrorCode {
             "conflict" => ErrorCode::Conflict,
             "resync_required" => ErrorCode::ResyncRequired,
             "internal_error" => ErrorCode::Internal,
+            "unauthorized" => ErrorCode::Unauthorized,
             other => ErrorCode::Other(other.to_owned()),
         }
     }
@@ -167,6 +171,7 @@ impl ErrorCode {
             P::Conflict => ErrorCode::Conflict,
             P::ResyncRequired => ErrorCode::ResyncRequired,
             P::InternalError => ErrorCode::Internal,
+            P::Unauthorized => ErrorCode::Unauthorized,
             P::Unspecified => ErrorCode::Other(String::new()),
         }
     }
@@ -180,6 +185,7 @@ impl ErrorCode {
             ErrorCode::Conflict => "conflict",
             ErrorCode::ResyncRequired => "resync_required",
             ErrorCode::Internal => "internal_error",
+            ErrorCode::Unauthorized => "unauthorized",
             ErrorCode::Unavailable => "unavailable",
             ErrorCode::Protocol => "protocol",
             ErrorCode::Other(code) if code.is_empty() => "unknown",
@@ -471,6 +477,10 @@ impl RemoteBridge {
 }
 
 impl CoreBridge for RemoteBridge {
+    fn reload_credentials(&self) {
+        let mut child = self.tunnel.child.lock().unwrap();
+        if let Some(mut old) = child.take() { let _ = old.kill(); let _ = old.wait(); }
+    }
     fn label(&self) -> String {
         match &self.endpoint {
             Endpoint::Peer { id, mode } => format!("配对主机 · {id}（{mode}）"),

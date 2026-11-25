@@ -115,6 +115,10 @@ pub enum ErrorCode {
     ResyncRequired,
     #[serde(rename = "internal_error")]
     InternalError,
+    /// A paired host rejected this device's credential (revoked or reset):
+    /// the user pairs again with a new code.
+    #[serde(rename = "unauthorized")]
+    Unauthorized,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

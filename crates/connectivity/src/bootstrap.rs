@@ -134,6 +134,37 @@ pub async fn redeem_code(
     name: &str,
     stop: CancellationToken,
 ) -> Result<String> {
+    let pair = match fetch_bootstrap(relay, code, local, name).await? {
+        Ok(id) => return Ok(id),
+        Err(pair) => pair,
+    };
+    peer::redeem(&pair, local, name, Route::Auto, stop).await
+}
+
+/// As [`redeem_code`], but returns a [`peer::Redemption::Pending`] when the
+/// host approves new devices instead of waiting for it.
+pub async fn redeem_code_start(
+    relay: &str,
+    code: &str,
+    local: &IdentityStore,
+    name: &str,
+    stop: CancellationToken,
+) -> Result<peer::Redemption> {
+    let pair = match fetch_bootstrap(relay, code, local, name).await? {
+        Ok(id) => return Ok(peer::Redemption::Paired(id)),
+        Err(pair) => pair,
+    };
+    peer::redeem_start(&pair, local, name, Route::Auto, stop).await
+}
+
+/// The relay's public bootstrap for `code`: a saved peer for a v1 entry, or
+/// the invitation to redeem with the host.
+async fn fetch_bootstrap(
+    relay: &str,
+    code: &str,
+    local: &IdentityStore,
+    name: &str,
+) -> Result<std::result::Result<String, Pair>> {
     let base = relay_url(relay, private_http())?;
     let entry = result(
         post(
@@ -151,7 +182,7 @@ pub async fn redeem_code(
         serde_json::from_value(entry.payload.ok_or_else(|| anyhow!("missing bootstrap"))?)
             .map_err(|_| anyhow!("invalid bootstrap"))?;
     if pair.v == 1 {
-        return local.save_peer(pair);
+        return Ok(Ok(local.save_peer(pair)?));
     }
     ensure!(pair.v == 2 && pair.secret.is_empty(), "invalid bootstrap");
     pair.code = code.trim().to_ascii_uppercase();
@@ -159,5 +190,5 @@ pub async fn redeem_code(
     if pair.relay.is_empty() {
         pair.relay = relay.into()
     }
-    peer::redeem(&pair, local, name, Route::Auto, stop).await
+    Ok(Err(pair))
 }

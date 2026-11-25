@@ -512,6 +512,10 @@ async fn execute(
             Arc::new(crate::secret_tool::RequestSecret::new(ui.clone(), dir)),
             pi_coding_agent::agent_session::ToolSource::sdk("vantry_request_secret"),
         );
+        session.register_tool(
+            Arc::new(crate::todo_tool::TodoWrite),
+            pi_coding_agent::agent_session::ToolSource::sdk(crate::todo_tool::NAME),
+        );
         ensure!(
             ui.approval_ready(),
             "approval extension failed to initialize"

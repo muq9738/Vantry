@@ -73,11 +73,16 @@ pub enum ToolKind {
     Read,
     Edit,
     Search,
+    /// The agent's task list (`vantry_todo_write`).
+    Plan,
     Other,
 }
 
 impl ToolKind {
     pub fn of(name: &str) -> ToolKind {
+        if super::todo::is_todo_tool(name) {
+            return ToolKind::Plan;
+        }
         match name.to_ascii_lowercase().as_str() {
             "bash" | "shell" | "terminal" | "exec" | "exec_command" | "run" | "command"
             | "vantry_terminal_run" => ToolKind::Command,
@@ -523,7 +528,12 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         let entry = ToolEntry {
             id: format!("tool:{}", tool.id),
             name: tool.name.clone(),
-            summary: summarize_arguments(tool.arguments.as_ref()),
+            summary: if super::todo::is_todo_tool(&tool.name) {
+                super::todo::summary(tool.arguments.as_ref())
+                    .unwrap_or_else(|| summarize_arguments(tool.arguments.as_ref()))
+            } else {
+                summarize_arguments(tool.arguments.as_ref())
+            },
             status: if awaiting {
                 ToolStatus::AwaitingApproval
             } else {

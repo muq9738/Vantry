@@ -1,6 +1,6 @@
 //! Device-side relay registration, TLS routing and authenticated Core proxy.
 use crate::{
-    identity::{Configuration, IdentityStore, Pair, client_tls},
+    identity::{Configuration, DeviceRequestPoll, IdentityStore, Pair, client_tls},
     pairing::token,
     relay::{Open, Rate},
     transport::{
@@ -17,7 +17,9 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::TokioIo;
 use rand::Rng;
 use rustls::pki_types::ServerName;
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use hyper::Response;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     convert::Infallible,
@@ -449,25 +451,53 @@ impl PeerEventStream {
         }
     }
 }
-pub async fn redeem(
-    bootstrap: &Pair,
-    local: &IdentityStore,
-    name: &str,
-    route: Route,
-    stop: CancellationToken,
-) -> Result<String> {
-    bootstrap.validate(private_http())?;
-    ensure!(bootstrap.v == 2, "expected pairing invitation");
-    let c = PeerConnection::connect(bootstrap, None, route, stop).await?;
-    let res=c.request(Method::POST,"/pairings/redeem",Some(json!({"code":bootstrap.code,"name":name,"scope":"session","certificate":local.snapshot().host.certificate}))).await?;
-    ensure!(res.status() == 200, "device rejected pairing");
-    let v: Value = serde_json::from_slice(
+/// A device waiting for the host to approve it (the host requires approval
+/// of new devices). Both sides show `verification_code`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPairing {
+    pub bootstrap: Pair,
+    pub request_id: String,
+    pub claim: String,
+    pub verification_code: String,
+    pub expires_at: DateTime<Utc>,
+    pub host_name: String,
+}
+
+impl std::fmt::Debug for PendingPairing {
+    // The bootstrap and claim are credentials: never in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPairing")
+            .field("request_id", &self.request_id)
+            .field("verification_code", &self.verification_code)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a redemption stands.
+#[derive(Debug)]
+pub enum Redemption {
+    /// Paired: the saved peer's ID.
+    Paired(String),
+    Pending(PendingPairing),
+    /// The host denied this device.
+    Denied,
+    /// The request expired (or the host restarted): pair again with a new code.
+    Expired,
+}
+
+async fn read_json(res: Response<Incoming>) -> Result<Value> {
+    Ok(serde_json::from_slice(
         &Limited::new(res.into_body(), 32 << 10)
             .collect()
             .await
             .map_err(|_| anyhow!("invalid pairing response body"))?
             .to_bytes(),
-    )?;
+    )?)
+}
+
+fn save_issued(bootstrap: &Pair, local: &IdentityStore, v: &Value) -> Result<String> {
     let p: Pair = serde_json::from_value(v["payload"].clone())
         .map_err(|_| anyhow!("invalid pairing response"))?;
     ensure!(
@@ -479,6 +509,99 @@ pub async fn redeem(
         "peer identity changed"
     );
     local.save_peer(p)
+}
+
+/// Redeems a one-time code; a host that approves new devices answers with a
+/// verification code to wait on ([`poll_redemption`]).
+pub async fn redeem_start(
+    bootstrap: &Pair,
+    local: &IdentityStore,
+    name: &str,
+    route: Route,
+    stop: CancellationToken,
+) -> Result<Redemption> {
+    bootstrap.validate(private_http())?;
+    ensure!(bootstrap.v == 2, "expected pairing invitation");
+    let claim = crate::pairing::token();
+    let c = PeerConnection::connect(bootstrap, None, route, stop).await?;
+    let res = c
+        .request(
+            Method::POST,
+            "/pairings/redeem",
+            Some(json!({"code":bootstrap.code,"name":name,"scope":"session","certificate":local.snapshot().host.certificate,"claim":claim})),
+        )
+        .await?;
+    match res.status().as_u16() {
+        200 => Ok(Redemption::Paired(save_issued(bootstrap, local, &read_json(res).await?)?)),
+        202 => {
+            let v = read_json(res).await?;
+            Ok(Redemption::Pending(PendingPairing {
+                bootstrap: bootstrap.clone(),
+                request_id: v["requestId"].as_str().unwrap_or_default().to_owned(),
+                claim,
+                verification_code: v["verificationCode"].as_str().unwrap_or_default().to_owned(),
+                expires_at: serde_json::from_value(v["expiresAt"].clone())
+                    .unwrap_or_else(|_| Utc::now() + chrono::Duration::minutes(10)),
+                host_name: v["name"].as_str().unwrap_or(&bootstrap.name).to_owned(),
+            }))
+        }
+        _ => bail!("配对码无效或已过期：请在主机上重新生成配对码"),
+    }
+}
+
+/// Asks the host once whether it approved a waiting device.
+pub async fn poll_redemption(
+    pending: &PendingPairing,
+    local: &IdentityStore,
+    route: Route,
+    stop: CancellationToken,
+) -> Result<Redemption> {
+    if pending.expires_at <= Utc::now() {
+        return Ok(Redemption::Expired);
+    }
+    // The one-time code is spent; only its route and certificate matter now.
+    let mut pair = pending.bootstrap.clone();
+    pair.expires_at = Some(pending.expires_at);
+    let c = PeerConnection::connect(&pair, None, route, stop).await?;
+    let res = c
+        .request(
+            Method::POST,
+            "/pairings/status",
+            Some(json!({"requestId":pending.request_id,"claim":pending.claim})),
+        )
+        .await?;
+    match res.status().as_u16() {
+        200 => Ok(Redemption::Paired(save_issued(&pending.bootstrap, local, &read_json(res).await?)?)),
+        202 => Ok(Redemption::Pending(pending.clone())),
+        403 => Ok(Redemption::Denied),
+        410 => Ok(Redemption::Expired),
+        other => bail!("主机暂时无法返回批准状态（HTTP {other}）"),
+    }
+}
+
+/// Redeems a code and, when the host approves new devices, waits for it.
+pub async fn redeem(
+    bootstrap: &Pair,
+    local: &IdentityStore,
+    name: &str,
+    route: Route,
+    stop: CancellationToken,
+) -> Result<String> {
+    let mut state = redeem_start(bootstrap, local, name, route.clone(), stop.clone()).await?;
+    loop {
+        match state {
+            Redemption::Paired(id) => return Ok(id),
+            Redemption::Denied => bail!("主机拒绝了此设备"),
+            Redemption::Expired => bail!("等待批准已超时，请重新配对"),
+            Redemption::Pending(p) => {
+                tokio::select! {
+                    _ = stop.cancelled() => bail!("pairing cancelled"),
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+                state = poll_redemption(&p, local, route.clone(), stop.clone()).await?;
+            }
+        }
+    }
 }
 
 struct PeerProxyPool {
@@ -610,7 +733,7 @@ impl PeerProxyPool {
                 if reply.status() != 101 {
                     self.recycle(tx, tasks);
                 }
-                return reply;
+                return credential_rejected(reply);
             }
         }
 
@@ -628,11 +751,23 @@ impl PeerProxyPool {
                 if reply.status() != 101 {
                     self.recycle(tx, tasks);
                 }
-                reply
+                credential_rejected(reply)
             }
             Err(e) => json(502, json!({"code":"not_ready","message":e.to_string()})),
         }
     }
+}
+
+/// The host's bare 401 (a revoked or reset device credential) as a Core
+/// error the desktop understands: it asks for a new pairing code.
+fn credential_rejected(reply: Reply) -> Reply {
+    if reply.status() == 401 {
+        return json(
+            401,
+            json!({"code":"unauthorized","message":"主机拒绝了此设备的凭据（可能已被撤销或重置配对），请重新输入配对码"}),
+        );
+    }
+    reply
 }
 
 /// Expose a local Core endpoint (`socket`: Unix socket on Unix, token-authenticated
@@ -779,6 +914,10 @@ pub async fn serve_gateway_with_t3(
     tasks.close().await;
     result
 }
+pub(crate) fn host_pairing_action(action: &str) -> bool {
+    action.starts_with("remote.pair.") || action.starts_with("remote.requests.") || action == "remote.access.approval"
+}
+
 async fn gateway_request(
     mut req: Request<Incoming>,
     identity: Arc<IdentityStore>,
@@ -827,15 +966,41 @@ async fn gateway_request(
             name: String,
             scope: String,
             certificate: String,
+            claim: String,
         }
         let v: Input = decode(req).await?;
         if !v.scope.is_empty() && v.scope != "session" {
             return Err(400);
         }
         return identity
-            .redeem(&v.code, &v.name, &v.certificate)
-            .map(|v| json(200, v))
+            .redeem_with_claim(&v.code, &v.name, &v.certificate, &v.claim)
+            .map(|v| {
+                // A device that must wait for approval learns its code (202).
+                let status = if v["status"] == "pending" { 202 } else { 200 };
+                json(status, v)
+            })
             .map_err(|_| 400);
+    }
+    if path == "/pairings/status" {
+        if req.method() != Method::POST {
+            return Err(405);
+        }
+        if !rates.lock().unwrap().allow(peer.ip(), 120) {
+            return Err(429);
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default, rename_all = "camelCase")]
+        struct Poll {
+            request_id: String,
+            claim: String,
+        }
+        let v: Poll = decode(req).await?;
+        return Ok(match identity.poll_device_request(&v.request_id, &v.claim) {
+            DeviceRequestPoll::Pending(v) => json(202, v),
+            DeviceRequestPoll::Approved(v) => json(200, v),
+            DeviceRequestPoll::Denied => json(403, json!({"status":"denied"})),
+            DeviceRequestPoll::Gone => json(410, json!({"status":"expired"})),
+        });
     }
     let revoke = identity.authorize(bearer(req.headers())).ok_or(401u16)?;
     if path.starts_with("/v1/admin/") || path == "/v1/admin" {
@@ -862,7 +1027,7 @@ async fn gateway_request(
         if actions.next().is_some() {
             return Err(400);
         }
-        if action.starts_with("rd.") || action.starts_with("plugins.") {
+        if action.starts_with("rd.") || action.starts_with("plugins.") || host_pairing_action(action) {
             return Err(403);
         }
         Request::from_parts(parts, full(data))

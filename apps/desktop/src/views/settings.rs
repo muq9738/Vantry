@@ -1137,6 +1137,16 @@ fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
                     badge("需授权", colors.warning)
                 }))
                 .child(view().flex_1())
+                .child(when(plugin.has_update && !plugin.builtin, {
+                    let id = id.clone();
+                    move || {
+                        let id = id.clone();
+                        ghost_button("更新插件", move || {
+                            let mut req = actions::request("plugins.update"); req.plugin_id = id.clone();
+                            controller::settings_op(format!("plugin:{id}"), req, "已更新插件");
+                        })
+                    }
+                }))
                 .children(opens.into_iter().map(|(page, label)| {
                     let id = id.clone();
                     ghost_button(label, move || controller::open_plugin(id.clone(), page.clone()))
@@ -1145,12 +1155,36 @@ fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
         )
 }
 
+pub(crate) fn pairing_dialog() -> impl IntoElement {
+    let close = || controller::ui().update(|u| { u.forms.pair_dialog = false; u.forms.pair_code.clear(); });
+    when(|| controller::ui().with(|u| u.forms.pair_dialog), move || {
+        let colors = palette();
+        nsh_base::dialog().on_cancel(close).child(view().flex_1().items_center().justify_center().bg(colors.scrim).p_4().child(
+            card().w_full().max_w(px(440.0)).p_5().gap_3()
+                .child(row().child(title("连接另一台电脑").flex_1()).child(super::icon_button(crate::icons::Icon::X, "关闭", close)))
+                .child(hint("在主机的「设置 → 环境」生成一次性配对链接，然后粘贴到这里。"))
+                .child(secret_field(|| controller::ui().with(|u| u.forms.pair_code.clone()), |t| controller::set_pair_field(true, t), "一次性配对码或连接链接"))
+                .child(field(|| controller::ui().with(|u| u.forms.pair_name.clone()), |t| controller::set_pair_field(false, t), "这台设备的名称（可选）"))
+                .child(hint(|| controller::ui().with(|u| u.forms.pair_wait.clone())))
+                .child(feedback_line())
+                .child(primary_button(|| if busy("pair.redeem")() { "正在配对…" } else { "连接" }, controller::pair_redeem).disabled(|| controller::ui().with(|u| u.forms.pair_code.trim().is_empty() || u.op_busy("pair.redeem"))))
+        ))
+    })
+}
+
 fn remote_page(data: Data) -> impl IntoElement {
     let colors = palette();
     let target = computed(|| controller::ui().with(|u| u.remote_target.clone()));
-    let code = computed(|| controller::ui().with(|u| u.forms.pair_code.clone()));
-    let name = computed(|| controller::ui().with(|u| u.forms.pair_name.clone()));
-    let redeeming = busy("pair.redeem");
+    if target.get_untracked().is_none() {
+        spawn(async {
+            loop {
+                timer(std::time::Duration::from_secs(3)).await;
+                if controller::ui().with_untracked(|u| u.data().and_then(|d| d.remote.as_ref()).and_then(|r| r.require_approval)) == Some(true) {
+                    controller::refresh_device_requests().await;
+                }
+            }
+        });
+    }
     view()
         .flex_col()
         .gap_3()
@@ -1249,33 +1283,27 @@ fn remote_page(data: Data) -> impl IntoElement {
                         .child(link_button("复制", move || controller::copy(copy.clone()))),
                 );
             }
+            if !remote.pairing_link.is_empty() {
+                let link = remote.pairing_link.clone();
+                c = c.child(ghost_button("复制电脑配对链接", move || controller::copy(link.clone())));
+            }
+            if let Some(on) = remote.require_approval && target.get().is_none() {
+                c = c.child(switch_row("新电脑需要批准", "使用一次性配对码后，在本机核对设备显示的验证码。", move || on, move || {
+                    let mut req = actions::request("remote.access.approval");
+                    req.input = Some(serde_json::json!({"enabled":!on}));
+                    controller::settings_op("approval.policy", req, "已更新设备批准设置");
+                }));
+                for device in &remote.requests {
+                    let approve = device.id.clone();
+                    let deny = device.id.clone();
+                    c = c.child(row().child(text(format!("{} · {}",device.name,device.verification_code)).flex_1())
+                        .child(ghost_button("拒绝", move || controller::settings_op(format!("request:{deny}"), actions::named("remote.requests.deny", &deny), "已拒绝设备")))
+                        .child(primary_button("批准", move || controller::settings_op(format!("request:{approve}"), actions::named("remote.requests.approve", &approve), "已批准设备"))));
+                }
+            }
             c.into_element()
         }))
-        .child(
-            card()
-                .gap_2()
-                .child(row().child(secret_field(
-                    move || code.get(),
-                    |t: &str| controller::set_pair_field(true, t),
-                    "SESSION-… / vantry://connect…",
-                )))
-                .child(
-                    row()
-                        .child(field(
-                            move || name.get(),
-                            |t: &str| controller::set_pair_field(false, t),
-                            "主机名称（可选）",
-                        ))
-                        .child(
-                            primary_button(
-                                move || if redeeming() { "配对中…" } else { "配对" },
-                                controller::pair_redeem,
-                            )
-                            .h(px(32.0))
-                            .disabled(busy("pair.redeem")),
-                        ),
-                ),
-        )
+        .child(ghost_button("连接另一台电脑…", || controller::ui().update(|u| { u.forms.feedback = None; u.forms.pair_dialog = true; })))
         .child(dynamic(move || {
             let Some(data) = data.get() else {
                 return view().into_element();

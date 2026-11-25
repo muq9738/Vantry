@@ -858,6 +858,7 @@ impl T3Server {
                         core_http_json(&core_socket, Method::POST, "/v1/commands", Some(params))
                             .await
                     }
+                    "workbench" if crate::peer::host_pairing_action(params["action"].as_str().unwrap_or("")) => Err(anyhow::anyhow!("pairing management requires the local host")),
                     "workbench" => {
                         core_http_json(&core_socket, Method::POST, "/v1/workbench", Some(params))
                             .await

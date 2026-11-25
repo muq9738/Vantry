@@ -367,6 +367,12 @@ pub(crate) fn composer() -> impl IntoElement {
     let notice = computed(|| controller::state().with(|s| s.notice.clone()));
     let running_action = computed(|| controller::state().with(|s| s.running_action));
     let queue = computed(|| controller::state().with(|s| s.queue_items()));
+    let todo = computed(|| {
+        controller::state().with(|s| {
+            let thread = s.selected.as_deref()?;
+            crate::state::todo::latest(s.tools.iter(), thread)
+        })
+    });
     let plan = computed(move || draft.with(|d| d.mode == InteractionMode::Plan));
     let attachments = computed(move || draft.with(|d| d.attachments.clone()));
     let importing =
@@ -521,6 +527,10 @@ pub(crate) fn composer() -> impl IntoElement {
                 .child(when(
                     move || notice.with(Option::is_some),
                     move || notice_line(notice),
+                ))
+                .child(when(
+                    move || todo.with(Option::is_some),
+                    move || todo_panel(todo),
                 ))
                 .child(when(
                     move || queue.with(|q| !q.is_empty()),
@@ -1867,4 +1877,201 @@ mod tests {
             ("claude-opus-5.5".to_owned(), "dmit-ai".to_owned())
         );
     }
+}
+
+/// The agent's task list for the open thread (`vantry_todo_write`), pinned
+/// above the composer as Antigravity's task list.
+fn todo_panel(list: Memo<Option<crate::state::todo::TodoList>>) -> impl IntoElement {
+    use crate::state::todo::TodoStatus;
+    let colors = palette();
+    // Folding follows the list: open while it runs, closed once all is done;
+    // the user's choice holds until the agent writes a new list.
+    let folded = signal(None::<(String, bool)>);
+    let is_folded = computed(move || {
+        let Some(l) = list.get() else { return true };
+        match folded.get() {
+            Some((call, f)) if call == l.call_id => f,
+            _ => l.all_done(),
+        }
+    });
+    let toggle = move || {
+        if let Some(l) = list.get_untracked() {
+            folded.set(Some((l.call_id.clone(), !is_folded.get_untracked())));
+        }
+    };
+    let header = nsh_base::button()
+        .accessibility_label("展开或收起任务清单")
+        .on_press(toggle)
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded(px(10.0))
+        .hover(|s| s.bg(colors.soft))
+        .child(icon(Icon::ListChecks, 14.0, colors.accent))
+        .child(
+            text(move || {
+                list.with(|l| {
+                    let l = l.as_ref();
+                    let title = l.map(|l| l.title.clone()).filter(|t| !t.is_empty());
+                    title.unwrap_or_else(|| "任务清单".to_owned())
+                })
+            })
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_size(px(12.5))
+            .text_color(colors.ink),
+        )
+        .child(
+            text(move || {
+                list.with(|l| {
+                    let Some(l) = l else { return String::new() };
+                    if !is_folded.get() {
+                        return String::new();
+                    }
+                    match l.current() {
+                        Some(now) => now.label().to_owned(),
+                        None if l.all_done() => "全部完成".to_owned(),
+                        None => String::new(),
+                    }
+                })
+            })
+            .flex_1()
+            .min_w_0()
+            .number_of_lines(1u32)
+            .text_size(px(12.0))
+            .text_color(colors.muted),
+        )
+        .child(
+            view()
+                .w(px(64.0))
+                .h(px(4.0))
+                .rounded_full()
+                .bg(colors.line)
+                .overflow_hidden()
+                .child(
+                    view()
+                        .h_full()
+                        .rounded_full()
+                        .bg(move || {
+                            if list.with(|l| l.as_ref().is_some_and(|l| l.all_done())) {
+                                colors.success
+                            } else {
+                                colors.accent
+                            }
+                        })
+                        .w(move || {
+                            px(list.with(|l| {
+                                l.as_ref().map_or(0.0, |l| {
+                                    64.0 * l.done() as f32 / l.items.len().max(1) as f32
+                                })
+                            }))
+                        }),
+                ),
+        )
+        .child(
+            text(move || list.with(|l| l.as_ref().map(|l| l.progress()).unwrap_or_default()))
+                .font_family("Menlo")
+                .text_size(px(11.5))
+                .text_color(colors.muted),
+        )
+        .child(dynamic(move || {
+            icon(
+                if is_folded.get() { Icon::ChevronDown } else { Icon::ChevronUp },
+                13.0,
+                colors.faint,
+            )
+        }));
+    let items = dynamic(move || {
+        if is_folded.get() {
+            return view().into_element();
+        }
+        let Some(l) = list.get() else { return view().into_element() };
+        let mut col = view().flex_col().gap_0p5().px_3().pb_2p5();
+        for item in l.items {
+            let (mark, ink) = match item.status {
+                TodoStatus::Completed => (
+                    view()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .items_center()
+                        .justify_center()
+                        .child(icon(Icon::CircleCheck, 14.0, colors.success))
+                        .into_element(),
+                    colors.faint,
+                ),
+                TodoStatus::InProgress => (
+                    view()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            view()
+                                .w(px(13.0))
+                                .h(px(13.0))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(colors.accent)
+                                .items_center()
+                                .justify_center()
+                                .child(view().w(px(5.0)).h(px(5.0)).rounded_full().bg(colors.accent)),
+                        )
+                        .into_element(),
+                    colors.ink,
+                ),
+                TodoStatus::Pending => (
+                    view()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            view()
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(colors.faint),
+                        )
+                        .into_element(),
+                    colors.muted,
+                ),
+            };
+            let done = item.status == TodoStatus::Completed;
+            let active = item.status == TodoStatus::InProgress;
+            let mut label = text(item.label().to_owned())
+                .flex_1()
+                .min_w_0()
+                .text_size(px(12.5))
+                .line_height(nsh_core::LineHeight::Multiple(1.45))
+                .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                .text_color(ink);
+            if done {
+                label = label.line_through().text_decoration_color(colors.faint);
+            }
+            col = col.child(
+                view()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .py(px(3.0))
+                    .px_1()
+                    .rounded(px(6.0))
+                    .style_when(move || active, |s| s.bg(colors.soft))
+                    .child(view().pt(px(1.0)).child(mark))
+                    .child(label),
+            );
+        }
+        scroll().max_h(px(220.0)).child(col).into_element()
+    });
+    view()
+        .flex_col()
+        .rounded(px(12.0))
+        .bg(colors.raised)
+        .border_1()
+        .border_color(colors.line)
+        .child(header)
+        .child(items)
 }

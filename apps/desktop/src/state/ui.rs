@@ -146,6 +146,9 @@ pub struct SettingsForms {
     pub mcp_draft: Option<McpServerSpec>,
     /// The pairing code (or link) to redeem, and a name for the machine.
     pub pair_code: String,
+    pub pair_dialog: bool,
+    pub pair_wait: String,
+    pub repair_peer: String,
     pub pair_name: String,
     /// Pi quick setup: provider, key (secret), default model.
     pub pi_provider: String,

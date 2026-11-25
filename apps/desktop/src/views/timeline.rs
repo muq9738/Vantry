@@ -627,7 +627,16 @@ fn tool_glyph(name: &str) -> Icon {
         ToolKind::Command => Icon::Terminal,
         ToolKind::Read | ToolKind::Edit => Icon::FileText,
         ToolKind::Search => Icon::Search,
+        ToolKind::Plan => Icon::ListChecks,
         ToolKind::Other => Icon::Wrench,
+    }
+}
+
+/// A tool's name as the timeline shows it.
+fn tool_display_name(name: &str) -> String {
+    match ToolKind::of(name) {
+        ToolKind::Plan => crate::tr("任务清单").to_owned(),
+        _ => name.to_owned(),
     }
 }
 
@@ -654,6 +663,9 @@ fn tools_headline(calls: &[ToolEntry], lang: Language) -> String {
             (Language::En, ToolKind::Edit) => format!("edited {n} file{s}"),
             (Language::En, ToolKind::Search) => format!("searched {n} time{s}"),
             (Language::En, ToolKind::Other) => format!("used {n} tool{s}"),
+            (Language::En, ToolKind::Plan) => "updated the task list".to_owned(),
+            (Language::Ja, ToolKind::Plan) => "タスクリストを更新".to_owned(),
+            (Language::Zh, ToolKind::Plan) => "更新了任务清单".to_owned(),
             (Language::Ja, ToolKind::Command) => format!("{n} 件のコマンドを実行"),
             (Language::Ja, ToolKind::Read) => format!("{n} 件のファイルを読み込み"),
             (Language::Ja, ToolKind::Edit) => format!("{n} 件のファイルを編集"),
@@ -855,7 +867,7 @@ fn tool_entry_row(call: ReadSignal<ToolEntry>, lang: Language) -> impl IntoEleme
                     }
                 }))
                 .child(
-                    text(move || call.with(|c| c.name.clone()))
+                    text(move || call.with(|c| tool_display_name(&c.name)))
                         .flex_shrink_0()
                         .font_weight(FontWeight::MEDIUM)
                         .text_size(px(12.0))

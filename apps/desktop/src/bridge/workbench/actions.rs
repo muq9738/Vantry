@@ -263,10 +263,20 @@ pub struct RemoteClient {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeviceApproval {
+    pub id: String,
+    pub name: String,
+    pub verification_code: String,
+}
+
 /// `remote.status` (0.1.42 `access.status`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RemoteStatus {
+    pub require_approval: Option<bool>,
+    pub requests: Vec<DeviceApproval>,
     pub enabled: bool,
     pub connected: bool,
     pub state: String,

@@ -139,6 +139,7 @@ impl SettingsData {
             | names::REMOTE_PAIR_CREATE
             | names::REMOTE_PAIR_REDEEM
             | names::REMOTE_PEERS_LIST
+            | "remote.access.approval" | "remote.requests.approve" | "remote.requests.deny"
             | names::REMOTE_PEERS_REVOKE => {
                 if let Ok(status) = RemoteStatus::read(response) {
                     // The paired machines are the remote desktop's peers.

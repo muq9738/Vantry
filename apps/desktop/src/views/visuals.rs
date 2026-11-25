@@ -7,6 +7,7 @@ use nsh_core::{LineHeight, prelude::*};
 use serde_json::Value;
 
 use super::{badge, ghost_button, link_button, primary_button};
+use crate::icons::Icon;
 use crate::{
     controller,
     theme::{metrics, palette},
@@ -1172,59 +1173,213 @@ fn math_card(source: &str) -> impl IntoElement {
     )
 }
 
+fn css_color(c: AdaptiveColor, dark: bool) -> String {
+    let c = if dark { c.dark } else { c.light };
+    format!(
+        "hsl({:.1} {:.1}% {:.1}% / {:.3})",
+        c.h * 360.0,
+        c.s * 100.0,
+        c.l * 100.0,
+        c.a
+    )
+}
+
+/// The page an `svg` / `html` / `artifact` block shows: Vantry's theme as CSS
+/// variables, no network (CSP), optional zoom.
+pub(crate) fn artifact_document(kind: &str, title: &str, source: &str, zoom: f32, dark: bool) -> String {
+    artifact_page(palette(), kind, title, source, zoom, dark)
+}
+
+fn artifact_page(c: &crate::theme::Palette, kind: &str, title: &str, source: &str, zoom: f32, dark: bool) -> String {
+    let css_color = |color| css_color(color, dark);
+    let vars = format!(
+        ":root{{color-scheme:{scheme};--v-bg:{bg};--v-surface:{surface};--v-surface-2:{surface2};--v-ink:{ink};--v-muted:{muted};--v-faint:{faint};--v-line:{line};--v-accent:{accent};--v-good:{good};--v-warn:{warn};--v-bad:{bad}}}",
+        scheme = if dark { "dark" } else { "light" },
+        bg = css_color(c.card),
+        surface = css_color(c.raised),
+        surface2 = css_color(c.soft),
+        ink = css_color(c.ink),
+        muted = css_color(c.muted),
+        faint = css_color(c.faint),
+        line = css_color(c.line),
+        accent = css_color(c.accent),
+        good = css_color(c.success),
+        warn = css_color(c.warning),
+        bad = css_color(c.danger),
+    );
+    let csp = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data: blob:; media-src data: blob:; font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'\">";
+    let base = format!(
+        "{vars}html,body{{margin:0;background:transparent;color:var(--v-ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,'PingFang SC',system-ui,sans-serif}}body{{padding:14px 16px;zoom:{zoom}}}*{{box-sizing:border-box}}a{{color:var(--v-accent)}}.tnum{{font-variant-numeric:tabular-nums}}svg{{max-width:100%;height:auto}}table{{border-collapse:collapse}}td,th{{border-bottom:1px solid var(--v-line);padding:4px 8px}}"
+    );
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let center = if kind == "svg" { "body{display:flex;justify-content:center}" } else { "" };
+    let content = format!("<!doctype html><meta charset=utf-8>{csp}<style>{base}{center}</style>{source}");
+    let encoded = STANDARD.encode(content);
+    let title = title.replace('&', "&amp;").replace('<', "&lt;");
+    format!(r#"<!doctype html><meta charset=utf-8><meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; form-action 'none'; base-uri 'none'"><title>{title}</title><style>html,body,iframe{{width:100%;height:100%;border:0;margin:0;display:block}}</style><iframe sandbox="allow-scripts" src="data:text/html;charset=utf-8;base64,{encoded}"></iframe>"#)
+}
+
+fn artifact_view(doc: Memo<String>, height: Signal<f32>, max_height: f32) -> AnyElement {
+    nsh_core::element::web_view_html(move || doc.get(), None)
+        .incognito(true)
+        .w_full()
+        .h(move || px(height.get().min(max_height)))
+        .into_element()
+}
+
 fn artifact_card(kind: &str, args: &str, source: &str) -> impl IntoElement {
     let colors = palette();
     let title = args
         .split_once("title=")
         .map(|(_, rest)| rest.trim().trim_matches('"'))
         .filter(|s| !s.is_empty())
-        .unwrap_or(if kind == "svg" {
-            "矢量图形"
-        } else {
-            "离线交互组件"
-        });
-    let preview_src = source.to_owned();
-    let preview_kind = kind.to_owned();
-    let preview_title = title.to_owned();
+        .unwrap_or(if kind == "svg" { "矢量图形" } else { "交互组件" })
+        .to_owned();
+    let zoom = signal(1.0f32);
+    let show_source = signal(false);
+    let expanded = signal(false);
+    let height = signal(160.0f32);
+    let (kind_s, title_s, src_s) = (kind.to_owned(), title.clone(), source.to_owned());
+    let doc = computed(move || {
+        // Follows light / dark and the zoom.
+        artifact_document(&kind_s, &title_s, &src_s, zoom.get(), nsh_core::element::dark())
+    });
+    let zoom_label = computed(move || format!("{:.0}%", zoom.get() * 100.0));
+    let (open_kind, open_title, open_src) = (kind.to_owned(), title.clone(), source.to_owned());
+    let copy_src = source.to_owned();
     let header = view()
+        .w_full()
+        .min_w_0()
         .flex_row()
         .items_center()
         .gap_2()
         .px_3()
         .py_1p5()
-        .bg(colors.soft)
         .border_b_1()
         .border_b_color(colors.line_soft)
         .child(badge(kind.to_uppercase(), colors.accent))
         .child(
-            text(title.to_owned())
+            text(title.clone())
                 .flex_1()
+                .min_w_0()
+                .number_of_lines(1u32)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_size(px(12.5))
                 .text_color(colors.ink),
         )
-        .child(link_button("离线预览", move || {
-            controller::open_offline_artifact(
-                preview_kind.clone(),
-                preview_title.clone(),
-                preview_src.clone(),
-            )
+        .child(super::small_icon_button(Icon::Minus, "缩小", move || {
+            zoom.set((zoom.get_untracked() - 0.1).max(0.5))
         }))
-        .child(link_button("复制", {
-            let src = source.to_owned();
-            move || controller::copy(src.clone())
+        .child(
+            nsh_base::button()
+                .accessibility_label("重置缩放")
+                .on_press(move || zoom.set(1.0))
+                .px_1()
+                .rounded(px(5.0))
+                .hover(|s| s.bg(colors.soft))
+                .child(
+                    text(move || zoom_label.get())
+                        .font_family(MONO)
+                        .text_size(px(11.0))
+                        .text_color(colors.muted),
+                ),
+        )
+        .child(super::small_icon_button(Icon::Plus, "放大", move || {
+            zoom.set((zoom.get_untracked() + 0.1).min(2.0))
+        }))
+        .child(super::small_icon_button(Icon::Code, "查看源码", move || {
+            show_source.set(!show_source.get_untracked())
+        }))
+        .child(super::small_icon_button(Icon::Maximize2, "全屏查看", move || expanded.set(true)))
+        .child(super::small_icon_button(Icon::ExternalLink, "在浏览器打开", move || {
+            controller::open_offline_artifact(open_kind.clone(), open_title.clone(), open_src.clone())
+        }))
+        .child(super::small_icon_button(Icon::Copy, "复制源码", move || {
+            controller::copy(copy_src.clone())
         }));
-    let line_count = source.lines().count();
-    card_shell(
-        header,
-        view()
-            .flex_col()
-            .gap_1()
-            .p_3()
-            .child(
-                text(format!("离线自包含 {kind} 内容（{line_count} 行），点击「离线预览」在本地沙盒打开。"))
-                    .text_size(px(12.0))
-                    .text_color(colors.muted),
-            ),
-    )
+    let raw = source.trim().to_owned();
+    let modal_title = title.clone();
+    let modal_height = signal(480.0f32);
+    let body = view()
+        .w_full()
+        .min_w_0()
+        .flex_col()
+        .child(when(move || expanded.get(), move || {
+            let w = (crate::window_size().width.0 - 120.0).clamp(360.0, 1100.0);
+            let max_h = (crate::window_size().height.0 - 140.0).max(240.0);
+            nsh_base::dialog()
+                .animation(ModalAnimation::Fade)
+                .on_cancel(move || expanded.set(false))
+                .child(
+                    view()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .bg(colors.scrim)
+                        .p_6()
+                        .on_press(move || expanded.set(false))
+                        .child(
+                            view()
+                                .w(px(w))
+                                .flex_col()
+                                .rounded(px(16.0))
+                                .bg(colors.card)
+                                .border_1()
+                                .border_color(colors.line)
+                                .shadow_xl()
+                                .overflow_hidden()
+                                .on_press(|| {})
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_4()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_b_color(colors.line_soft)
+                                        .child(
+                                            text(modal_title.clone())
+                                                .flex_1()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(14.0))
+                                                .text_color(colors.ink),
+                                        )
+                                        .child(super::icon_button(Icon::X, "关闭", move || {
+                                            expanded.set(false)
+                                        })),
+                                )
+                                .child(artifact_view(doc, modal_height, max_h)),
+                        ),
+                )
+        }))
+        .child(dynamic(move || {
+            if show_source.get() {
+                return view()
+                    .w_full()
+                    .p_3()
+                    .child(
+                        text(raw.clone())
+                            .select_text()
+                            .font_family(MONO)
+                            .text_size(px(12.0))
+                            .line_height(LineHeight::Multiple(1.5))
+                            .text_color(colors.ink),
+                    )
+                    .into_element();
+            }
+            artifact_view(doc, height, 640.0)
+        }));
+    card_shell(header, body)
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    #[test]
+    fn artifact_document_adds_csp_and_theme() {
+        let doc = super::artifact_page(&crate::theme::PALETTE, "html", "T", "<b>hi</b>", 1.0, true);
+        assert!(doc.contains("Content-Security-Policy"));
+        assert!(doc.contains(r#"sandbox="allow-scripts""#));
+        assert!(!doc.contains("<b>hi</b>"));
+    }
 }

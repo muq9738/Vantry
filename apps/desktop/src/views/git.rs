@@ -35,6 +35,10 @@ fn clip_patch(patch: &str) -> (String, bool) {
 
 pub(super) fn git_tools() -> impl IntoElement {
     let colors = palette();
+    let sync_status = computed(|| controller::bench().with(|b| {
+        let status = b.git.status.as_ref()?;
+        (!status.remote_branch.is_empty()).then(|| format!("{}   ↑ {}   ↓ {}", status.remote_branch, status.ahead, status.behind))
+    }));
     let page = computed(|| controller::bench().with(|b| b.git.page));
     let dialog = computed(|| controller::bench().with(|b| b.git.dialog));
     let busy = computed(|| controller::bench().with(|b| b.git.busy || b.git.loading));
@@ -42,6 +46,10 @@ pub(super) fn git_tools() -> impl IntoElement {
         .flex_1()
         .min_h_0()
         .flex_col()
+        .child(when(move || sync_status.with(Option::is_some), move || {
+            text(move || sync_status.get().unwrap_or_default())
+                .number_of_lines(1u32).px_3().pt_2().text_size(px(12.0)).text_color(colors.muted)
+        }))
         .child(
             view()
                 .flex_row()
