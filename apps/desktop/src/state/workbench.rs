@@ -15,6 +15,7 @@ use crate::bridge::workbench::{DirEntry, FileContent, PrSummary, SearchHit};
 pub enum DockTab {
     #[default]
     Files,
+    Summary,
     Git,
     Terminal,
     Plugins,
@@ -22,7 +23,8 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    pub const ALL: [DockTab; 5] = [
+    pub const ALL: [DockTab; 6] = [
+        DockTab::Summary,
         DockTab::Files,
         DockTab::Git,
         DockTab::Terminal,
@@ -32,6 +34,7 @@ impl DockTab {
 
     pub fn label(self) -> &'static str {
         match self {
+            DockTab::Summary => "会话概览",
             DockTab::Files => "文件",
             DockTab::Git => "Git",
             DockTab::Terminal => "终端",
@@ -42,6 +45,7 @@ impl DockTab {
 
     pub fn wire(self) -> &'static str {
         match self {
+            DockTab::Summary => "summary",
             DockTab::Files => "files",
             DockTab::Git => "git",
             DockTab::Terminal => "terminal",

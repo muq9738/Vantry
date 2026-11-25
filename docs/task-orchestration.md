@@ -4,7 +4,7 @@
 
 ## 两种不同的能力
 
-- Vantry 委派（默认且唯一的子代理路径）：由 Core 管理持久 task、独立会话、工作区隔离、跨环境执行和结果交付。子代理挂在父会话下显示，结束后由 Core 唤醒父会话。
+- Vantry 委派（默认且唯一的子代理路径）：由 Core 管理持久 task、独立会话、工作区隔离、跨环境执行和结果交付。在父会话右上角的会话概览中展开子代理，结束后由 Core 唤醒父会话。
 - Pi 原生子代理（pi-subagents 的 `subagent`、`subagent_supervisor`、`bg_wait`、`contact_supervisor`）：**默认关闭**。Vantry 在每个回合结束时关闭 Pi 进程，原生子代理的运行既不进入 Core，也无法在 Pi 退出后唤醒父会话，异步/后台运行会变成无人接收的孤儿。设置 `VANTRY_PI_NATIVE_SUBAGENTS=1` 可重新开启，此时提示词只允许前台、同 provider 同模型、本回合内完成的原生子代理。
 
 生产 Core 默认沿用用户的 Pi 扩展和 MCP，只通过 `--exclude-tools` 去掉上述原生子代理工具（用户其它扩展工具与 codemode 不受影响）。设置 `VANTRY_PI_USER_EXTENSIONS=0` 或 `VANTRY_PI_USER_MCP=0` 可显式禁用对应资源。Skill 查询采用相同默认值。

@@ -65,8 +65,7 @@ fn main() -> impl Termination {
             Exit::Code(ExitCode::from(2))
         }
         Ok(Invocation::Desktop(config)) => {
-            // `--peer` opens the window on that environment; its
-            // transport reports what is not wired yet (bridge::RemoteBridge).
+            // An explicit peer is the initial conversation scope in the shared window.
             vantry_desktop::set_launch_config(*config);
             Exit::Window(platform::run_app(
                 platform::AppSource::Rust(platform::Root::of::<vantry_desktop::App>()),

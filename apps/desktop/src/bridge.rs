@@ -309,10 +309,15 @@ impl std::fmt::Debug for RemoteBridge {
 
 impl RemoteBridge {
     pub fn new(endpoint: Endpoint, data_dir: Option<std::path::PathBuf>) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "vantry-remote-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let name = format!("vt-{}", uuid::Uuid::new_v4().simple());
+        let dir = std::env::temp_dir().join(&name);
+        // Darwin's sockaddr_un.sun_path has 104 bytes, including the NUL.
+        #[cfg(unix)]
+        let dir = if dir.join("core.sock").as_os_str().as_encoded_bytes().len() >= 104 {
+            std::path::Path::new("/tmp").join(name)
+        } else {
+            dir
+        };
         let socket = dir.join("core.sock");
         RemoteBridge {
             endpoint,
@@ -344,56 +349,42 @@ impl RemoteBridge {
                     }
                 }
             }
-        }
-
-        let mut needs_spawn = false;
-        {
-            let guard = self.tunnel.child.lock().unwrap();
             if guard.is_none() {
-                needs_spawn = true;
-            }
-        }
-
-        if needs_spawn {
-            let child = match &self.endpoint {
-                Endpoint::Peer { id, mode } => {
-                    let locator = crate::service::Locator::from_env();
-                    let exe = locator.find("vantry-service").ok_or_else(|| {
-                        BridgeError::new(
-                            ErrorCode::NotReady,
-                            "找不到 vantry-service 可执行文件，无法建立配对主机代理",
-                        )
-                    })?;
-                    let _ = std::fs::remove_file(&socket);
-                    let mut command = std::process::Command::new(exe);
-                    command.arg("peer-proxy");
-                    if let Some(dir) = &self.data_dir {
-                        command.arg("--data-dir").arg(dir);
+                let child = match &self.endpoint {
+                    Endpoint::Peer { id, mode } => {
+                        let locator = crate::service::Locator::from_env();
+                        let exe = locator.find("vantry-service").ok_or_else(|| {
+                            BridgeError::new(
+                                ErrorCode::NotReady,
+                                "找不到 vantry-service 可执行文件，无法建立配对主机代理",
+                            )
+                        })?;
+                        let _ = std::fs::remove_file(&socket);
+                        let mut command = std::process::Command::new(exe);
+                        command.arg("peer-proxy");
+                        if let Some(dir) = &self.data_dir {
+                            command.arg("--data-dir").arg(dir);
+                        }
+                        command
+                            .args(["--peer", id, "--mode", mode, "--socket"])
+                            .arg(&socket)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::piped())
+                            .spawn()
+                            .map_err(|e| {
+                                BridgeError::unavailable(format!("无法启动 peer-proxy：{e}"))
+                            })?
                     }
-                    command.args([
-                            "--peer",
-                            id,
-                            "--mode",
-                            mode,
-                            "--socket",
-                        ])
-                        .arg(&socket)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .map_err(|e| {
-                            BridgeError::unavailable(format!("无法启动 peer-proxy：{e}"))
-                        })?
-                }
-                _ => {
-                    return Err(BridgeError::new(
-                        ErrorCode::NotReady,
-                        "当前配置不是远程端点",
-                    ));
-                }
-            };
-            *self.tunnel.child.lock().unwrap() = Some(child);
+                    _ => {
+                        return Err(BridgeError::new(
+                            ErrorCode::NotReady,
+                            "当前配置不是远程端点",
+                        ));
+                    }
+                };
+                *guard = Some(child);
+            }
         }
 
         // Wait briefly for the tunnel socket to appear (or child to exit early).
@@ -407,11 +398,17 @@ impl RemoteBridge {
                 if let Some(child) = guard.as_mut()
                     && let Ok(Some(status)) = child.try_wait()
                 {
+                    use std::io::Read;
+                    let mut reason = String::new();
+                    if let Some(stderr) = child.stderr.take() {
+                        let _ = stderr.take(1024).read_to_string(&mut reason);
+                    }
                     *guard = None;
-                    return Err(BridgeError::unavailable(format!(
-                        "{} 连接进程提前退出（{status}）",
-                        self.label()
-                    )));
+                    return Err(BridgeError::unavailable(if reason.trim().is_empty() {
+                        format!("配对代理启动失败（{status}）")
+                    } else {
+                        format!("配对代理启动失败（{}）", reason.trim())
+                    }));
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -599,6 +596,17 @@ mod tests {
             assert_eq!(events::run_status(events::of_run_status(status)), Some(status));
         }
         assert_eq!(events::run_status("run.output"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_proxy_socket_fits_a_darwin_sockaddr() {
+        let remote = RemoteBridge::new(Endpoint::Peer { id: "peer".into(), mode: "auto".into() }, None);
+        let path = remote.socket();
+        assert!(path.as_os_str().as_encoded_bytes().len() < 104);
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        drop(listener);
     }
 
     #[tokio::test]

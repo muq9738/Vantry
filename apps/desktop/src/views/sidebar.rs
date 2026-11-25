@@ -9,7 +9,7 @@ use nsh_core::{
 };
 
 use super::{
-    badge, caption, dot, icon_button, run_status_color, small_icon_button, status_color,
+    caption, dot, icon_button, small_icon_button, status_color,
     status_label,
 };
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
         ThreadStatus,
         sidebar::{
             Group, InboxItem, InboxKind, SidebarRow, SidebarSection, StatusFilter, project_name,
-            project_section_key, task_badge,
+            project_section_key, scoped_project,
         },
         ui::{MainView, SettingsPage, ThemePreference},
         workbench::DockTab,
@@ -33,37 +33,39 @@ use crate::{
 enum Entry {
     Header(Group, usize),
     Project {
+        machine: String,
         key: String,
         count: usize,
         folded: bool,
     },
-    More(String, usize),
+    More(String, String, usize),
     Categories,
     Row(SidebarRow),
 }
 
-fn entries(sections: Vec<SidebarSection>) -> (Vec<Entry>, usize, Vec<SidebarRow>) {
+fn entries(sections: Vec<(String, SidebarSection)>) -> (Vec<Entry>, usize, Vec<SidebarRow>) {
     let mut out = Vec::new();
     let mut archived_count = 0;
     let mut archived_rows = Vec::new();
     let mut projects_started = false;
-    for section in sections {
+    for (machine, section) in sections {
         if section.group == Group::Archived {
-            archived_count = section.count;
-            archived_rows = section.rows;
+            archived_count += section.count;
+            archived_rows.extend(section.rows);
         } else if let Some(key) = section.project {
             if !projects_started && !out.is_empty() {
                 out.push(Entry::Categories);
             }
             projects_started = true;
             out.push(Entry::Project {
+                machine: machine.clone(),
                 key: key.clone(),
                 count: section.count,
                 folded: section.folded,
             });
             out.extend(section.rows.into_iter().map(Entry::Row));
             if section.hidden > 0 {
-                out.push(Entry::More(key, section.hidden));
+                out.push(Entry::More(machine, key, section.hidden));
             }
         } else {
             out.push(Entry::Header(section.group, section.count));
@@ -77,9 +79,9 @@ fn entry_key(entry: &Entry) -> String {
     match entry {
         Entry::Header(group, _) => format!("group:{group:?}"),
         Entry::Categories => "categories".to_owned(),
-        Entry::Project { key, .. } => format!("project:{key}"),
-        Entry::More(key, _) => format!("more:{key}"),
-        Entry::Row(row) => format!("row:{}", row.id),
+        Entry::Project { machine, key, .. } => format!("project:{machine}:{key}"),
+        Entry::More(machine, key, _) => format!("more:{machine}:{key}"),
+        Entry::Row(row) => format!("row:{}:{}", row.machine, row.id),
     }
 }
 
@@ -88,14 +90,40 @@ pub(crate) fn sidebar() -> impl IntoElement {
     let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
     let filter = computed(|| controller::ui().with(|u| u.filter.clone()));
     let computed_list = computed(move || {
-        revision.get();
         let filter = filter.get();
-        controller::state()
-            .with_untracked(|s| entries(s.sidebar_sections(&filter, chrono::Utc::now())))
+        let only = controller::machines::navigation().with(|n| n.filter.clone());
+        let mut groups = std::collections::BTreeMap::new();
+        for host in controller::machines::records().get() {
+            if only.as_ref().is_some_and(|id| id != &host.id) { continue; }
+            let Some(filter) = filter.for_machine(&host.id) else { continue };
+            host.revision.get();
+            let sections = host.session.state.with_untracked(|s| s.sidebar_sections(&filter, chrono::Utc::now()));
+            for mut section in sections {
+                for row in &mut section.rows { row.machine.clone_from(&host.id); }
+                let scope = if section.project.is_some() { host.id.clone() } else { String::new() };
+                let key = (section.group, scope.clone(), section.project.clone());
+                groups.entry(key).and_modify(|(_, prev): &mut (String, SidebarSection)| {
+                    prev.count += section.count;
+                    prev.latest = prev.latest.max(section.latest);
+                    prev.rows.append(&mut section.rows);
+                }).or_insert((scope, section));
+            }
+        }
+        let mut sections: Vec<_> = groups.into_values().collect();
+        sections.sort_by_key(|(_, s)| (s.group, s.project.as_deref() == Some(""), std::cmp::Reverse(s.latest)));
+        for (_, section) in &mut sections {
+            section.rows.sort_by_key(|r| std::cmp::Reverse(r.latest));
+        }
+        entries(sections)
     });
     let local_drafts = computed(move || {
         let filter = filter.get();
-        controller::state().with(|s| {
+        let only = controller::machines::navigation().with(|n| n.filter.clone());
+        let mut drafts = Vec::new();
+        for host in controller::machines::records().get() {
+            if only.as_ref().is_some_and(|id| id != &host.id) { continue; }
+            let Some(filter) = filter.for_machine(&host.id) else { continue };
+            drafts.extend(host.session.state.with(|s| {
             let project = crate::state::sidebar::workspace_key(s.new_thread.workspace.as_ref(), "");
             if filter.status != StatusFilter::All
                 || filter.project.as_ref().is_some_and(|p| p != &project)
@@ -116,10 +144,12 @@ pub(crate) fn sidebar() -> impl IntoElement {
                     (query.is_empty()
                         || title.to_lowercase().contains(&query)
                         || project.to_lowercase().contains(&query))
-                    .then(|| (id.clone(), title))
+                    .then(|| (host.id.clone(), id.clone(), title))
                 })
                 .collect()
-        })
+        }));
+        }
+        drafts
     });
     let list = computed(move || computed_list.with(|(rows, _, _)| rows.clone()));
     let archived_count = computed(move || computed_list.with(|(_, count, _)| *count));
@@ -258,16 +288,16 @@ pub(crate) fn sidebar() -> impl IntoElement {
                         })),
                 )
                 .child(
-                    icon_button(Icon::FolderPlus, "添加项目", controller::choose_project)
-                        .disabled(|| controller::ui().with(|u| u.remote_target.is_some())),
+                    icon_button(Icon::FolderPlus, "添加项目", || controller::machines::activate("", controller::choose_project))
+                        .disabled(|| !controller::machines::draft_target().is_empty()),
                 )
                 .child(icon_button(
                     Icon::SquarePen,
                     "新建会话 (⌘N)",
-                    controller::new_thread,
-                )),
+                    controller::machines::new_draft,
+                ).disabled(|| !controller::machines::can_new_draft())),
         )
-        // This window's machine and the way to another (v0.1.42's machine row)
+        // The machine filter belongs to navigation, independently of the open conversation.
         .child(machine_row())
         // Scrollable thread list
         .child(
@@ -280,13 +310,14 @@ pub(crate) fn sidebar() -> impl IntoElement {
                     .pb_3()
                     .child(each(
                         move || local_drafts.get(),
-                        |(id, _)| id.clone(),
+                        |(machine, id, _)| (machine.clone(), id.clone()),
                         move |item, _| {
-                            let id = move || item.with_untracked(|v| v.0.clone());
+                            let target = move || item.with_untracked(|v| (v.0.clone(),v.1.clone()));
+                            let active_scope = controller::current_machine().unwrap_or_default();
                             let selected = computed(move || {
                                 controller::state().with(|s| {
-                                    s.selected.is_none()
-                                        && s.local_selected.as_deref() == Some(&id())
+                                    let (scope,id) = target();
+                                    active_scope == scope && s.selected.is_none() && s.local_selected.as_ref() == Some(&id)
                                 })
                             });
                             let hovered = signal(false);
@@ -307,7 +338,7 @@ pub(crate) fn sidebar() -> impl IntoElement {
                                 .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
                                 .child(
                                     nsh_base::button()
-                                        .on_press(move || controller::select_thread(id()))
+                                        .on_press(move || { let (scope,id) = target(); controller::machines::activate(&scope, || controller::select_thread(id)); })
                                         .selected(move || selected.get())
                                         .h_full()
                                         .px_2p5()
@@ -320,7 +351,7 @@ pub(crate) fn sidebar() -> impl IntoElement {
                                                 .gap_1p5()
                                                 .child(dot(colors.accent))
                                                 .child(
-                                                    text(move || item.with(|v| v.1.clone()))
+                                                    text(move || item.with(|v| v.2.clone()))
                                                         .flex_1()
                                                         .number_of_lines(1u32)
                                                         .text_size(px(12.5))
@@ -343,8 +374,8 @@ pub(crate) fn sidebar() -> impl IntoElement {
                                             .right_1()
                                             .top(px(10.0))
                                             .child(small_icon_button(Icon::X, "丢弃草稿", move || {
-                                                controller::state()
-                                                    .update(|s| s.discard_local_draft(&id()))
+                                                let (scope,id) = target();
+                                                controller::machines::run_on(&scope, || controller::state().update(|s| s.discard_local_draft(&id)))
                                             }))
                                     },
                                 ))
@@ -391,95 +422,110 @@ pub(crate) fn sidebar() -> impl IntoElement {
         .child(footer())
 }
 
-/// The machine this window works on, a menu of the paired ones to move the
-/// window to, and a quick way to pair another (v0.1.42's machine row).
+/// Filter the shared session list or manage a pairing.
 fn machine_row() -> impl IntoElement {
+    use controller::machines::{by_id, navigation, records};
     let colors = palette();
-    let label = computed(|| {
-        controller::machines().with(|_| ());
-        controller::machine_label()
+    let filter = computed(|| navigation().with(|n| n.filter.clone()));
+    let label = move || {
+        filter
+            .get()
+            .and_then(|id| {
+                records().with(|list| list.iter().find(|r| r.id == id).map(|r| r.name.clone()))
+            })
+            .unwrap_or_else(|| crate::tr("全部机器").into())
+    };
+    let failure = computed(move || {
+        filter
+            .get()
+            .and_then(|id| by_id(&id))
+            .map(|m| m.failure.get())
+            .unwrap_or_default()
     });
-    let remote = controller::current_machine().is_some();
     view()
-        .flex_row()
-        .items_center()
-        .gap_1()
+        .flex_col()
         .px_3()
         .pb_1p5()
         .child(
-            nsh_base::button()
-                .accessibility_label(crate::tr("切换机器"))
-                .on_press(|| controller::refresh_machines(machine_menu))
-                .flex_1()
-                .min_w(px(0.0))
-                .h(px(26.0))
+            view()
                 .flex_row()
                 .items_center()
-                .gap_1p5()
-                .px_2()
-                .rounded(px(6.0))
-                .hover(|s| s.bg(colors.soft))
-                .active(|s| s.opacity(0.7))
-                .child(icon(
-                    if remote { Icon::Server } else { Icon::Monitor },
-                    12.5,
-                    if remote { colors.accent } else { colors.muted },
-                ))
+                .gap_1()
                 .child(
-                    text(move || label.get())
+                    nsh_base::button()
+                        .accessibility_label(crate::tr("筛选机器"))
+                        .on_press(machine_menu)
                         .flex_1()
-                        .min_w(px(0.0))
-                        .number_of_lines(1u32)
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.muted),
+                        .min_w_0()
+                        .h(px(26.0))
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .px_2()
+                        .rounded(px(6.))
+                        .hover(|s| s.bg(colors.soft))
+                        .child(icon(Icon::Server, 12.5, colors.muted))
+                        .child(
+                            text(label)
+                                .min_w_0()
+                                .number_of_lines(1u32)
+                                .text_size(px(12.))
+                                .text_color(colors.muted),
+                        )
+                        .child(icon(Icon::ChevronDown, 11., colors.faint)),
                 )
-                .child(icon(Icon::ChevronDown, 11.0, colors.faint)),
+                .child(small_icon_button(
+                    Icon::Plus,
+                    "连接另一台机器",
+                    || {
+                        controller::machines::activate("", || {
+                            controller::open_settings(SettingsPage::Remote)
+                        })
+                    },
+                )),
         )
-        .child(
-            view()
-                .tooltip(super::tip(crate::tr("连接另一台机器")))
-                .child(small_icon_button(Icon::Plus, "连接另一台机器", || {
-                    controller::open_settings(SettingsPage::Remote)
-                })),
-        )
+        .child(when(
+            move || !failure.with(String::is_empty),
+            move || {
+                nsh_base::button()
+                    .accessibility_label("重试连接")
+                    .on_press(move || {
+                        if let Some(m) = filter.get_untracked().and_then(|id| by_id(&id)) {
+                            controller::machines::refresh_summary(m);
+                        }
+                    })
+                    .child(
+                        text("未连接 · 重试")
+                            .tooltip(super::tip(move || failure.get()))
+                            .text_size(px(11.))
+                            .text_color(colors.warning),
+                    )
+            },
+        ))
 }
 
-pub(crate) fn machine_menu() {
-    let current = controller::current_machine();
-    let peers = controller::machines().get_untracked();
+fn machine_menu() {
+    use controller::machines::{navigation, records};
+    let current = navigation().with_untracked(|n| n.filter.clone());
     let mut items = vec![
-        MenuItem::new(crate::tr("本机"))
+        MenuItem::new(crate::tr("全部机器"))
             .checked(current.is_none())
-            .on_select(|| controller::switch_machine(None)),
+            .on_select(|| navigation().update(|n| n.filter = None)),
     ];
-    if peers.is_empty() {
-        items.push(MenuItem::new(crate::tr("尚未配对其他机器")).disabled(true));
-    }
-    for peer in peers {
-        let name = if peer.name.is_empty() { peer.id.clone() } else { peer.name.clone() };
-        let reach = match peer.reachable {
-            Some(true) => crate::tr("在线"),
-            Some(false) => crate::tr("离线"),
-            None => "",
-        };
-        let label = if reach.is_empty() { name } else { format!("{name} · {reach}") };
-        let id = peer.id.clone();
+    for m in records().get_untracked() {
         items.push(
-            MenuItem::new(label)
-                .checked(current.as_deref() == Some(id.as_str()))
-                .on_select(move || controller::switch_machine(Some(id.clone()))),
+            MenuItem::new(m.name.clone())
+                .checked(current.as_ref() == Some(&m.id))
+                .on_select(move || {
+                    navigation().update(|n| n.filter = Some(m.id.clone()));
+                    controller::machines::refresh_summary(m.clone());
+                }),
         );
     }
     items.push(MenuItem::separator());
-    items.push(
-        MenuItem::new(crate::tr("连接另一台机器…"))
-            .on_select(|| controller::open_settings(SettingsPage::Remote)),
-    );
-    items.push(
-        MenuItem::new(crate::tr("刷新机器列表"))
-            .on_select(|| controller::refresh_machines(machine_menu)),
-    );
+    items.push(MenuItem::new(crate::tr("管理机器连接…")).on_select(|| {
+        controller::machines::activate("", || controller::open_settings(SettingsPage::Remote))
+    }));
     drop(popup_menu(items));
 }
 
@@ -492,19 +538,30 @@ fn filter_menu() {
                 controller::ui().update(|u| u.filter.project = None);
             }),
     ];
-    let keys = controller::state().with_untracked(|s| s.project_keys());
-    for key in &keys {
-        let name = project_name(key);
-        let label = if keys.iter().any(|k| k != key && project_name(k) == name) {
-            key.as_str()
-        } else {
-            name
-        };
-        let selected = filter.project.as_ref() == Some(key);
-        let key = key.clone();
-        options.push(MenuItem::new(label).checked(selected).on_select(move || {
-            controller::ui().update(|u| u.filter.project = Some(key.clone()));
-        }));
+    let only = controller::machines::navigation().with_untracked(|n| n.filter.clone());
+    for host in controller::machines::records().get_untracked() {
+        if only.as_ref().is_some_and(|id| id != &host.id) {
+            continue;
+        }
+        let keys = host.session.state.with_untracked(|s| s.project_keys());
+        for path in &keys {
+            let key = scoped_project(&host.id, path);
+            let selected = filter.project.as_ref() == Some(&key);
+            let short = project_name(path);
+            let name = if keys.iter().any(|p| p != path && project_name(p) == short) {
+                path.as_str()
+            } else {
+                short
+            };
+            let label = if host.id.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} · {}", host.name)
+            };
+            options.push(MenuItem::new(label).checked(selected).on_select(move || {
+                controller::ui().update(|u| u.filter.project = Some(key.clone()))
+            }));
+        }
     }
     options.push(MenuItem::separator());
     for status in [
@@ -575,12 +632,13 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
                 }),
             )
             .into_element(),
-        Entry::Project { key, .. } => {
+        Entry::Project { machine, key, .. } => {
             let folded =
                 computed(move || entry.with(|e| matches!(e, Entry::Project { folded: true, .. })));
             let hovered = signal(false);
-            let name = project_name(&key).to_owned();
-            let toggle_key = key.clone();
+            let name = if machine.is_empty() { project_name(&key).to_owned() } else { format!("{} · {}", project_name(&key), controller::machines::by_id(&machine).map(|m| m.name).unwrap_or_default()) };
+            let menu_machine = machine.clone();
+            let toggle_key = scoped_project(&machine, project_section_key(&key));
             let add_key = key.clone();
             let ctx_key = key.clone();
             let glyph = if key.is_empty() {
@@ -608,13 +666,14 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
                 .on_context_menu(move |event: &nsh_core::ContextMenuEvent| {
                     let k = ctx_key.clone();
                     let k_new = k.clone();
+                    let scope = menu_machine.clone();
                     let k_copy = k.clone();
-                    let k_filter = k.clone();
+                    let k_filter = scoped_project(&scope, &k);
                     let filtered_this =
-                        controller::ui().with_untracked(|u| u.filter.project.as_deref() == Some(k.as_str()));
+                        controller::ui().with_untracked(|u| u.filter.project.as_deref() == Some(k_filter.as_str()));
                     let mut items = vec![
                         MenuItem::new("在此项目新建会话")
-                            .on_select(move || controller::new_thread_in_project(k_new.clone())),
+                            .on_select(move || controller::machines::activate(&scope, || controller::new_thread_in_project(k_new.clone()))),
                     ];
                     if !k.is_empty() {
                         items.push(
@@ -646,7 +705,7 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
                         .on_press(move || {
                             controller::ui().update(|u| {
                                 u.filter.project_open.insert(
-                                    project_section_key(&toggle_key).to_owned(),
+                                    toggle_key.clone(),
                                     folded.get_untracked(),
                                 );
                             })
@@ -695,19 +754,20 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
                     move || hovered.get(),
                     move || {
                         let k = add_key.clone();
+                        let scope = machine.clone();
                         view().tooltip(super::tip(crate::tr("在此项目新建会话"))).child(
                             small_icon_button(Icon::Plus, "在此项目新建会话", move || {
-                                controller::new_thread_in_project(k.clone());
+                                controller::machines::activate(&scope, || controller::new_thread_in_project(k.clone()));
                             }),
                         )
                     },
                 ))
                 .into_element()
         }
-        Entry::More(key, _) => nsh_base::button()
+        Entry::More(machine, key, _) => nsh_base::button()
             .on_press(move || {
                 controller::ui().update(|u| {
-                    u.filter.show_all.insert(key.clone());
+                    u.filter.show_all.insert(scoped_project(&machine, &key));
                 })
             })
             .pl(px(28.0))
@@ -715,7 +775,7 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
             .justify_center()
             .child(caption(move || {
                 entry.with(|e| match e {
-                    Entry::More(_, n) => format!("更多 {n}"),
+                    Entry::More(_, _, n) => format!("更多 {n}"),
                     _ => String::new(),
                 })
             }))
@@ -735,21 +795,21 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
         let id = row.id.clone();
         MenuItem::new(label).on_select(move || apply(id.clone()))
     };
+    let navigate = |label: &'static str, apply: fn(String)| {
+        let (scope, id) = (row.machine.clone(), row.id.clone());
+        MenuItem::new(label).on_select(move || controller::machines::activate(&scope, || apply(id.clone())))
+    };
     let mut items = Vec::new();
     // Primary creation / branching actions (restoring full MyGo parity)
     if row.has_completed_run {
         let fork_id = row.id.clone();
-        items.push(
-            MenuItem::new("从当前会话分叉新会话")
-                .on_select(move || controller::fork(fork_id.clone(), None)),
-        );
+        let scope = row.machine.clone();
+        items.push(MenuItem::new("从当前会话分叉新会话").on_select(move || {
+            controller::machines::activate(&scope, || controller::fork(fork_id.clone(), None));
+        }));
     }
     if !row.project_key.is_empty() {
-        let id = row.id.clone();
-        items.push(
-            MenuItem::new("在此项目新建会话")
-                .on_select(move || controller::new_thread_in_thread_project(id.clone())),
-        );
+        items.push(navigate("在此项目新建会话", controller::new_thread_in_thread_project));
     }
     if !items.is_empty() {
         items.push(MenuItem::separator());
@@ -776,22 +836,15 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
         );
     }
     items.push(MenuItem::separator());
-    items.push(action("重命名", controller::begin_rename));
+    items.push(navigate("重命名", controller::begin_rename));
     items.push(action(
         if row.unread { "标为已读" } else { "标为未读" },
         controller::toggle_unread,
     ));
-    if !row.parent_thread_id.is_empty() {
-        let parent_id = row.parent_thread_id.clone();
-        items.push(
-            MenuItem::new("打开父会话")
-                .on_select(move || controller::select_thread(parent_id.clone())),
-        );
-    }
     if !row.project_key.is_empty() {
-        let key = row.project_key.clone();
-        let is_filtered = controller::ui()
-            .with_untracked(|u| u.filter.project.as_deref() == Some(key.as_str()));
+        let key = scoped_project(&row.machine, &row.project_key);
+        let stage = controller::machines::navigation().with_untracked(|n| controller::machines::by_id(&n.active)).map(|m| m.session.ui).unwrap_or_else(controller::ui);
+        let is_filtered = stage.with_untracked(|u| u.filter.project.as_deref() == Some(key.as_str()));
         items.push(
             MenuItem::new(if is_filtered {
                 "取消项目筛选"
@@ -799,7 +852,7 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
                 "按此项目筛选"
             })
             .on_select(move || {
-                controller::ui().update(|u| {
+                stage.update(|u| {
                     u.filter.project = if is_filtered { None } else { Some(key.clone()) };
                 });
             }),
@@ -820,26 +873,23 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
     let raw_id = row.id.clone();
     items.push(MenuItem::new("复制会话 ID").on_select(move || controller::copy(raw_id.clone())));
     if !row.project_key.is_empty() {
-        items.push(action("在终端中打开", controller::open_thread_in_terminal));
+        items.push(navigate("在终端中打开", controller::open_thread_in_terminal));
     }
     items.push(MenuItem::separator());
-    items.push(action("删除会话", controller::ask_delete));
+    items.push(navigate("删除会话", controller::ask_delete));
     items
 }
 
 fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> impl IntoElement {
     let colors = palette();
-    let id = move || row.with_untracked(|r| r.as_ref().map(|r| r.id.clone()).unwrap_or_default());
+    let active_machine = controller::current_machine().unwrap_or_default();
     let is_selected = computed(move || {
         row.with(|r| {
             r.as_ref()
-                .is_some_and(|r| selected.with(|s| s.as_ref() == Some(&r.id)))
+                .is_some_and(|r| r.machine == active_machine && selected.with(|s| s.as_ref() == Some(&r.id)))
         })
     });
     let status = move || row.with(|r| r.as_ref().map_or(ThreadStatus::Idle, |r| r.status));
-    let task = move || row.with(|r| r.as_ref().and_then(|r| r.task_status));
-    let children = move || row.with(|r| r.as_ref().map_or(0, |r| r.children));
-    let collapsed = move || row.with(|r| r.as_ref().is_some_and(|r| r.collapsed));
     let label = move |field: fn(&SidebarRow) -> &str| {
         move || row.with(|r| r.as_ref().map_or("", field).to_owned())
     };
@@ -867,7 +917,7 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
         .flex_shrink_0()
         .flex_row()
         .items_center()
-        .pl(move || px(8.0 + row.with(|r| r.as_ref().map_or(0.0, |r| f32::from(r.depth) * 14.0))))
+        .pl_2()
         .pr_2()
         .rounded(px(8.0))
         .bg(background)
@@ -875,32 +925,9 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
         .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
         .on_context_menu(move |event: &nsh_core::ContextMenuEvent| {
             if let Some(row) = row.get_untracked() {
-                drop(popup_menu_at(thread_menu(&row), event.page_position));
+                controller::machines::run_on(&row.machine, || drop(popup_menu_at(thread_menu(&row), event.page_position)));
             }
         })
-        .child(when(
-            move || children() > 0,
-            move || {
-                nsh_base::button()
-                    .accessibility_label("展开或折叠子任务")
-                    .on_press(move || controller::toggle_collapsed(id()))
-                    .w(px(16.0))
-                    .h(px(36.0))
-                    .items_center()
-                    .justify_center()
-                    .child(dynamic(move || {
-                        icon(
-                            if collapsed() {
-                                Icon::ChevronRight
-                            } else {
-                                Icon::ChevronDown
-                            },
-                            11.0,
-                            colors.faint,
-                        )
-                    }))
-            },
-        ))
         .child(
             nsh_base::button()
                 .flex_1()
@@ -911,7 +938,14 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
                 .accessibility_label(move || {
                     row.with(|r| r.as_ref().map(|r| SharedString::from(r.title.clone())))
                 })
-                .on_press(move || controller::select_thread(id()))
+                .on_press(move || {
+                    if let Some(r) = row.get_untracked() {
+                        controller::machines::activate(&r.machine, || {
+                            controller::select_thread(r.id);
+                            if let Some(child) = r.matched_child { controller::open_child(child); }
+                        });
+                    }
+                })
                 .selected(move || is_selected.get())
                 .child(
                     view()
@@ -954,20 +988,10 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
                         .items_center()
                         .gap_1()
                         .child(when(
-                            move || task().is_some() || status() != ThreadStatus::Idle,
-                            move || {
-                                text(move || {
-                                    task()
-                                        .map(task_badge)
-                                        .unwrap_or_else(|| status_label(status()))
-                                })
+                            move || status() != ThreadStatus::Idle,
+                            move || text(move || status_label(status()))
                                 .text_size(px(11.0))
-                                .text_color(move || {
-                                    task()
-                                        .map(run_status_color)
-                                        .unwrap_or_else(|| status_color(status()))
-                                })
-                            },
+                                .text_color(move || status_color(status())),
                         ))
                         .child(dynamic(move || {
                             icon(detail.with(|d| d.0), 11.0, colors.faint)
@@ -979,10 +1003,6 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
                                 .text_size(px(11.0))
                                 .text_color(colors.faint),
                         )
-                        .child(when(
-                            move || children() > 0 && collapsed(),
-                            move || badge(move || format!("{}", children()), colors.muted),
-                        ))
                         .child(when(
                             move || row.with(|r| r.as_ref().is_some_and(|r| r.pinned)),
                             move || icon(Icon::Pin, 10.5, colors.faint),
@@ -997,26 +1017,23 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
             move || hovered.get(),
             move || {
                 view()
-                    .absolute()
-                    .right_1p5()
-                    .top(px(12.0))
+                    .flex_shrink_0()
                     .flex_row()
                     .items_center()
                     .gap_0p5()
                     .px_0p5()
                     .rounded(px(6.0))
-                    .bg(background)
                     .child(small_icon_button(
                         Icon::Archive,
                         "归档",
-                        move || controller::toggle_archive(id()),
+                        move || { if let Some(r) = row.get_untracked() { controller::machines::run_on(&r.machine, || controller::toggle_archive(r.id)); } },
                     ))
                     .child(small_icon_button(
                         Icon::Ellipsis,
                         "更多",
                         move || {
                             if let Some(row) = row.get_untracked() {
-                                drop(popup_menu(thread_menu(&row)));
+                                controller::machines::run_on(&row.machine, || drop(popup_menu(thread_menu(&row))));
                             }
                         },
                     ))
@@ -1086,7 +1103,7 @@ fn archived_drawer(
                     .max_h(px(160.0))
                     .child(view().flex_col().gap_0p5().px_2p5().pb_2().child(each(
                         move || rows.get(),
-                        |r: &SidebarRow| r.id.clone(),
+                        |r: &SidebarRow| (r.machine.clone(), r.id.clone()),
                         move |row, _| {
                             let memo = computed(move || Some(row.get()));
                             thread_row(memo, selected)

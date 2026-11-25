@@ -391,33 +391,79 @@ pub(crate) fn diff_text(diff: &str) -> impl IntoElement {
 
 fn table_view(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> impl IntoElement {
     let colors = palette();
-    let cell = |inlines: &[Inline], strong: bool| {
-        let t = inline_text(inlines)
-            .text_size(px(13.0))
-            .text_color(colors.ink);
-        view()
-            .flex_1()
-            .min_w(px(80.0))
-            .px_2()
-            .py_1()
-            .child(if strong { t.font_weight(FontWeight::SEMIBOLD) } else { t })
+    let columns = rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .max(header.len());
+    let width = signal(0u32);
+    // Sample enough rows to distinguish short keys from prose without measuring every cell.
+    let weights: Vec<f32> = (0..columns)
+        .map(|col| {
+            std::iter::once(header)
+                .chain(rows.iter().take(32).map(Vec::as_slice))
+                .filter_map(|row| row.get(col))
+                .map(|cell| {
+                    crate::state::markdown::plain(cell)
+                        .chars()
+                        .take(48)
+                        .map(|c| if c.is_ascii() { 1 } else { 2 })
+                        .sum::<usize>()
+                        .clamp(10, 48)
+                })
+                .max()
+                .unwrap_or(10) as f32
+        })
+        .collect();
+    let total = weights.iter().sum::<f32>().max(1.0);
+    let row_view = |cells: &[Vec<Inline>], heading: bool| {
+        let mut row = view().flex_row().items_start();
+        if heading {
+            row = row.bg(colors.soft);
+        } else {
+            row = row.border_t_1().border_t_color(colors.line_soft);
+        }
+        for (i, weight) in weights.iter().enumerate() {
+            let share = weight / total;
+            let value = cells.get(i).map(Vec::as_slice).unwrap_or_default();
+            let label = inline_text(value)
+                .select_text()
+                .w_full()
+                .text_color(colors.ink)
+                .text_size(px(if heading { 12.5 } else { 14.0 }))
+                .line_height(LineHeight::Multiple(1.5));
+            row = row.child(
+                view()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .w(move || {
+                        px(76.0
+                            + (width.get() as f32 - 2.0 - 76.0 * columns as f32).max(0.0) * share)
+                    })
+                    .child(if heading {
+                        label.font_weight(FontWeight::SEMIBOLD)
+                    } else {
+                        label
+                    }),
+            );
+        }
+        row
     };
     let mut grid = view()
         .flex_col()
         .rounded(px(8.0))
         .border_1()
-        .border_color(colors.line);
-    let mut head = view().flex_row().bg(colors.soft);
-    for h in header {
-        head = head.child(cell(h, true));
-    }
-    grid = grid.child(head);
+        .border_color(colors.line)
+        .child(row_view(header, true));
     for row in rows {
-        let mut line = view().flex_row().border_t_1().border_t_color(colors.line_soft);
-        for c in row {
-            line = line.child(cell(c, false));
-        }
-        grid = grid.child(line);
+        grid = grid.child(row_view(row, false));
     }
-    scroll().horizontal().child(grid)
+    scroll()
+        .horizontal()
+        .w_full()
+        .min_w_0()
+        .on_layout(move |b: &Bounds<Points>| width.set(b.size.width.0.floor() as u32))
+        .child(grid)
 }

@@ -71,14 +71,19 @@ pub fn App() -> impl IntoElement {
     let mut attrs = WindowAttributes::default();
     attrs.title_bar = Some(title_bar);
     current_window().set(attrs);
-    controller::start(&launch_config());
-    let preset = computed(|| controller::ui().with(|u| (u.theme_preset,u.locale)));
+    controller::machines::init(launch_config());
+    let active = computed(|| controller::machines::navigation().with(|n| n.active.clone()));
     dynamic(move || {
-        let (preset,locale) = preset.get();
-        untracked(|| {
-            provide_context(locale);
-            theme::install_preset(preset);
-            workbench()
+        let machine = controller::machines::by_id(&active.get()).expect("active machine");
+        provide_context(machine.session);
+        let preset = computed(|| controller::ui().with(|u| (u.theme_preset, u.locale)));
+        dynamic(move || {
+            let (preset, locale) = preset.get();
+            untracked(|| {
+                provide_context(locale);
+                theme::install_preset(preset);
+                workbench()
+            })
         })
     })
 }
@@ -120,7 +125,7 @@ fn workbench() -> impl IntoElement {
         controller::open_settings(state::ui::SettingsPage::General)
     });
     on_key("mod+k", |_| controller::focus_search());
-    on_key("mod+n", |_| controller::new_thread());
+    on_key("mod+n", |_| controller::machines::new_draft());
     view()
         .flex_1()
         .flex_row()

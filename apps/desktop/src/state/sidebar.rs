@@ -1,6 +1,5 @@
 //! The sidebar's sections: search and status filters, the pinned / active /
-//! snoozed / archived groups, and delegated subtasks nested under their
-//! parent with their task's status.
+//! snoozed / archived groups. Delegated work contributes to its parent’s activity and search results.
 //!
 //! Computed in one pass over runs, requests and tasks (not per thread), so
 //! hundreds of threads cost little; the view recomputes them only when
@@ -66,13 +65,45 @@ pub struct SidebarFilter {
     pub status: StatusFilter,
     /// Whether the archived group is open.
     pub show_archived: bool,
-    /// Parents whose subtasks are folded.
+    /// Legacy fold state retained for desktop-state compatibility.
     pub collapsed: BTreeSet<String>,
     /// Explicit project header choices, shared with v0.1.42's sections.cat:<path>.
     pub project_open: BTreeMap<String, bool>,
     /// Projects showing more than the initial five families, for this window.
     pub show_all: BTreeSet<String>,
     pub project: Option<String>,
+}
+
+/// A project filter or fold key. Existing local preferences keep their path keys.
+pub fn scoped_project(machine: &str, path: &str) -> String {
+    if machine.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{machine}\x1f{path}")
+    }
+}
+
+impl SidebarFilter {
+    pub fn for_machine(&self, machine: &str) -> Option<Self> {
+        let local_key = |key: &str| {
+            let (owner, path) = key.split_once('\x1f').unwrap_or(("", key));
+            (owner == machine).then(|| path.to_owned())
+        };
+        let project = match &self.project {
+            Some(key) => Some(local_key(key)?),
+            None => None,
+        };
+        Some(Self {
+            project,
+            project_open: self
+                .project_open
+                .iter()
+                .filter_map(|(k, v)| Some((local_key(k)?, *v)))
+                .collect(),
+            show_all: self.show_all.iter().filter_map(|k| local_key(k)).collect(),
+            ..self.clone()
+        })
+    }
 }
 
 /// A sidebar group.
@@ -99,19 +130,15 @@ impl Group {
     }
 }
 
-/// One row: a thread, or a subtask under its parent.
+/// A root conversation in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
+    pub machine: String,
+    pub latest: Option<DateTime<Utc>>,
     pub id: String,
     pub title: String,
     pub status: ThreadStatus,
-    /// 0 for a top-level thread, 1+ for subtasks.
-    pub depth: u8,
-    /// Its subtasks (shown or folded).
-    pub children: usize,
-    pub collapsed: bool,
-    /// A subtask's task status (the badge).
-    pub task_status: Option<RunStatus>,
+    pub matched_child: Option<String>,
     pub pinned: bool,
     pub archived: bool,
     pub snoozed: bool,
@@ -125,8 +152,6 @@ pub struct SidebarRow {
     pub workspace_name: String,
     /// Full project directory key for copy-path / filter / new-thread-in-project.
     pub project_key: String,
-    /// Parent thread ID if this row is a delegated subtask.
-    pub parent_thread_id: String,
     pub unread: bool,
     pub has_completed_run: bool,
 }
@@ -134,6 +159,7 @@ pub struct SidebarRow {
 /// A group and its rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarSection {
+    pub latest: Option<DateTime<Utc>>,
     pub group: Group,
     /// The full project key. An empty key means an unassigned conversation.
     pub project: Option<String>,
@@ -300,18 +326,22 @@ pub struct InboxItem {
     at: Option<DateTime<Utc>>,
 }
 
-fn subtree_any(
-    t: &Thread,
-    children: &HashMap<&str, Vec<&Thread>>,
+fn subtree_match<'a>(
+    thread: &'a Thread,
+    children: &HashMap<&str, Vec<&'a Thread>>,
     matches: &dyn Fn(&Thread) -> bool,
     depth: u8,
-) -> bool {
-    matches(t)
-        || (depth < 8
-            && children.get(t.id.as_str()).is_some_and(|list| {
-                list.iter()
-                    .any(|child| subtree_any(child, children, matches, depth + 1))
-            }))
+) -> Option<&'a Thread> {
+    if matches(thread) {
+        return Some(thread);
+    }
+    if depth >= 8 {
+        return None;
+    }
+    children
+        .get(thread.id.as_str())?
+        .iter()
+        .find_map(|child| subtree_match(child, children, matches, depth + 1))
 }
 
 fn family_activity(
@@ -335,12 +365,10 @@ fn family_activity(
 
 struct SidebarTree<'a> {
     children: HashMap<&'a str, Vec<&'a Thread>>,
-    task_status: HashMap<&'a str, RunStatus>,
     statuses: HashMap<&'a str, ThreadStatus>,
     activity: HashMap<&'a str, Option<DateTime<Utc>>>,
     unread: &'a BTreeSet<String>,
     has_terminal_run: HashMap<&'a str, bool>,
-    filter: &'a SidebarFilter,
     now: DateTime<Utc>,
 }
 
@@ -349,32 +377,14 @@ impl SidebarTree<'_> {
         self.statuses.get(id).copied().unwrap_or(ThreadStatus::Idle)
     }
 
-    fn append_family(
-        &self,
-        rows: &mut Vec<SidebarRow>,
-        thread: &Thread,
-        depth: u8,
-        latest: Option<DateTime<Utc>>,
-        show_project: bool,
-        only: Option<&dyn Fn(&Thread) -> bool>,
-    ) {
-        let kids = self
-            .children
-            .get(thread.id.as_str())
-            .map_or(&[][..], Vec::as_slice);
-        let collapsed = self.filter.collapsed.contains(&thread.id) && only.is_none();
-        rows.push(SidebarRow {
+    fn row(&self, thread: &Thread, latest: Option<DateTime<Utc>>, show_project: bool, matched_child: Option<String>) -> SidebarRow {
+        SidebarRow {
+            machine: String::new(),
+            latest,
             id: thread.id.clone(),
             title: display_title(thread),
             status: self.status(&thread.id),
-            depth,
-            children: kids.len(),
-            collapsed,
-            task_status: if depth > 0 {
-                self.task_status.get(thread.id.as_str()).copied()
-            } else {
-                None
-            },
+            matched_child,
             pinned: thread.pinned,
             archived: thread.archived,
             snoozed: is_snoozed(thread.snoozed_until.as_deref(), self.now),
@@ -397,31 +407,12 @@ impl SidebarTree<'_> {
                 String::new()
             },
             project_key: thread_project(thread),
-            parent_thread_id: thread.parent_thread_id.clone(),
             unread: self.unread.contains(&thread.id),
             has_completed_run: self
                 .has_terminal_run
                 .get(thread.id.as_str())
                 .copied()
                 .unwrap_or(false),
-        });
-        if collapsed || depth >= 8 {
-            return;
-        }
-        for child in kids {
-            if let Some(only) = only
-                && !subtree_any(child, &self.children, only, depth + 1)
-            {
-                continue;
-            }
-            self.append_family(
-                rows,
-                child,
-                depth + 1,
-                self.activity.get(child.id.as_str()).copied().flatten(),
-                show_project,
-                only,
-            );
         }
     }
 }
@@ -555,11 +546,6 @@ impl AppState {
         for list in children.values_mut() {
             list.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         }
-        let task_status: HashMap<&str, RunStatus> = self
-            .tasks
-            .iter()
-            .map(|t| (t.child_thread_id.as_str(), t.status))
-            .collect();
         let query = filter.query.trim().to_lowercase();
         let filtering = !query.is_empty() || filter.status != StatusFilter::All;
         let mut activity: HashMap<_, _> = self
@@ -599,12 +585,10 @@ impl AppState {
         }
         let tree = SidebarTree {
             children,
-            task_status,
             statuses,
             activity,
             unread: &self.unread,
             has_terminal_run,
-            filter,
             now,
         };
         let matches_filter = |t: &Thread, by_project: bool| {
@@ -616,7 +600,7 @@ impl AppState {
         for top in self
             .threads
             .iter()
-            .filter(|t| t.parent_thread_id.is_empty() || !ids.contains(t.parent_thread_id.as_str()))
+            .filter(|t| t.parent_thread_id.is_empty())
         {
             let key = thread_project(top);
             if filter
@@ -630,26 +614,17 @@ impl AppState {
                 && (key.to_lowercase().contains(&query)
                     || project_name(&key).to_lowercase().contains(&query));
             let matches = |t: &Thread| matches_filter(t, by_project);
-            if filtering && !subtree_any(top, &tree.children, &matches, 0) {
-                continue;
-            }
+            let matched_child = if filtering {
+                let Some(hit) = subtree_match(top, &tree.children, &matches, 0) else { continue };
+                (!query.is_empty() && hit.id != top.id).then(|| hit.id.clone())
+            } else { None };
             let group = if top.archived {
                 Group::Archived
             } else if is_snoozed(top.snoozed_until.as_deref(), now) {
                 Group::Snoozed
-            } else if subtree_any(
-                top,
-                &tree.children,
-                &|t| tree.status(&t.id) == ThreadStatus::NeedsApproval,
-                0,
-            ) {
+            } else if subtree_match(top, &tree.children, &|t| tree.status(&t.id) == ThreadStatus::NeedsApproval, 0).is_some() {
                 Group::Attention
-            } else if subtree_any(
-                top,
-                &tree.children,
-                &|t| tree.status(&t.id) == ThreadStatus::Running,
-                0,
-            ) {
+            } else if subtree_match(top, &tree.children, &|t| tree.status(&t.id) == ThreadStatus::Running, 0).is_some() {
                 Group::Running
             } else if self.unread.contains(&top.id)
                 || (top.unread_sequence.is_none() && tree.status(&top.id) == ThreadStatus::Failed)
@@ -664,7 +639,7 @@ impl AppState {
                 top,
                 group,
                 key,
-                by_project,
+                matched_child,
                 family_activity(top, &tree.children, &tree.activity, 0),
             ));
         }
@@ -672,7 +647,7 @@ impl AppState {
         families.sort_by(|a, b| b.4.cmp(&a.4).then(a.2.cmp(&b.2)).then(a.0.id.cmp(&b.0.id)));
         let mut indices = HashMap::new();
         let mut sections = Vec::<SidebarSection>::new();
-        for (top, group, key, by_project, latest) in families {
+        for (top, group, key, matched_child, latest) in families {
             let project = (group == Group::Active).then_some(key);
             let index = *indices.entry((group, project.clone())).or_insert_with(|| {
                 let folded = !filtering
@@ -683,6 +658,7 @@ impl AppState {
                         None => group == Group::Archived && !filter.show_archived,
                     };
                 sections.push(SidebarSection {
+                    latest,
                     group,
                     project,
                     rows: Vec::new(),
@@ -707,36 +683,21 @@ impl AppState {
                 section.hidden += 1;
                 continue;
             }
-            let matches = |t: &Thread| matches_filter(t, by_project);
-            tree.append_family(
-                &mut section.rows,
-                top,
-                0,
-                latest,
-                group != Group::Active,
-                filtering.then_some(&matches as &dyn Fn(&Thread) -> bool),
-            );
+            section.rows.push(tree.row(top, latest, group != Group::Active, matched_child));
         }
         sections.sort_by_key(|s| (s.group, s.project.as_deref() == Some("")));
         sections
     }
 
-    /// Subtasks of thread `id` with their task status (the header's
-    /// orchestration capsule).
+    /// Child threads and their Core task status, including summary-only threads.
     pub fn subtasks(&self, id: &str) -> Vec<(String, String, RunStatus)> {
-        let mut out: Vec<(String, String, RunStatus)> = self
-            .tasks
-            .iter()
-            .filter(|t| t.parent_thread_id == id)
-            .map(|t| {
-                let title = self
-                    .thread(&t.child_thread_id)
-                    .map(display_title)
-                    .unwrap_or_else(|| t.title.clone());
-                (t.child_thread_id.clone(), title, t.status)
-            })
-            .collect();
-        out.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut children: HashMap<_, _> = self.threads.iter().filter(|t| t.parent_thread_id == id)
+            .map(|t| (t.id.as_str(), (display_title(t), RunStatus::Unspecified))).collect();
+        for task in self.tasks.iter().filter(|t| t.parent_thread_id == id && !t.child_thread_id.is_empty()) {
+            children.entry(task.child_thread_id.as_str()).or_insert_with(|| (task.title.clone(), task.status)).1 = task.status;
+        }
+        let mut out: Vec<_> = children.into_iter().map(|(id, (title, status))| (id.to_owned(), title, status)).collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
         out
     }
 }

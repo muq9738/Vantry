@@ -38,19 +38,23 @@ const LIVE_AFTER: Duration = Duration::from_millis(300);
 /// Changes are saved this long after the last one.
 const SAVE_AFTER: Duration = Duration::from_millis(600);
 
+pub(crate) mod machines;
+
+fn session() -> Option<machines::Session> { use_context() }
+
 /// The conversation.
 pub(crate) fn state() -> Signal<AppState> {
-    global::<AppState>()
+    session().map(|c| c.state).unwrap_or_else(global::<AppState>)
 }
 
 /// The window.
 pub(crate) fn ui() -> Signal<UiState> {
-    global::<UiState>()
+    session().map(|c| c.ui).unwrap_or_else(global::<UiState>)
 }
 
 /// The dock.
 pub(crate) fn bench() -> Signal<WorkbenchState> {
-    global::<WorkbenchState>()
+    session().map(|c| c.bench).unwrap_or_else(global::<WorkbenchState>)
 }
 
 /// The bridges and where state is saved, once [`start`] made them.
@@ -72,7 +76,7 @@ impl PartialEq for Bridges {
 }
 
 fn bridges<R>(f: impl FnOnce(&Bridges) -> R) -> R {
-    global::<Bridges>().with_untracked(f)
+    session().map(|c| c.bridges).unwrap_or_else(global::<Bridges>).with_untracked(f)
 }
 
 /// Runs a job for the lifetime of the window. The initiating menu or reactive
@@ -160,7 +164,7 @@ pub(crate) fn start(config: &LaunchConfig) {
         }
     };
     let state_path = config.state_path();
-    global::<Bridges>().set(Bridges {
+    session().map(|c| c.bridges).unwrap_or_else(global::<Bridges>).set(Bridges {
         owner: Some(Owner::current()),
         core: Some(core.clone()),
         workbench: Some(workbench.clone()),
@@ -174,7 +178,7 @@ pub(crate) fn start(config: &LaunchConfig) {
     });
 
     let saved = state_path.as_deref().map(persist::load);
-    let label = core.label();
+    let label = current_machine().and_then(|id| machines::by_id(&id)).map_or_else(|| core.label(), |m| m.name);
     let workspace = config.workspace_label();
     let demo_root = mock.then(|| workbench.root());
     let remote_target = config.endpoint.is_remote().then(|| label.clone());
@@ -230,7 +234,9 @@ pub(crate) fn start(config: &LaunchConfig) {
     });
 
     // The theme follows the preference.
-    effect(|| {
+    let scope = current_machine().unwrap_or_default();
+    effect(move || {
+        if machines::navigation().with(|n| n.active != scope) { return; }
         let theme = ui().with(|u| u.theme);
         set_color_scheme(match theme {
             ThemePreference::System => Appearance::System,
@@ -284,28 +290,22 @@ async fn boot_then_connect(
 
 // ---------------------------------------------------------------- persistence
 
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq)]
 struct SaveSlot {
     last: Option<persist::DesktopStateFile>,
     generation: u64,
 }
 
-thread_local! {
-    static SAVES: RefCell<SaveSlot> = RefCell::new(SaveSlot::default());
-}
 
 /// Saves `file` after [`SAVE_AFTER`] unless a newer one replaces it.
 fn schedule_save(file: persist::DesktopStateFile) {
-    let generation = SAVES.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.last.as_ref() == Some(&file) {
-            return None;
-        }
-        // The first capture is what was restored: nothing to write.
-        let first = slot.last.is_none();
-        slot.last = Some(file.clone());
-        slot.generation += 1;
-        (!first).then_some(slot.generation)
+    let slot = session().map(|s| s.saves).unwrap_or_else(global::<SaveSlot>);
+    let mut generation = None;
+    slot.update(|s| {
+        if s.last.as_ref() == Some(&file) { return; }
+        s.generation = s.generation.wrapping_add(1);
+        if s.last.is_some() { generation = Some(s.generation); }
+        s.last = Some(file.clone());
     });
     let Some(generation) = generation else {
         return;
@@ -315,7 +315,7 @@ fn schedule_save(file: persist::DesktopStateFile) {
     };
     spawn_for_window(async move {
         timer(SAVE_AFTER).await;
-        let current = SAVES.with(|slot| slot.borrow().generation);
+        let current = slot.with_untracked(|s| s.generation);
         if current != generation {
             return;
         }
@@ -463,7 +463,7 @@ fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<CoreEvent>) {
 }
 
 fn acknowledge_visible_completion(events: &[CoreEvent]) {
-    if !ui().with_untracked(|u| u.view == MainView::Conversation) { return; }
+    if machines::navigation().with_untracked(|n| Some(&n.active).filter(|id| !id.is_empty()).cloned() != current_machine()) || !ui().with_untracked(|u| u.view == MainView::Conversation) { return; }
     let selected = state().with_untracked(|s| {
         let thread = s.selected_thread()?;
         let seq = thread.unread_sequence?;
@@ -574,41 +574,77 @@ pub(crate) fn open_link(url: String) {
     if let Some(rest) = trimmed.strip_prefix("vantry-thread://") {
         let thread_id = rest.split(['?', '#']).next().unwrap_or("").trim();
         let environment = rest.split_once('?').and_then(|(_, query)| {
-            query.split('&').find_map(|p| p.strip_prefix("environmentId="))
+            query
+                .split('&')
+                .find_map(|p| p.strip_prefix("environmentId="))
         });
-        if let Some(env) = environment.filter(|v| !v.is_empty())
-            && !bridges(|b| match &b.peer_id {
-                Some(peer) => peer == env,
-                None => env == "local" || b.core_socket.as_deref().and_then(|p| p.parent())
-                    .and_then(|p| std::fs::read_to_string(p.join("environment-id")).ok())
-                    .is_some_and(|id| id.trim() == env),
-            })
-        {
-            warn("请在链接所属的机器中打开会话。");
-        } else if state().with_untracked(|s| s.thread(thread_id).is_some()) {
-            select_thread(thread_id.to_owned());
-        } else {
-            warn("找不到链接中的会话。");
-        }
-        return;
-    }
-    if let Some(rest) = trimmed.strip_prefix("file://") {
-        let path_part = rest.split('#').next().unwrap_or(rest);
-        let root = bench().with_untracked(|b| b.root.clone());
-        if !root.is_empty()
-            && let Ok(rel) = std::path::Path::new(path_part).strip_prefix(&root)
-        {
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            if !rel_str.is_empty() {
-                open_search_hit(rel_str);
+        let scope = match environment.filter(|v| !v.is_empty()) {
+            Some(env) if machines::by_id(env).is_some() => env.to_owned(),
+            Some("local") => String::new(),
+            Some(env)
+                if std::fs::read_to_string(
+                    crate::launch_config().data_dir.join("environment-id"),
+                )
+                .is_ok_and(|local| local.trim() == env) =>
+            {
+                String::new()
+            }
+            Some(_) => {
+                warn("会话所属主机尚未配对。");
                 return;
             }
-        }
-        open_external_target(path_part.to_owned());
+            None => current_machine().unwrap_or_default(),
+        };
+        machines::activate(&scope, || {
+            if state().with_untracked(|s| s.thread(thread_id).is_some()) {
+                select_thread(thread_id.to_owned());
+            } else {
+                warn("找不到链接中的会话。");
+            }
+        });
         return;
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        open_external_target(trimmed.to_owned());
+        drop(nsh_core::element::open_url(trimmed));
+        return;
+    }
+    let file = if trimmed.starts_with("file://") {
+        url::Url::parse(trimmed)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+    } else if std::path::Path::new(trimmed).is_absolute() {
+        Some(PathBuf::from(trimmed))
+    } else {
+        None
+    };
+    if let Some(file) = file {
+        let path = file.to_string_lossy();
+        let path = path
+            .rsplit_once(':')
+            .filter(|(_, line)| line.parse::<u32>().is_ok())
+            .map_or(path.as_ref(), |(p, _)| p);
+        let root = bench().with_untracked(|b| b.root.clone());
+        let label = std::path::Path::new(path);
+        if !remote_project()
+            && label.extension().and_then(|s| s.to_str()).is_some_and(|s| {
+                matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "png" | "jpeg" | "jpg" | "webp" | "gif"
+                )
+            })
+        {
+            drop(nsh_core::element::open_path(label));
+        } else if !root.is_empty()
+            && let Ok(relative) = label.strip_prefix(root)
+            && !relative.as_os_str().is_empty()
+        {
+            select_dock_tab(DockTab::Files);
+            open_search_hit(relative.to_string_lossy().replace('\\', "/"));
+        } else if !remote_project() {
+            drop(nsh_core::element::open_path(path));
+        } else {
+            warn("文件位于远端工作区之外。");
+        }
     }
 }
 
@@ -633,21 +669,8 @@ pub(crate) fn open_offline_artifact(kind: String, title: String, source: String)
         uuid::Uuid::new_v4().simple()
     ));
     if std::fs::write(&path, doc.as_bytes()).is_ok() {
-        open_external_target(path.display().to_string());
+        drop(nsh_core::element::open_path(path));
     }
-}
-
-fn open_external_target(target: String) {
-    std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("open").arg(&target).status();
-        #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("xdg-open").arg(&target).status();
-        #[cfg(target_os = "windows")]
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &target])
-            .status();
-    });
 }
 
 pub(crate) fn stop() {
@@ -678,6 +701,7 @@ pub(crate) fn open_child(child: String) {
         return;
     };
     ui().update(|u| {
+        u.expanded_task_parent = Some(parent.clone());
         u.child_panel = Some((parent, child));
         u.dock_open = true;
         u.dock_maximized = false;
@@ -902,24 +926,21 @@ pub(crate) fn paste_draft_text(text: &str, caret: u32) -> u32 {
     next
 }
 
-thread_local! {
-    /// The composer's last caret: its draft and the UTF-16 offset in the
-    /// body. Pasted and picked files put their `@` reference there.
-    static COMPOSER_CARET: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
+fn caret_position() -> Signal<Option<(String, u32)>> {
+    session().map(|s| s.position).unwrap_or_else(global::<Option<(String, u32)>>)
 }
 
 /// The composer reports where its caret is (a selection's end).
 pub(crate) fn note_composer_caret(caret: u32) {
     let key = state().with_untracked(|s| s.draft_key());
-    COMPOSER_CARET.with(|c| *c.borrow_mut() = Some((key, caret)));
+    caret_position().set(Some((key, caret)));
 }
 
 /// Where draft `key`'s next reference goes: the caret if the composer
 /// reported one for it.
 fn composer_caret(key: &str) -> Option<u32> {
-    COMPOSER_CARET.with(|c| {
-        c.borrow()
-            .as_ref()
+    caret_position().with_untracked(|c| {
+        c.as_ref()
             .filter(|(k, _)| k == key)
             .map(|(_, caret)| *caret)
     })
@@ -935,11 +956,11 @@ pub(crate) struct CaretRequest {
 }
 
 pub(crate) fn caret_request() -> Signal<CaretRequest> {
-    global::<CaretRequest>()
+    session().map(|c| c.caret).unwrap_or_else(global::<CaretRequest>)
 }
 
 fn move_composer_caret(key: &str, caret: u32) {
-    COMPOSER_CARET.with(|c| *c.borrow_mut() = Some((key.to_owned(), caret)));
+    caret_position().set(Some((key.to_owned(), caret)));
     let request = caret_request();
     let nonce = request.get_untracked().nonce.wrapping_add(1);
     request.set(CaretRequest {
@@ -986,22 +1007,21 @@ pub(crate) fn reopen_request(id: String) {
 pub(crate) fn copy_thread_link(id: String) {
     let title = state().with_untracked(|s| s.thread(&id).map(crate::state::sidebar::display_title));
     let Some(title) = title else { return };
+    let scope = current_machine().or_else(|| std::fs::read_to_string(crate::launch_config().data_dir.join("environment-id")).ok());
     let mut url = format!("{}{id}", vantry_protocol::THREAD_SCHEME);
-    if let Some(peer) = bridges(|b| b.peer_id.clone()) {
-        url.push_str(&format!("?environmentId={peer}"));
-    }
+    if let Some(scope) = scope.filter(|s| !s.trim().is_empty()) { url.push_str(&format!("?environmentId={}", scope.trim())); }
     let escape = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
     let mut item = ClipboardItem::default();
     item.text = vantry_protocol::thread_markdown(&title, &url);
     item.html = Some(format!("<a href=\"{}\">{}</a>", escape(&url), escape(&title)));
-    set_clipboard_item(item);
+    drop(set_clipboard_item(item));
 }
 
 /// Copies `text` to the clipboard and says so.
 pub(crate) fn copy(text: String) {
-    set_clipboard(text);
+    drop(set_clipboard(text));
     state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制。")));
 }
 
@@ -1105,7 +1125,7 @@ pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attac
             .collect()
     });
     if !text.trim().is_empty() {
-        set_clipboard(text.clone());
+        drop(set_clipboard(text.clone()));
     }
     state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制消息与图片。")));
     spawn_for_window(async move {
@@ -1164,7 +1184,7 @@ pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attac
             let mut clip = ClipboardItem::default();
             clip.text = text;
             clip.html = Some(html);
-            set_clipboard_item(clip);
+            drop(set_clipboard_item(clip));
         }
     });
 }
@@ -1563,7 +1583,8 @@ pub(crate) async fn attachment_preview(
     if !item.mime.starts_with("image/") || !(1..=(8 << 20)).contains(&item.size) {
         return None;
     }
-    if let Some(src) = PREVIEWS.with(|p| p.borrow().0.get(&item.id).cloned()) {
+    let key = format!("{}\x1f{}", current_machine().unwrap_or_default(), item.id);
+    if let Some(src) = PREVIEWS.with(|p| p.borrow().0.get(&key).cloned()) {
         return Some(src);
     }
     let src = read_attachment_preview(&item, source).await?;
@@ -1574,7 +1595,7 @@ pub(crate) async fn attachment_preview(
             *bytes = 0;
         }
         *bytes += src.len();
-        if let Some(old) = map.insert(item.id.clone(), src.clone()) {
+        if let Some(old) = map.insert(key, src.clone()) {
             *bytes -= old.len();
         }
     });
@@ -1603,118 +1624,7 @@ pub(crate) fn remove_attachment(id: String) {
     state().update(move |s| s.remove_attachment(&id));
 }
 
-// --------------------------------------------------------------- machines
-
-/// The machines this window can work on: this one and the paired ones the
-/// Core reaches (`remote.status`), refreshed as the machine menu opens.
-pub(crate) fn machines() -> Signal<Vec<crate::bridge::workbench::actions::RemotePeer>> {
-    global::<Vec<crate::bridge::workbench::actions::RemotePeer>>()
-}
-
-/// The paired machine this window shows, when not this one.
-pub(crate) fn current_machine() -> Option<String> {
-    bridges(|b| b.peer_id.clone())
-}
-
-/// What the machine menu names the window's machine.
-pub(crate) fn machine_label() -> String {
-    match current_machine() {
-        None => crate::tr("本机").to_owned(),
-        Some(id) => machines().with(|list| {
-            list.iter()
-                .find(|p| p.id == id && !p.name.is_empty())
-                .map_or_else(|| id.clone(), |p| p.name.clone())
-        }),
-    }
-}
-
-/// Reads the paired machines, then runs `then` (the menu).
-pub(crate) fn refresh_machines(then: impl FnOnce() + 'static) {
-    let Some(workbench) = workbench() else {
-        then();
-        return;
-    };
-    spawn_for_window(async move {
-        let request = actions::request(names::REMOTE_STATUS);
-        if let Ok(response) = call(workbench.workbench(request)).await
-            && let Ok(status) = crate::bridge::workbench::actions::RemoteStatus::read(&response)
-        {
-            // A paired machine's window lists that machine's own peers:
-            // keep the ones it names, with this window's machine.
-            let mut peers = status.peers().to_vec();
-            if let Some(id) = current_machine()
-                && !peers.iter().any(|p| p.id == id)
-            {
-                let known = machines().with_untracked(|list| list.iter().find(|p| p.id == id).cloned());
-                peers.insert(0, known.unwrap_or(crate::bridge::workbench::actions::RemotePeer {
-                    id,
-                    ..Default::default()
-                }));
-            }
-            machines().set(peers);
-        }
-        then();
-    });
-}
-
-/// Saves what lasts now (the window is about to close).
-fn save_desktop_state_now() {
-    let Some(path) = bridges(|b| b.state_path.clone()) else {
-        return;
-    };
-    let file = state().with_untracked(|s| ui().with_untracked(|u| persist::capture(s, u)));
-    if let Err(error) = persist::save_atomic(&path, &file) {
-        eprintln!("vantry: desktop-state.json: {error}");
-    }
-}
-
-/// Opens Vantry again with `args` (the app bundle on macOS, so it is a
-/// proper app with its own window).
-fn launch_app(args: &[String]) -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
-    #[cfg(target_os = "macos")]
-    if let Some(bundle) = exe
-        .ancestors()
-        .find(|p| p.extension().is_some_and(|e| e == "app"))
-    {
-        std::process::Command::new("/usr/bin/open")
-            .arg("-n")
-            .arg(bundle)
-            .arg("--args")
-            .args(args)
-            .spawn()?;
-        return Ok(());
-    }
-    std::process::Command::new(exe).args(args).spawn().map(|_| ())
-}
-
-/// Moves the window to machine `peer` (`None`: this machine): the window
-/// opens again on that machine's Core, which keeps its own threads, drafts
-/// and state; this machine's Core and its runs go on as they were.
-pub(crate) fn switch_machine(peer: Option<String>) {
-    if current_machine() == peer {
-        return;
-    }
-    let config = crate::launch_config();
-    let mut args = Vec::new();
-    let default_dir = crate::cli::default_data_dir(&|name| {
-        std::env::var(name).ok().filter(|v| !v.is_empty())
-    })
-    .ok();
-    if default_dir.as_deref() != Some(config.data_dir.as_path()) {
-        args.push("--data-dir".to_owned());
-        args.push(config.data_dir.display().to_string());
-    }
-    if let Some(id) = &peer {
-        args.push("--peer".to_owned());
-        args.push(id.clone());
-    }
-    save_desktop_state_now();
-    match launch_app(&args) {
-        Ok(()) => nsh_core::element::desktop::quit(),
-        Err(error) => warn(format!("无法切换机器：{error}")),
-    }
-}
+pub(crate) fn current_machine() -> Option<String> { bridges(|b| b.peer_id.clone()) }
 
 // --------------------------------------------------------------------- ui
 
@@ -1799,10 +1709,6 @@ pub(crate) fn toggle_archived_group() {
     ui().update(|u| u.filter.show_archived = !u.filter.show_archived);
 }
 
-pub(crate) fn toggle_collapsed(id: String) {
-    ui().update(move |u| u.toggle_collapsed(&id));
-}
-
 pub(crate) fn open_settings(page: SettingsPage) {
     let mut load = false;
     ui().update(|u| load = u.open_settings(page));
@@ -1838,6 +1744,10 @@ fn load_catalogs(already_marked: bool) {
     let workspace = bench().with_untracked(|b| b.root.clone());
     spawn_for_window(async move {
         let result = call(workbench.settings(workspace)).await.map_err(|e| e.message);
+        if current_machine().is_none() && !bridges(|b| b.mock)
+            && let Ok(data) = &result && let Some(remote) = &data.remote && remote.error.is_empty() {
+            machines::sync(remote.peers());
+        }
         ui().update(move |u| u.on_catalogs(result));
     });
 }
@@ -2409,7 +2319,7 @@ pub(crate) fn select_dock_tab(tab: DockTab) {
 
 fn show_tab(tab: DockTab) {
     ui().update(|u| u.child_panel = None);
-    if matches!(tab, DockTab::Plugins | DockTab::Mcp) { load_settings_catalogs(); }
+    if matches!(tab, DockTab::Summary | DockTab::Plugins | DockTab::Mcp) { load_settings_catalogs(); }
     if matches!(tab, DockTab::Git | DockTab::Files) && bench().with_untracked(|b| b.root.is_empty())
     {
         return;

@@ -246,7 +246,7 @@ fn highlight_attachment_mentions(
         let mut rest = text.as_str();
         while let Some((at, (needle, display, url))) = pairs
             .iter()
-            .filter_map(|p| rest.find(&p.0).map(|pos| (pos, p)))
+            .filter_map(|p| crate::state::draft::mention_at(rest, &p.0).map(|pos| (pos, p)))
             .min_by_key(|(pos, _)| *pos)
         {
             if at > 0 {

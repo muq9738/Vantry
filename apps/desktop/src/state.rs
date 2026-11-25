@@ -572,7 +572,7 @@ impl AppState {
 
     /// Threads not archived, pinned first, newest first.
     pub fn visible_threads(&self) -> Vec<&Thread> {
-        let mut threads: Vec<&Thread> = self.threads.iter().filter(|t| !t.archived).collect();
+        let mut threads: Vec<&Thread> = self.threads.iter().filter(|t| !t.archived && t.parent_thread_id.is_empty()).collect();
         threads.sort_by(|a, b| {
             b.pinned
                 .cmp(&a.pinned)

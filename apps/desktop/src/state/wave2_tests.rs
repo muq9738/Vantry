@@ -482,7 +482,24 @@ fn promoting_needs_a_running_run_and_cancel_is_per_input() {
 // ------------------------------------------------------------------ sidebar
 
 #[test]
-fn the_sidebar_groups_nests_subtasks_and_filters() {
+fn same_project_path_on_two_machines_has_independent_sidebar_preferences() {
+    use super::sidebar::scoped_project;
+    let mut filter = SidebarFilter::default();
+    let peer_key = scoped_project("peer", "/repo");
+    filter.project_open.insert(peer_key.clone(), false);
+    filter.show_all.insert(peer_key.clone());
+    let local = filter.for_machine("").unwrap();
+    assert!(local.project_open.is_empty() && local.show_all.is_empty());
+    filter.project = Some(peer_key);
+    assert!(filter.for_machine("").is_none());
+    let peer = filter.for_machine("peer").unwrap();
+    assert_eq!(peer.project.as_deref(), Some("/repo"));
+    assert_eq!(peer.project_open.get("/repo"), Some(&false));
+    assert!(peer.show_all.contains("/repo"));
+}
+
+#[test]
+fn sidebar_groups_roots_and_finds_their_subtasks() {
     let now = chrono::DateTime::parse_from_rfc3339("2026-11-23T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
     let mut pinned = thread("pinned", "2026-11-01T00:00:00Z");
     pinned.pinned = true;
@@ -517,26 +534,18 @@ fn the_sidebar_groups_nests_subtasks_and_filters() {
     let sections = state.sidebar_sections(&filter, now);
     let groups: Vec<Group> = sections.iter().map(|s| s.group).collect();
     assert_eq!(groups, [Group::Pinned, Group::Active, Group::Snoozed, Group::Archived]);
-    let active: Vec<(&str, u8)> = sections[1].rows.iter().map(|r| (r.id.as_str(), r.depth)).collect();
-    assert_eq!(active, [("parent", 0), ("child", 1), ("woke", 0)]);
-    assert_eq!(sections[1].rows[0].children, 1);
-    assert_eq!(sections[1].rows[1].task_status, Some(RunStatus::Failed));
-    assert_eq!(sections[1].rows[1].status, ThreadStatus::Failed);
+    let active: Vec<_> = sections[1].rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(active, ["parent", "woke"]);
     assert!(sections[3].folded && sections[3].rows.is_empty());
     assert_eq!(sections[3].count, 1);
     assert_eq!(state.subtasks("parent").len(), 1);
 
-    // Folding the parent hides the child.
-    filter.collapsed.insert("parent".into());
-    let sections = state.sidebar_sections(&filter, now);
-    assert_eq!(sections[1].rows.len(), 2);
-    assert!(sections[1].rows[0].collapsed);
-
-    // A search for the child keeps its parent; it opens archived matches.
+    // A child match opens its detail from the parent row.
     filter.query = "测试".into();
     let sections = state.sidebar_sections(&filter, now);
     let ids: Vec<&str> = sections.iter().flat_map(|s| s.rows.iter().map(|r| r.id.as_str())).collect();
-    assert_eq!(ids, ["parent", "child"]);
+    assert_eq!(ids, ["parent"]);
+    assert_eq!(sections[0].rows[0].matched_child.as_deref(), Some("child"));
     filter.query = "archived".into();
     let sections = state.sidebar_sections(&filter, now);
     assert_eq!(sections.len(), 1);
@@ -547,7 +556,7 @@ fn the_sidebar_groups_nests_subtasks_and_filters() {
     filter.status = StatusFilter::Attention;
     let sections = state.sidebar_sections(&filter, now);
     let ids: Vec<&str> = sections.iter().flat_map(|s| s.rows.iter().map(|r| r.id.as_str())).collect();
-    assert_eq!(ids, ["parent", "child"]);
+    assert_eq!(ids, ["parent"]);
 }
 
 #[test]

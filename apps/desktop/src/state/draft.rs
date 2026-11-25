@@ -268,7 +268,7 @@ impl Draft {
         let mut rest = self.text.as_str();
         while let Some((at, mention)) = mentions
             .iter()
-            .filter_map(|m| rest.find(&m.display).map(|at| (at, m)))
+            .filter_map(|m| mention_at(rest, &m.display).map(|at| (at, m)))
             .min_by_key(|p| p.0)
         {
             result.push_str(&rest[..at]);
@@ -278,6 +278,19 @@ impl Draft {
         result.push_str(rest);
         result.into()
     }
+}
+
+/// The next whole numbered reference (e.g. 图1 must not match the start of 图12).
+pub(crate) fn mention_at(text: &str, label: &str) -> Option<usize> {
+    if label.is_empty() {
+        return None;
+    }
+    text.match_indices(label)
+        .find(|(at, _)| {
+            !label.ends_with(|c: char| c.is_ascii_digit())
+                || !text[at + label.len()..].starts_with(|c: char| c.is_ascii_digit())
+        })
+        .map(|(at, _)| at)
 }
 
 pub(crate) fn is_generic_image_name(name: &str) -> bool {

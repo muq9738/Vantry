@@ -542,7 +542,7 @@ pub fn parse_inlines(text: &str) -> Vec<Inline> {
                 flush(&mut plain, &mut out);
                 out.push(Inline::Link {
                     text,
-                    url: url.trim().to_owned(),
+                    url: url.trim().trim_start_matches('<').trim_end_matches('>').to_owned(),
                 });
                 i = url_end + 1;
                 continue;
@@ -668,11 +668,23 @@ fn link_at(chars: &[char], at: usize) -> Option<(usize, usize)> {
     if chars.get(text_end + 1) != Some(&'(') {
         return None;
     }
-    let url_end = chars[text_end + 2..].iter().position(|c| *c == ')')? + text_end + 2;
-    if chars[text_end + 2..url_end].iter().any(|c| *c == ' ' || *c == '\n') {
-        return None;
+    let mut pos = text_end + 2;
+    if chars.get(pos) == Some(&'<') {
+        let end = chars[pos + 1..].iter().position(|c| matches!(c, '>' | '\n'))? + pos + 1;
+        return (chars[end] == '>' && chars.get(end + 1) == Some(&')')).then_some((text_end, end + 1));
     }
-    Some((text_end, url_end))
+    let mut nested = 0;
+    while let Some(&c) = chars.get(pos) {
+        match c {
+            '(' => nested += 1,
+            ')' if nested == 0 => return Some((text_end, pos)),
+            ')' => nested -= 1,
+            c if c.is_whitespace() => return None,
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -773,6 +785,12 @@ mod tests {
         };
         assert_eq!(header.len(), 2);
         assert_eq!(rows[0][1], vec![Inline::Code("2".into())]);
+    }
+
+    #[test]
+    fn angle_delimited_file_paths_and_balanced_url_parentheses() {
+        assert_eq!(parse_inlines("[详情](</my folder/r (2).rs:4>)"), [Inline::Link { text: "详情".into(), url: "/my folder/r (2).rs:4".into() }]);
+        assert_eq!(parse_inlines("[wiki](https://example.org/a_(b))"), [Inline::Link { text: "wiki".into(), url: "https://example.org/a_(b)".into() }]);
     }
 
     #[test]

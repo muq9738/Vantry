@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -37,12 +37,12 @@ pi-agent = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 pi-ai = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 pi-mcp = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 
-# Upstream NSH UI (v0.6.1)
-nsh-core = { git = "https://github.com/longbridge/nsh", tag = "v0.6.1" }
-nsh-base = { git = "https://github.com/longbridge/nsh", tag = "v0.6.1", default-features = false }
-nsh-platform-macos = { git = "https://github.com/longbridge/nsh", tag = "v0.6.1", default-features = false }
-nsh-platform-linux = { git = "https://github.com/longbridge/nsh", tag = "v0.6.1", default-features = false }
-nsh-platform-windows = { git = "https://github.com/longbridge/nsh", tag = "v0.6.1", default-features = false }
+# Upstream NSH UI
+nsh-core = { git = "https://github.com/longbridge/nsh", tag = "v0.7.0" }
+nsh-base = { git = "https://github.com/longbridge/nsh", tag = "v0.7.0", default-features = false }
+nsh-platform-macos = { git = "https://github.com/longbridge/nsh", tag = "v0.7.0", default-features = false }
+nsh-platform-linux = { git = "https://github.com/longbridge/nsh", tag = "v0.7.0", default-features = false }
+nsh-platform-windows = { git = "https://github.com/longbridge/nsh", tag = "v0.7.0", default-features = false }
 
 # Common ecosystem dependencies (aligned with pi-rust & nsh)
 anyhow = "1"

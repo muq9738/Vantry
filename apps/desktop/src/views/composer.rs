@@ -13,7 +13,7 @@ use std::path::Path;
 use nsh_core::{LineHeight, prelude::*};
 use vantry_protocol::Attachment;
 
-use super::{dot, ghost_button, link_button, pill};
+use super::{dot, ghost_button, link_button, pill, reference_input::{InputRef, reference_input}};
 use crate::{
     bridge::workbench::actions::{split_thinking, thinking_label},
     controller,
@@ -223,7 +223,7 @@ fn discover_files(workspace: &str, query: &str) -> Vec<Suggestion> {
 
 type Completions = Option<(String, CompletionTrigger, Vec<Suggestion>)>;
 
-fn choose_suggestion(state: Memo<Completions>, index: usize, editor: ElementRef) {
+fn choose_suggestion(state: Memo<Completions>, index: usize, editor: InputRef) {
     let Some((draft, trigger, items)) = state.get_untracked() else {
         return;
     };
@@ -305,7 +305,7 @@ fn splice_text_at_selection(
     (next, caret)
 }
 
-fn paste_into_composer(paste: &PasteEvent, editor: ElementRef, selection: Option<(u32, u32)>) {
+fn paste_into_composer(paste: &PasteEvent, editor: InputRef, selection: Option<(u32, u32)>) {
     let has_images = paste.files.iter().any(|f| f.mime.starts_with("image/"));
     // Pasted files put their `@` reference where the caret is.
     if let Some((_, end)) = selection {
@@ -392,7 +392,7 @@ pub(crate) fn composer() -> impl IntoElement {
     });
     let effort_open = signal(false);
 
-    let editor = element_ref();
+    let editor = InputRef::new();
     let card = element_ref();
     let model_anchor = element_ref();
     let effort_anchor = element_ref();
@@ -402,6 +402,7 @@ pub(crate) fn composer() -> impl IntoElement {
     let dismissed = signal(false);
     let active = signal(0usize);
     let thread = computed(|| controller::state().with(|s| s.draft_key()));
+    let rich_key = computed(move || draft.with(|d| !d.mentions.is_empty() || !d.attachments.is_empty()).then(|| thread.get()));
     let overlay_open = computed(|| controller::ui().with(|u|u.settings.is_some() || u.dock_open));
     let previous = stored(false);
     effect(move || { let open=overlay_open.get(); if previous.replace(open) && !open {editor.focus();} });
@@ -427,7 +428,7 @@ pub(crate) fn composer() -> impl IntoElement {
     });
     let send_with_enter = computed(|| controller::ui().with(|u| u.send_with_enter));
     effect(move || {
-        if focused.get() && !send_with_enter.get() && !composing.get() {
+        if focused.get() && rich_key.get().is_none() && !send_with_enter.get() && !composing.get() {
             for key in ["ctrl+enter", "mod+enter"] {
                 on_key_with(key, KeyOptions { when: nsh_core::keymap::When::Always, ..Default::default() }, |_| controller::submit());
             }
@@ -608,9 +609,19 @@ pub(crate) fn composer() -> impl IntoElement {
                             move || references.with(|links| !links.is_empty()),
                             move || dynamic(move || reference_chips(references.get())),
                         ))
-                        .child(
+                        .child(dynamic(move || {
+                            if rich_key.get().is_some() {
+                                return reference_input(editor, draft, focused, composing, selection,
+                                    move || { dismissed.set(false); active.set(0); },
+                                    move || {
+                                        if composing.get_untracked() { return; }
+                                        if count.get_untracked() > 0 { choose_suggestion(completion, active.get_untracked(), editor); }
+                                        else { controller::submit(); }
+                                    },
+                                ).into_element();
+                            }
                             nsh_base::input()
-                                .element_ref(&editor)
+                                .element_ref(&editor.plain)
                                 .label("消息输入框")
                                 .on_focus(move || focused.set(true))
                                 .on_blur(move || focused.set(false))
@@ -664,8 +675,8 @@ pub(crate) fn composer() -> impl IntoElement {
                                 .px_0p5()
                                 .text_size(px(metrics::BODY + 0.5))
                                 .line_height(LineHeight::Multiple(1.5))
-                                .text_color(colors.ink),
-                        )
+                                .text_color(colors.ink).into_element()
+                        }))
                         .child(toolbar(
                             status,
                             plan,
@@ -698,27 +709,9 @@ fn context_strip(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                // The machine the thread runs on; its menu moves the window
-                // to another paired machine (v0.1.42's "运行机器").
-                .child(
-                    nsh_base::button()
-                        .accessibility_label(crate::tr("切换机器"))
-                        .on_press(|| controller::refresh_machines(super::sidebar::machine_menu))
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_1()
-                        .rounded(px(5.0))
-                        .hover(|s| s.bg(colors.soft))
-                        .active(|s| s.opacity(0.7))
-                        .child(icon(Icon::Server, 12.0, colors.faint))
-                        .child(
-                            text(move || endpoint.get())
-                                .text_size(px(11.0))
-                                .text_color(colors.faint),
-                        )
-                        .child(icon(Icon::ChevronDown, 10.0, colors.faint)),
-                )
+                .child(view().flex_row().items_center().gap_1()
+                    .child(icon(Icon::Server, 12.0, colors.faint))
+                    .child(text(move || endpoint.get()).number_of_lines(1u32).text_size(px(11.0)).text_color(colors.faint)))
                 .child(text("|").text_size(px(11.0)).text_color(colors.line))
                 .child(
                     view()
@@ -1157,7 +1150,7 @@ fn effort_popover(open: Signal<bool>, anchor: ElementRef) -> impl IntoElement {
 fn completion_popover(
     state: Memo<Completions>,
     active: Signal<usize>,
-    editor: ElementRef,
+    editor: InputRef,
 ) -> impl IntoElement {
     let colors = palette();
     let header_label = move || {

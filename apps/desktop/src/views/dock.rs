@@ -86,9 +86,9 @@ fn child_panel(id: String) -> impl IntoElement {
                     .flex_1(),
                 )
                 .child(icon_button(
-                    Icon::X,
-                    "关闭子代理分栏",
-                    controller::close_dock,
+                    Icon::ArrowLeft,
+                    "返回会话概览",
+                    || controller::select_dock_tab(DockTab::Summary),
                 )),
         )
         .child(
@@ -98,7 +98,8 @@ fn child_panel(id: String) -> impl IntoElement {
                         s.runs
                             .iter()
                             .filter(|r| r.thread_id == target.get())
-                            .map(|r| format!("{}\n{}", r.input, r.output))
+                            .map(|r| [r.input.as_str(), r.output.as_str(), r.error.as_str()]
+                                .into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n"))
                             .collect::<Vec<_>>()
                             .join("\n\n")
                     })
@@ -139,6 +140,253 @@ fn child_panel(id: String) -> impl IntoElement {
         )
 }
 
+fn summary_row(
+    glyph: Icon,
+    label: impl IntoReactive<SharedString>,
+    action: impl Fn() + 'static,
+    disclosure: impl Fn() -> Icon + 'static,
+) -> impl IntoElement {
+    let colors = palette();
+    nsh_base::button()
+        .on_press(action)
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_2()
+        .rounded(px(6.0))
+        .hover(|s| s.bg(colors.soft))
+        .child(crate::icons::icon(glyph, 14.0, colors.muted))
+        .child(
+            text(label)
+                .flex_1()
+                .min_w_0()
+                .number_of_lines(2u32)
+                .text_size(px(13.0))
+                .text_color(colors.ink),
+        )
+        .child(dynamic(move || {
+            crate::icons::icon(disclosure(), 12.0, colors.faint)
+        }))
+}
+
+fn session_summary() -> impl IntoElement {
+    use crate::state::{
+        sidebar::{project_name, task_badge},
+        ui::Catalogs,
+    };
+    use vantry_protocol::RunStatus;
+
+    let colors = palette();
+    let selected = computed(|| controller::state().with(|s| s.selected.clone()));
+    let expanded = computed(move || {
+        selected.with(|id| {
+            id.is_some()
+                && controller::ui().with(|u| u.expanded_task_parent.as_ref() == id.as_ref())
+        })
+    });
+    let toggle_tasks = move || {
+        let next = if expanded.get_untracked() {
+            None
+        } else {
+            selected.get_untracked()
+        };
+        controller::ui().update(|u| u.expanded_task_parent = next);
+    };
+    let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
+    let tasks = computed(move || {
+        revision.get();
+        let parent = selected.get();
+        controller::state().with_untracked(|s| parent.map(|id| s.subtasks(&id)).unwrap_or_default())
+    });
+    let git = move || {
+        let project =
+            controller::state().with(|s| project_name(&s.current_project_key()).to_owned());
+        controller::bench().with(|b| {
+            let mut parts = vec![project];
+            if let Some(status) = &b.git.status {
+                parts.push(status.branch.clone());
+                if let Some(files) = &status.files {
+                    parts.push(format!("{} 个变更文件", files.len()));
+                }
+            } else if let Some(branch) =
+                controller::state().with(|s| s.current_workspace().map(|w| w.branch.clone()))
+            {
+                parts.push(branch);
+            }
+            parts.retain(|p| !p.is_empty());
+            if parts.is_empty() {
+                "查看 Git".into()
+            } else {
+                parts.join(" · ")
+            }
+        })
+    };
+    let sources = || {
+        controller::ui().with(|u| match &u.catalogs {
+            Catalogs::Loaded(data) => {
+                let names: Vec<_> = data
+                    .mcp
+                    .servers
+                    .iter()
+                    .flatten()
+                    .filter(|s| u.mcp_enabled(&s.name, s.enabled))
+                    .map(|s| s.name.as_str())
+                    .collect();
+                if names.is_empty() {
+                    "无已启用的 MCP 服务".into()
+                } else {
+                    names.join(" · ")
+                }
+            }
+            _ => "查看 MCP 服务".into(),
+        })
+    };
+    let counts = move || {
+        tasks.with(|tasks| {
+            let mut parts = Vec::new();
+            for status in [
+                RunStatus::Running,
+                RunStatus::Waiting,
+                RunStatus::Queued,
+                RunStatus::Completed,
+                RunStatus::Failed,
+                RunStatus::Cancelled,
+                RunStatus::Interrupted,
+                RunStatus::Unspecified,
+            ] {
+                let count = tasks.iter().filter(|t| t.2 == status).count();
+                if count > 0 {
+                    parts.push(format!(
+                        "{count} {}",
+                        if status == RunStatus::Unspecified {
+                            "待确认"
+                        } else {
+                            task_badge(status)
+                        }
+                    ));
+                }
+            }
+            parts.join(" · ")
+        })
+    };
+    let can_delegate = computed(move || {
+        revision.get();
+        let parent = selected.get();
+        controller::state().with_untracked(|s| {
+            s.runs
+                .iter()
+                .any(|r| Some(&r.thread_id) == parent.as_ref() && r.status == RunStatus::Completed)
+        })
+    });
+    scroll().flex_1().child(
+        view()
+            .w_full()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .child(caption("变更"))
+            .child(summary_row(
+                Icon::GitBranch,
+                git,
+                || controller::select_dock_tab(DockTab::Git),
+                || Icon::ChevronRight,
+            ))
+            .child(when(
+                move || can_delegate.get() || tasks.with(|t| !t.is_empty()),
+                move || {
+                    view()
+                        .flex_col()
+                        .gap_1()
+                        .border_t_1()
+                        .border_t_color(colors.line_soft)
+                        .pt_3()
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .child(caption("子智能体").flex_1())
+                                .child(when(
+                                    move || can_delegate.get(),
+                                    || {
+                                        icon_button(Icon::Plus, "新建子任务", || {
+                                            controller::open_child(String::new())
+                                        })
+                                    },
+                                )),
+                        )
+                        .child(when(
+                            move || tasks.with(|t| !t.is_empty()),
+                            move || {
+                                summary_row(Icon::Bot, counts, toggle_tasks, move || {
+                                    if expanded.get() {
+                                        Icon::ChevronDown
+                                    } else {
+                                        Icon::ChevronRight
+                                    }
+                                })
+                            },
+                        ))
+                        .child(when(
+                            move || expanded.get(),
+                            move || {
+                                view().flex_col().child(each(
+                                    move || tasks.get(),
+                                    |t| t.0.clone(),
+                                    move |task, _| {
+                                        nsh_base::button()
+                                            .on_press(move || {
+                                                controller::open_child(
+                                                    task.with_untracked(|t| t.0.clone()),
+                                                )
+                                            })
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_2()
+                                            .py_2()
+                                            .rounded(px(6.0))
+                                            .hover(|s| s.bg(colors.soft))
+                                            .child(super::dot(move || {
+                                                super::run_status_color(task.with(|t| t.2))
+                                            }))
+                                            .child(
+                                                text(move || task.with(|t| t.1.clone()))
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .number_of_lines(2u32)
+                                                    .text_size(px(13.0))
+                                                    .text_color(colors.ink),
+                                            )
+                                            .child(
+                                                text(move || task_badge(task.with(|t| t.2)))
+                                                    .text_size(px(11.0))
+                                                    .text_color(colors.muted),
+                                            )
+                                    },
+                                ))
+                            },
+                        ))
+                },
+            ))
+            .child(
+                view()
+                    .flex_col()
+                    .gap_1()
+                    .border_t_1()
+                    .border_t_color(colors.line_soft)
+                    .pt_3()
+                    .child(caption("来源"))
+                    .child(summary_row(
+                        Icon::Server,
+                        sources,
+                        || controller::select_dock_tab(DockTab::Mcp),
+                        || Icon::ChevronRight,
+                    )),
+            ),
+    )
+}
+
 fn tool_dock() -> impl IntoElement {
     let colors = palette();
     let tab = computed(|| controller::ui().with(|u| u.dock_tab));
@@ -173,6 +421,7 @@ fn tool_dock() -> impl IntoElement {
                         .bg(colors.soft)
                         .children(DockTab::ALL.map(|t| {
                             let glyph = match t {
+                                DockTab::Summary => Icon::Layers,
                                 DockTab::Files => Icon::FileText,
                                 DockTab::Git => Icon::GitBranch,
                                 DockTab::Terminal => Icon::SquareTerminal,
@@ -291,6 +540,7 @@ fn tool_dock() -> impl IntoElement {
             DockTab::Files => files_panel().into_element(),
             DockTab::Git => super::git::git_tools().into_element(),
             DockTab::Terminal => terminal_panel().into_element(),
+            DockTab::Summary => session_summary().into_element(),
             DockTab::Mcp => super::settings::dock_catalog(true).into_element(),
             DockTab::Plugins => super::settings::dock_catalog(false).into_element(),
         }))

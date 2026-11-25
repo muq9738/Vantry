@@ -15,6 +15,7 @@ pub(crate) mod git;
 pub(crate) mod header;
 pub(crate) mod markdown;
 pub(crate) mod plugin_panel;
+mod reference_input;
 pub(crate) mod remote_desktop;
 pub(crate) mod settings;
 pub(crate) mod sidebar;

@@ -27,20 +27,15 @@ use crate::{
 
 const MONO: &str = "Menlo";
 
-const SERIES_PALETTE: [u32; 8] = [
-    0x4F7DF3, // cobalt
-    0x2FB380, // emerald
-    0xE88B36, // amber
-    0xA26CF5, // violet
-    0xE6597A, // rose
-    0x1EA7C9, // cyan
-    0xC49A2B, // ochre
-    0x78849E, // slate
+const SERIES_PALETTE: [(u32, u32); 8] = [
+    (0x416CB5, 0x89AEED), (0x247C70, 0x70BEAF), (0xAB681F, 0xE6AF71),
+    (0x8053A7, 0xBD9BD7), (0xB14C66, 0xE195A9), (0x337790, 0x80BFD5),
+    (0x927626, 0xD5BC74), (0x596D89, 0xA5B7CC),
 ];
 
 fn series_color(idx: usize) -> AdaptiveColor {
-    let hex = SERIES_PALETTE[idx % SERIES_PALETTE.len()];
-    AdaptiveColor::rgb(hex, hex)
+    let (light, dark) = SERIES_PALETTE[idx % SERIES_PALETTE.len()];
+    AdaptiveColor::rgb(light, dark)
 }
 
 fn hsla(c: AdaptiveColor) -> Hsla {
@@ -416,7 +411,8 @@ fn parse_chart_pipe(args: &str, source: &str) -> Option<ChartSpec> {
         }
         let highlight = trimmed.starts_with('*');
         let cleaned = trimmed.trim_start_matches('*').trim();
-        let parts: Vec<&str> = cleaned.split('|').map(str::trim).collect();
+        let cells = cleaned.strip_prefix('|').and_then(|s| s.strip_suffix('|')).unwrap_or(cleaned);
+        let parts: Vec<&str> = cells.split('|').map(str::trim).collect();
         if parts.len() < 2 {
             continue;
         }
@@ -609,10 +605,10 @@ fn paint_grid_and_y_axis(
 ) -> Painter {
     let colors = palette();
     let grid = hsla(colors.line_soft);
-    let label_c = hsla(colors.faint);
+    let label_c = hsla(colors.muted);
     let steps = 4usize;
     p = p
-        .font("10px sans-serif")
+        .font("11px sans-serif")
         .text_align(CanvasTextAlign::Right)
         .text_baseline(CanvasTextBaseline::Middle);
     for i in 0..=steps {
@@ -1372,19 +1368,17 @@ pub(crate) fn render_chart_card(args: &str, source: &str) -> impl IntoElement {
         .flex_row()
         .items_center()
         .gap_2()
-        .px_3()
-        .py_1p5()
-        .bg(colors.soft)
+        .px_4()
+        .py_3()
         .border_b_1()
         .border_b_color(colors.line_soft)
-        .child(badge(kind_tag, colors.accent))
         .child(
-            text(spec.title.clone())
+            text(if spec.title.is_empty() || spec.title == "数据图表" { kind_tag.to_owned() } else { spec.title.clone() })
                 .flex_1()
                 .min_w_0()
-                .number_of_lines(1u32)
+                .number_of_lines(2u32)
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(12.5))
+                .text_size(px(15.0))
                 .text_color(colors.ink),
         )
         .child(link_button(
@@ -1402,7 +1396,7 @@ pub(crate) fn render_chart_card(args: &str, source: &str) -> impl IntoElement {
         )
         .child(link_button("复制", move || controller::copy(copy_src.clone())));
 
-    let spec_inline = spec.clone();
+    let spec_inline = std::rc::Rc::new(spec.clone());
     let spec_modal = spec.clone();
     let title_modal = spec.title.clone();
 
@@ -1590,13 +1584,18 @@ pub(crate) fn render_chart_card(args: &str, source: &str) -> impl IntoElement {
                 && (spec_inline.series.iter().any(|s| !s.data.is_empty())
                     || spec_inline.series.iter().any(|s| !s.points.is_empty()))
             {
-                let (cw, ch) = chart_canvas_size(&spec_inline, false);
+                let (_, ch) = chart_canvas_size(&spec_inline, false);
+                let viewport = signal(0u32);
+                let spec = spec_inline.clone();
                 content = content.child(
-                    scroll()
-                        .w_full()
-                        .min_w_0()
-                        .horizontal()
-                        .child(canvas(paint_chart(&spec_inline, cw, ch)).w(px(cw)).h(px(ch))),
+                    scroll().horizontal().w_full().min_w_0().h(px(ch))
+                        .on_layout(move |b: &Bounds<Points>| viewport.set(b.size.width.0.floor() as u32))
+                        .child(dynamic(move || {
+                            let width = viewport.get();
+                            if width == 0 { return view().into_element(); }
+                            let cw = (width as f32).max(320.0);
+                            canvas(paint_chart(&spec, cw, ch)).w(px(cw)).h(px(ch)).into_element()
+                        })),
                 );
                 if spec_inline.series.len() > 1
                     && spec_inline.kind != "pie"
@@ -2853,6 +2852,15 @@ Postgres  | 28  | 95\n";
         assert_eq!(spec.series[1].data, vec![40.0, 31.0, 95.0]);
         assert_eq!(spec.ref_lines.len(), 1);
         assert_eq!(spec.ref_lines[0].value, 100.0);
+    }
+
+    #[test]
+    fn renders_markdown_pipe_tables_as_chart_data() {
+        let chart = parse_chart_spec("bar", "| 周次 | 桌面 | 服务 |\n|---|---|---|\n| 第一周 | 12 | 8 |").unwrap();
+        assert_eq!(chart.labels, ["第一周"]);
+        assert_eq!(chart.series.len(), 2);
+        assert_eq!(chart.series[0].name, "桌面");
+        assert_eq!(chart.series[1].data, [8.0]);
     }
 
     #[test]

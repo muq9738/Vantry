@@ -8,13 +8,12 @@ use nsh_core::{
     prelude::*,
 };
 
-use super::{dot, icon_button, icon_pill, run_status_color, status_color, status_label};
+use super::{dot, icon_button, icon_pill, status_color, status_label};
 use crate::{
     controller,
     icons::{Icon, icon, project_badge},
     state::{
         Connection, ThreadStatus,
-        sidebar::task_badge,
         ui::{MainView, SettingsPage},
         workbench::DockTab,
     },
@@ -54,11 +53,6 @@ pub(crate) fn header() -> impl IntoElement {
         })
     });
     let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
-    let subtasks = computed(move || {
-        revision.get();
-        let id = selected.get();
-        controller::state().with_untracked(|s| id.map(|id| s.subtasks(&id)).unwrap_or_default())
-    });
     let can_merge = computed(move || {
         revision.get();
         let id = selected.get();
@@ -90,8 +84,6 @@ pub(crate) fn header() -> impl IntoElement {
     };
     let dock = computed(|| controller::ui().with(|u| u.dock_open.then_some(u.dock_tab)));
     let remote = computed(|| controller::ui().with(|u| u.remote_target.clone()));
-    let tasks_anchor=element_ref();
-    let tasks_open = signal(false);
     let more_open = signal(false);
     let thread_id = move || selected.get_untracked().unwrap_or_default();
 
@@ -234,96 +226,6 @@ pub(crate) fn header() -> impl IntoElement {
                             }
                         }),
                     )
-            },
-        ))
-        .child(when(move ||has_completed.get(), ||icon_button(Icon::Bot,"新建子任务",||controller::open_child(String::new()))))
-        // Subtask orchestration capsule
-        .child(when(
-            move || subtasks.with(|t| !t.is_empty()),
-            move || {
-                view()
-                    .relative()
-                    .child(
-                        nsh_base::button()
-                            .element_ref(&tasks_anchor)
-                            .accessibility_label("任务统筹")
-                            .on_press(move || tasks_open.set(!tasks_open.get_untracked()))
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(colors.line)
-                            .hover(|s| s.bg(colors.soft))
-                            .active(|s| s.opacity(0.7))
-                            .child(icon(Icon::Bot, 12.0, colors.muted))
-                            .child(
-                                text(move || {
-                                    subtasks.with(|t| {
-                                        let done =
-                                            t.iter().filter(|(_, _, s)| s.terminal()).count();
-                                        format!("子任务 {done}/{}", t.len())
-                                    })
-                                })
-                                .text_size(px(11.0))
-                                .text_color(colors.muted),
-                            ),
-                    )
-                    .child(when(
-                        move || tasks_open.get(),
-                        move || {
-                            overlay().anchor(&tasks_anchor).placement(Placement::Bottom).align(Align::Start)
-                                .offset(px(4.0)).on_cancel(move ||tasks_open.set(false))
-                                .on_press_outside(move |_:&Point<Points>|tasks_open.set(false)).w(px(280.0))
-                                .child(view().flex_col()
-                                .gap_1()
-                                .p_2()
-                                .rounded(px(10.0))
-                                .bg(colors.card)
-                                .border_1()
-                                .border_color(colors.line)
-                                .shadow_md()
-                                .child(each(
-                                    move || subtasks.get(),
-                                    |t: &(String, String, vantry_protocol::RunStatus)| t.0.clone(),
-                                    move |task, _| {
-                                        let id = move || task.with_untracked(|t| t.0.clone());
-                                        nsh_base::button()
-                                            .on_press(move || {
-                                                let child=id();
-                                                tasks_open.set(false);
-                                                controller::open_child(child);
-                                            })
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded(px(6.0))
-                                            .hover(|s| s.bg(colors.soft))
-                                            .child(dot(move || {
-                                                run_status_color(task.with(|t| t.2))
-                                            }))
-                                            .child(
-                                                text(move || task.with(|t| t.1.clone()))
-                                                    .flex_1()
-                                                    .number_of_lines(1u32)
-                                                    .text_size(px(12.5))
-                                                    .text_color(colors.ink),
-                                            )
-                                            .child(
-                                                text(move || task_badge(task.with(|t| t.2)))
-                                                    .text_size(px(10.5))
-                                                    .text_color(move || {
-                                                        run_status_color(task.with(|t| t.2))
-                                                    }),
-                                            )
-                                    },
-                                )))
-                        },
-                    ))
             },
         ))
         .child(view().flex_1())
@@ -482,14 +384,8 @@ pub(crate) fn header() -> impl IntoElement {
         // Right panel open/close toggle
         .child(icon_button(
             Icon::PanelRight,
-            "切换右侧面板",
-            move || {
-                if dock.get_untracked().is_some() {
-                    controller::close_dock();
-                } else {
-                    controller::toggle_dock(DockTab::Files);
-                }
-            },
+            "会话概览",
+            || controller::toggle_dock(DockTab::Summary),
         ))
 }
 

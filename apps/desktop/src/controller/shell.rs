@@ -15,7 +15,8 @@ pub(crate) fn native_shell() -> bool {
 }
 
 pub(crate) fn shell_start(id: String) {
-    if id.starts_with("task-") || SHELLS.with(|all| all.borrow().contains_key(&id)) {
+    let key = format!("{}\x1f{id}", current_machine().unwrap_or_default());
+    if id.starts_with("task-") || SHELLS.with(|all| all.borrow().contains_key(&key)) {
         return;
     }
     let Some(bridge) = project_workbench()
@@ -25,7 +26,7 @@ pub(crate) fn shell_start(id: String) {
         return;
     };
     let (input, mut events) = unbounded_channel();
-    SHELLS.with(|all| all.borrow_mut().insert(id.clone(), input));
+    SHELLS.with(|all| all.borrow_mut().insert(key.clone(), input));
     let (sink, mut output) = unbounded_channel();
     bench().update(|b| {
         if let Some(s) = b.terminal.sessions.iter_mut().find(|s| s.id == id) {
@@ -69,14 +70,14 @@ pub(crate) fn shell_start(id: String) {
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r.map_err(|e| e.message));
-        SHELLS.with(|all| all.borrow_mut().remove(&id));
+        SHELLS.with(|all| all.borrow_mut().remove(&key));
         bench().update(|b| b.terminal.on_exit(&id, result));
     });
 }
 fn send(id: &str, event: Input) -> bool {
     SHELLS.with(|all| {
         all.borrow()
-            .get(id)
+            .get(&format!("{}\x1f{id}", current_machine().unwrap_or_default()))
             .is_some_and(|tx| tx.send(event).is_ok())
     })
 }

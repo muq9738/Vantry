@@ -534,6 +534,7 @@ pub struct UiState {
     pub send_with_enter: bool,
     pub manual_delivery: bool,
     pub child_panel: Option<(String, String)>,
+    pub expanded_task_parent: Option<String>,
     pub settings: Option<SettingsPage>,
     pub catalogs: Catalogs,
     pub view: MainView,
@@ -573,6 +574,7 @@ impl Default for UiState {
             send_with_enter: true,
             manual_delivery: false,
             child_panel: None,
+            expanded_task_parent: None,
             settings: None,
             catalogs: Catalogs::NotLoaded,
             view: MainView::Conversation,
@@ -644,12 +646,6 @@ impl UiState {
 
     pub fn set_status_filter(&mut self, status: StatusFilter) {
         self.filter.status = status;
-    }
-
-    pub fn toggle_collapsed(&mut self, id: &str) {
-        if !self.filter.collapsed.remove(id) {
-            self.filter.collapsed.insert(id.to_owned());
-        }
     }
 
     pub fn begin_rename(&mut self, thread_id: &str, title: &str) {
@@ -1019,7 +1015,5 @@ mod tests {
         assert_eq!(ui.view, MainView::Plugin("usage".into()));
         assert!(!ui.open_plugin("usage", "main"), "already loading");
         ui.set_status_filter(StatusFilter::Running);
-        ui.toggle_collapsed("p");
-        assert!(ui.filter.collapsed.contains("p"));
     }
 }
