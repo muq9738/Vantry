@@ -321,7 +321,12 @@ async fn commands_queue_steer_approvals_and_thread_history() {
     cmd(&core, "input.reorder", json!({"inputId":b,"position":0}));
     cmd(&core, "message.cancel", json!({"messageId":d}));
     cmd(&core, "input.cancel", json!({"inputId":f}));
-    cmd(&core, "input.promote_steer", json!({"inputId":g}));
+    let mut stale = Command::new("promote-stale", vantry_protocol::CommandKind::PromoteInputToSteer);
+    stale.input_id = g.clone();
+    stale.thread_id = th.clone();
+    stale.run_id = "previous-run".into();
+    assert!(core.dispatch(&stale).is_err());
+    cmd(&core, "input.promote_steer", json!({"inputId":g,"runId":send.run_id}));
     let ctrl = h.control().await;
     assert_eq!(ctrl.id, g);
     emit(

@@ -305,7 +305,13 @@ fn splice_text_at_selection(
     (next, caret)
 }
 
-fn paste_into_composer(paste: &PasteEvent, editor: InputRef, selection: Option<(u32, u32)>) {
+pub(super) fn paste_into_composer(paste: &PasteEvent, editor: InputRef, selection: Option<(u32, u32)>) {
+    if let Some(text) = super::reference_input::restore_selection(&paste.html) {
+        let mut restored = PasteEvent::default();
+        restored.text = text;
+        paste_into_composer(&restored, editor, selection);
+        return;
+    }
     let has_images = paste.files.iter().any(|f| f.mime.starts_with("image/"));
     // Pasted files put their `@` reference where the caret is.
     if let Some((_, end)) = selection {
@@ -1475,7 +1481,11 @@ fn queue_list(queue: Memo<Vec<QueueItem>>) -> impl IntoElement {
         .child(super::caption(move || {
             queue.with(|q| {
                 let queued = q.iter().filter(|i| i.kind == QueueItemKind::Queued).count();
-                format!("排队 {queued} 条 · 当前任务结束后依次发送")
+                if queued == 0 {
+                    "当前轮次的补充消息".to_owned()
+                } else {
+                    format!("待发送 {queued} 条 · 当前轮次结束后依次发送")
+                }
             })
         }))
         .child(each(
@@ -1536,19 +1546,16 @@ fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
             view()
                 .flex_row()
                 .gap_0p5()
+                .child(when(move || item.with(|i| i.can_insert), move || {
+                    super::ghost_button("立即插入", move || controller::promote_queued(id())).disabled(busy)
+                }))
                 .child(link_button("编辑", move || controller::edit_queued(id())).disabled(busy))
-                .child(
-                    link_button("上移", move || controller::move_queued(id(), -1))
-                        .disabled(move || busy() || first()),
-                )
-                .child(
-                    link_button("下移", move || controller::move_queued(id(), 1))
-                        .disabled(move || busy() || last()),
-                )
-                .child(
-                    link_button("立即追加", move || controller::promote_queued(id()))
-                        .disabled(busy),
-                )
+                .child(when(move || item.with(|i| i.count > 1), move || view().flex_row()
+                    .child(link_button("上移", move || controller::move_queued(id(), -1))
+                        .disabled(move || busy() || first()))
+                    .child(link_button("下移", move || controller::move_queued(id(), 1))
+                        .disabled(move || busy() || last()))
+                ))
                 .child(link_button("取消", move || controller::cancel_queued(id())).disabled(busy))
         }))
 }

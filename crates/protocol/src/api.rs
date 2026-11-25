@@ -1290,6 +1290,12 @@ pub struct Input {
     pub updated_at: String,
 }
 
+impl Input {
+    pub fn is_queued(&self) -> bool {
+        self.kind == "queue" && matches!(self.status.as_str(), "queued" | "pending")
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {

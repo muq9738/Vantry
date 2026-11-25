@@ -1534,7 +1534,7 @@ fn update_page(data: Data) -> impl IntoElement {
                                     .text_size(px(13.5))
                                     .text_color(colors.ink),
                             )
-                            .child(badge("已是最新", colors.success))
+                            .child(when(!update.latest_version.is_empty(), move || badge("已是最新", colors.success)))
                             .child(view().flex_1())
                             .child(when(working.clone(), || hint("检查中…")))
                             .child(
@@ -1544,10 +1544,12 @@ fn update_page(data: Data) -> impl IntoElement {
                     )
                     .into_element();
             }
-            let size = if update.delta_available {
-                format!("增量 {:.1} MB", update.delta_size as f64 / 1_000_000.0)
+            let size = if update.delta_available && (!update.staged || update.used_delta) {
+                let saved = update.asset_size.saturating_sub(update.delta_size);
+                let size = format!("增量 {:.1} MB", update.delta_size as f64 / 1_000_000.0);
+                if saved > 0 { format!("{size}，节省 {:.1} MB", saved as f64 / 1_000_000.0) } else { size }
             } else if update.asset_size > 0 {
-                format!("{:.1} MB", update.asset_size as f64 / 1_000_000.0)
+                format!("完整包 {:.1} MB", update.asset_size as f64 / 1_000_000.0)
             } else {
                 String::new()
             };
@@ -1567,7 +1569,10 @@ fn update_page(data: Data) -> impl IntoElement {
                             let size = size.clone();
                             move || badge(size.clone(), colors.muted)
                         }))
-                        .child(if update.staged {
+                        .child(if update.staged && !update.can_auto_restart {
+                            let path = if update.installer_path.is_empty() { update.staged_path.clone() } else { update.installer_path.clone() };
+                            ghost_button("复制安装路径", move || controller::copy(path.clone())).into_element()
+                        } else if update.staged {
                             primary_button("重启更新", || controller::update_op(names::UPDATE_INSTALL))
                                 .disabled(busy("update"))
                                 .into_element()

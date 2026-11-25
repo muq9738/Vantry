@@ -9,6 +9,16 @@ mod patch;
 mod release;
 mod token;
 mod tree;
+/// Unpack a versioned release into a private temporary directory and locate its payload.
+pub fn unpack_release(
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    archive::extract(path, name, root)?;
+    archive::payload(root, false)
+}
+
 pub use delta::{apply_delta, write_delta};
 pub use install::{InstallPlan, UpdateLock};
 pub use manager::*;

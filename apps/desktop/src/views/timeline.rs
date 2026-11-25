@@ -281,6 +281,14 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     let plan = move || user.with(|u| u.as_ref().is_some_and(|u| u.2));
     let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.clone()).unwrap_or_default());
     let visible_text = computed(move || text_of());
+    let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
+    let inserted = computed(move || {
+        revision.get();
+        let id = user.with(|u| u.as_ref().map(|u| u.0.clone()));
+        controller::state().with_untracked(|s| s.inputs.iter().filter(|i| {
+            Some(i.run_id.as_str()) == id.as_deref() && i.kind == "steer" && matches!(i.status.as_str(), "delivered" | "failed")
+        }).map(|i| (i.id.clone(), i.message.clone(), i.status == "delivered", i.error.clone())).collect::<Vec<_>>())
+    });
     let run_id = move || user.with_untracked(|u| u.as_ref().map(|u| u.0.clone()).unwrap_or_default());
     // Rewind and fork need the run finished and the thread idle.
     let settled = computed(move || {
@@ -402,6 +410,11 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                         ))
                     },
                 ))
+                .child(each(move || inserted.get(), |i| i.0.clone(), |item, _| {
+                    view().flex_col().items_end().gap_1().child(super::caption(move || item.with(|(_, _, ok, error)| {
+                        if *ok { "已插入本轮".to_owned() } else { format!("插入失败 · {error}") }
+                    }))).child(text(move || item.with(|i| i.1.clone())).select_text().text_color(colors.ink).text_size(px(metrics::BODY)))
+                }))
                 .child(when(
                     move || hovered.get() && settled.get(),
                     move || {

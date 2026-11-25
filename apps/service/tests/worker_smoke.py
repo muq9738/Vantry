@@ -50,7 +50,8 @@ class Model(BaseHTTPRequestHandler):
             self.server.title_started.set()
             self.server.title_release.wait(8)
             deltas = [({'role': 'assistant', 'content': '会话链接渲染'}, None), ({}, 'stop')]
-        elif any('标题回归' in str(m['content']) for m in body['messages'] if m['role'] == 'user'):
+        elif any(marker in str(m['content']) for m in body['messages'] if m['role'] == 'user'
+                 for marker in ('标题回归', 'parallel directory probe')):
             deltas = [({'role': 'assistant', 'content': '正常回复'}, None), ({}, 'stop')]
         elif tools:
             deltas = [({'role': 'assistant', 'content': 'recorded'}, None), ({}, 'stop')]
@@ -162,6 +163,14 @@ def run_case(root, server, decision):
                     subprocess.run([BINARY, 'worker-stop','--job-dir',str(job)],env=env,check=True,timeout=10)
                 elif decision in ('allow','deny','steer'):
                     if decision == 'steer':
+                        # A second thread in this directory must finish while the first
+                        # worker still holds its session and waits for our response.
+                        other = dict(req, request=dict(req['request'], ThreadID='other', AttemptID='parallel',
+                                                      RunID='parallel', Message='parallel directory probe'))
+                        subprocess.run([BINARY, 'smoke-worker'], input=json.dumps(other), text=True,
+                                       env=env, check=True, timeout=8)
+                        assert load(data/'jobs/parallel/result.json')['status'] == 'completed'
+                        assert proc.poll() is None
                         deliver({'kind':'steer','id':'steer','message':'include the follow-up'})
                     response = {'kind':'response','id':'control:1','requestId':dialogs[0]['id'],'confirmed':decision=='allow'}
                     deliver(response)

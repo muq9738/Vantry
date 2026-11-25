@@ -39,6 +39,11 @@ const CHUNK: usize = 32 * 1024;
 /// This produces ordinary bsdiff control triples without a whole-file suffix array.
 pub(crate) fn encode(old: &mut File, new: &mut File, out: &mut File) -> Result<()> {
     let (a, b) = (old.metadata()?.len(), new.metadata()?.len());
+    // Release binaries move functions and sections between builds. Re-align at
+    // matching byte runs before encoding differences in the existing v1 format.
+    if a.max(b) <= 64 << 20 {
+        return encode_indexed(old, new, out);
+    }
     let mut suffix = 0;
     let (mut left, mut right) = ([0; CHUNK], [0; CHUNK]);
     if a != b {
@@ -109,6 +114,78 @@ pub(crate) fn encode(old: &mut File, new: &mut File, out: &mut File) -> Result<(
     literals.finish()?;
     Ok(())
 }
+fn encode_indexed(old: &mut File, new: &mut File, out: &mut File) -> Result<()> {
+    use std::collections::HashMap;
+    let (mut base, mut target) = (Vec::new(), Vec::new());
+    old.rewind()?;
+    new.rewind()?;
+    old.read_to_end(&mut base)?;
+    new.read_to_end(&mut target)?;
+    const ANCHOR: usize = 32;
+    let key = |s: &[u8]| u64::from_le_bytes(s[..8].try_into().unwrap());
+    let mut index = HashMap::new();
+    for (i, chunk) in base.chunks_exact(64).enumerate() {
+        index.entry(key(chunk)).or_insert(i * 64);
+    }
+    let mut control = Vec::new();
+    let mut diffs = DeflateEncoder::new(Vec::new(), Compression::best());
+    let mut literals = DeflateEncoder::new(Vec::new(), Compression::best());
+    let (mut start, mut pos, mut cursor, mut blocks) = (0, 0, 0, 0);
+    loop {
+        let span = cursor - start;
+        let aligned = pos + span;
+        let remaining = &target[cursor..];
+        if remaining.len() >= ANCHOR
+            && base.get(aligned..aligned + ANCHOR) == Some(&remaining[..ANCHOR])
+        {
+            cursor += ANCHOR;
+            continue;
+        }
+        let next = if remaining.is_empty() {
+            pos
+        } else {
+            let found = remaining.get(..ANCHOR).and_then(|anchor| {
+                let &at = index.get(&key(anchor))?;
+                (base[at..at + ANCHOR] == *anchor).then_some(at)
+            });
+            let Some(found) = found else {
+                cursor += 1;
+                continue;
+            };
+            found
+        };
+        let n = span.min(base.len() - pos);
+        put(&mut control, n as u64)?;
+        put(&mut control, (span - n) as u64)?;
+        let seek = next as i64 - (pos + n) as i64;
+        put(&mut control, ((seek << 1) ^ (seek >> 63)) as u64)?;
+        for (i, chunk) in target[start..start + n].chunks(CHUNK).enumerate() {
+            let mut buf = [0u8; CHUNK];
+            for (j, &byte) in chunk.iter().enumerate() {
+                buf[j] = byte.wrapping_sub(base[pos + i * CHUNK + j]);
+            }
+            diffs.write_all(&buf[..chunk.len()])?;
+        }
+        literals.write_all(&target[start + n..cursor])?;
+        blocks += 1;
+        if remaining.is_empty() {
+            break;
+        }
+        start = cursor;
+        pos = next;
+        cursor += ANCHOR;
+    }
+    let ctrl = compress(&control)?;
+    let diff = diffs.finish()?;
+    put(&mut *out, blocks)?;
+    put(&mut *out, ctrl.len() as u64)?;
+    put(&mut *out, diff.len() as u64)?;
+    out.write_all(&ctrl)?;
+    out.write_all(&diff)?;
+    out.write_all(&literals.finish()?)?;
+    Ok(())
+}
+
 struct Section<'a, R> {
     reader: &'a RefCell<R>,
     offset: u64,

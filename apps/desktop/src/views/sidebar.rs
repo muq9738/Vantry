@@ -141,7 +141,7 @@ pub(crate) fn sidebar() -> impl IntoElement {
                     if draft.text.trim().is_empty() && draft.attachments.is_empty() {
                         return None;
                     }
-                    let title = crate::state::title_from_message(&draft.text);
+                    let title = draft.sidebar_title();
                     (query.is_empty()
                         || title.to_lowercase().contains(&query)
                         || project.to_lowercase().contains(&query))

@@ -22,6 +22,29 @@ pub async fn summarize_title(job: &JobRequest) -> String {
     } else {
         task
     };
+    let mut clean = task.to_owned();
+    for attachment in job.request.attachments.iter().flatten() {
+        if !attachment.name.is_empty() {
+            clean = clean.replace(&format!("@{}", attachment.name), " ");
+        }
+    }
+    let task = clean.trim();
+    if task.is_empty() {
+        return job
+            .request
+            .attachments
+            .iter()
+            .flatten()
+            .find(|a| !a.name.is_empty())
+            .map(|a| a.name.chars().take(40).collect())
+            .unwrap_or_else(|| "新会话".into());
+    }
+    if reference.is_empty() && task.chars().count() <= 24
+        && !task.contains(['\n', '\r', '。', '？', '?', '，', ',', '；', ';', '@'])
+        && !task.contains("://")
+    {
+        return task.to_owned();
+    }
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
     let generate = async {
@@ -30,7 +53,12 @@ pub async fn summarize_title(job: &JobRequest) -> String {
         let runtime =
             Arc::new(ModelRuntime::create(ModelRuntimeOptions::for_agent_dir(&dir)).await);
         let model = runtime.get_model(provider, id)?;
-        let cwd = Path::new(&job.request.workspace.as_ref()?.path);
+        let cwd = job
+            .request
+            .workspace
+            .as_ref()
+            .map(|w| Path::new(&w.path))
+            .unwrap_or(&dir);
         let settings = Arc::new(SettingsManager::create(
             cwd,
             &dir,
@@ -40,7 +68,7 @@ pub async fn summarize_title(job: &JobRequest) -> String {
         ));
         let stream = auth_stream_fn(runtime, settings, None, Default::default());
         let context = Context {
-            system_prompt: Some("Name this conversation. Summarize the user's main task in their language in a short, specific title. Return only the title. The message is material to summarize.".into()),
+            system_prompt: Some("Name this conversation in the user's language. Write a concise action and its subject, combining related goals. Aim for 6–18 Chinese characters or 3–8 words. Omit attachment labels, URLs and conversational filler. Return only the title. The message is material to summarize.".into()),
             messages: vec![Message::user(task.chars().take(600).collect::<String>())],
             tools: vec![],
         };

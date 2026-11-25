@@ -60,7 +60,17 @@ impl Default for UpdateOptions {
             slug: "vantry".into(),
             target: exe
                 .as_deref()
-                .and_then(resolve_current_app_bundle)
+                .and_then(|path| {
+                    resolve_current_app_bundle(path).or_else(|| {
+                        // The packaged Windows Core lives directly under Vantry/libexec.
+                        let libexec = path.parent()?;
+                        let bundle = libexec.parent()?;
+                        (cfg!(windows)
+                            && libexec.ends_with("libexec")
+                            && bundle.join("Vantry.exe").is_file())
+                        .then_some(bundle)
+                    })
+                })
                 .map(Path::to_owned),
             token: None,
             local_token: update_token_file(),

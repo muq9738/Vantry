@@ -567,7 +567,11 @@ fn edit_queue(db: &Connection, c: &Command) -> Result<Receipt> {
             order(db, &ids)?;
         }
         PromoteInputToSteer => {
-            if let Some(target) = active(db, &i.thread_id)? {
+            let target = active(db, &i.thread_id)?;
+            if !c.run_id.is_empty() && target.as_deref() != Some(c.run_id.as_str()) {
+                return Err(conflict("target run has changed"));
+            }
+            if let Some(target) = target {
                 let r = run(db, &target)?;
                 if r.status != RunStatus::Running {
                     return Err(conflict("no running attempt"));

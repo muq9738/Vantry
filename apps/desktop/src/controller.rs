@@ -1128,6 +1128,10 @@ function run(argv) {
 /// attachments, writes native image data (`PNG`/`TIFF`) alongside plain text & HTML
 /// so pasting into chat apps, rich editors, image apps, or Vantry itself keeps both.
 pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attachment>) {
+    copy_with_images(text, attachments, None);
+}
+
+pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::Attachment>, selection_id: Option<String>) {
     let images: Vec<vantry_protocol::Attachment> = attachments
         .into_iter()
         .filter(|a| a.mime.starts_with("image/"))
@@ -1146,7 +1150,13 @@ pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attac
             })
             .collect()
     });
-    if !text.trim().is_empty() {
+    if let Some(id) = &selection_id {
+        let mut clip = ClipboardItem::default();
+        clip.text = text.clone();
+        let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        clip.html = Some(format!("<div data-vantry-selection=\"{id}\">{escaped}</div>"));
+        drop(set_clipboard_item(clip));
+    } else if !text.trim().is_empty() {
         drop(set_clipboard(text.clone()));
     }
     state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制消息与图片。")));
@@ -1157,7 +1167,10 @@ pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attac
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
         };
-        let mut html = String::from("<div>");
+        let mut html = match &selection_id {
+            Some(id) => format!("<div data-vantry-selection=\"{id}\">"),
+            None => String::from("<div>"),
+        };
         if !text.is_empty() {
             html.push_str("<p>");
             html.push_str(&escape(&text).replace('\n', "<br>"));
@@ -1182,8 +1195,15 @@ pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attac
         }
         html.push_str("</div>");
         let Some(first_uri) = first_data_uri else {
+            warn("无法读取所选图片，剪贴板已保留文字。");
             return;
         };
+        if let Some(id) = selection_id {
+            let marker = format!("data-vantry-selection=\"{id}\"");
+            if arboard::Clipboard::new().and_then(|mut c| c.get().html()).is_ok_and(|html| !html.contains(&marker)) {
+                return;
+            }
+        }
         if text.trim().is_empty() {
             set_clipboard_image(first_uri);
             return;

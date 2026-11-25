@@ -24,6 +24,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+vantry-platform.workspace = true
 vantry-protocol.workspace = true
 
 [dev-dependencies]

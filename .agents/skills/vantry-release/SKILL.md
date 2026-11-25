@@ -59,16 +59,33 @@ gh run download "$run_id" --name release-windows-amd64 --dir "$release_dir/windo
 
 ## Publish the GitHub Release
 
-When publication is requested, upload the five versioned files from the same release tag. Use the English notes from the tagged checkout.
+When publication is requested, generate desktop deltas against the previous public stable release before uploading the versioned files. For a re-run, set `previous` to the same base tag used originally. Both inputs are the actual distributed ZIPs. `make-delta` reconstructs the target and verifies the file hashes before publishing its output.
 
 ```bash
+previous=${previous:-$(gh release view --json tagName --jq .tagName)}
+test "$previous" != "$tag"
+base=${previous#v}
+mkdir -p "$release_dir/base"
+deltas=()
+for platform in darwin-arm64 windows-amd64; do
+  folder=desktop
+  if [[ $platform == windows-amd64 ]]; then folder=windows/desktop; fi
+  asset="vantry-$base-$platform.zip"
+  gh release download "$previous" --pattern "$asset" --dir "$release_dir/base" --clobber
+  patch="$release_dir/vantry-$base-to-$version-$platform.delta"
+  cargo run --locked -p xtask -- make-delta --from "$base" --to "$version" \
+    --old "$release_dir/base/$asset" --new "$release_dir/$folder/vantry-$version-$platform.zip" --out "$patch"
+  deltas+=("$patch")
+done
+
 gh release create "$tag" --verify-tag --title "Vantry $version" \
   --notes-file "docs/releases/$version.md" \
   "$release_dir/desktop/Vantry-$version-macos-arm64.dmg" \
   "$release_dir/desktop/vantry-$version-darwin-arm64.zip" \
   "$release_dir/service/vantry-service-$version-darwin-arm64.zip" \
   "$release_dir/windows/desktop/vantry-$version-windows-amd64.zip" \
-  "$release_dir/windows/service/vantry-service-$version-windows-amd64.zip"
+  "$release_dir/windows/service/vantry-service-$version-windows-amd64.zip" \
+  "${deltas[@]}"
 ```
 
 If a release already exists, inspect it with `gh release view "$tag" --json isDraft,assets,url` and upload any missing files with `gh release upload`. Publish a completed draft with `gh release edit "$tag" --draft=false`. Verify the published asset names and return the release URL.

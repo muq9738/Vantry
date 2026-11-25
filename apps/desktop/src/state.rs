@@ -290,8 +290,8 @@ impl PrimaryAction {
     pub fn label(self) -> &'static str {
         match self {
             PrimaryAction::Send => "发送",
-            PrimaryAction::Steer => "追加",
-            PrimaryAction::Queue => "排队",
+            PrimaryAction::Steer => "立即插入",
+            PrimaryAction::Queue => "下一轮",
             PrimaryAction::Save => "保存",
         }
     }
@@ -1067,7 +1067,7 @@ impl AppState {
             && !self
                 .inputs
                 .iter()
-                .any(|i| i.id == edit.input_id && i.status == "pending")
+                .any(|i| i.id == edit.input_id && i.is_queued())
         {
             self.end_queue_edit();
         }
@@ -1438,7 +1438,7 @@ impl AppState {
         if input.id.is_empty() {
             return false;
         }
-        if input.status != "pending"
+        if !input.is_queued()
             && self
                 .queue_edit
                 .as_ref()
@@ -1647,7 +1647,7 @@ impl AppState {
             send.attachments = draft.attachments.clone();
             let mut create = Command::new(new_command_id("thread"), CommandKind::CreateThread);
             if self.new_thread.provider_id == "controlled" {
-                create.title = title_from_message(&text);
+                create.title = draft.sidebar_title();
             }
             create.provider_id = self.new_thread.provider_id.clone();
             create.model = self.new_thread.model.clone();

@@ -212,12 +212,14 @@ pub fn read_file(root: &Path, path: &Path, limit: usize) -> io::Result<Vec<u8>> 
     }
     Ok(data)
 }
-pub fn lock_dir(path: &Path, wait: bool) -> io::Result<File> {
+pub fn directory_lock_handle(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
-    let handle = directory_handle(path)?;
+    return directory_handle(path);
     #[cfg(windows)]
-    let handle = imp::directory_lock(path)?;
-    lock(handle, wait)
+    return imp::directory_lock(path);
+}
+pub fn lock_dir(path: &Path, wait: bool) -> io::Result<File> {
+    lock(directory_lock_handle(path)?, wait)
 }
 pub fn lock_file(path: &Path, wait: bool) -> io::Result<File> {
     lock(imp::open(path, true)?, wait)

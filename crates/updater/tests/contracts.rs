@@ -23,10 +23,12 @@ fn versions_channels_and_platform_assets() -> Result<()> {
         assert_eq!(compare_versions(b, a), want.reverse());
     }
     let github=br#"{"tag_name":"v2","assets":[{"name":"vantry-2-arm64.dmg"},{"name":"vantry-2-darwin-arm64.zip","size":20},{"name":"vantry-1-to-2-darwin-arm64.delta","size":3}]}"#;
-    let release = parse_release(github, Channel::Stable)?;
+    let mut release = parse_release(github, Channel::Stable)?;
     let (full, delta) = release.assets_for("vantry", "darwin-arm64", "v1");
     assert_eq!(full.unwrap().size, 20);
     assert_eq!(delta.unwrap().size, 3);
+    release.assets.iter_mut().find(|a| a.name.ends_with(".delta")).unwrap().size = 21;
+    assert!(release.assets_for("vantry", "darwin-arm64", "v1").1.is_none());
     assert!(release.assets_for("vantry", "linux-amd64", "1").0.is_none());
     let manifest=br#"{"releases":[{"version":"2.1","channel":"stable"},{"version":"3-beta.2","channel":"beta"},{"version":"4-nightly","channel":"nightly"},{"version":"100","draft":true}]}"#;
     for (channel, ver) in [
@@ -82,6 +84,7 @@ fn delta_roundtrip_mutation_permissions_and_bad_input() -> Result<()> {
     let mut code = old_bytes.clone();
     code[361] = 22;
     code.splice(24680..24680, b"extra call".iter().copied());
+    code.rotate_left(740_021); // A linker can also reorder whole sections.
     for (dir, bytes) in [(&old, &old_bytes), (&new, &code)] {
         fs::write(dir.join("code"), bytes)?;
         fs::write(dir.join("asset"), b"kept")?;

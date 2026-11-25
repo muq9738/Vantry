@@ -34,6 +34,7 @@ pub struct QueueItem {
     pub status: String,
     /// A command about it is on its way.
     pub busy: bool,
+    pub can_insert: bool,
     pub editing: bool,
 }
 
@@ -231,9 +232,10 @@ impl AppState {
         let mut queued: Vec<&Input> = self
             .inputs
             .iter()
-            .filter(|i| i.thread_id == thread_id && i.kind == "queue" && i.status == "pending")
+            .filter(|i| i.thread_id == thread_id && i.is_queued())
             .collect();
         queued.sort_by_key(|i| (i.position, i.created_at.clone()));
+        let can_insert = self.active_run(thread_id).is_some_and(|r| r.status == RunStatus::Running);
         let count = queued.len();
         let editing = self.queue_edit.as_ref().map(|e| e.input_id.as_str());
         let mut items: Vec<QueueItem> = queued
@@ -246,7 +248,8 @@ impl AppState {
                 index,
                 count,
                 attachments: input.attachments.len(),
-                status: "排队中".to_owned(),
+                status: if self.in_flight(&format!("queue:{}:promote", input.id)) { "正在插入" } else { "排队中" }.to_owned(),
+                can_insert,
                 busy: self.busy(&format!("queue:{}:", input.id)),
                 editing: editing == Some(input.id.as_str()),
             })
@@ -269,9 +272,10 @@ impl AppState {
                     status: if input.status == "unknown" {
                         "交付不明（不会自动重发）".to_owned()
                     } else {
-                        "追加中".to_owned()
+                        "等待当前轮次接收".to_owned()
                     },
                     busy: false,
+                    can_insert: false,
                     editing: false,
                 }),
         );
@@ -281,7 +285,7 @@ impl AppState {
     fn queued_input(&self, input_id: &str) -> Option<Input> {
         self.inputs
             .iter()
-            .find(|i| i.id == input_id && i.kind == "queue" && i.status == "pending")
+            .find(|i| i.id == input_id && i.is_queued())
             .cloned()
     }
 
@@ -361,7 +365,7 @@ impl AppState {
         let mut queue: Vec<Input> = self
             .inputs
             .iter()
-            .filter(|i| i.thread_id == input.thread_id && i.kind == "queue" && i.status == "pending")
+            .filter(|i| i.thread_id == input.thread_id && i.is_queued())
             .cloned()
             .collect();
         queue.sort_by_key(|i| (i.position, i.created_at.clone()));
@@ -391,18 +395,17 @@ impl AppState {
     /// Hands queued message `input_id` to the running attempt now.
     pub fn promote_queued(&mut self, input_id: &str) -> Option<Command> {
         let input = self.queued_input(input_id)?;
-        let running = self
-            .active_run(&input.thread_id)
-            .is_some_and(|r| r.status == RunStatus::Running);
-        if !running {
+        if self.busy(&format!("queue:{input_id}:")) { return None; }
+        let Some(run) = self.active_run(&input.thread_id).filter(|r| r.status == RunStatus::Running) else {
             self.notice = Some(Notice::new(
                 NoticeLevel::Warn,
                 "只有运行中的任务可以接收追加。",
             ));
             return None;
-        }
+        };
         let mut command =
             thread_command(CommandKind::PromoteInputToSteer, "promote", &input.thread_id);
+        command.run_id = run.id.clone();
         command.input_id = input_id.to_owned();
         Some(self.track(
             format!("queue:{input_id}:promote"),

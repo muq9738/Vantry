@@ -160,7 +160,87 @@ impl References {
         result
     }
 }
+#[derive(Clone)]
+struct CopiedSelection {
+    id: String,
+    machine: Option<String>,
+    text: String,
+    // Byte ranges in the copied text, in reading order. An image may recur.
+    refs: Vec<(std::ops::Range<usize>, String)>,
+    images: Vec<vantry_protocol::Attachment>,
+    paths: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+thread_local! {
+    static LAST_SELECTION: std::cell::RefCell<Option<CopiedSelection>> = const { std::cell::RefCell::new(None) };
+}
+impl CopiedSelection {
+    fn insert_images(&self, draft: &mut Draft, lang: crate::state::language::Language) -> String {
+        let mut labels = BTreeMap::new();
+        for image in &self.images {
+            let mention = draft
+                .mentions
+                .iter()
+                .find(|m| m.attachment_id == image.id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mention = draft.build_attachment_mention(image, lang);
+                    draft.mentions.push(mention.clone());
+                    mention
+                });
+            if !draft.attachments.iter().any(|a| a.id == image.id) {
+                draft.attachments.push(image.clone());
+            }
+            if let Some(path) = self.paths.get(&image.id) {
+                draft.image_paths.insert(image.id.clone(), path.clone());
+            }
+            labels.insert(&image.id, mention.display);
+        }
+        let mut text = self.text.clone();
+        for (range, id) in self.refs.iter().rev() {
+            text.replace_range(range.clone(), &labels[id]);
+        }
+        text
+    }
+}
+
+pub(super) fn restore_selection(html: &str) -> Option<String> {
+    let id = html
+        .split_once("data-vantry-selection=\"")?
+        .1
+        .split_once('"')?
+        .0;
+    LAST_SELECTION.with_borrow(|last| {
+        let clip = last.as_ref()?;
+        if clip.id != id || clip.machine != controller::current_machine() {
+            return None;
+        }
+        let lang = controller::ui().with_untracked(|u| u.locale);
+        let mut text = None;
+        controller::state().update(|s| {
+            let key = s.draft_key();
+            text = Some(clip.insert_images(s.drafts.entry(key).or_default(), lang));
+        });
+        text
+    })
+}
+
 impl PluginSpec for References {
+    fn transform_pasted_html(&self, _: &EditorState, html: String) -> String {
+        match restore_selection(&html) {
+            Some(text) => text
+                .split('\n')
+                .map(|line| {
+                    format!(
+                        "<p>{}</p>",
+                        line.replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    )
+                })
+                .collect(),
+            None => html,
+        }
+    }
     fn decorations(&self, state: &EditorState) -> Option<DecorationSet> {
         let attrs = BTreeMap::from([("class".into(), json!("text-blue-500 underline"))]);
         let marks = self
@@ -176,6 +256,51 @@ impl PluginSpec for References {
         event: &nsh_base::rich_editor::state::KeyEvent,
         dispatch: &mut dyn FnMut(Transaction),
     ) -> bool {
+        if event.mod_key && !event.alt && !event.shift && event.key.eq_ignore_ascii_case("c") {
+            let from = state.selection().from();
+            let to = state.selection().to();
+            let body = plain(state.doc());
+            let offset = |pos| {
+                crate::state::draft::utf16_to_byte(&body, text_offset(state.doc(), pos as u32))
+            };
+            let start = offset(from);
+            let draft = controller::state().with_untracked(|s| s.draft());
+            let mut images = Vec::new();
+            let mut refs = Vec::new();
+            for (left, right, url) in self.spans(state.doc()) {
+                if left < from || right > to {
+                    continue;
+                }
+                let Some(id) = url.strip_prefix("vantry-attachment://") else {
+                    continue;
+                };
+                let Some(image) = draft
+                    .attachments
+                    .iter()
+                    .find(|a| a.id == id && a.mime.starts_with("image/"))
+                else {
+                    continue;
+                };
+                refs.push((offset(left) - start..offset(right) - start, id.to_owned()));
+                if !images.contains(image) {
+                    images.push(image.clone());
+                }
+            }
+            if !images.is_empty() {
+                let id = uuid::Uuid::new_v4().to_string();
+                let text = body[start..offset(to)].to_owned();
+                LAST_SELECTION.replace(Some(CopiedSelection {
+                    id: id.clone(),
+                    machine: controller::current_machine(),
+                    text: text.clone(),
+                    refs,
+                    images: images.clone(),
+                    paths: draft.image_paths,
+                }));
+                controller::copy_with_images(text, images, Some(id));
+                return true;
+            }
+        }
         if event.key != "Enter" {
             return false;
         }
@@ -322,6 +447,17 @@ pub(super) fn reference_input(
             }
         })
         .on_paste_files(move |p: &RichEditorPastedFiles| {
+            // nsh reports only the file flavors here, dropping the HTML of a mixed paste.
+            if !p.files.is_empty()
+                && LAST_SELECTION.with_borrow(Option::is_some)
+                && let Ok(html) = arboard::Clipboard::new().and_then(|mut c| c.get().html())
+                && let Some(text) = restore_selection(&html)
+            {
+                let mut paste = PasteEvent::default();
+                paste.text = text;
+                super::composer::paste_into_composer(&paste, input, selection.get_untracked());
+                return;
+            }
             if !p.uris.is_empty() {
                 controller::paste_file_uris(&p.uris);
             }
@@ -340,6 +476,38 @@ pub(super) fn reference_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn copied_images_remap_repeated_references_in_an_occupied_draft() {
+        let image = vantry_protocol::Attachment {
+            id: "source".into(),
+            name: "pasted-image-1.png".into(),
+            mime: "image/png".into(),
+            ..Default::default()
+        };
+        let text = "😀@图1 和 @图1".to_owned();
+        let clip = CopiedSelection {
+            refs: text
+                .match_indices("@图1")
+                .map(|(at, s)| (at..at + s.len(), image.id.clone()))
+                .collect(),
+            id: "nonce".into(),
+            machine: None,
+            text,
+            images: vec![image],
+            paths: Default::default(),
+        };
+        let mut draft = Draft {
+            text: "已有 @图1".into(),
+            ..Default::default()
+        };
+        let lang = crate::state::language::Language::Zh;
+        for _ in 0..2 {
+            assert_eq!(clip.insert_images(&mut draft, lang), "😀@图2 和 @图2");
+            assert_eq!(draft.attachments.len(), 1);
+            assert_eq!(draft.mentions.len(), 1);
+        }
+    }
+
     #[test]
     fn reference_offsets_follow_utf16_across_paragraphs_and_numbered_images() {
         let body = "😀看图\n@图12 @图1\n\n收尾";

@@ -143,6 +143,10 @@ impl Release {
                     .cloned()
             });
         }
+        let delta = delta.filter(|d| {
+            full.as_ref()
+                .is_none_or(|f| d.size == 0 || f.size == 0 || d.size < f.size)
+        });
         (full, delta)
     }
 }

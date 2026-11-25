@@ -340,9 +340,13 @@ async fn execute(
     let stop_file = dir.join("stop.json");
     let (_workspace_lock, waited_for_lock) = crate::workspace::lock_workspace_dir(
         &cwd,
-        &job.data_dir,
         &stop_file,
         &journal.failed,
+        if req.workspace.as_ref().is_some_and(|w| w.kind == "directory") {
+            crate::workspace::WorkspaceLease::Shared
+        } else {
+            crate::workspace::WorkspaceLease::Exclusive
+        },
         || {
             journal.record(json!({
                 "type": "workspace_lock_wait",
@@ -621,6 +625,11 @@ pub(crate) async fn consume_controls(
         let outcome = if uncertain {
             Err(anyhow::anyhow!("prior delivery unconfirmed"))
         } else if let Some((session, ui)) = active {
+            // The Core can accept a steer while Pi is still binding extensions.
+            // Leave it durable for the next poll until the prompt can receive it.
+            if c.kind == "steer" && matches!(session, Active::Pi(pi) if !pi.is_streaming()) {
+                continue;
+            }
             disk::directory(&sent)?;
             disk::write_json(&sent.join(&name), &json!({"id":id}))?;
             match c.kind.as_str() {

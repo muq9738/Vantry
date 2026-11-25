@@ -241,7 +241,7 @@ impl MockCore {
         let mut queue: Vec<Input> = self
             .inputs
             .iter()
-            .filter(|i| i.thread_id == thread_id && i.kind == "queue" && i.status == "pending")
+            .filter(|i| i.thread_id == thread_id && i.is_queued())
             .cloned()
             .collect();
         queue.sort_by_key(|i| i.position);
@@ -883,7 +883,7 @@ impl MockBridge {
                         kind: "queue".into(),
                         message: command.message.clone(),
                         attachments: command.attachments.clone(),
-                        status: "pending".into(),
+                        status: "queued".into(),
                         position,
                         ..Input::default()
                     };
@@ -917,7 +917,7 @@ impl MockBridge {
             }
             CommandKind::EditInput => {
                 let mut input = core.input(&command)?;
-                if input.status != "pending" {
+                if !input.is_queued() {
                     return Err(BridgeError::new(ErrorCode::Conflict, "input already started"));
                 }
                 if command.message.trim().is_empty() {
@@ -948,10 +948,10 @@ impl MockBridge {
                 let mut input = core.input(&command)?;
                 let run = core
                     .active_run(&input.thread_id)
-                    .filter(|r| r.status == RunStatus::Running)
+                    .filter(|r| r.status == RunStatus::Running && (command.run_id.is_empty() || r.id == command.run_id))
                     .cloned()
-                    .ok_or_else(|| BridgeError::new(ErrorCode::Conflict, "no running run"))?;
-                if input.status != "pending" {
+                    .ok_or_else(|| BridgeError::new(ErrorCode::Conflict, "no matching running run"))?;
+                if !input.is_queued() {
                     return Err(BridgeError::new(ErrorCode::Conflict, "input already started"));
                 }
                 input.kind = "steer".into();
@@ -979,7 +979,7 @@ impl MockBridge {
                     .find(|i| i.id == id)
                     .cloned()
                     .ok_or_else(|| not_found("input"))?;
-                if input.status == "pending" {
+                if input.is_queued() {
                     input.status = "cancelled".into();
                     core.upsert_input(input.clone());
                     let rest = core.pending_queue(&input.thread_id);

@@ -16,7 +16,7 @@ struct Cli {
 enum Commands {
     /// Build and assemble a desktop, standalone service or relay release.
     Package(package::Options),
-    /// Create a v1 binary delta between two bundle directories.
+    /// Create a v1 binary delta between two release archives or bundle directories.
     MakeDelta(Delta),
     /// Remove connected edge background and generate application icons.
     PrepareIcon(icon::Options),
@@ -39,7 +39,15 @@ fn parent(path: &Path) -> &Path {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
 }
-fn delta(opts: Delta) -> Result<()> {
+fn delta(mut opts: Delta) -> Result<()> {
+    let unpacked = tempfile::tempdir()?;
+    for (input, name) in [(&mut opts.old, "old"), (&mut opts.new, "new")] {
+        if input.is_file() {
+            let root = unpacked.path().join(name);
+            fs::create_dir(&root)?;
+            *input = vantry_updater::unpack_release(input, &root)?;
+        }
+    }
     let dir = parent(&opts.out);
     fs::create_dir_all(dir)?;
     let dir = dir.canonicalize()?;
@@ -62,6 +70,14 @@ fn delta(opts: Delta) -> Result<()> {
             (file, total)
         };
     file.as_file().sync_all()?;
+    let rebuilt = unpacked.path().join("verified");
+    vantry_updater::apply_delta(
+        fs::File::open(file.path())?,
+        &opts.from,
+        &opts.to,
+        &opts.old,
+        &rebuilt,
+    )?;
     let bytes = file.as_file().metadata()?.len();
     file.persist(&opts.out).context("publish delta")?;
     println!(

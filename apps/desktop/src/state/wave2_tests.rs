@@ -375,7 +375,7 @@ fn queued(id: &str, position: i64, text: &str) -> Input {
         thread_id: "t1".into(),
         kind: "queue".into(),
         message: text.into(),
-        status: "pending".into(),
+        status: "queued".into(),
         position,
         ..Input::default()
     }
@@ -459,6 +459,8 @@ fn promoting_needs_a_running_run_and_cancel_is_per_input() {
     let mut state = queue_state();
     let promote = state.promote_queued("a").unwrap();
     assert_eq!(promote.kind, CommandKind::PromoteInputToSteer);
+    assert_eq!(promote.run_id, "r1");
+    assert!(state.promote_queued("a").is_none());
     let cancel = state.cancel_queued("b").unwrap();
     assert_eq!((cancel.kind, cancel.input_id.as_str()), (CommandKind::CancelInput, "b"));
     // A queued run (not running yet) takes no steer.
@@ -467,6 +469,7 @@ fn promoting_needs_a_running_run_and_cancel_is_per_input() {
         vec![run("r1", "t1", RunStatus::Queued, "2026-11-23T00:00:01Z")],
     );
     waiting.apply_event(&input_event(11, &queued("a", 0, "甲")));
+    assert!(!waiting.queue_items()[0].can_insert);
     assert!(waiting.promote_queued("a").is_none());
     assert!(waiting.notice.is_some());
     // Undelivered steers show with their state.

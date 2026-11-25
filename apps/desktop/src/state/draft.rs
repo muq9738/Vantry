@@ -53,6 +53,36 @@ pub struct Draft {
 }
 
 impl Draft {
+    pub(crate) fn sidebar_title(&self) -> String {
+        let topics = self.replace_mentions(|m| {
+            if m.kind == MENTION_ATTACHMENT { "\n" } else { &m.display }
+        });
+        let mut parts = Vec::new();
+        for clause in topics.split(['\n', '；', ';', '。']).map(str::trim) {
+            if clause.is_empty() || clause.starts_with("https://") || clause.starts_with("http://") {
+                continue;
+            }
+            let title = super::title_from_message(clause);
+            if !parts.contains(&title) {
+                parts.push(title);
+            }
+            if parts.len() == 3 {
+                break;
+            }
+        }
+        if parts.is_empty() {
+            if !self.attachments.is_empty() && self.attachments.iter().all(|a| a.mime.starts_with("image/")) {
+                return format!("{} 张图片", self.attachments.len());
+            }
+            return super::title_from_message(&self.text);
+        }
+        if parts.len() > 1 {
+            for part in &mut parts {
+                *part = part.split(['，', ',']).next().unwrap_or(part).chars().take(12).collect();
+            }
+        }
+        super::title_from_message(&parts.join(" · "))
+    }
     pub(super) fn is_blank(&self) -> bool {
         self.text.trim().is_empty() && self.attachments.is_empty()
     }
@@ -86,7 +116,7 @@ impl Draft {
         middle_truncate_name(&item.name, 18)
     }
 
-    pub(super) fn build_attachment_mention(
+    pub(crate) fn build_attachment_mention(
         &self,
         item: &Attachment,
         lang: super::language::Language,
@@ -467,6 +497,18 @@ mod tests {
         let (_, links, body) = thread_links::draft_parts(&draft.text);
         assert!(links.is_empty());
         assert_eq!(body, "@前次 请提取");
+    }
+
+    #[test]
+    fn draft_title_collects_topics_and_omits_numbered_images() {
+        let draft = Draft {
+            text: "@图1 优化增量更新，参考发布包； @图2 复制图片引用； @图3 归纳会话标题".into(),
+            mentions: (1..=3).map(|i| DraftMention {
+                kind: MENTION_ATTACHMENT, display: format!("@图{i}"), ..Default::default()
+            }).collect(),
+            ..Default::default()
+        };
+        assert_eq!(draft.sidebar_title(), "优化增量更新 · 复制图片引用 · 归纳会话标题");
     }
 
     #[test]
