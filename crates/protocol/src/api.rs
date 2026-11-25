@@ -123,6 +123,8 @@ pub struct Command {
     pub version: i64,
     pub command_id: String,
     pub kind: CommandKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_state: Option<ThreadReadChange>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -220,9 +222,19 @@ pub struct Receipt {
     pub delivery: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadChange {
+    pub unread: bool,
+    pub observed_sequence: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
+    /// Zero means read. Older Cores omit the shared marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sequence: Option<i64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub project_path: String,
     pub id: String,
@@ -1466,6 +1478,25 @@ pub struct ModelInfo {
     pub input: Option<Vec<String>>,
     pub context_window: i64,
     pub max_tokens: i64,
+}
+
+impl ModelInfo {
+    /// Canonical `provider/id` key matching Go v0.1.42's `ModelInfo.Key()`.
+    pub fn key(&self) -> String {
+        let provider = self.provider.trim();
+        let id = self.id.trim();
+        if provider.is_empty() || id.is_empty() {
+            return id.to_owned();
+        }
+        if id
+            .strip_prefix(provider)
+            .is_some_and(|rest| rest.starts_with('/'))
+        {
+            id.to_owned()
+        } else {
+            format!("{provider}/{id}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

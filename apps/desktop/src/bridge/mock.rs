@@ -384,6 +384,29 @@ impl MockBridge {
                 created_at: "2026-11-23T08:00:01Z".into(),
                 ..Run::default()
             });
+            // Steps before the reply: one quiet, collapsible tool line.
+            for (n, (name, args, output)) in [
+                ("bash", json!({ "command": "git status --short" }), "M apps/desktop/src/views/timeline.rs"),
+                ("read", json!({ "path": "docs/desktop-ui.md" }), "# Desktop UI"),
+                ("grep", json!({ "pattern": "TimelineItem" }), "apps/desktop/src/state/timeline.rs"),
+                ("bash", json!({ "command": "cargo test -p vantry-desktop" }), "test result: ok"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                core.tools.push(ToolCall {
+                    id: format!("tool-demo-{n}"),
+                    thread_id: welcome.id.clone(),
+                    run_id: "run-demo".into(),
+                    attempt_id: "run-demo-a1".into(),
+                    name: name.into(),
+                    arguments: Some(args),
+                    output: output.into(),
+                    status: "completed".into(),
+                    output_offset: 0,
+                    ..ToolCall::default()
+                });
+            }
             for (child, status, output) in [
                 (&child_ok, RunStatus::Completed, "依赖均为最新。"),
                 (&child_failed, RunStatus::Failed, ""),

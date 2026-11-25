@@ -234,6 +234,7 @@ fn workbench() -> impl IntoElement {
         .child(views::settings::settings())
         .child(views::dialogs::rename_dialog())
         .child(views::dialogs::confirm_dialog())
+        .child(views::dialogs::attachment_preview_dialog())
 }
 
 /// The desktop links NSH, the protocol and the client only: never the Core

@@ -1847,6 +1847,53 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
       if (opts.selectedTools.includes("codemode") || opts.toolGuidelines.codemode) {
         opts.toolGuidelines.codemode = [...VANTRY_CODEMODE_GUIDELINES];
         opts.toolSnippets.codemode = VANTRY_CODEMODE_SNIPPET;
+
+        // pi-rust calls `tools.apply_to_prompt` after `before_agent_start`, overwriting
+        // `toolSnippets` and `toolGuidelines`, while preserving `sections` overrides in place.
+        // Render `tools` and `rules` sections here so Vantry's codemode guidance always sticks.
+        if (!opts.customPrompt && isRecord(opts.sections)) {
+          const hidden = new Set(Array.isArray(opts.hiddenTools) ? opts.hiddenTools : []);
+          const declared = opts.selectedTools.filter((name) => !hidden.has(name));
+          const visibleTools = declared
+            .map((name) => {
+              const snippet = typeof opts.toolSnippets?.[name] === "string" ? opts.toolSnippets[name].trim() : "";
+              return snippet ? `- ${name}: ${snippet}` : "";
+            })
+            .filter(Boolean);
+          const toolsBody = visibleTools.length > 0 ? visibleTools.join("\n") : "(none)";
+          opts.sections.tools = `${toolsBody}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
+
+          const rules: string[] = [];
+          const addRule = (rule: unknown) => {
+            if (typeof rule !== "string") return;
+            const trimmed = rule.trim();
+            if (trimmed && !rules.includes(trimmed)) rules.push(trimmed);
+          };
+          const hasTool = (name: string) => declared.includes(name);
+          const hasBash = hasTool("bash");
+          const hasPowerShell = hasTool("powershell");
+          if ((hasBash || hasPowerShell) && !hasTool("grep") && !hasTool("find") && !hasTool("ls")) {
+            addRule(
+              hasBash && hasPowerShell
+                ? "Use bash or PowerShell for file operations like listing, searching, and finding files"
+                : hasPowerShell
+                  ? "Use PowerShell for file operations like listing, searching, and finding files"
+                  : "Use bash for file operations like ls, rg, find",
+            );
+          }
+          for (const name of declared) {
+            const list = opts.toolGuidelines?.[name];
+            if (Array.isArray(list)) {
+              for (const rule of list) addRule(rule);
+            }
+          }
+          if (Array.isArray(opts.promptGuidelines)) {
+            for (const rule of opts.promptGuidelines) addRule(rule);
+          }
+          addRule("Be concise in your responses");
+          addRule("Show file paths clearly when working with files");
+          opts.sections.rules = rules.map((r) => `- ${r}`).join("\n");
+        }
       }
     });
 

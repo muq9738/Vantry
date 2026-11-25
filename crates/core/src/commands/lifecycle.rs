@@ -102,6 +102,7 @@ pub(super) fn apply(db: &Connection, c: &Command, options: &CoreOptions) -> Resu
                 "DELETE FROM thread_watches WHERE watcher_thread_id=?1 OR target_thread_id=?1",
                 [&t.id],
             )?;
+            set_unread_sequence(db, &t.id, 0)?;
             db.execute("DELETE FROM threads WHERE id=?", [&t.id])?;
             event(db, "thread.deleted", &t.id, "", "", json!({"thread":t}))?;
             Ok(receipt(&t.id, ""))

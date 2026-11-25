@@ -18,6 +18,13 @@ impl Language {
             Self::Ja => "日本語",
         }
     }
+    pub fn image_label(self, index: usize) -> String {
+        match self {
+            Self::Zh => format!("图{index}"),
+            Self::En => format!("Image {index}"),
+            Self::Ja => format!("画像{index}"),
+        }
+    }
     pub fn label<'a>(self, zh: &'a str) -> &'a str {
         if self == Self::Zh {
             return zh;
@@ -92,8 +99,29 @@ impl Language {
             "确认并派工" => ("Confirm & dispatch", "確認してディスパッチ"),
             "直接在本会话执行" => ("Run directly here", "このスレッドで直接実行"),
             "复制" => ("Copy", "コピー"),
+            "复制消息" => ("Copy message", "メッセージをコピー"),
+            "复制图片" => ("Copy image", "画像をコピー"),
+            "预览图片" => ("Preview image", "画像をプレビュー"),
+            "加载中…" => ("Loading…", "読み込み中…"),
             "关闭" => ("Close", "閉じる"),
             "刷新" => ("Refresh", "更新"),
+            "本机" => ("This machine", "このマシン"),
+            "切换机器" => ("Switch machine", "マシンを切り替え"),
+            "连接另一台机器" => ("Connect another machine", "別のマシンに接続"),
+            "连接另一台机器…" => ("Connect another machine…", "別のマシンに接続…"),
+            "刷新机器列表" => ("Refresh machines", "マシン一覧を更新"),
+            "尚未配对其他机器" => ("No paired machines yet", "ペアリング済みのマシンはありません"),
+            "在线" => ("online", "オンライン"),
+            "离线" => ("offline", "オフライン"),
+            "在此项目新建会话" => ("New thread in this project", "このプロジェクトで新規スレッド"),
+            "抓取远程更新 (Fetch)" => ("Fetch remote updates", "リモートの更新を取得"),
+            "拉取 (Pull)" => ("Pull", "プル"),
+            "推送 (Push)" => ("Push", "プッシュ"),
+            "在访达中显示" => ("Show in Finder", "Finder で表示"),
+            "复制路径" => ("Copy path", "パスをコピー"),
+            "引用到输入框" => ("Quote in composer", "入力欄に引用"),
+            "刷新 Git 状态" => ("Refresh Git status", "Git の状態を更新"),
+            "撤销所有未暂存更改" => ("Discard all unstaged changes", "未ステージの変更をすべて破棄"),
             _ => return zh,
         };
         if self == Self::En { en } else { ja }

@@ -53,6 +53,7 @@ pub struct T3Options {
     pub version: String,
     pub provider: String,
     pub model: String,
+    pub identity: Option<Arc<crate::identity::IdentityStore>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +98,7 @@ struct BootstrapCode {
 }
 
 struct WsTicket {
-    _client_id: String,
+    client_id: String,
     expires: DateTime<Utc>,
 }
 
@@ -106,7 +107,7 @@ struct Inner {
     state: Mutex<AuthState>,
     codes: Mutex<HashMap<String, BootstrapCode>>,
     tickets: Mutex<HashMap<String, WsTicket>>,
-    sessions: Mutex<Vec<CancellationToken>>,
+    sessions: Mutex<Vec<(String, CancellationToken)>>,
 }
 
 #[derive(Clone)]
@@ -212,13 +213,31 @@ impl T3Server {
         Ok((bootstrap, u.to_string()))
     }
 
+    /// Mint the invitation on the same adapter that consumes it at /oauth/token.
+    pub fn mobile_pairing_link(&self) -> Result<Option<String>> {
+        let Some(identity) = &self.0.opts.identity else { return Ok(None) };
+        let cfg = identity.snapshot();
+        let routes = cfg.mobile_routes();
+        let public = crate::transport::relay_url(cfg.public_url(), false).ok().filter(|url| {
+            url.scheme() == "https" && url.path() == "/"
+                && url.host_str().is_some_and(|h| {
+                    let host = h.trim_end_matches('.').trim_matches(['[', ']']);
+                    host != "localhost" && !host.ends_with(".localhost")
+                        && !host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+                })
+        });
+        let base = public.as_ref().map(Url::as_str)
+            .or_else(|| routes.as_ref().and_then(|r| r["direct"][0].as_str()));
+        base.map(|url| self.pairing_link(url, routes.as_ref()).map(|(_, link)| link)).transpose()
+    }
+
     pub fn revoke_all(&self) -> Result<()> {
         let mut state = self.0.state.lock().unwrap();
         state.clients.clear();
         self.save_locked(&state)?;
         self.0.codes.lock().unwrap().clear();
         self.0.tickets.lock().unwrap().clear();
-        for tok in self.0.sessions.lock().unwrap().drain(..) {
+        for (_, tok) in self.0.sessions.lock().unwrap().drain(..) {
             tok.cancel();
         }
         Ok(())
@@ -235,6 +254,34 @@ impl T3Server {
             .filter(|c| c.expires_at > now)
             .cloned()
             .collect()
+    }
+
+    pub fn paired_devices(&self) -> Vec<Value> {
+        let now = Utc::now();
+        let state = self.0.state.lock().unwrap();
+        state.clients.iter().filter(|c| c.expires_at > now)
+            .map(|c| json!({"id":c.id,"name":c.name,"createdAt":c.created_at}))
+            .chain(state.legacy_sessions.iter().filter(|c| c.expires_at > now)
+                .map(|c| json!({"id":c.id,"name":c.name,"createdAt":c.created_at})))
+            .collect()
+    }
+
+    pub fn revoke_client(&self, id: &str) -> Result<bool> {
+        let mut state = self.0.state.lock().unwrap();
+        let mut next = state.clone();
+        next.clients.retain(|c| c.id != id);
+        next.legacy_sessions.retain(|c| c.id != id);
+        if next.clients.len() == state.clients.len() && next.legacy_sessions.len() == state.legacy_sessions.len() {
+            return Ok(false);
+        }
+        self.save_locked(&next)?;
+        *state = next;
+        self.0.tickets.lock().unwrap().retain(|_, t| t.client_id != id);
+        self.0.sessions.lock().unwrap().retain(|(owner, stop)| {
+            if owner == id { stop.cancel(); }
+            !stop.is_cancelled()
+        });
+        Ok(true)
     }
 
     fn authorize(&self, candidate: &str) -> Option<T3Client> {
@@ -276,6 +323,14 @@ impl T3Server {
         })
     }
 
+    fn connection_routes(&self) -> Option<Value> {
+        self.0
+            .opts
+            .identity
+            .as_ref()
+            .and_then(|id| id.snapshot().mobile_routes())
+    }
+
     fn well_known_descriptor(&self) -> Value {
         let arch = match std::env::consts::ARCH {
             "x86_64" => "x64",
@@ -286,7 +341,7 @@ impl T3Server {
             "macos" => "darwin",
             other => other,
         };
-        json!({
+        let mut out = json!({
             "environmentId": self.environment_id(),
             "label": self.0.opts.name,
             "name": self.0.opts.name,
@@ -314,7 +369,11 @@ impl T3Server {
                 "threadSnooze": true,
                 "agentActivityPublishing": false,
             },
-        })
+        });
+        if let Some(routes) = self.connection_routes() {
+            out["connectionRoutes"] = routes;
+        }
+        out
     }
 
     fn exchange_token(&self, body: &Value) -> Result<Value, u16> {
@@ -350,7 +409,7 @@ impl T3Server {
             self.0.tickets.lock().unwrap().insert(
                 ticket_val.clone(),
                 WsTicket {
-                    _client_id: client.id.clone(),
+                    client_id: client.id.clone(),
                     expires,
                 },
             );
@@ -408,7 +467,7 @@ impl T3Server {
         self.0.tickets.lock().unwrap().insert(
             ticket_val.clone(),
             WsTicket {
-                _client_id: client.id.clone(),
+                client_id: client.id.clone(),
                 expires: now + ChronoDuration::minutes(5),
             },
         );
@@ -494,27 +553,34 @@ impl T3Server {
             let ticket = url::form_urlencoded::parse(query.as_bytes()).find_map(|(k, v)| {
                 matches!(k.as_ref(), "ticket" | "wsTicket").then(|| v.into_owned())
             });
-            let auth_ok = if let Some(t) = ticket {
+            let client_id = if let Some(t) = ticket {
                 let now = Utc::now();
                 let mut map = self.0.tickets.lock().unwrap();
                 map.retain(|_, v| v.expires > now);
-                map.remove(&t).is_some()
+                map.remove(&t).map(|ticket| ticket.client_id)
             } else {
                 let (tok, _) = extract_request_token(req.headers());
-                self.authorize(&tok).is_some()
+                self.authorize(&tok).map(|client| client.id)
             };
-            if !auth_ok {
-                return Err(401);
-            }
+            let client_id = client_id.ok_or(401u16)?;
             let (reply, up) = upgrade(&mut req)?;
-            let this = self.clone();
             let session_stop = tasks.stop.child_token();
-            self.0.sessions.lock().unwrap().push(session_stop.clone());
+            {
+                let state = self.0.state.lock().unwrap();
+                let now = Utc::now();
+                if !state.clients.iter().any(|c| c.id == client_id && c.expires_at > now)
+                    && !state.legacy_sessions.iter().any(|c| c.id == client_id && c.expires_at > now) {
+                    return Err(401);
+                }
+                self.0.sessions.lock().unwrap().push((client_id, session_stop.clone()));
+            }
+            let this = self.clone();
             tasks.spawn(async move {
-                let Ok(ws) = accepted(up, 4 << 20).await else {
-                    return;
-                };
-                this.drive_ws(ws, session_stop).await;
+                if let Ok(ws) = accepted(up, 64 << 20).await {
+                    this.drive_ws(ws, session_stop.clone()).await;
+                }
+                session_stop.cancel();
+                this.0.sessions.lock().unwrap().retain(|(_, stop)| !stop.is_cancelled());
             });
             return Ok(reply);
         }
@@ -546,6 +612,9 @@ impl T3Server {
                 result["expiresAt"] = json!(utc_iso(c.expires_at));
                 if !granted_perms.is_empty() {
                     result["permissions"] = json!(granted_perms);
+                }
+                if let Some(routes) = self.connection_routes() {
+                    result["connectionRoutes"] = routes;
                 }
             }
             return Ok(json(200, result));
@@ -612,7 +681,7 @@ impl T3Server {
                 tickets.insert(
                     key.clone(),
                     WsTicket {
-                        _client_id: client.id.clone(),
+                        client_id: client.id.clone(),
                         expires: expiry,
                     },
                 );
@@ -822,27 +891,122 @@ impl T3Server {
     }
 
     fn t3_descriptor(&self) -> Value {
-        json!({
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            _ => "other",
+        };
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        let mut out = json!({
             "environmentId": self.environment_id(),
             "label": self.0.opts.name,
             "platform": {
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
+                "os": os,
+                "arch": arch,
             },
             "version": self.0.opts.version,
-        })
+        });
+        if let Some(routes) = self.connection_routes() {
+            out["connectionRoutes"] = routes;
+        }
+        out
     }
 
-    fn t3_server_config(&self) -> Value {
+    async fn t3_server_config(&self, core_socket: &Path) -> Value {
+        let provider = if self.0.opts.provider.trim().is_empty() {
+            "pi"
+        } else {
+            self.0.opts.provider.as_str()
+        };
+        let mut entries: Vec<Value> = Vec::new();
+        let mut has_default = false;
+        if let Ok(Value::Array(list)) =
+            core_http_json(core_socket, Method::GET, "/v1/models", None).await
+        {
+            for item in list {
+                let id = item["id"].as_str().unwrap_or("").trim();
+                let p = item["provider"].as_str().unwrap_or("").trim();
+                let slug = if !id.is_empty() {
+                    if !p.is_empty() && !id.starts_with(&format!("{p}/")) {
+                        format!("{p}/{id}")
+                    } else {
+                        id.to_owned()
+                    }
+                } else {
+                    continue;
+                };
+                let name = item["name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&slug)
+                    .to_owned();
+                let is_default = !self.0.opts.model.is_empty() && slug == self.0.opts.model;
+                if is_default {
+                    has_default = true;
+                }
+                entries.push(json!({
+                    "slug": slug,
+                    "name": name,
+                    "isCustom": false,
+                    "capabilities": {"optionDescriptors": []},
+                    "isDefault": is_default,
+                }));
+            }
+        }
+        if entries.is_empty() && !self.0.opts.model.is_empty() {
+            has_default = true;
+            entries.push(json!({
+                "slug": self.0.opts.model,
+                "name": self.0.opts.model,
+                "isCustom": false,
+                "capabilities": {"optionDescriptors": []},
+                "isDefault": true,
+            }));
+        }
+        if !entries.is_empty() && !has_default {
+            entries[0]["isDefault"] = json!(true);
+        }
+        let now_iso = utc_iso(Utc::now());
         json!({
             "environment": self.t3_descriptor(),
+            "auth": self.auth_descriptor(),
+            "cwd": self.0.opts.data_dir,
+            "keybindingsConfigPath": self.0.opts.data_dir.join("keybindings.json"),
+            "keybindings": [],
+            "issues": [],
             "providers": [{
-                "provider": self.0.opts.provider,
+                "instanceId": provider,
+                "driver": "pi",
+                "displayName": "Pi",
+                "continuation": {"groupKey": format!("pi:instance:{provider}")},
+                "showInteractionModeToggle": false,
+                "reportsContextWindow": true,
+                "supportsTextGeneration": true,
+                "supportedRuntimeModes": ["approval-required", "auto-accept-edits", "full-access"],
+                "setup": {"canAuthenticate": false, "canInstall": false},
                 "enabled": true,
                 "installed": true,
-                "models": if self.0.opts.model.is_empty() { json!([]) } else { json!([{"id": self.0.opts.model, "name": self.0.opts.model}]) },
+                "version": if self.0.opts.version.is_empty() { "0.1.0" } else { self.0.opts.version.as_str() },
+                "status": "ready",
+                "auth": {"status": "authenticated", "type": "pi"},
+                "checkedAt": now_iso,
+                "models": entries,
+                "slashCommands": [],
+                "skills": [],
             }],
-            "cwd": self.0.opts.data_dir,
+            "availableEditors": [],
+            "settings": {},
+            "observability": {
+                "logsDirectoryPath": self.0.opts.data_dir,
+                "localTracingEnabled": false,
+                "otlpTracesEnabled": false,
+                "otlpMetricsEnabled": false,
+            },
+            "serverTime": now_iso,
         })
     }
 
@@ -861,10 +1025,11 @@ impl T3Server {
         };
         match method {
             "subscribeServerConfig" => {
+                let cfg = self.t3_server_config(&core_socket).await;
                 let _ = send_chunk(json!({
                     "version": 1,
                     "type": "snapshot",
-                    "config": self.t3_server_config(),
+                    "config": cfg,
                 }))
                 .await;
                 req_stop.cancelled().await;
@@ -889,7 +1054,7 @@ impl T3Server {
                     "sequence": 2,
                     "type": "ready",
                     "payload": {
-                        "at": Utc::now().to_rfc3339(),
+                        "at": utc_iso(Utc::now()),
                         "environment": self.t3_descriptor(),
                     }
                 }))
@@ -935,7 +1100,7 @@ impl T3Server {
                 return;
             }
             "subscribeDiscoveredLocalServers" => {
-                let _ = send_chunk(json!({"servers": [], "scannedAt": Utc::now().to_rfc3339()}))
+                let _ = send_chunk(json!({"servers": [], "scannedAt": utc_iso(Utc::now())}))
                     .await;
                 req_stop.cancelled().await;
                 return;
@@ -950,35 +1115,60 @@ impl T3Server {
                 return;
             }
             "orchestration.subscribeShell" | "orchestration.subscribeThread" => {
+                let is_shell = method == "orchestration.subscribeShell";
                 let filter_thread = payload["threadId"].as_str().unwrap_or("").to_owned();
-                let snap = core_http_json(&core_socket, Method::GET, "/v1/snapshot", None).await;
-                let after = snap
-                    .as_ref()
-                    .ok()
-                    .and_then(|s| s["sequence"].as_i64())
-                    .unwrap_or(0);
-                if let Ok(s) = snap {
-                    let initial = if method == "orchestration.subscribeThread" && !filter_thread.is_empty() {
-                        build_t3_thread_projection(&s, &filter_thread, &self.0.opts)
-                    } else {
-                        build_t3_shell_snapshot(&s, &self.0.opts)
+                let snap = match mobile_snapshot(&core_socket, (!is_shell).then_some(filter_thread.as_str())).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let _ = tx
+                            .send(Message::text(t3_exit(req_id, Err(err)).to_string()))
+                            .await;
+                        return;
+                    }
+                };
+                let after = snap["sequence"].as_i64().unwrap_or(0);
+                let initial_frame = if is_shell {
+                    json!({
+                        "kind": "snapshot",
+                        "snapshot": build_t3_shell_snapshot(&snap, &self.0.opts),
+                    })
+                } else {
+                    let Some(proj) = build_t3_thread_projection_opt(&snap, &filter_thread, &self.0.opts) else {
+                        let _ = tx
+                            .send(Message::text(t3_exit(req_id, Err(anyhow!("会话不存在"))).to_string()))
+                            .await;
+                        return;
                     };
-                    let _ = send_chunk(json!({
-                        "type": "snapshot",
+                    json!({
+                        "kind": "snapshot",
                         "snapshotSequence": after,
-                        "snapshot": initial,
-                    }))
-                    .await;
+                        "projection": proj,
+                        "historyCursor": Value::Null,
+                        "hasMoreHistory": false,
+                        "latestLocalTurnOrdinal": Value::Null,
+                    })
+                };
+                if send_chunk(initial_frame).await.is_err() {
+                    return;
                 }
-                let _ = stream_t3_effect_events(
+                if send_chunk(json!({"kind": "synchronized"})).await.is_err() {
+                    return;
+                }
+                let result = stream_t3_effect_events(
                     &core_socket,
+                    &self.0.opts,
                     after,
                     req_id.clone(),
+                    is_shell,
                     filter_thread,
-                    tx,
-                    req_stop,
+                    tx.clone(),
+                    req_stop.clone(),
                 )
                 .await;
+                if !req_stop.is_cancelled() {
+                    let failure = result.err().unwrap_or_else(|| anyhow!("Core subscription closed"));
+                    let _ = tx.send(Message::text(t3_exit(req_id, Err(failure)).to_string())).await;
+                }
                 return;
             }
             _ => {}
@@ -1063,23 +1253,59 @@ impl T3Server {
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or(payload);
-                core_http_json(&core_socket, Method::POST, "/v1/commands", Some(cmd)).await
+                dispatch_t3_command(&core_socket, &self.0.opts, &cmd).await
             }
             "orchestration.launchThread" => {
-                core_http_json(
-                    &core_socket,
-                    Method::POST,
-                    "/v1/orchestration/threads/launch",
-                    Some(payload),
-                )
-                .await
+                launch_t3_thread(&core_socket, &self.0.opts, &payload).await
             }
-            "server.getConfig" | "getServerConfig" => Ok(self.t3_server_config()),
+            "server.getConfig" | "getServerConfig" => {
+                Ok(self.t3_server_config(&core_socket).await)
+            }
             "server.refreshProviders" => {
-                let cfg = self.t3_server_config();
+                let cfg = self.t3_server_config(&core_socket).await;
                 Ok(json!({"providers": cfg["providers"]}))
             }
-            "server.probe" | "server.reportClientActivity" => Ok(json!({})),
+            "server.probe" | "server.reportClientActivity" | "preview.reportProfiles" => {
+                Ok(json!({}))
+            }
+            "server.connectionProbe" => Ok(json!({"serverTime": utc_iso(Utc::now())})),
+            "server.discoverSourceControl" => Ok(json!({
+                "versionControlSystems": [],
+                "sourceControlProviders": [],
+            })),
+            "server.getSettings" => Ok(json!({})),
+            "peerLinks.list" => Ok(json!({"links": []})),
+            "vcs.listRefs" => Ok(json!({
+                "isAtRepositoryRoot": false,
+                "refs": [],
+                "isRepo": false,
+                "hasPrimaryRemote": false,
+                "nextCursor": Value::Null,
+                "totalCount": 0,
+            })),
+            "vcs.refreshStatus" => Ok(json!({
+                "isRepo": false,
+                "hasPrimaryRemote": false,
+                "isDefaultRef": false,
+                "refName": Value::Null,
+                "hasWorkingTreeChanges": false,
+                "workingTree": {"files": [], "insertions": 0, "deletions": 0},
+                "hasUpstream": false,
+                "aheadCount": 0,
+                "behindCount": 0,
+                "pr": Value::Null,
+            })),
+            "preview.list" => Ok(json!({
+                "sessions": [],
+                "serverEpoch": self.environment_id(),
+                "revision": 0,
+            })),
+            "filesystem.getMetadata" => {
+                let count = payload["paths"].as_array().map_or(0, Vec::len);
+                Ok(json!({"entries": vec![Value::Null; count]}))
+            }
+            "filesystem.browse" => browse_filesystem(&payload, &self.0.opts),
+            "filesystem.readFile" => read_filesystem_file(&payload),
             other => Err(anyhow!("unknown T3 RPC method {other}")),
         };
         let _ = tx
@@ -1463,6 +1689,7 @@ fn project_thread_base(thread: &Value, opts: &T3Options) -> Value {
         "settledOverride": if archived { Value::String("settled".into()) } else { Value::Null },
         "settledAt": if archived { Value::String(created.to_owned()) } else { Value::Null },
         "lastVisitedAt": Value::Null,
+        "unreadSequence": thread["unreadSequence"],
         "deletedAt": Value::Null,
         "pinnedAt": if pinned { Value::String(created.to_owned()) } else { Value::Null },
         "snoozedUntil": snoozed,
@@ -1499,6 +1726,7 @@ fn build_t3_shell_snapshot(snap: &Value, opts: &T3Options) -> Value {
 
         let mut count = 0usize;
         let mut latest_run: Option<&Value> = None;
+        let mut active_run = None;
         for run in runs.iter().filter(|r| r["threadId"].as_str() == Some(tid)) {
             count += 1;
             if !run["output"].as_str().unwrap_or("").is_empty() {
@@ -1510,6 +1738,9 @@ fn build_t3_shell_snapshot(snap: &Value, opts: &T3Options) -> Value {
             let cur = run["createdAt"].as_str().unwrap_or("");
             if latest_run.is_none_or(|prev| cur > prev["createdAt"].as_str().unwrap_or("")) {
                 latest_run = Some(run);
+            }
+            if run["status"].as_str().is_some_and(|s| !is_terminal_run_status(s)) {
+                active_run = Some(run);
             }
         }
         count += tools.iter().filter(|x| x["threadId"].as_str() == Some(tid)).count();
@@ -1538,8 +1769,9 @@ fn build_t3_shell_snapshot(snap: &Value, opts: &T3Options) -> Value {
             if !r_created.is_empty() {
                 row["latestUserMessageAt"] = json!(r_created);
             }
-            if !is_terminal_run_status(status) {
-                row["activeRunId"] = json!(rid);
+            if let Some(active) = active_run {
+                row["activeRunId"] = active["id"].clone();
+                row["status"] = json!(t3_run_status(active["status"].as_str().unwrap_or("running")));
             }
             let output = run["output"].as_str().unwrap_or("");
             let (role, text, msg_id) = if !output.is_empty() {
@@ -1664,22 +1896,8 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
     let mut nodes_out = Vec::new();
     let mut messages_out = Vec::new();
     let mut turn_items_out = Vec::new();
-    let mut visible_out = Vec::new();
     let mut runtime_requests_out = Vec::new();
-    let mut ordinal = 0usize;
-
-    let mut push_item = |item: Value| {
-        let pos = visible_out.len();
-        let item_id = item["id"].clone();
-        visible_out.push(json!({
-            "position": pos,
-            "visibility": "local",
-            "sourceThreadId": thread_id,
-            "sourceItemId": item_id,
-            "item": item,
-        }));
-        turn_items_out.push(item);
-    };
+    let inputs = snap["inputs"].as_array().map(Vec::as_slice).unwrap_or_default();
 
     for (idx, run) in runs_src.iter().enumerate() {
         let rid = run["id"].as_str().unwrap_or("");
@@ -1695,7 +1913,9 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
         } else {
             Value::Null
         };
-        let user_msg_id = format!("{rid}/user");
+        let input_id = inputs.iter().find(|input| input["threadId"] == thread_id && input["kind"] == "queue" && input["runId"] == rid)
+            .and_then(|input| input["id"].as_str()).unwrap_or(rid);
+        let user_msg_id = format!("{input_id}/user");
         let provider = run["providerId"].as_str().unwrap_or("");
         let model = run["model"].as_str().unwrap_or("");
         runs_out.push(json!({
@@ -1737,7 +1957,8 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
             let text = if role == "user" {
                 run["input"].as_str().unwrap_or("")
             } else {
-                let out = run["output"].as_str().unwrap_or("");
+                let out = run["output"].as_str().filter(|text| !text.is_empty())
+                    .or_else(|| run["error"].as_str()).unwrap_or("");
                 if out.is_empty() {
                     continue;
                 }
@@ -1773,7 +1994,6 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
                 "providerTurnId": Value::Null,
                 "nativeItemRef": Value::Null,
                 "parentItemId": Value::Null,
-                "ordinal": ordinal,
                 "status": if streaming { "running" } else { "completed" },
                 "title": Value::Null,
                 "startedAt": msg_updated,
@@ -1789,11 +2009,37 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
                 item["attachments"] = json!([]);
                 item["createdBy"] = json!("user");
             }
-            ordinal += 1;
-            push_item(item);
+            turn_items_out.push(item);
+        }
+        if let Some(text) = run["reasoning"].as_str().filter(|v| !v.is_empty()) {
+            turn_items_out.push(json!({"id":format!("{rid}/reasoning"),"threadId":thread_id,"runId":rid,
+                "type":"reasoning","text":text,"status":t3_status,"streaming": !is_terminal_run_status(status),
+                "startedAt":created,"updatedAt":updated}));
         }
     }
 
+    for input in inputs.iter().filter(|i| i["threadId"] == thread_id) {
+        let queued = input["kind"] == "queue" && input["status"] == "queued";
+        let steer = input["kind"] == "steer" && input["status"] != "cancelled";
+        if !queued && !steer { continue; }
+        let id = input["id"].as_str().unwrap_or_default();
+        let message_id = if queued { format!("{id}/user") } else { format!("{id}/steer") };
+        let run_id = if queued { json!(format!("input/{id}")) } else { input["runId"].clone() };
+        if queued {
+            runs_out.push(json!({"id":run_id,"status":"queued","queuePosition":input["position"].as_i64().unwrap_or(0)+1,
+                "ordinal":runs_out.len()+1,"requestedAt":input["createdAt"],"userMessageId":message_id,"threadId":thread_id}));
+        }
+        messages_out.push(json!({"id":message_id,"runId":run_id,"role":"user","text":input["message"],
+            "createdAt":input["createdAt"],"updatedAt":input["updatedAt"],"streaming":false}));
+        turn_items_out.push(json!({"id":message_id,"threadId":thread_id,"runId":run_id,"type":"user_message",
+            "text":input["message"],"inputIntent":if queued {"queued_turn"} else {"steer"},
+            "status":input["status"],"startedAt":input["createdAt"],"updatedAt":input["updatedAt"]}));
+    }
+    for tool in snap["tools"].as_array().into_iter().flatten().filter(|t| t["threadId"] == thread_id) {
+        turn_items_out.push(json!({"id":tool["id"],"threadId":thread_id,"runId":tool["runId"],
+            "type":"dynamic_tool","toolName":tool["name"],"input":tool["arguments"],"output":tool["output"],
+            "status":tool["status"],"updatedAt":tool["updatedAt"]}));
+    }
     for req in snap["requests"]
         .as_array()
         .into_iter()
@@ -1805,18 +2051,56 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
         } else {
             "user_input"
         };
+        let status = match req["status"].as_str().unwrap_or("") {
+            "responded" => "resolved", "failed" => "expired", other => other,
+        };
+        let prompt = req["message"].as_str().filter(|s| !s.is_empty()).or(req["title"].as_str()).unwrap_or("");
+        let mut item = json!({"id":req["id"],"requestId":req["id"],"threadId":thread_id,"runId":req["runId"],
+            "type":"user_input_request","status":if status == "pending" {"waiting"} else {"completed"},
+            "startedAt":req["createdAt"],"updatedAt":req["updatedAt"]});
+        if kind == "permission" {
+            item["type"] = json!("approval_request");
+            item["prompt"] = json!(prompt);
+            item["reason"] = req["title"].clone();
+            item["options"] = json!([{"decision":"accept","label":"Allow once"},{"decision":"decline","label":"Decline"}]);
+        } else {
+            let options: Vec<_> = req["options"].as_array().into_iter().flatten()
+                .filter_map(Value::as_str).map(|s| json!({"label":s,"description":""})).collect();
+            item["questions"] = json!([{"id":req["id"],"header":req["title"],"question":prompt,
+                "options":options,"multiSelect":false,"allowCustomAnswer":req["method"] != "select"}]);
+        }
+        turn_items_out.push(item);
         runtime_requests_out.push(json!({
             "id": req["id"],
             "threadId": thread_id,
             "runId": req["runId"],
             "kind": kind,
-            "status": req["status"],
+            "status": status,
             "title": req["title"],
-            "prompt": req["prompt"],
+            "prompt": prompt,
             "createdAt": req["createdAt"],
+            "resolvedAt": if status == "pending" || status == "responding" { Value::Null } else { req["updatedAt"].clone() },
         }));
     }
 
+    let run_order: HashMap<_, _> = runs_out.iter().enumerate()
+        .filter_map(|(i,r)| r["id"].as_str().map(|id|(id,i))).collect();
+    turn_items_out.sort_by(|a,b| {
+        let key = |v: &Value| {
+            let rank = match v["type"].as_str() {
+                Some("user_message") if v["inputIntent"] != "steer" => 0,
+                Some("reasoning") => 1, Some("assistant_message") => 3, _ => 2,
+            };
+            (run_order.get(v["runId"].as_str().unwrap_or("")).copied().unwrap_or(usize::MAX),rank)
+        };
+        key(a).cmp(&key(b)).then_with(|| a["startedAt"].as_str().or(a["updatedAt"].as_str())
+            .cmp(&b["startedAt"].as_str().or(b["updatedAt"].as_str())))
+    });
+    let visible_out: Vec<_> = turn_items_out.iter_mut().enumerate().map(|(pos,item)| {
+        if let Some(at) = item["updatedAt"].as_str() && at > updated_at.as_str() { updated_at = at.to_owned(); }
+        item["ordinal"] = json!(pos);
+        json!({"position":pos,"visibility":"local","sourceThreadId":thread_id,"sourceItemId":item["id"],"item":item})
+    }).collect();
     Some(json!({
         "threadId": thread_id,
         "thread": thread_obj,
@@ -1840,10 +2124,553 @@ fn build_t3_thread_projection_opt(snap: &Value, thread_id: &str, opts: &T3Option
     }))
 }
 
+fn t3_policy_from_runtime_mode(mode: &str) -> Result<&'static str> {
+    match mode.trim() {
+        "" | "full-access" | "auto" => Ok("auto"),
+        "approval-required" | "ask" => Ok("ask"),
+        "auto-accept-edits" => Ok("auto-accept-edits"),
+        _ => Err(anyhow!("Vantry 暂不支持此运行权限模式")),
+    }
+}
+
+fn answer_value_text(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .map(answer_value_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if let Some(a) = map.get("answers") {
+                return answer_value_text(a);
+            }
+            if let Some(v) = map.get("value") {
+                return answer_value_text(v);
+            }
+            val.to_string()
+        }
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn ensure_scratch_workspace_path(opts: &T3Options, thread_id: &str, fallback_id: &str) -> Result<String> {
+    let raw = if !thread_id.trim().is_empty() {
+        thread_id.trim()
+    } else if !fallback_id.trim().is_empty() {
+        fallback_id.trim()
+    } else {
+        "scratch"
+    };
+    let safe = raw.replace(['/', '\\'], "_").replace("..", "_");
+    let safe = if safe.is_empty() || safe == "." {
+        "scratch".to_owned()
+    } else {
+        safe
+    };
+    let dir = opts.data_dir.join("workspaces").join(safe).join("chat");
+    fs::create_dir_all(&dir)?;
+    Ok(dir.display().to_string())
+}
+
+fn resolve_t3_workspace_path(snap: &Value, wire: &Value, opts: &T3Options) -> Result<String> {
+    let strategy = wire.get("workspaceStrategy").unwrap_or(&Value::Null);
+    let strategy_type = strategy["type"].as_str().unwrap_or("");
+    let no_project = wire["noProject"].as_bool().unwrap_or(false);
+    let proj_id = wire["projectId"].as_str().unwrap_or("");
+    if matches!(strategy_type, "scratch" | "none")
+        || no_project
+        || proj_id == t3_project_id(SCRATCH_PROJECT_IDENTITY)
+    {
+        return ensure_scratch_workspace_path(
+            opts,
+            wire["threadId"].as_str().unwrap_or(""),
+            wire["commandId"].as_str().unwrap_or(""),
+        );
+    }
+    let explicit = wire["workspacePath"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| wire["workspaceRoot"].as_str().filter(|s| !s.trim().is_empty()))
+        .or_else(|| strategy["path"].as_str().filter(|s| !s.trim().is_empty()));
+    if let Some(raw) = explicit {
+        let trimmed = raw.trim();
+        ensure!(
+            !trimmed.contains('\0') && !trimmed.contains("environment:"),
+            "不支持在该目录启动会话"
+        );
+        let expanded = expand_home_path(trimmed)?;
+        ensure!(expanded.is_dir(), "所选目录不存在或不是有效文件夹");
+        return Ok(expanded.display().to_string());
+    }
+    if !proj_id.is_empty() {
+        for t in snap["threads"].as_array().into_iter().flatten() {
+            let (identity, root) = thread_project_identity(t, opts);
+            if t3_project_id(&identity) == proj_id && !root.is_empty() {
+                return Ok(root);
+            }
+        }
+    }
+    ensure_scratch_workspace_path(
+        opts,
+        wire["threadId"].as_str().unwrap_or(""),
+        wire["commandId"].as_str().unwrap_or(""),
+    )
+}
+
+async fn dispatch_t3_command(core_socket: &Path, opts: &T3Options, wire: &Value) -> Result<Value> {
+    let kind = wire["type"].as_str().unwrap_or("");
+    let command_id = wire["commandId"].as_str().unwrap_or("").trim();
+    ensure!(!command_id.is_empty(), "commandId 不能为空");
+    let thread_id = wire["threadId"].as_str().unwrap_or("");
+    let run_id = wire["runId"].as_str().unwrap_or("");
+    if wire["attachments"].as_array().is_some_and(|a| !a.is_empty()) {
+        return Err(anyhow!("此连接尚不支持附件发送"));
+    }
+    if wire["context"].as_array().is_some_and(|a| !a.is_empty()) {
+        return Err(anyhow!("此连接尚不支持附加消息上下文"));
+    }
+
+    let mut cmd = json!({
+        "version": 1,
+        "commandId": command_id,
+        "threadId": thread_id,
+    });
+    if !run_id.is_empty() {
+        cmd["runId"] = json!(run_id);
+    }
+    if let Some(model) = wire.get("modelSelection").and_then(Value::as_object) {
+        let p = model
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| model.get("provider").and_then(Value::as_str))
+            .unwrap_or("");
+        let m = model.get("model").and_then(Value::as_str).unwrap_or("");
+        if !p.is_empty() {
+            cmd["providerId"] = json!(p);
+        }
+        if !m.is_empty() {
+            cmd["model"] = json!(m);
+        }
+    }
+
+    match kind {
+        "thread.read-state.set" => {
+            let change: vantry_protocol::ThreadReadChange = serde_json::from_value(wire["readState"].clone())?;
+            cmd["kind"] = json!("thread.update");
+            cmd["readState"] = json!(change);
+        }
+        "thread.create" => {
+            let snap = core_http_json(core_socket, Method::GET, "/v1/snapshot", None).await?;
+            let path = resolve_t3_workspace_path(&snap, wire, opts)?;
+            let wt = wire["worktreePath"].as_str().unwrap_or("");
+            let branch = wire["branch"].as_str().unwrap_or("");
+            cmd["kind"] = json!("thread.create");
+            cmd["title"] = json!(wire["title"].as_str().unwrap_or(""));
+            cmd["interactionMode"] = json!(wire["interactionMode"].as_str().unwrap_or(""));
+            cmd["approvalPolicy"] = json!(t3_policy_from_runtime_mode(
+                wire["runtimeMode"].as_str().unwrap_or("")
+            )?);
+            cmd["workspace"] = if !wt.is_empty() {
+                json!({"kind": "worktree", "path": wt, "repository": path, "branch": branch})
+            } else {
+                json!({"kind": "directory", "path": path, "branch": branch})
+            };
+        }
+        "message.dispatch" => {
+            cmd["message"] = json!(wire["text"].as_str().unwrap_or(""));
+            if let Some(mid) = wire["messageId"].as_str().filter(|s| !s.is_empty()) {
+                cmd["messageId"] = json!(mid);
+            }
+            let mode = wire["dispatchMode"]["type"].as_str().unwrap_or("");
+            match mode {
+                "steer_active" => {
+                    cmd["kind"] = json!("run.steer");
+                    if let Some(target) = wire["dispatchMode"]["targetRunId"].as_str() {
+                        cmd["runId"] = json!(target);
+                    }
+                }
+                "queue_after_active" => {
+                    cmd["kind"] = json!("message.queue");
+                }
+                "" | "start_immediately" | "defer_start" => {
+                    cmd["kind"] = json!("message.send");
+                }
+                _ => return Err(anyhow!("尚不支持此消息投递方式")),
+            }
+        }
+        "queued-run.cancel" | "queued-run.edit" | "queued-message.promote-to-steer" => {
+            let queued = if kind == "queued-message.promote-to-steer" {
+                wire["queuedRunId"].as_str().unwrap_or("")
+            } else {
+                run_id
+            };
+            let input_id = queued
+                .strip_prefix("input/")
+                .ok_or_else(|| anyhow!("该运行不属于待处理输入队列"))?;
+            cmd["inputId"] = json!(input_id);
+            cmd.as_object_mut().unwrap().remove("runId");
+            match kind {
+                "queued-run.cancel" => cmd["kind"] = json!("input.cancel"),
+                "queued-run.edit" => {
+                    cmd["kind"] = json!("input.edit");
+                    cmd["message"] = json!(wire["text"].as_str().unwrap_or(""));
+                }
+                _ => {
+                    cmd["kind"] = json!("input.promote_steer");
+                    if let Some(target) = wire["targetRunId"].as_str() {
+                        cmd["runId"] = json!(target);
+                    }
+                }
+            }
+        }
+        "thread.model-selection.set" => {
+            cmd["kind"] = json!("thread.model");
+        }
+        "thread.runtime-mode.set" => {
+            cmd["kind"] = json!("thread.update");
+            cmd["approvalPolicy"] = json!(t3_policy_from_runtime_mode(
+                wire["runtimeMode"].as_str().unwrap_or("")
+            )?);
+        }
+        "thread.interaction-mode.set" => {
+            cmd["kind"] = json!("thread.update");
+            cmd["interactionMode"] = json!(wire["interactionMode"].as_str().unwrap_or(""));
+        }
+        "thread.metadata.update" => {
+            cmd["kind"] = json!("thread.update");
+            cmd["title"] = json!(wire["title"].as_str().unwrap_or(""));
+        }
+        "thread.archive" | "thread.unarchive" | "thread.settle" | "thread.auto-settle"
+        | "thread.unsettle" => {
+            cmd["kind"] = json!("thread.update");
+            let archived = matches!(kind, "thread.archive" | "thread.settle" | "thread.auto-settle");
+            cmd["archived"] = json!(archived);
+        }
+        "thread.pin" | "thread.unpin" => {
+            cmd["kind"] = json!("thread.update");
+            cmd["pinned"] = json!(kind == "thread.pin");
+        }
+        "thread.snooze" => {
+            cmd["kind"] = json!("thread.update");
+            let raw = wire["snoozedUntil"].as_str().unwrap_or("");
+            let dt = DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| anyhow!("无效的延后时间格式"))?
+                .with_timezone(&Utc);
+            cmd["snoozedUntil"] = json!(utc_iso(dt));
+        }
+        "thread.unsnooze" => {
+            cmd["kind"] = json!("thread.update");
+            cmd["snoozedUntil"] = json!("0001-01-01T00:00:00Z");
+        }
+        "thread.visit"
+        | "thread.mark-unread"
+        | "thread.auto-settle.set"
+        | "thread.pin.reorder"
+        | "thread.active.reorder" => {
+            let snap = core_http_json(core_socket, Method::GET, "/v1/snapshot", None).await?;
+            return Ok(json!({"sequence": snap["sequence"].as_i64().unwrap_or(0)}));
+        }
+        "thread.delete" => {
+            cmd["kind"] = json!("thread.delete");
+        }
+        "run.interrupt" | "thread.stop" => {
+            cmd["kind"] = json!("run.stop");
+            if run_id.is_empty() {
+                let snap = core_http_json(core_socket, Method::GET, "/v1/snapshot", None).await?;
+                let active_rid = snap["runs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|r| {
+                        r["threadId"].as_str() == Some(thread_id)
+                            && !is_terminal_run_status(r["status"].as_str().unwrap_or(""))
+                    })
+                    .and_then(|r| r["id"].as_str());
+                if let Some(rid) = active_rid {
+                    cmd["runId"] = json!(rid);
+                } else {
+                    return Ok(json!({"sequence": snap["sequence"].as_i64().unwrap_or(0)}));
+                }
+            }
+        }
+        "runtime-request.respond" => {
+            cmd["kind"] = json!("request.respond");
+            let req_id = wire["requestId"].as_str().unwrap_or("");
+            cmd["requestId"] = json!(req_id);
+            let snap = core_http_json(core_socket, Method::GET, "/v1/snapshot", None).await?;
+            let found = snap["requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|r| r["id"].as_str() == Some(req_id) && r["threadId"].as_str() == Some(thread_id))
+                .ok_or_else(|| anyhow!("请求不属于此会话或已不存在"))?;
+            cmd["runId"] = json!(found["runId"].as_str().unwrap_or(""));
+            if found["method"].as_str() == Some("confirm") {
+                match wire["decision"].as_str().unwrap_or("") {
+                    "accept" => cmd["confirmed"] = json!(true),
+                    "decline" => cmd["confirmed"] = json!(false),
+                    "cancel" => cmd["cancelled"] = json!(true),
+                    _ => return Err(anyhow!("只支持本次允许、拒绝或取消")),
+                }
+            } else if let Some(answers) = wire["answers"].as_object() {
+                if let Some(v) = answers.get(req_id) {
+                    cmd["value"] = json!(answer_value_text(v));
+                } else if answers.len() == 1 {
+                    let (_, v) = answers.iter().next().unwrap();
+                    cmd["value"] = json!(answer_value_text(v));
+                } else {
+                    return Err(anyhow!("请回答此请求对应的问题"));
+                }
+            } else {
+                return Err(anyhow!("请回答此请求对应的问题"));
+            }
+        }
+        other => return Err(anyhow!("Vantry 尚不支持 T3 操作 {other:?}")),
+    }
+
+    let receipt = core_http_json(core_socket, Method::POST, "/v1/commands", Some(cmd)).await?;
+    Ok(json!({"sequence": receipt["sequence"].as_i64().unwrap_or(0)}))
+}
+
+async fn launch_t3_thread(core_socket: &Path, opts: &T3Options, input: &Value) -> Result<Value> {
+    let command_id = input["commandId"].as_str().unwrap_or("").trim();
+    ensure!(!command_id.is_empty(), "commandId 不能为空");
+    let thread_id = input["threadId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("t3_{command_id}"));
+    let mut resumed = false;
+    if input["reuseExistingThread"].as_bool().unwrap_or(false)
+        && let Ok(snap) = core_http_json(core_socket, Method::GET, "/v1/snapshot", None).await
+    {
+        resumed = snap["threads"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|t| t["id"].as_str() == Some(thread_id.as_str()));
+    }
+    if !resumed {
+        let mut create = input.clone();
+        if let Some(obj) = create.as_object_mut() {
+            obj.insert("type".into(), json!("thread.create"));
+            obj.insert("threadId".into(), json!(thread_id));
+            obj.insert("commandId".into(), json!(format!("{command_id}/create")));
+            if let Some(strategy) = input.get("workspaceStrategy").and_then(Value::as_object) {
+                if let Some(b) = strategy.get("branch").and_then(Value::as_str).filter(|s| !s.is_empty())
+                    && !obj.contains_key("branch")
+                {
+                    obj.insert("branch".into(), json!(b));
+                }
+                if let Some(p) = strategy.get("path").and_then(Value::as_str).filter(|s| !s.is_empty())
+                    && !obj.contains_key("workspacePath")
+                {
+                    obj.insert("workspacePath".into(), json!(p));
+                }
+                if strategy.get("type").and_then(Value::as_str) == Some("existing_worktree")
+                    && let Some(wt) = strategy.get("worktreePath").and_then(Value::as_str).filter(|s| !s.is_empty())
+                {
+                    obj.insert("worktreePath".into(), json!(wt));
+                }
+            }
+        }
+        dispatch_t3_command(core_socket, opts, &create).await?;
+    }
+    if let Some(initial) = input.get("initialMessage").and_then(Value::as_object)
+        && !initial.is_empty()
+    {
+        let msg_id = initial
+            .get("messageId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{command_id}/message"));
+        let message = json!({
+            "type": "message.dispatch",
+            "commandId": format!("{command_id}/message"),
+            "threadId": thread_id,
+            "messageId": msg_id,
+            "text": initial.get("text").and_then(Value::as_str).unwrap_or(""),
+            "attachments": initial.get("attachments").cloned().unwrap_or_else(|| json!([])),
+            "dispatchMode": {"type": "start_immediately"},
+        });
+        dispatch_t3_command(core_socket, opts, &message).await?;
+    }
+    let snap = core_http_json(core_socket, Method::GET, "/v1/snapshot", None).await?;
+    let seq = snap["sequence"].as_i64().unwrap_or(0);
+    let projection = build_t3_thread_projection_opt(&snap, &thread_id, opts)
+        .ok_or_else(|| anyhow!("会话不存在"))?;
+    Ok(json!({
+        "threadId": thread_id,
+        "projection": projection,
+        "resumed": resumed,
+        "sequence": seq,
+    }))
+}
+
+fn expand_home_path(raw: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    ensure!(
+        !trimmed.is_empty() && !trimmed.contains('\0') && !trimmed.contains("environment:"),
+        "无效的路径"
+    );
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let expanded = if trimmed == "~" {
+        home.ok_or_else(|| anyhow!("无法解析用户主目录"))?
+    } else if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        home.ok_or_else(|| anyhow!("无法解析用户主目录"))?.join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    Ok(std::path::absolute(&expanded)?)
+}
+
+fn browse_filesystem(input: &Value, opts: &T3Options) -> Result<Value> {
+    let raw = input["path"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| input["directory"].as_str().filter(|s| !s.trim().is_empty()))
+        .or_else(|| input["cwd"].as_str().filter(|s| !s.trim().is_empty()));
+    let expanded = match raw {
+        Some(p) => expand_home_path(p)?,
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| opts.data_dir.clone()),
+    };
+    let show_hidden = input["showHidden"].as_bool().unwrap_or(false);
+    let mut items: Vec<(String, String, Value)> = Vec::new();
+    for entry in fs::read_dir(&expanded).with_context(|| format!("无法读取目录 {}", expanded.display()))? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let full = entry.path();
+        if !full.is_dir() {
+            continue;
+        }
+        let is_git = full.join(".git").exists();
+        items.push((
+            name.to_ascii_lowercase(),
+            name.clone(),
+            json!({
+                "name": name,
+                "path": full.display().to_string(),
+                "isDirectory": true,
+                "isGitRepo": is_git,
+            }),
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    items.truncate(500);
+    let entries: Vec<Value> = items.into_iter().map(|(_, _, v)| v).collect();
+    let parent = expanded
+        .parent()
+        .filter(|p| *p != expanded.as_path())
+        .map(|p| Value::String(p.display().to_string()))
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "path": expanded.display().to_string(),
+        "parentPath": parent,
+        "entries": entries,
+    }))
+}
+
+fn read_filesystem_file(input: &Value) -> Result<Value> {
+    let raw_path = input["path"].as_str().unwrap_or("").trim();
+    ensure!(!raw_path.is_empty(), "文件路径不能为空");
+    let full = if Path::new(raw_path).is_absolute() || raw_path.starts_with('~') {
+        expand_home_path(raw_path)?
+    } else if let Some(cwd) = input["cwd"].as_str().filter(|s| !s.trim().is_empty()) {
+        std::path::absolute(expand_home_path(cwd)?.join(raw_path))?
+    } else {
+        expand_home_path(raw_path)?
+    };
+    let meta = fs::metadata(&full).with_context(|| format!("无法读取文件 {}", full.display()))?;
+    let name = full
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| full.display().to_string());
+    if meta.is_dir() {
+        return Ok(json!({
+            "path": full.display().to_string(),
+            "name": name,
+            "kind": "directory",
+            "mimeType": "inode/directory",
+            "encoding": "utf-8",
+            "content": "",
+            "size": 0,
+            "truncated": false,
+            "isDirectory": true,
+        }));
+    }
+    let max_bytes = input["maxBytes"]
+        .as_u64()
+        .map(|n| (n as usize).clamp(1, 1024 * 1024))
+        .unwrap_or(524_288);
+    let ext = full
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (kind, mime, is_binary) = match ext.as_str() {
+        "png" => ("image", "image/png", true),
+        "jpg" | "jpeg" => ("image", "image/jpeg", true),
+        "gif" => ("image", "image/gif", true),
+        "webp" => ("image", "image/webp", true),
+        "svg" => ("image", "image/svg+xml", false),
+        "pdf" => ("pdf", "application/pdf", true),
+        "md" | "markdown" => ("markdown", "text/markdown", false),
+        _ => ("text", "text/plain", false),
+    };
+    let bytes = fs::read(&full)?;
+    let size = bytes.len() as i64;
+    if is_binary {
+        let cap = if kind == "pdf" { 12 * 1024 * 1024 } else { 8 * 1024 * 1024 };
+        let truncated = bytes.len() > cap;
+        let slice = &bytes[..bytes.len().min(cap)];
+        return Ok(json!({
+            "path": full.display().to_string(),
+            "name": name,
+            "kind": kind,
+            "mimeType": mime,
+            "encoding": "base64",
+            "content": STANDARD.encode(slice),
+            "size": size,
+            "truncated": truncated,
+            "isDirectory": false,
+        }));
+    }
+    let truncated = bytes.len() > max_bytes;
+    let slice = &bytes[..bytes.len().min(max_bytes)];
+    let text = String::from_utf8_lossy(slice).into_owned();
+    let line_count = text.lines().count();
+    Ok(json!({
+        "path": full.display().to_string(),
+        "name": name,
+        "kind": kind,
+        "mimeType": mime,
+        "language": if ext.is_empty() { Value::Null } else { Value::String(ext) },
+        "encoding": "utf-8",
+        "content": text,
+        "size": size,
+        "truncated": truncated,
+        "isDirectory": false,
+        "lineCount": line_count,
+    }))
+}
+
 async fn stream_t3_effect_events(
     core: &Path,
+    opts: &T3Options,
     after: i64,
     req_id: Value,
+    is_shell: bool,
     filter_thread: String,
     tx: mpsc::Sender<Message>,
     stop: CancellationToken,
@@ -1864,33 +2691,74 @@ async fn stream_t3_effect_events(
     ensure!(res.status().is_success(), "Core event subscribe failed");
     let mut body = res.into_body();
     let mut buf = Vec::new();
+    let mut dirty = false;
+    let mut wire_seq = after;
+    let mut covered_core = after;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        let frame = tokio::select! {
+        tokio::select! {
             _ = stop.cancelled() => break,
-            f = body.frame() => match f {
-                Some(Ok(frame)) => frame,
-                _ => break,
-            }
-        };
-        if let Some(data) = frame.data_ref() {
-            buf.extend_from_slice(data);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line = buf.drain(..=pos).collect::<Vec<_>>();
-                if let Ok(env) = serde_json::from_slice::<Value>(&line) {
-                    let ev = env.get("event").unwrap_or(&env);
-                    if !filter_thread.is_empty()
-                        && ev["threadId"].as_str() != Some(filter_thread.as_str())
-                    {
-                        continue;
+            _ = ticker.tick(), if dirty => {
+                dirty = false;
+                {
+                    let snap = mobile_snapshot(core, (!is_shell).then_some(filter_thread.as_str())).await?;
+                    let core_seq = snap["sequence"].as_i64().unwrap_or(covered_core);
+                    let next_seq = core_seq.max(wire_seq + 1);
+                    let frame = if is_shell {
+                        let mut shell_snap = build_t3_shell_snapshot(&snap, opts);
+                        shell_snap["snapshotSequence"] = json!(next_seq);
+                        Some(json!({
+                            "kind": "snapshot",
+                            "snapshot": shell_snap,
+                        }))
+                    } else {
+                        build_t3_thread_projection_opt(&snap, &filter_thread, opts).map(|proj| json!({
+                            "kind": "snapshot",
+                            "snapshotSequence": next_seq,
+                            "projection": proj,
+                            "historyCursor": Value::Null,
+                            "hasMoreHistory": false,
+                            "latestLocalTurnOrdinal": Value::Null,
+                        }))
+                    };
+                    if let Some(f) = frame {
+                        let msg = json!({
+                            "_tag": "Chunk",
+                            "requestId": req_id,
+                            "values": [f],
+                        });
+                        if tx.send(Message::text(msg.to_string())).await.is_err() {
+                            driver.abort();
+                            return Ok(());
+                        }
+                        wire_seq = next_seq;
+                        covered_core = core_seq;
                     }
-                    let msg = json!({
-                        "_tag": "Chunk",
-                        "requestId": req_id,
-                        "values": [{"type": "event", "event": ev}],
-                    });
-                    if tx.send(Message::text(msg.to_string())).await.is_err() {
-                        driver.abort();
-                        return Ok(());
+                }
+            }
+            f = body.frame() => {
+                let frame = match f {
+                    Some(Ok(frame)) => frame,
+                    _ => break,
+                };
+                if let Some(data) = frame.data_ref() {
+                    buf.extend_from_slice(data);
+                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let line = buf.drain(..=pos).collect::<Vec<_>>();
+                        if let Ok(env) = serde_json::from_slice::<Value>(&line) {
+                            ensure!(env.get("error").is_none(), "Core event cursor expired");
+                            let ev = env.get("event").unwrap_or(&env);
+                            let seq = ev["sequence"].as_i64().unwrap_or(0);
+                            if seq > covered_core
+                                && (is_shell
+                                    || filter_thread.is_empty()
+                                    || ev["threadId"].as_str() == Some(filter_thread.as_str()))
+                            {
+                                dirty = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1916,6 +2784,17 @@ async fn connect_core(core: &Path) -> Result<(crate::transport::Stream, Option<S
     {
         anyhow::bail!("local Core endpoint unavailable")
     }
+}
+
+async fn mobile_snapshot(core: &Path, thread: Option<&str>) -> Result<Value> {
+    let Some(id) = thread else {
+        return core_http_json(core, Method::GET, "/v1/snapshot", None).await;
+    };
+    let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("threadId", id).finish();
+    let mut detail = core_http_json(core, Method::GET, &format!("/v1/threads/detail?{query}"), None).await?;
+    let thread = detail["thread"].take();
+    detail["threads"] = json!([thread]);
+    Ok(detail)
 }
 
 async fn core_http_json(
@@ -2015,6 +2894,7 @@ mod tests {
             version: "0.1.42".into(),
             provider: "controlled".into(),
             model: "local/fixture".into(),
+            identity: None,
         })?;
         let (code, link) = server.pairing_link("http://127.0.0.1:8080", None)?;
         assert!(link.contains(&format!("token={code}")));
@@ -2106,6 +2986,23 @@ mod tests {
         assert_eq!(
             cfg_json["exit"]["value"]["environment"]["environmentId"],
             "env_test"
+        );
+        assert_eq!(
+            cfg_json["exit"]["value"]["providers"][0]["instanceId"],
+            "controlled"
+        );
+        assert!(
+            cfg_json["exit"]["value"]["providers"][0]["supportedRuntimeModes"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|v| v == "full-access"))
+        );
+        assert_eq!(
+            cfg_json["exit"]["value"]["providers"][0]["models"][0]["slug"],
+            "local/fixture"
+        );
+        assert_eq!(
+            cfg_json["exit"]["value"]["providers"][0]["models"][0]["isDefault"],
+            true
         );
 
         server.revoke_all()?;

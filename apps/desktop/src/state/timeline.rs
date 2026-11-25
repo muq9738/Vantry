@@ -54,6 +54,43 @@ impl ToolStatus {
     }
 }
 
+/// One tool call of a [`TimelineItem::Tools`] group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolEntry {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub status: ToolStatus,
+    /// The arguments, pretty JSON (the expanded entry).
+    pub arguments: String,
+    pub output: String,
+}
+
+/// What kind of work a tool did, for a group's one-line summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolKind {
+    Command,
+    Read,
+    Edit,
+    Search,
+    Other,
+}
+
+impl ToolKind {
+    pub fn of(name: &str) -> ToolKind {
+        match name.to_ascii_lowercase().as_str() {
+            "bash" | "shell" | "terminal" | "exec" | "exec_command" | "run" | "command"
+            | "vantry_terminal_run" => ToolKind::Command,
+            "read" | "read_file" | "view" | "cat" | "open" => ToolKind::Read,
+            "write" | "edit" | "multi_edit" | "multiedit" | "apply_patch" | "patch"
+            | "str_replace" | "create" => ToolKind::Edit,
+            "grep" | "find" | "ls" | "glob" | "rg" | "search" | "web_search"
+            | "websearch" | "tool_search" => ToolKind::Search,
+            _ => ToolKind::Other,
+        }
+    }
+}
+
 /// One row of the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimelineItem {
@@ -81,16 +118,10 @@ pub enum TimelineItem {
         doc: Arc<MarkdownDoc>,
         streaming: bool,
     },
-    /// A tool call.
-    Tool {
-        id: String,
-        name: String,
-        summary: String,
-        status: ToolStatus,
-        /// The arguments, pretty JSON (the expanded card).
-        arguments: String,
-        output: String,
-    },
+    /// Consecutive tool calls (no reply text between them), shown as one
+    /// collapsible group as Claude's desktop does. Its id is its first
+    /// call's, so a call joining the group keeps the list's keys.
+    Tools { id: String, calls: Vec<ToolEntry> },
     /// An unanswered (or failed) extension request, answerable in place.
     Approval { id: String, view: ApprovalView },
     /// The run's end when it did not complete.
@@ -108,7 +139,7 @@ impl TimelineItem {
             TimelineItem::User { id, .. }
             | TimelineItem::Reasoning { id, .. }
             | TimelineItem::Text { id, .. }
-            | TimelineItem::Tool { id, .. }
+            | TimelineItem::Tools { id, .. }
             | TimelineItem::Approval { id, .. }
             | TimelineItem::Status { id, .. } => id,
         }
@@ -489,7 +520,7 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         push_text(&mut items, cursor, at, &mut segment_no);
         cursor = at;
         let awaiting = tool.status == "running" && pending.iter().any(|r| r.status == "pending");
-        items.push(TimelineItem::Tool {
+        let entry = ToolEntry {
             id: format!("tool:{}", tool.id),
             name: tool.name.clone(),
             summary: summarize_arguments(tool.arguments.as_ref()),
@@ -500,7 +531,15 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
             },
             arguments: pretty_arguments(tool.arguments.as_ref()),
             output: tail_lines(&tool.output, 40),
-        });
+        };
+        // A call right after another (no reply text between) joins its group.
+        match items.last_mut() {
+            Some(TimelineItem::Tools { calls, .. }) => calls.push(entry),
+            _ => items.push(TimelineItem::Tools {
+                id: entry.id.clone(),
+                calls: vec![entry],
+            }),
+        }
     }
     let before = items.len();
     push_text(&mut items, cursor, run.output.len(), &mut segment_no);

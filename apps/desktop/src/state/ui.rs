@@ -539,6 +539,7 @@ pub struct UiState {
     pub view: MainView,
     pub rename: Option<Rename>,
     pub confirm: Option<Confirm>,
+    pub attachment_preview: Option<(vantry_protocol::Attachment, String)>,
     pub model_picker: bool,
     /// The model picker's search (and free entry).
     pub model_query: String,
@@ -577,6 +578,7 @@ impl Default for UiState {
             view: MainView::Conversation,
             rename: None,
             confirm: None,
+            attachment_preview: None,
             model_picker: false,
             model_query: String::new(),
             default_policy: "ask".to_owned(),
@@ -753,7 +755,7 @@ impl UiState {
         match self.data() {
             Some(data) => (
                 data.models.thinking_levels.clone(),
-                data.models.models.iter().flatten().map(|m| m.id.clone()).collect(),
+                data.models.models.iter().flatten().map(vantry_protocol::ModelInfo::key).collect(),
             ),
             None => (Vec::new(), Vec::new()),
         }
@@ -772,19 +774,23 @@ impl UiState {
             .iter()
             .flatten()
             .filter(|m| {
-                query.is_empty()
+                if query.is_empty() {
+                    return true;
+                }
+                let key = m.key();
+                key.to_lowercase().contains(&query)
                     || m.id.to_lowercase().contains(&query)
+                    || m.provider.to_lowercase().contains(&query)
                     || m.name.to_lowercase().contains(&query)
             })
             .map(|m| {
-                (
-                    m.id.clone(),
-                    if m.name.is_empty() {
-                        m.id.clone()
-                    } else {
-                        m.name.clone()
-                    },
-                )
+                let key = m.key();
+                let label = if m.name.is_empty() {
+                    key.clone()
+                } else {
+                    m.name.clone()
+                };
+                (key, label)
             })
             .collect();
         if !out.iter().any(|(id, _)| id.eq_ignore_ascii_case(self.model_query.trim())) {

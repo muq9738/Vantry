@@ -66,32 +66,6 @@ impl Provider {
         } else {
             &request.model
         };
-        let (expected_model, thinking_level) = if controlled {
-            (String::new(), String::new())
-        } else {
-            let selection = self
-                .magpie
-                .as_ref()
-                .map(|p| MagpieSelection::load(Some(p)))
-                .transpose()?;
-            let model = vantry_pi_runtime::resolve_model_catalog(
-                &vantry_pi_runtime::agent_dir(),
-                Some(selected),
-                selection.as_ref(),
-            )
-            .await?;
-            ensure!(!model.selected_model.is_empty(), "no Pi model configured");
-            let level = model
-                .thinking_level
-                .map(|l| l.as_str().to_owned())
-                .unwrap_or_default();
-            if level.is_empty() {
-                request.model.clone_from(&model.selected_model);
-            } else {
-                request.model = format!("{}:{level}", model.selected_model);
-            }
-            (model.selected_model, level)
-        };
         request.workspace = Some(match request.workspace.take() {
             Some(spec) => workspace::prepare(&self.data, &request.thread_id, spec)?,
             None => WorkspaceSpec {
@@ -102,14 +76,19 @@ impl Provider {
                 ..Default::default()
             },
         });
-        // Capture a Git-native pre-run checkpoint matching Go v0.1.42.
-        if !controlled
-            && std::env::var("VANTRY_AUTO_CHECKPOINT").as_deref() != Ok("0")
-            && request.interaction_mode != "plan"
-            && !request.run_id.is_empty()
-            && let Some(ws_path) = request.workspace.as_ref().map(|w| w.path.clone())
-            && let Ok(repo) = vantry_platform::git::Repository::discover(Path::new(&ws_path))
-        {
+        let checkpoint_fut = {
+            let should_checkpoint = !controlled
+                && std::env::var("VANTRY_AUTO_CHECKPOINT").as_deref() != Ok("0")
+                && request.interaction_mode != "plan"
+                && !request.run_id.is_empty();
+            let repo_root = should_checkpoint
+                .then(|| request.workspace.as_ref().map(|w| w.path.clone()))
+                .flatten()
+                .and_then(|ws_path| {
+                    vantry_platform::git::Repository::discover(Path::new(&ws_path))
+                        .ok()
+                        .map(|r| r.root().to_path_buf())
+                });
             let run_id = request.run_id.clone();
             let summary: String = request
                 .message
@@ -120,23 +99,58 @@ impl Provider {
                 .chars()
                 .take(80)
                 .collect();
-            let label = if summary.is_empty() {
-                format!("Before turn: {run_id}")
-            } else {
-                format!("Before turn: {summary}")
-            };
-            let repo_root = repo.root().to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(error) = crate::workbench_git::capture_with_index_timeout(
-                    &repo_root,
-                    &format!("run-{run_id}"),
-                    &label,
-                    Duration::from_secs(2),
-                ) {
-                    tracing::warn!(%run_id, %error, "pre-run checkpoint skipped");
+            async move {
+                if let Some(repo_root) = repo_root {
+                    let label = if summary.is_empty() {
+                        format!("Before turn: {run_id}")
+                    } else {
+                        format!("Before turn: {summary}")
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(error) = crate::workbench_git::capture_with_index_timeout(
+                            &repo_root,
+                            &format!("run-{run_id}"),
+                            &label,
+                            Duration::from_millis(750),
+                        ) {
+                            tracing::warn!(%run_id, %error, "pre-run checkpoint skipped");
+                        }
+                    })
+                    .await;
                 }
-            })
-            .await;
+            }
+        };
+        let model_fut = async {
+            if controlled {
+                Ok::<_, anyhow::Error>((String::new(), String::new()))
+            } else {
+                let selection = self
+                    .magpie
+                    .as_ref()
+                    .map(|p| MagpieSelection::load(Some(p)))
+                    .transpose()?;
+                let model = vantry_pi_runtime::resolve_model_catalog(
+                    &vantry_pi_runtime::agent_dir(),
+                    Some(selected),
+                    selection.as_ref(),
+                )
+                .await?;
+                ensure!(!model.selected_model.is_empty(), "no Pi model configured");
+                let level = model
+                    .thinking_level
+                    .map(|l| l.as_str().to_owned())
+                    .unwrap_or_default();
+                Ok((model.selected_model, level))
+            }
+        };
+        let (model_res, _) = tokio::join!(model_fut, checkpoint_fut);
+        let (expected_model, thinking_level) = model_res?;
+        if !controlled {
+            if thinking_level.is_empty() {
+                request.model.clone_from(&expected_model);
+            } else {
+                request.model = format!("{expected_model}:{thinking_level}");
+            }
         }
         let exe = std::env::current_exe()?;
         let pi_settings = crate::settings::document(&self.data.join("pi-runtime.json"))

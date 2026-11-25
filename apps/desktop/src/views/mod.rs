@@ -7,6 +7,7 @@
 //! the small dialogs over everything.
 
 pub(crate) mod approval_modal;
+pub(crate) mod charts;
 pub(crate) mod composer;
 pub(crate) mod dialogs;
 pub(crate) mod dock;
@@ -85,6 +86,30 @@ pub(crate) fn conversation(sheet: Memo<bool>) -> impl IntoElement {
             move || home.get(),
             || view().flex_1().min_h_0().mb_8(),
         ))
+}
+
+/// A tooltip's bubble: `nsh` shows a tooltip element as it is, so a bare
+/// `text` would float as unstyled (black) text over the window.
+pub(crate) fn tip(label: impl IntoReactive<SharedString>) -> View {
+    let bubble = AdaptiveColor::rgb(0x2B2A27, 0x3A3935);
+    let edge = AdaptiveColor::rgb(0x2B2A27, 0x4A4843);
+    let ink = AdaptiveColor::rgb(0xF5F4EF, 0xECEAE4);
+    view()
+        .px_2()
+        .py_1()
+        .rounded(px(6.0))
+        .bg(bubble)
+        .border_1()
+        .border_color(edge)
+        .shadow_md()
+        .child(
+            text(label)
+                .number_of_lines(2u32)
+                .max_w(px(320.0))
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ink),
+        )
 }
 
 /// A crisp 28×28 icon-only toolbar button with subtle hover fill and tooltip,

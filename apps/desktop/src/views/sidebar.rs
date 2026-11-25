@@ -267,6 +267,8 @@ pub(crate) fn sidebar() -> impl IntoElement {
                     controller::new_thread,
                 )),
         )
+        // This window's machine and the way to another (v0.1.42's machine row)
+        .child(machine_row())
         // Scrollable thread list
         .child(
             scroll().flex_1().child(
@@ -389,6 +391,98 @@ pub(crate) fn sidebar() -> impl IntoElement {
         .child(footer())
 }
 
+/// The machine this window works on, a menu of the paired ones to move the
+/// window to, and a quick way to pair another (v0.1.42's machine row).
+fn machine_row() -> impl IntoElement {
+    let colors = palette();
+    let label = computed(|| {
+        controller::machines().with(|_| ());
+        controller::machine_label()
+    });
+    let remote = controller::current_machine().is_some();
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .px_3()
+        .pb_1p5()
+        .child(
+            nsh_base::button()
+                .accessibility_label(crate::tr("切换机器"))
+                .on_press(|| controller::refresh_machines(machine_menu))
+                .flex_1()
+                .min_w(px(0.0))
+                .h(px(26.0))
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .rounded(px(6.0))
+                .hover(|s| s.bg(colors.soft))
+                .active(|s| s.opacity(0.7))
+                .child(icon(
+                    if remote { Icon::Server } else { Icon::Monitor },
+                    12.5,
+                    if remote { colors.accent } else { colors.muted },
+                ))
+                .child(
+                    text(move || label.get())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1u32)
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.muted),
+                )
+                .child(icon(Icon::ChevronDown, 11.0, colors.faint)),
+        )
+        .child(
+            view()
+                .tooltip(super::tip(crate::tr("连接另一台机器")))
+                .child(small_icon_button(Icon::Plus, "连接另一台机器", || {
+                    controller::open_settings(SettingsPage::Remote)
+                })),
+        )
+}
+
+pub(crate) fn machine_menu() {
+    let current = controller::current_machine();
+    let peers = controller::machines().get_untracked();
+    let mut items = vec![
+        MenuItem::new(crate::tr("本机"))
+            .checked(current.is_none())
+            .on_select(|| controller::switch_machine(None)),
+    ];
+    if peers.is_empty() {
+        items.push(MenuItem::new(crate::tr("尚未配对其他机器")).disabled(true));
+    }
+    for peer in peers {
+        let name = if peer.name.is_empty() { peer.id.clone() } else { peer.name.clone() };
+        let reach = match peer.reachable {
+            Some(true) => crate::tr("在线"),
+            Some(false) => crate::tr("离线"),
+            None => "",
+        };
+        let label = if reach.is_empty() { name } else { format!("{name} · {reach}") };
+        let id = peer.id.clone();
+        items.push(
+            MenuItem::new(label)
+                .checked(current.as_deref() == Some(id.as_str()))
+                .on_select(move || controller::switch_machine(Some(id.clone()))),
+        );
+    }
+    items.push(MenuItem::separator());
+    items.push(
+        MenuItem::new(crate::tr("连接另一台机器…"))
+            .on_select(|| controller::open_settings(SettingsPage::Remote)),
+    );
+    items.push(
+        MenuItem::new(crate::tr("刷新机器列表"))
+            .on_select(|| controller::refresh_machines(machine_menu)),
+    );
+    drop(popup_menu(items));
+}
+
 fn filter_menu() {
     let filter = controller::ui().with_untracked(|u| u.filter.clone());
     let mut options = vec![
@@ -430,12 +524,7 @@ fn filter_menu() {
 fn inbox_menu(items: Vec<InboxItem>) {
     let mut options = Vec::new();
     if items.iter().any(|item| item.kind != InboxKind::Approval) {
-        options.push(MenuItem::new("全部已读").on_select(|| {
-            controller::state().update(|s| {
-                s.unread.clear();
-                s.sidebar_revision += 1;
-            });
-        }));
+        options.push(MenuItem::new("全部已读").on_select(controller::mark_all_read));
         options.push(MenuItem::separator());
     }
     for item in items {
@@ -606,7 +695,7 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
                     move || hovered.get(),
                     move || {
                         let k = add_key.clone();
-                        view().tooltip(text("在此项目新建会话")).child(
+                        view().tooltip(super::tip(crate::tr("在此项目新建会话"))).child(
                             small_icon_button(Icon::Plus, "在此项目新建会话", move || {
                                 controller::new_thread_in_project(k.clone());
                             }),

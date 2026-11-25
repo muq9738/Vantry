@@ -337,6 +337,22 @@ async fn fixture(root: &Path) -> Result<()> {
         "approval effects mismatch"
     );
     let observed = requests.lock().unwrap();
+    let initial_system = observed[0]["messages"].to_string();
+    ensure!(
+        initial_system.contains("Run sandboxed JavaScript to filter large payloads, call codemode MCP/Vantry tools")
+            && initial_system.contains("Call native read, grep, find, and ls tools directly in parallel")
+            && !initial_system.contains("instead of many separate calls"),
+        "Vantry codemode snippet/guidelines did not override Pi defaults"
+    );
+    ensure!(
+        !observed[0]["tools"]
+            .to_string()
+            .contains("vantry_delegate_task")
+            && !observed[0]["tools"]
+                .to_string()
+                .contains("vantry_thread_send"),
+        "orchestration vantry_* tools must stay deferred/codemode instead of upfront direct tools"
+    );
     ensure!(
         !observed[0]["tools"]
             .to_string()

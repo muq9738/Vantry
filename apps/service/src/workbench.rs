@@ -28,6 +28,8 @@ pub struct Workbench {
     pub identity: Arc<IdentityStore>,
     pub federator: Arc<crate::federation::Federator>,
     invitations: vantry_connectivity::bootstrap::Publisher,
+    pub start_remote: tokio::sync::Notify,
+    pub mobile_server: tokio::sync::watch::Sender<Option<vantry_connectivity::t3compat::T3Server>>,
     updater: AsyncMutex<UpdateManager>,
     plugins: Mutex<plugins::Host>,
     desktop: AsyncMutex<Option<(DesktopClient, String, String)>>,
@@ -79,6 +81,8 @@ impl Workbench {
             options,
             magpie,
             invitations: vantry_connectivity::bootstrap::Publisher::new(identity.clone())?,
+            start_remote: tokio::sync::Notify::new(),
+            mobile_server: tokio::sync::watch::channel(None).0,
             identity,
             federator,
             updater,
@@ -147,7 +151,48 @@ impl Workbench {
                 out.mcp = Some(settings::mcp(&r, self.root(&r)?).await?)
             }
             "sandbox.get" | "sandbox.set" => out.output = settings::sandbox(data, &r)?,
-            "attachment.import" | "attachment.read" => return settings::attachment(data, &r),
+            "attachment.import" => return settings::attachment(data, &r),
+            "attachment.read" => {
+                match settings::attachment(data, &r) {
+                    Ok(resp) => return Ok(resp),
+                    Err(local_err) => {
+                        if !r.thread_id.is_empty()
+                            && let Ok(snap) = self.core.snapshot()
+                            && let Some(env_id) = snap
+                                .threads
+                                .as_deref()
+                                .unwrap_or(&[])
+                                .iter()
+                                .find(|t| t.id == r.thread_id)
+                                .and_then(|t| t.workspace.as_ref())
+                                .map(|w| w.environment_id.trim())
+                                .filter(|id| !id.is_empty())
+                        {
+                            let cfg = self.identity.snapshot();
+                            if let Some(peer) = cfg.peers.iter().find(|p| p.id == env_id) {
+                                let stop = tokio_util::sync::CancellationToken::new();
+                                if let Ok(conn) = vantry_connectivity::peer::PeerConnection::connect(
+                                    &peer.pair,
+                                    Some(&cfg),
+                                    vantry_connectivity::peer::Route::Auto,
+                                    stop,
+                                )
+                                .await
+                                    && let Ok(val) = conn
+                                        .post_json("/v1/workbench", serde_json::to_value(&r)?)
+                                        .await
+                                    && let Ok(remote_resp) =
+                                        serde_json::from_value::<WorkbenchResponse>(val)
+                                    && !remote_resp.data.is_empty()
+                                {
+                                    return Ok(remote_resp);
+                                }
+                            }
+                        }
+                        return Err(local_err);
+                    }
+                }
+            }
             "usage.summary" => {
                 out.output = crate::usage::summary(&self.core, &self.options.model, &r.thread_id)?;
             }
@@ -861,11 +906,14 @@ impl Workbench {
                 )
             })
             .collect();
-        let clients: Vec<_> = cfg
+        let mut clients: Vec<_> = cfg
             .clients
             .iter()
             .map(|c| json!({"id":c.id,"name":c.name,"createdAt":c.created_at}))
             .collect();
+        if let Some(mobile) = self.mobile_server.borrow().as_ref() {
+            clients.extend(mobile.paired_devices());
+        }
         out.output =
             json!({"enabled":cfg.enabled,"name":cfg.host.name,"direct":cfg.host.direct,
                     "identity":self.identity.public_identity(),"peers":peers,"clients":clients})
@@ -874,11 +922,21 @@ impl Workbench {
         Ok(out)
     }
     async fn pair(&self) -> Result<WorkbenchResponse> {
-        let mut out = WorkbenchResponse::default();
-        let key = self.identity.snapshot().registration_key;
-        let invite = self.invitations.issue(&key).await?;
-        out.output = json!({"code":invite.code,"link":invite.link(),"expiresAt":invite.expires_at})
-            .to_string();
+        let mut ready = self.mobile_server.subscribe();
+        self.start_remote.notify_one();
+        let mobile = tokio::time::timeout(Duration::from_secs(5), ready.wait_for(Option::is_some))
+            .await.context("Remote access could not start")??.clone().context("Remote access stopped")?;
+        let cfg = self.identity.snapshot();
+        let invite = self.invitations.issue(&cfg.registration_key).await?;
+        let mut out = self.remote_status()?;
+        let mut status: Value = serde_json::from_str(&out.output)?;
+        status["code"] = json!(invite.code);
+        status["link"] = json!(invite.link());
+        status["expiresAt"] = json!(invite.expires_at);
+        if let Some(link) = mobile.mobile_pairing_link()? {
+            status["t3PairingLink"] = json!(link);
+        }
+        out.output = status.to_string();
         Ok(out)
     }
     async fn redeem(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
@@ -919,8 +977,10 @@ impl Workbench {
         let id = input["id"].as_str().unwrap_or(&r.name);
         let removed = self.identity.remove_peer(id)?;
         let revoked = self.identity.revoke_client(id)?;
+        let mobile_revoked = self.mobile_server.borrow().as_ref()
+            .map(|server| server.revoke_client(id)).transpose()?.unwrap_or(false);
         out.output = json!({
-        "revoked":removed||revoked}
+        "revoked":removed||revoked||mobile_revoked}
         )
         .to_string();
 

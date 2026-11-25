@@ -205,6 +205,18 @@ fn switched_provider(
 }
 fn update_thread(db: &Connection, c: &Command, options: &CoreOptions) -> Result<Receipt> {
     let t = thread(db, &c.thread_id)?;
+    if let Some(change) = c.read_state {
+        let current = t.unread_sequence.unwrap_or(0);
+        if c.kind != UpdateThread || change.observed_sequence < 0 {
+            return Err(invalid("invalid thread read state"));
+        }
+        if change.observed_sequence == current && change.unread != (current > 0) {
+            let next = if change.unread { sequence(db)? + 1 } else { 0 };
+            set_unread_sequence(db, &t.id, next)?;
+            thread_event(db, &t.id, "thread.updated")?;
+        }
+        return Ok(receipt(&t.id, ""));
+    }
     if c.kind == UpdateThread
         && (!c.model.is_empty() || !c.interaction_mode.is_empty() || c.archived == Some(true))
         && (active(db, &t.id)?.is_some() || !queued(db, &t.id)?.is_empty())

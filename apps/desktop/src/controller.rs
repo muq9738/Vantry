@@ -390,6 +390,7 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
                                 s.on_live();
                             }
                         });
+                        acknowledge_visible_completion(&batch);
                         live = true;
                     }
                 }
@@ -437,7 +438,20 @@ fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<CoreEvent>) {
                 s.apply_event(event);
             }
         });
+        acknowledge_visible_completion(&batch);
     }
+}
+
+fn acknowledge_visible_completion(events: &[CoreEvent]) {
+    if !ui().with_untracked(|u| u.view == MainView::Conversation) { return; }
+    let selected = state().with_untracked(|s| {
+        let thread = s.selected_thread()?;
+        let seq = thread.unread_sequence?;
+        events.iter().any(|event| event.thread_id == thread.id && event.sequence == seq
+            && matches!(event.r#type.as_str(), "run.completed" | "run.failed" | "run.interrupted"))
+            .then(|| thread.id.clone())
+    });
+    if let Some(id) = selected { set_thread_read_state(&id, false); }
 }
 
 /// Sends `command`; its result goes back into the state, which may name a
@@ -492,6 +506,51 @@ pub(crate) fn send_quick_reply(message: String) {
 /// Open a clickable link from a Markdown message (`vantry-thread://`, `file://`, `http(s)://`).
 pub(crate) fn open_link(url: String) {
     let trimmed = url.trim();
+    if let Some(att_id) = trimmed.strip_prefix("vantry-attachment://") {
+        let att_id = att_id.split(['?', '#']).next().unwrap_or("").trim();
+        let lang = ui().with_untracked(|u| u.locale);
+        let found = state().with_untracked(|s| {
+            // Search runs in the currently selected thread first, then all runs, then drafts.
+            let find_in = |atts: &[vantry_protocol::Attachment]| -> Option<(vantry_protocol::Attachment, String)> {
+                let mut img_seq = 0usize;
+                for a in atts {
+                    let is_generic = a.mime.starts_with("image/")
+                        && crate::state::draft::is_generic_image_name(&a.name);
+                    if is_generic {
+                        img_seq += 1;
+                    }
+                    if a.id == att_id {
+                        let lbl = if is_generic {
+                            lang.image_label(img_seq)
+                        } else {
+                            crate::state::draft::middle_truncate_name(&a.name, 24)
+                        };
+                        return Some((a.clone(), lbl));
+                    }
+                }
+                None
+            };
+            if let Some(tid) = s.selected.as_deref() {
+                for run in s.runs.iter().filter(|r| r.thread_id == tid) {
+                    if let Some(hit) = find_in(&run.attachments) {
+                        return Some(hit);
+                    }
+                }
+            }
+            for draft in s.drafts.values() {
+                if let Some(hit) = find_in(&draft.attachments) {
+                    return Some(hit);
+                }
+            }
+            None
+        });
+        if let Some((item, label)) = found {
+            open_attachment_preview(item, label);
+        } else {
+            warn("找不到该附件。");
+        }
+        return;
+    }
     if let Some(rest) = trimmed.strip_prefix("vantry-thread://") {
         let thread_id = rest.split(['?', '#']).next().unwrap_or("").trim();
         let environment = rest.split_once('?').and_then(|(_, query)| {
@@ -644,6 +703,7 @@ pub(crate) fn delegate_child(message: String) {
 }
 
 pub(crate) fn select_thread(id: String) {
+    set_thread_read_state(&id, false);
     if state().with_untracked(|s|s.tasks.iter().any(|t|Some(&t.parent_thread_id)==s.selected.as_ref() && t.child_thread_id==id)) { open_child(id); return; }
     if ui().with_untracked(|u|u.child_panel.is_some()){close_dock();}
     state().update(move |s| s.select_thread(Some(id)));
@@ -744,12 +804,32 @@ pub(crate) fn copy_thread_path(id: String) {
 }
 
 pub(crate) fn toggle_unread(id: String) {
-    state().update(|s| {
-        if !s.unread.remove(&id) {
-            s.unread.insert(id);
-        }
-        s.sidebar_revision += 1;
-    });
+    let unread = state().with_untracked(|s| !s.unread.contains(&id));
+    set_thread_read_state(&id, unread);
+}
+
+pub(crate) fn mark_all_read() {
+    let ids = state().with_untracked(|s| s.unread.clone());
+    for id in ids { set_thread_read_state(&id, false); }
+}
+
+fn set_thread_read_state(id: &str, unread: bool) {
+    let observed = state().with_untracked(|s| s.thread(id).and_then(|t| t.unread_sequence));
+    if let Some(sequence) = observed {
+        if (sequence > 0) == unread { return; }
+        let Some(core) = core() else { return; };
+        let mut command = Command::new(bridge::new_command_id("read"), vantry_protocol::CommandKind::UpdateThread);
+        command.thread_id = id.to_owned();
+        command.read_state = Some(vantry_protocol::ThreadReadChange { unread, observed_sequence: sequence });
+        spawn_for_window(async move {
+            if let Err(error) = call(core.dispatch(command)).await { warn(error.message); }
+        });
+    } else {
+        state().update(|s| {
+            if unread { s.unread.insert(id.to_owned()); } else { s.unread.remove(id); }
+            s.sidebar_revision += 1;
+        });
+    }
 }
 
 pub(crate) fn open_thread_in_terminal(id: String) {
@@ -764,6 +844,84 @@ pub(crate) fn set_draft(text: &str) {
     }
     let text = text.to_owned();
     state().update(move |s| s.set_draft_text(&text));
+}
+
+/// Sets the draft to pasted `text` whose caret is `caret` (UTF-16 in the
+/// body): Markdown thread links in it become `@title` references where they
+/// stand. Returns the caret, moved with the text around it.
+pub(crate) fn paste_draft_text(text: &str, caret: u32) -> u32 {
+    let mut next = caret;
+    let text = text.to_owned();
+    state().update(|s| {
+        s.set_draft_text(&text);
+        let key = s.draft_key();
+        if let Some(draft) = s.drafts.get_mut(&key) {
+            next = draft.collapse_thread_links(Some(caret)).1.unwrap_or(caret);
+        }
+    });
+    note_composer_caret(next);
+    next
+}
+
+thread_local! {
+    /// The composer's last caret: its draft and the UTF-16 offset in the
+    /// body. Pasted and picked files put their `@` reference there.
+    static COMPOSER_CARET: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
+}
+
+/// The composer reports where its caret is (a selection's end).
+pub(crate) fn note_composer_caret(caret: u32) {
+    let key = state().with_untracked(|s| s.draft_key());
+    COMPOSER_CARET.with(|c| *c.borrow_mut() = Some((key, caret)));
+}
+
+/// Where draft `key`'s next reference goes: the caret if the composer
+/// reported one for it.
+fn composer_caret(key: &str) -> Option<u32> {
+    COMPOSER_CARET.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(k, _)| k == key)
+            .map(|(_, caret)| *caret)
+    })
+}
+
+/// Asks the composer to put its caret at `caret` (draft `key`), after text
+/// was inserted for it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct CaretRequest {
+    pub key: String,
+    pub caret: u32,
+    pub nonce: u64,
+}
+
+pub(crate) fn caret_request() -> Signal<CaretRequest> {
+    global::<CaretRequest>()
+}
+
+fn move_composer_caret(key: &str, caret: u32) {
+    COMPOSER_CARET.with(|c| *c.borrow_mut() = Some((key.to_owned(), caret)));
+    let request = caret_request();
+    let nonce = request.get_untracked().nonce.wrapping_add(1);
+    request.set(CaretRequest {
+        key: key.to_owned(),
+        caret,
+        nonce,
+    });
+}
+
+/// Adds an imported attachment to draft `key` with its reference at the
+/// composer's caret, which then moves past it.
+fn attach_to_draft(key: &str, attachment: vantry_protocol::Attachment, path: Option<PathBuf>) {
+    let lang = ui().with_untracked(|u| u.locale);
+    let caret = composer_caret(key);
+    let mut next = None;
+    state().update(|s| {
+        next = s.add_attachment_with_mention_for_lang(key.to_owned(), attachment, path, lang, caret)
+    });
+    if let Some(next) = next {
+        move_composer_caret(key, next);
+    }
 }
 
 pub(crate) fn toggle_mode() {
@@ -806,6 +964,205 @@ pub(crate) fn copy_thread_link(id: String) {
 pub(crate) fn copy(text: String) {
     set_clipboard(text);
     state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制。")));
+}
+
+/// Converts a `data:` URI or `file://` URL into a base64 `data:` URI accepted by `set_clipboard_image`.
+fn ensure_image_data_uri(src: &str) -> Option<String> {
+    if src.starts_with("data:") {
+        return Some(src.to_owned());
+    }
+    let path = decode_file_uri(src);
+    let bytes = std::fs::read(&path).ok()?;
+    let mime = nsh_core::platform::clipboard::image_mime(&bytes).unwrap_or("image/png");
+    Some(nsh_core::platform::clipboard::data_uri(mime, &bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn write_macos_text_and_image_pasteboard(text: &str, html: &str, image_data_uri: &str) -> bool {
+    let Some((_, png_bytes)) = nsh_core::platform::clipboard::decode_data_uri(image_data_uri) else {
+        return false;
+    };
+    let tmp = std::env::temp_dir().join(format!("vantry-clip-{}", uuid::Uuid::new_v4().simple()));
+    let img_path = tmp.with_extension("img");
+    let txt_path = tmp.with_extension("txt");
+    let html_path = tmp.with_extension("html");
+    if std::fs::write(&img_path, &png_bytes).is_err()
+        || std::fs::write(&txt_path, text.as_bytes()).is_err()
+        || std::fs::write(&html_path, html.as_bytes()).is_err()
+    {
+        let _ = std::fs::remove_file(&img_path);
+        let _ = std::fs::remove_file(&txt_path);
+        let _ = std::fs::remove_file(&html_path);
+        return false;
+    }
+    let script = r#"
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+function run(argv) {
+  var pb = $.NSPasteboard.generalPasteboard;
+  pb.clearContents;
+  var txt = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, $());
+  var html = $.NSString.stringWithContentsOfFileEncodingError(argv[1], $.NSUTF8StringEncoding, $());
+  var imgData = $.NSData.dataWithContentsOfFile(argv[2]);
+  var types = [];
+  if (txt && txt.js) types.push($.NSPasteboardTypeString);
+  if (html && html.js) types.push($.NSPasteboardTypeHTML);
+  if (imgData && imgData.length > 0) {
+    types.push($.NSPasteboardTypePNG);
+    types.push($.NSPasteboardTypeTIFF);
+  }
+  pb.declareTypesOwner($(types), $());
+  if (txt && txt.js) pb.setStringForType(txt, $.NSPasteboardTypeString);
+  if (html && html.js) pb.setStringForType(html, $.NSPasteboardTypeHTML);
+  if (imgData && imgData.length > 0) {
+    var img = $.NSImage.alloc.initWithData(imgData);
+    var tiff = img ? img.TIFFRepresentation : $();
+    var pngData = imgData;
+    if (tiff && tiff.length > 0) {
+      var rep = $.NSBitmapImageRep.imageRepWithData(tiff);
+      if (rep) {
+        var encoded = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+        if (encoded && encoded.length > 0) pngData = encoded;
+      }
+      pb.setDataForType(tiff, $.NSPasteboardTypeTIFF);
+    }
+    pb.setDataForType(pngData, $.NSPasteboardTypePNG);
+  }
+}
+"#;
+    let ok = std::process::Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", script, "--"])
+        .arg(&txt_path)
+        .arg(&html_path)
+        .arg(&img_path)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = std::fs::remove_file(&img_path);
+    let _ = std::fs::remove_file(&txt_path);
+    let _ = std::fs::remove_file(&html_path);
+    ok
+}
+
+/// Copies a user message preserving its exact original text AND, if it has image
+/// attachments, writes native image data (`PNG`/`TIFF`) alongside plain text & HTML
+/// so pasting into chat apps, rich editors, image apps, or Vantry itself keeps both.
+pub(crate) fn copy_message(text: String, attachments: Vec<vantry_protocol::Attachment>) {
+    let images: Vec<vantry_protocol::Attachment> = attachments
+        .into_iter()
+        .filter(|a| a.mime.starts_with("image/"))
+        .collect();
+    if images.is_empty() {
+        copy(text);
+        return;
+    }
+    let sources: Vec<(vantry_protocol::Attachment, Option<PathBuf>)> = state().with_untracked(|s| {
+        let draft = s.drafts.get(&s.draft_key());
+        images
+            .into_iter()
+            .map(|item| {
+                let path = draft.and_then(|d| d.image_paths.get(&item.id)).cloned();
+                (item, path)
+            })
+            .collect()
+    });
+    if !text.trim().is_empty() {
+        set_clipboard(text.clone());
+    }
+    state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制消息与图片。")));
+    spawn_for_window(async move {
+        let escape = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        };
+        let mut html = String::from("<div>");
+        if !text.is_empty() {
+            html.push_str("<p>");
+            html.push_str(&escape(&text).replace('\n', "<br>"));
+            html.push_str("</p>");
+        }
+        let mut first_data_uri: Option<String> = None;
+        let mut embedded = 0usize;
+        for (item, path) in sources {
+            if let Some(src) = attachment_preview(item.clone(), path).await
+                && let Some(data_uri) = ensure_image_data_uri(&src)
+            {
+                if first_data_uri.is_none() {
+                    first_data_uri = Some(data_uri.clone());
+                }
+                html.push_str(&format!(
+                    "<p><img src=\"{}\" alt=\"{}\" /></p>",
+                    escape(&data_uri),
+                    escape(&item.name)
+                ));
+                embedded += 1;
+            }
+        }
+        html.push_str("</div>");
+        let Some(first_uri) = first_data_uri else {
+            return;
+        };
+        if text.trim().is_empty() {
+            set_clipboard_image(first_uri);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let text_clone = text.clone();
+            let html_clone = html.clone();
+            let uri_clone = first_uri.clone();
+            let wrote = tokio::task::spawn_blocking(move || {
+                write_macos_text_and_image_pasteboard(&text_clone, &html_clone, &uri_clone)
+            })
+            .await
+            .unwrap_or(false);
+            if wrote {
+                return;
+            }
+        }
+        if embedded > 0 {
+            let mut clip = ClipboardItem::default();
+            clip.text = text;
+            clip.html = Some(html);
+            set_clipboard_item(clip);
+        }
+    });
+}
+
+/// Copies a single image preview (`data:...` or `file://...`) natively as PNG/TIFF to the system clipboard.
+pub(crate) fn copy_image_preview(src: String, _name: String) {
+    if let Some(data_uri) = ensure_image_data_uri(&src) {
+        set_clipboard_image(data_uri);
+        state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制图片。")));
+    } else {
+        warn("无法读取图片数据以复制。");
+    }
+}
+
+/// Loads (local or remote) and copies an image attachment natively to the system clipboard.
+pub(crate) fn copy_attachment_image(item: vantry_protocol::Attachment) {
+    let source = state().with_untracked(|s| {
+        s.drafts
+            .get(&s.draft_key())
+            .and_then(|d| d.image_paths.get(&item.id))
+            .cloned()
+    });
+    spawn_for_window(async move {
+        if let Some(src) = attachment_preview(item.clone(), source).await {
+            copy_image_preview(src, item.name);
+        } else {
+            warn("无法读取图片数据以复制。");
+        }
+    });
+}
+
+pub(crate) fn open_attachment_preview(item: vantry_protocol::Attachment, label: String) {
+    ui().update(move |u| u.attachment_preview = Some((item, label)));
+}
+
+pub(crate) fn close_attachment_preview() {
+    ui().update(|u| u.attachment_preview = None);
 }
 
 /// Copies a reply's text row.
@@ -1034,9 +1391,7 @@ pub(crate) fn paste_images(paste: &PasteEvent) {
             req.data = base64::engine::general_purpose::STANDARD.encode(bytes);
             match call(bridge.workbench(req)).await {
                 Ok(response) => match response.attachment {
-                    Some(item) => {
-                        state().update(|s| s.add_attachment_with_mention(key.clone(), item, None))
-                    }
+                    Some(item) => attach_to_draft(&key, item, None),
                     None => warn("Core 没有返回图片附件。"),
                 },
                 Err(err) => warn(format!("无法粘贴图片：{}", err.message)),
@@ -1088,9 +1443,7 @@ pub(crate) fn paste_file_uris(uris: &[String]) {
     spawn_for_window(async move {
         for path in paths {
             match call(workbench.attach(path.clone())).await {
-                Ok(attachment) => state().update(|s| {
-                    s.add_attachment_with_mention(key.clone(), attachment, Some(path))
-                }),
+                Ok(attachment) => attach_to_draft(&key, attachment, Some(path)),
                 Err(error) => warn(format!("无法附加文件：{}", error.message)),
             }
         }
@@ -1121,9 +1474,7 @@ pub(crate) fn pick_attachments() {
             Ok(Some(paths)) => {
                 for path in paths {
                     match call(workbench.attach(path.clone())).await {
-                        Ok(attachment) => state().update(|s| {
-                            s.add_attachment_with_mention(key.clone(), attachment, Some(path))
-                        }),
+                        Ok(attachment) => attach_to_draft(&key, attachment, Some(path)),
                         Err(error) => warn(format!("无法附加文件：{}", error.message)),
                     }
                 }
@@ -1137,6 +1488,35 @@ pub(crate) fn pick_attachments() {
     });
 }
 
+thread_local! {
+    /// Image previews already read, by attachment id: a thumbnail made again
+    /// (a re-render, another draft, the sent message) shows at once.
+    static PREVIEWS: RefCell<(std::collections::HashMap<String, String>, usize)> =
+        RefCell::new((std::collections::HashMap::new(), 0));
+}
+
+/// The previews kept, in bytes of their data URLs.
+const PREVIEW_CACHE_BYTES: usize = 48 << 20;
+
+/// An image attachment's preview, retried while the Core is not answering
+/// yet (a thumbnail restored as the app or its Core starts); `None` when it
+/// still has none after that.
+pub(crate) async fn attachment_preview_retrying(
+    item: vantry_protocol::Attachment,
+    source: Option<PathBuf>,
+) -> Option<String> {
+    for attempt in 0..7u32 {
+        if let Some(src) = attachment_preview(item.clone(), source.clone()).await {
+            return Some(src);
+        }
+        if !item.mime.starts_with("image/") || !(1..=(8 << 20)).contains(&item.size) {
+            return None;
+        }
+        timer(Duration::from_millis(400 << attempt.min(4))).await;
+    }
+    None
+}
+
 pub(crate) async fn attachment_preview(
     item: vantry_protocol::Attachment,
     source: Option<PathBuf>,
@@ -1144,8 +1524,32 @@ pub(crate) async fn attachment_preview(
     if !item.mime.starts_with("image/") || !(1..=(8 << 20)).contains(&item.size) {
         return None;
     }
+    if let Some(src) = PREVIEWS.with(|p| p.borrow().0.get(&item.id).cloned()) {
+        return Some(src);
+    }
+    let src = read_attachment_preview(&item, source).await?;
+    PREVIEWS.with(|p| {
+        let (map, bytes) = &mut *p.borrow_mut();
+        if *bytes + src.len() > PREVIEW_CACHE_BYTES {
+            map.clear();
+            *bytes = 0;
+        }
+        *bytes += src.len();
+        if let Some(old) = map.insert(item.id.clone(), src.clone()) {
+            *bytes -= old.len();
+        }
+    });
+    Some(src)
+}
+
+async fn read_attachment_preview(
+    item: &vantry_protocol::Attachment,
+    source: Option<PathBuf>,
+) -> Option<String> {
+    let item = item.clone();
     if let Some(workbench) = workbench() {
         let mut request = actions::request(names::ATTACHMENT_READ);
+        request.thread_id = state().with_untracked(|s| s.selected.clone().unwrap_or_default());
         request.input = Some(serde_json::to_value(&item).ok()?);
         if let Ok(response) = call(workbench.workbench(request)).await
             && !response.data.is_empty()
@@ -1158,6 +1562,119 @@ pub(crate) async fn attachment_preview(
 
 pub(crate) fn remove_attachment(id: String) {
     state().update(move |s| s.remove_attachment(&id));
+}
+
+// --------------------------------------------------------------- machines
+
+/// The machines this window can work on: this one and the paired ones the
+/// Core reaches (`remote.status`), refreshed as the machine menu opens.
+pub(crate) fn machines() -> Signal<Vec<crate::bridge::workbench::actions::RemotePeer>> {
+    global::<Vec<crate::bridge::workbench::actions::RemotePeer>>()
+}
+
+/// The paired machine this window shows, when not this one.
+pub(crate) fn current_machine() -> Option<String> {
+    bridges(|b| b.peer_id.clone())
+}
+
+/// What the machine menu names the window's machine.
+pub(crate) fn machine_label() -> String {
+    match current_machine() {
+        None => crate::tr("本机").to_owned(),
+        Some(id) => machines().with(|list| {
+            list.iter()
+                .find(|p| p.id == id && !p.name.is_empty())
+                .map_or_else(|| id.clone(), |p| p.name.clone())
+        }),
+    }
+}
+
+/// Reads the paired machines, then runs `then` (the menu).
+pub(crate) fn refresh_machines(then: impl FnOnce() + 'static) {
+    let Some(workbench) = workbench() else {
+        then();
+        return;
+    };
+    spawn_for_window(async move {
+        let request = actions::request(names::REMOTE_STATUS);
+        if let Ok(response) = call(workbench.workbench(request)).await
+            && let Ok(status) = crate::bridge::workbench::actions::RemoteStatus::read(&response)
+        {
+            // A paired machine's window lists that machine's own peers:
+            // keep the ones it names, with this window's machine.
+            let mut peers = status.peers().to_vec();
+            if let Some(id) = current_machine()
+                && !peers.iter().any(|p| p.id == id)
+            {
+                let known = machines().with_untracked(|list| list.iter().find(|p| p.id == id).cloned());
+                peers.insert(0, known.unwrap_or(crate::bridge::workbench::actions::RemotePeer {
+                    id,
+                    ..Default::default()
+                }));
+            }
+            machines().set(peers);
+        }
+        then();
+    });
+}
+
+/// Saves what lasts now (the window is about to close).
+fn save_desktop_state_now() {
+    let Some(path) = bridges(|b| b.state_path.clone()) else {
+        return;
+    };
+    let file = state().with_untracked(|s| ui().with_untracked(|u| persist::capture(s, u)));
+    if let Err(error) = persist::save_atomic(&path, &file) {
+        eprintln!("vantry: desktop-state.json: {error}");
+    }
+}
+
+/// Opens Vantry again with `args` (the app bundle on macOS, so it is a
+/// proper app with its own window).
+fn launch_app(args: &[String]) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = exe
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+    {
+        std::process::Command::new("/usr/bin/open")
+            .arg("-n")
+            .arg(bundle)
+            .arg("--args")
+            .args(args)
+            .spawn()?;
+        return Ok(());
+    }
+    std::process::Command::new(exe).args(args).spawn().map(|_| ())
+}
+
+/// Moves the window to machine `peer` (`None`: this machine): the window
+/// opens again on that machine's Core, which keeps its own threads, drafts
+/// and state; this machine's Core and its runs go on as they were.
+pub(crate) fn switch_machine(peer: Option<String>) {
+    if current_machine() == peer {
+        return;
+    }
+    let config = crate::launch_config();
+    let mut args = Vec::new();
+    let default_dir = crate::cli::default_data_dir(&|name| {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    })
+    .ok();
+    if default_dir.as_deref() != Some(config.data_dir.as_path()) {
+        args.push("--data-dir".to_owned());
+        args.push(config.data_dir.display().to_string());
+    }
+    if let Some(id) = &peer {
+        args.push("--peer".to_owned());
+        args.push(id.clone());
+    }
+    save_desktop_state_now();
+    match launch_app(&args) {
+        Ok(()) => nsh_core::element::desktop::quit(),
+        Err(error) => warn(format!("无法切换机器：{error}")),
+    }
 }
 
 // --------------------------------------------------------------------- ui

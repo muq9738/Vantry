@@ -76,7 +76,7 @@ pub(super) fn git_tools() -> impl IntoElement {
                 )
                 .child(view().flex_1())
                 .child(
-                    view().tooltip(text("抓取远程更新 (Fetch)")).child(
+                    view().tooltip(super::tip(crate::tr("抓取远程更新 (Fetch)"))).child(
                         small_icon_button(Icon::RefreshCw, "抓取", || {
                             controller::git_sync_action("git.fetch")
                         })
@@ -84,7 +84,7 @@ pub(super) fn git_tools() -> impl IntoElement {
                     ),
                 )
                 .child(
-                    view().tooltip(text("拉取 (Pull)")).child(
+                    view().tooltip(super::tip(crate::tr("拉取 (Pull)"))).child(
                         small_icon_button(Icon::Download, "拉取", || {
                             controller::git_sync_action("git.pull")
                         })
@@ -92,7 +92,7 @@ pub(super) fn git_tools() -> impl IntoElement {
                     ),
                 )
                 .child(
-                    view().tooltip(text("推送 (Push)")).child(
+                    view().tooltip(super::tip(crate::tr("推送 (Push)"))).child(
                         small_icon_button(Icon::Upload, "推送", || {
                             controller::git_sync_action("git.push")
                         })
@@ -103,14 +103,14 @@ pub(super) fn git_tools() -> impl IntoElement {
                 .child(when(
                     move || dialog.get().is_none(),
                     || {
-                        view().tooltip(text("展开 Git 面板")).child(small_icon_button(
+                        view().tooltip(super::tip(crate::tr("展开 Git 面板"))).child(small_icon_button(
                             Icon::Maximize2,
                             "展开 Git 面板",
                             || controller::git_dialog(Some(GitDialog::Expanded)),
                         ))
                     },
                 ))
-                .child(view().tooltip(text("文件变更")).child(small_icon_button(
+                .child(view().tooltip(super::tip(crate::tr("文件变更"))).child(small_icon_button(
                     Icon::FileDiff,
                     "文件变更",
                     || controller::git_dialog(Some(GitDialog::Changes)),

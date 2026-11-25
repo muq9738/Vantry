@@ -15,7 +15,10 @@ use super::{dot, ghost_button, markdown, primary_button, small_icon_button};
 use crate::{
     controller,
     icons::{Icon, icon},
-    state::{ApprovalDecision, ApprovalView, Risk, TimelineItem, ToolStatus, markdown::MarkdownDoc},
+    state::{
+        ApprovalDecision, ApprovalView, Risk, TimelineItem, ToolEntry, ToolKind, ToolStatus,
+        language::Language, markdown::MarkdownDoc,
+    },
     theme::{metrics, palette},
 };
 
@@ -29,7 +32,7 @@ enum Kind {
     User,
     Reasoning,
     Text,
-    Tool,
+    Tools,
     Approval,
     Status,
 }
@@ -39,7 +42,7 @@ fn kind_of(item: &TimelineItem) -> Kind {
         TimelineItem::User { .. } => Kind::User,
         TimelineItem::Reasoning { .. } => Kind::Reasoning,
         TimelineItem::Text { .. } => Kind::Text,
-        TimelineItem::Tool { .. } => Kind::Tool,
+        TimelineItem::Tools { .. } => Kind::Tools,
         TimelineItem::Approval { .. } => Kind::Approval,
         TimelineItem::Status { .. } => Kind::Status,
     }
@@ -80,7 +83,9 @@ fn thread_timeline(thread: Memo<Option<String>>) -> impl IntoElement {
 
     view()
         .flex_1()
+        .min_w(px(0.0))
         .relative()
+        .overflow_hidden()
         .bg(colors.canvas)
         .child(
             virtual_list(move || keys.with(Vec::len), move |at| row(at, thread))
@@ -142,6 +147,7 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
     let kind = computed(move || item.with(|i| i.as_ref().map(kind_of)));
     view()
         .w_full()
+        .min_w(px(0.0))
         .flex_row()
         .justify_center()
         .px_6()
@@ -149,12 +155,13 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
         .child(
             view()
                 .flex_1()
+                .min_w(px(0.0))
                 .max_w(px(metrics::READING_WIDTH))
                 .child(dynamic(move || match kind.get() {
                     Some(Kind::User) => user_row(item).into_element(),
                     Some(Kind::Reasoning) => reasoning_row(item).into_element(),
                     Some(Kind::Text) => text_row(item).into_element(),
-                    Some(Kind::Tool) => tool_row(item).into_element(),
+                    Some(Kind::Tools) => tools_row(item).into_element(),
                     Some(Kind::Approval) => approval_row(item).into_element(),
                     Some(Kind::Status) => status_row(item).into_element(),
                     None => view().into_element(),
@@ -164,40 +171,71 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
 
 type ItemMemo = Memo<Option<TimelineItem>>;
 
-fn attachment_short_name(item: &vantry_protocol::Attachment, image_index: usize) -> String {
-    if item.mime.starts_with("image/") && crate::state::draft::is_generic_image_name(&item.name) {
-        format!("图{image_index}")
+fn attachment_short_name(
+    item: &vantry_protocol::Attachment,
+    image_index: usize,
+    lang: crate::state::language::Language,
+) -> String {
+    if item.mime.starts_with("image/") && image_index > 0 {
+        lang.image_label(image_index)
     } else {
         crate::state::draft::middle_truncate_name(&item.name, 20)
     }
 }
 
-/// Replaces `@attachment-name` references in a sent message with highlighted inline tokens.
+/// Replaces `@attachment-name` / `图1` / `图 1` / `Image 1` / `画像1` references in a sent
+/// message with highlighted, clickable hyperlink tokens (`vantry-attachment://<id>`),
+/// adapting display labels to the active UI language.
 fn highlight_attachment_mentions(
     inlines: Vec<crate::state::markdown::Inline>,
     files: &[vantry_protocol::Attachment],
+    lang: crate::state::language::Language,
 ) -> Vec<crate::state::markdown::Inline> {
     if files.is_empty() {
         return inlines;
     }
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
     let mut img_seq = 0usize;
     for file in files {
-        let short = if file.mime.starts_with("image/")
-            && crate::state::draft::is_generic_image_name(&file.name)
-        {
+        let url = format!("vantry-attachment://{}", file.id);
+        let is_image = file.mime.starts_with("image/");
+        let display = if is_image {
             img_seq += 1;
-            format!("@图{img_seq}")
+            format!("@{}", lang.image_label(img_seq))
         } else {
             format!("@{}", crate::state::draft::middle_truncate_name(&file.name, 20))
         };
-        let raw = format!("@{}", file.name);
-        pairs.push((raw, short.clone()));
-        if !pairs.iter().any(|(k, _)| k == &short) {
-            pairs.push((short.clone(), short));
+        let mut push_alias = |needle: String| {
+            if !needle.is_empty() && !pairs.iter().any(|(k, _, _)| k == &needle) {
+                pairs.push((needle, display.clone(), url.clone()));
+            }
+        };
+        push_alias(format!("@{}", file.name));
+        push_alias(display.clone());
+        if is_image {
+            let n = img_seq;
+            for alias in [
+                format!("@图{n}"),
+                format!("@图 {n}"),
+                format!("@圖{n}"),
+                format!("@圖 {n}"),
+                format!("@Image {n}"),
+                format!("@Image{n}"),
+                format!("@image {n}"),
+                format!("@画像{n}"),
+                format!("@画像 {n}"),
+                format!("图{n}"),
+                format!("图 {n}"),
+                format!("圖{n}"),
+                format!("圖 {n}"),
+                format!("Image {n}"),
+                format!("画像{n}"),
+            ] {
+                push_alias(alias);
+            }
         }
     }
-    pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    pairs.sort_by_key(|(k, _, _)| std::cmp::Reverse(k.len()));
 
     let mut out = Vec::with_capacity(inlines.len());
     for inline in inlines {
@@ -206,7 +244,7 @@ fn highlight_attachment_mentions(
             continue;
         };
         let mut rest = text.as_str();
-        while let Some((at, (needle, display))) = pairs
+        while let Some((at, (needle, display, url))) = pairs
             .iter()
             .filter_map(|p| rest.find(&p.0).map(|pos| (pos, p)))
             .min_by_key(|(pos, _)| *pos)
@@ -214,7 +252,10 @@ fn highlight_attachment_mentions(
             if at > 0 {
                 out.push(crate::state::markdown::Inline::Text(rest[..at].into()));
             }
-            out.push(crate::state::markdown::Inline::Code(display.clone()));
+            out.push(crate::state::markdown::Inline::Link {
+                text: display.clone(),
+                url: url.clone(),
+            });
             rest = &rest[at + needle.len()..];
         }
         if !rest.is_empty() {
@@ -253,12 +294,15 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     let hovered = signal(false);
     view()
         .w_full()
+        .min_w(px(0.0))
         .flex_row()
         .justify_end()
         .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
         .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
         .child(
             view()
+                .w_full()
+                .min_w(px(0.0))
                 .max_w(px(560.0))
                 .flex_col()
                 .items_end()
@@ -270,28 +314,39 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                 }))
                 .child(
                     view()
+                        .w_full()
+                        .min_w(px(0.0))
                         .flex_row()
+                        .justify_end()
                         .items_end()
                         .gap_1p5()
                         .child(when(move || !visible_text.get().trim().is_empty(), move ||
                             view()
+                                .flex_shrink(1.0)
+                                .min_w(px(0.0))
+                                .max_w(px(520.0))
                                 .px_4()
                                 .py_2p5()
                                 .rounded(px(16.0))
                                 .bg(colors.user)
+                                .overflow_hidden()
                                 .child(dynamic(move || {
                                     let text = visible_text.get();
                                     let files = attachments();
+                                    let lang = controller::ui().with(|u| u.locale);
                                     let (skill, body) = crate::state::thread_links::skill_prefix(&text);
                                     let mut inlines = highlight_attachment_mentions(
                                         crate::state::thread_links::message_inlines(body),
                                         &files,
+                                        lang,
                                     );
                                     if let Some(name) = skill {
                                         inlines.insert(0, crate::state::markdown::Inline::Text(" ".into()));
                                         inlines.insert(0, crate::state::markdown::Inline::Code(name.to_owned()));
                                     }
                                     markdown::inline_text(&inlines)
+                                        .w_full()
+                                        .min_w(px(0.0))
                                         .select_text()
                                         .text_size(px(metrics::BODY))
                                         .line_height(LineHeight::Multiple(1.55))
@@ -300,10 +355,11 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                         ))
                         .child(
                             view()
+                                .flex_shrink_0()
                                 .pb_1()
                                 .opacity(move || if hovered.get() { 1.0_f32 } else { 0.45_f32 })
                                 .child(small_icon_button(Icon::Copy, "复制消息", move || {
-                                    controller::copy(text_of());
+                                    controller::copy_message(text_of(), attachments());
                                 })),
                         ),
                 )
@@ -311,17 +367,16 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                     move || !attachments().is_empty(),
                     move || {
                         let numbered = computed(move || {
+                            let lang = controller::ui().with(|u| u.locale);
                             let mut img_seq = 0usize;
                             attachments()
                                 .into_iter()
                                 .map(|item| {
-                                    let lbl = if item.mime.starts_with("image/")
-                                        && crate::state::draft::is_generic_image_name(&item.name)
-                                    {
+                                    let lbl = if item.mime.starts_with("image/") {
                                         img_seq += 1;
-                                        attachment_short_name(&item, img_seq)
+                                        attachment_short_name(&item, img_seq, lang)
                                     } else {
-                                        attachment_short_name(&item, 0)
+                                        attachment_short_name(&item, 0, lang)
                                     };
                                     (item, lbl)
                                 })
@@ -528,87 +583,318 @@ fn tool_status_color(status: ToolStatus) -> AdaptiveColor {
     }
 }
 
-fn tool_row(item: ItemMemo) -> impl IntoElement {
-    let colors = palette();
-    let tool = computed(move || match item.get() {
-        Some(TimelineItem::Tool {
-            name,
-            summary,
-            status,
-            arguments,
-            output,
-            ..
-        }) => Some((name, summary, status, arguments, output)),
-        _ => None,
-    });
-    let status = move || tool.with(|t| t.as_ref().map_or(ToolStatus::Running, |t| t.2));
-    let field = move |f: fn(&(String, String, ToolStatus, String, String)) -> String| {
-        move || tool.with(|t| t.as_ref().map(f).unwrap_or_default())
+fn tool_status_label(status: ToolStatus, lang: Language) -> &'static str {
+    match (status, lang) {
+        (ToolStatus::Running, Language::En) => "Running",
+        (ToolStatus::Running, Language::Ja) => "実行中",
+        (ToolStatus::AwaitingApproval, Language::En) => "Needs approval",
+        (ToolStatus::AwaitingApproval, Language::Ja) => "承認待ち",
+        (ToolStatus::Completed, Language::En) => "Done",
+        (ToolStatus::Completed, Language::Ja) => "完了",
+        (ToolStatus::Failed, Language::En) => "Failed",
+        (ToolStatus::Failed, Language::Ja) => "失敗",
+        (ToolStatus::Interrupted, Language::En) => "Interrupted",
+        (ToolStatus::Interrupted, Language::Ja) => "中断",
+        (status, _) => status.label(),
+    }
+}
+
+fn tool_glyph(name: &str) -> Icon {
+    match ToolKind::of(name) {
+        ToolKind::Command => Icon::Terminal,
+        ToolKind::Read | ToolKind::Edit => Icon::FileText,
+        ToolKind::Search => Icon::Search,
+        ToolKind::Other => Icon::Wrench,
+    }
+}
+
+fn live(status: ToolStatus) -> bool {
+    matches!(status, ToolStatus::Running | ToolStatus::AwaitingApproval)
+}
+
+/// A finished group in one line, as Claude's desktop sums up its steps:
+/// "运行了 4 个命令，读取了 2 个文件".
+fn tools_headline(calls: &[ToolEntry], lang: Language) -> String {
+    let mut counts: Vec<(ToolKind, usize)> = Vec::new();
+    for call in calls {
+        let kind = ToolKind::of(&call.name);
+        match counts.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let phrase = |kind: ToolKind, n: usize| -> String {
+        let s = if n == 1 { "" } else { "s" };
+        match (lang, kind) {
+            (Language::En, ToolKind::Command) => format!("ran {n} command{s}"),
+            (Language::En, ToolKind::Read) => format!("read {n} file{s}"),
+            (Language::En, ToolKind::Edit) => format!("edited {n} file{s}"),
+            (Language::En, ToolKind::Search) => format!("searched {n} time{s}"),
+            (Language::En, ToolKind::Other) => format!("used {n} tool{s}"),
+            (Language::Ja, ToolKind::Command) => format!("{n} 件のコマンドを実行"),
+            (Language::Ja, ToolKind::Read) => format!("{n} 件のファイルを読み込み"),
+            (Language::Ja, ToolKind::Edit) => format!("{n} 件のファイルを編集"),
+            (Language::Ja, ToolKind::Search) => format!("{n} 回検索"),
+            (Language::Ja, ToolKind::Other) => format!("{n} 個のツールを使用"),
+            (Language::Zh, ToolKind::Command) => format!("运行了 {n} 个命令"),
+            (Language::Zh, ToolKind::Read) => format!("读取了 {n} 个文件"),
+            (Language::Zh, ToolKind::Edit) => format!("编辑了 {n} 个文件"),
+            (Language::Zh, ToolKind::Search) => format!("搜索了 {n} 次"),
+            (Language::Zh, ToolKind::Other) => format!("调用了 {n} 个工具"),
+        }
     };
+    let parts: Vec<String> = counts.into_iter().map(|(k, n)| phrase(k, n)).collect();
+    let mut line = parts.join(match lang {
+        Language::En => ", ",
+        Language::Ja => "、",
+        Language::Zh => "，",
+    });
+    if lang == Language::En
+        && let Some(first) = line.get(..1)
+    {
+        line = format!("{}{}", first.to_uppercase(), &line[1..]);
+    }
+    let failed = calls
+        .iter()
+        .filter(|c| matches!(c.status, ToolStatus::Failed | ToolStatus::Interrupted))
+        .count();
+    if failed > 0 {
+        line.push_str(&match lang {
+            Language::En => format!(" · {failed} failed"),
+            Language::Ja => format!(" · {failed} 件失敗"),
+            Language::Zh => format!(" · {failed} 个未成功"),
+        });
+    }
+    line
+}
+
+/// Consecutive tool calls as one quiet, collapsible line (Claude's desktop):
+/// while they run it names the current call; once done it sums them up.
+/// Opened, it lists the calls, each opening to its arguments and output.
+fn tools_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
+    let lang = use_context::<Language>().unwrap_or_default();
+    let calls = computed(move || match item.get() {
+        Some(TimelineItem::Tools { calls, .. }) => calls,
+        _ => Vec::new(),
+    });
     let open = signal(false);
+    let hovered = signal(false);
+    let single = computed(move || calls.with(|c| c.len() == 1));
+    let running = computed(move || calls.with(|c| c.iter().any(|t| live(t.status))));
+    let awaiting = computed(move || {
+        calls.with(|c| c.iter().any(|t| t.status == ToolStatus::AwaitingApproval))
+    });
+    // The call the line names: the running one, else the last.
+    let current = computed(move || {
+        calls.with(|c| {
+            c.iter()
+                .rev()
+                .find(|t| live(t.status))
+                .or(c.last())
+                .map(|t| (t.name.clone(), t.summary.clone()))
+                .unwrap_or_default()
+        })
+    });
+    let headline = computed(move || calls.with(|c| tools_headline(c, lang)));
+    let ink = move || if hovered.get() || open.get() { colors.ink } else { colors.muted };
     view()
         .flex_col()
-        .rounded(px(metrics::CARD_RADIUS))
-        .border_1()
-        .border_color(colors.line)
-        .overflow_hidden()
+        .gap_1()
         .child(
             nsh_base::button()
-                .accessibility_label("展开工具调用")
+                .accessibility_label(match lang {
+                    Language::En => "Show tool calls",
+                    Language::Ja => "ツール呼び出しを表示",
+                    Language::Zh => "展开工具调用",
+                })
                 .on_press(move || open.set(!open.get_untracked()))
+                .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
+                .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
+                .self_start()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .px_3()
-                .py_2()
-                .hover(|s| s.bg(colors.soft))
-                .child(dot(move || tool_status_color(status())))
+                .py_0p5()
+                .min_w(px(0.0))
                 .child(dynamic(move || {
-                    let name = tool
-                        .with(|t| t.as_ref().map(|t| t.0.to_ascii_lowercase()).unwrap_or_default());
-                    let glyph = match name.as_str() {
-                        "bash" | "shell" | "terminal" | "vantry_terminal_run" => Icon::Terminal,
-                        "read" | "write" | "edit" => Icon::FileText,
-                        "grep" | "find" | "ls" => Icon::Search,
-                        _ => Icon::Wrench,
-                    };
-                    icon(glyph, 13.5, colors.muted).into_element()
+                    if awaiting.get() {
+                        dot(colors.warning).into_element()
+                    } else if running.get() {
+                        dot(colors.accent).animate_pulse().into_element()
+                    } else {
+                        let glyph = current.with(|(name, _)| tool_glyph(name));
+                        icon(glyph, 13.0, colors.faint).into_element()
+                    }
                 }))
-                .child(
-                    text(field(|t| t.0.clone()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(12.5))
-                        .text_color(colors.ink),
-                )
-                .child(
-                    text(field(|t| t.1.clone()))
-                        .flex_1()
-                        .number_of_lines(1u32)
-                        .font_family("Menlo")
-                        .text_size(px(12.0))
-                        .text_color(colors.muted),
-                )
-                .child(when(move || open.get() || matches!(status(), ToolStatus::Running | ToolStatus::AwaitingApproval), move ||
-                    text(move || status().label()).text_size(px(11.0)).text_color(move || tool_status_color(status()))
-                ))
+                .child(dynamic(move || {
+                    if single.get() || running.get() {
+                        let (name, summary) = current.get();
+                        let label = if single.get() {
+                            name
+                        } else {
+                            format!(
+                                "{} · {name}",
+                                match lang {
+                                    Language::En => "Running",
+                                    Language::Ja => "実行中",
+                                    Language::Zh => "正在运行",
+                                }
+                            )
+                        };
+                        view()
+                            .flex_shrink(1.0)
+                            .min_w(px(0.0))
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                text(label)
+                                    .flex_shrink_0()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(12.5))
+                                    .text_color(ink),
+                            )
+                            .child(
+                                text(summary)
+                                    .flex_shrink(1.0)
+                                    .min_w(px(0.0))
+                                    .number_of_lines(1u32)
+                                    .font_family("Menlo")
+                                    .text_size(px(11.5))
+                                    .text_color(colors.faint),
+                            )
+                            .into_element()
+                    } else {
+                        text(move || headline.get())
+                            .flex_shrink(1.0)
+                            .min_w(px(0.0))
+                            .number_of_lines(1u32)
+                            .text_size(px(12.5))
+                            .text_color(ink)
+                            .into_element()
+                    }
+                }))
                 .child(dynamic(move || {
                     icon(
-                        if open.get() {
-                            Icon::ChevronDown
-                        } else {
-                            Icon::ChevronRight
-                        },
-                        13.0,
+                        if open.get() { Icon::ChevronDown } else { Icon::ChevronRight },
+                        12.0,
                         colors.faint,
                     )
                     .into_element()
                 })),
         )
         .child(when(
-            move || open.get() && tool.with(|t| t.as_ref().is_some_and(|t| !t.3.is_empty())),
+            move || open.get(),
+            move || dynamic(move || {
+                if single.get() {
+                    let entry = computed(move || calls.with(|c| c.first().cloned()));
+                    tool_details(entry).into_element()
+                } else {
+                    view()
+                        .flex_col()
+                        .gap_0p5()
+                        .ml(px(6.0))
+                        .pl_3()
+                        .border_l(px(1.5))
+                        .border_l_color(colors.line)
+                        .child(each(
+                            move || calls.get(),
+                            |call: &ToolEntry| call.id.clone(),
+                            move |call, _| tool_entry_row(call, lang),
+                        ))
+                        .into_element()
+                }
+            }),
+        ))
+}
+
+/// One call of an opened group: a line that opens to its details.
+fn tool_entry_row(call: ReadSignal<ToolEntry>, lang: Language) -> impl IntoElement {
+    let colors = palette();
+    let open = signal(false);
+    let status = move || call.with(|c| c.status);
+    view()
+        .flex_col()
+        .gap_1()
+        .child(
+            nsh_base::button()
+                .accessibility_label(call.with_untracked(|c| c.name.clone()))
+                .on_press(move || open.set(!open.get_untracked()))
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .py_0p5()
+                .min_w(px(0.0))
+                .rounded(px(6.0))
+                .hover(|s| s.bg(colors.soft))
+                .child(dynamic(move || {
+                    if live(status()) {
+                        dot(move || tool_status_color(status())).into_element()
+                    } else {
+                        icon(call.with(|c| tool_glyph(&c.name)), 12.0, colors.faint).into_element()
+                    }
+                }))
+                .child(
+                    text(move || call.with(|c| c.name.clone()))
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(12.0))
+                        .text_color(colors.muted),
+                )
+                .child(
+                    text(move || call.with(|c| c.summary.clone()))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1u32)
+                        .font_family("Menlo")
+                        .text_size(px(11.5))
+                        .text_color(colors.faint),
+                )
+                .child(when(
+                    move || status() != ToolStatus::Completed,
+                    move || {
+                        text(move || tool_status_label(status(), lang))
+                            .flex_shrink_0()
+                            .text_size(px(11.0))
+                            .text_color(move || tool_status_color(status()))
+                    },
+                ))
+                .child(dynamic(move || {
+                    icon(
+                        if open.get() { Icon::ChevronDown } else { Icon::ChevronRight },
+                        11.0,
+                        colors.faint,
+                    )
+                    .into_element()
+                })),
+        )
+        .child(when(
+            move || open.get(),
             move || {
-                view().px_3().py_2().border_t_1().border_t_color(colors.line_soft).child(
-                    text(field(|t| t.3.clone()))
+                let entry = computed(move || Some(call.get()));
+                tool_details(entry)
+            },
+        ))
+}
+
+/// A call's arguments and output, in a quiet code box.
+fn tool_details(entry: Memo<Option<ToolEntry>>) -> impl IntoElement {
+    let colors = palette();
+    let arguments = move || entry.with(|e| e.as_ref().map(|e| e.arguments.clone()).unwrap_or_default());
+    let output = move || entry.with(|e| e.as_ref().map(|e| e.output.clone()).unwrap_or_default());
+    view()
+        .flex_col()
+        .rounded(px(8.0))
+        .bg(colors.code)
+        .border_1()
+        .border_color(colors.line_soft)
+        .overflow_hidden()
+        .child(when(
+            move || !arguments().is_empty(),
+            move || {
+                view().px_3().py_2().child(
+                    text(arguments)
                         .select_text()
                         .font_family("Menlo")
                         .text_size(px(11.5))
@@ -618,17 +904,21 @@ fn tool_row(item: ItemMemo) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || open.get() && tool.with(|t| t.as_ref().is_some_and(|t| !t.4.is_empty())),
+            move || !output().is_empty(),
             move || {
-                view().px_3().py_2().bg(colors.code).child(
-                    text(field(|t| t.4.clone()))
-                        .select_text()
-                        .number_of_lines(move || if open.get() { 0u32 } else { 6u32 })
-                        .font_family("Menlo")
-                        .text_size(px(11.5))
-                        .line_height(LineHeight::Multiple(1.45))
-                        .text_color(colors.muted),
-                )
+                view()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_t_color(colors.line_soft)
+                    .child(
+                        text(output)
+                            .select_text()
+                            .font_family("Menlo")
+                            .text_size(px(11.5))
+                            .line_height(LineHeight::Multiple(1.45))
+                            .text_color(colors.muted),
+                    )
             },
         ))
 }

@@ -98,7 +98,11 @@ fn texts(state: &AppState) -> Vec<String> {
             TimelineItem::Text {
                 run_id, start, end, ..
             } => format!("text:{}", state.text_of(run_id, *start, *end)),
-            TimelineItem::Tool { name, status, .. } => format!("tool:{name}:{}", status.label()),
+            TimelineItem::Tools { calls, .. } => calls
+                .iter()
+                .map(|c| format!("tool:{}:{}", c.name, c.status.label()))
+                .collect::<Vec<_>>()
+                .join("|"),
             TimelineItem::Approval { view, .. } => format!("approval:{}", view.request_id),
             TimelineItem::Status { text, .. } => format!("status:{text}"),
         })
@@ -281,18 +285,57 @@ fn tools_start_and_finish_in_place_between_text_segments() {
     let after: Vec<String> = timeline.iter().map(|i| i.id().to_owned()).collect();
     assert_eq!(after, ids);
     match &timeline[2] {
-        TimelineItem::Tool {
-            status,
-            summary,
-            output,
-            ..
-        } => {
-            assert_eq!(*status, ToolStatus::Completed);
-            assert_eq!(summary, "ls -la…");
-            assert_eq!(output, "a\nb");
+        TimelineItem::Tools { calls, .. } => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].status, ToolStatus::Completed);
+            assert_eq!(calls[0].summary, "ls -la…");
+            assert_eq!(calls[0].output, "a\nb");
         }
-        other => panic!("expected a tool, got {other:?}"),
+        other => panic!("expected a tool group, got {other:?}"),
     }
+}
+
+#[test]
+fn consecutive_tools_share_one_group_whose_id_stays_its_first_call() {
+    let mut state = live_state();
+    state.apply_event(&ev(11, "run.output", "t1", "r1", json!({ "delta": "先查看。" })));
+    let at = "先查看。".len() as i64;
+    let call = |id: &str, name: &str, offset: i64| ToolCall {
+        id: id.into(),
+        run_id: "r1".into(),
+        thread_id: "t1".into(),
+        name: name.into(),
+        status: "completed".into(),
+        output_offset: offset,
+        ..ToolCall::default()
+    };
+    state.apply_event(&ev(12, "tool.updated", "t1", "r1", json!({ "tool": call("k1", "bash", at) })));
+    let before: Vec<String> = state.timeline().iter().map(|i| i.id().to_owned()).collect();
+    state.apply_event(&ev(13, "tool.updated", "t1", "r1", json!({ "tool": call("k2", "read", at) })));
+    // The second call joins the first one's row: the list keeps its keys.
+    let after: Vec<String> = state.timeline().iter().map(|i| i.id().to_owned()).collect();
+    assert_eq!(before, after);
+    assert_eq!(
+        texts(&state),
+        vec!["user:你好", "text:先查看。", "tool:bash:已完成|tool:read:已完成"]
+    );
+    // Reply text between calls starts a new group.
+    state.apply_event(&ev(14, "run.output", "t1", "r1", json!({ "delta": "再试。" })));
+    let later = ("先查看。".len() + "再试。".len()) as i64;
+    state.apply_event(&ev(15, "tool.updated", "t1", "r1", json!({ "tool": call("k3", "grep", later) })));
+    assert_eq!(
+        texts(&state),
+        vec![
+            "user:你好",
+            "text:先查看。",
+            "tool:bash:已完成|tool:read:已完成",
+            "text:再试。",
+            "tool:grep:已完成"
+        ]
+    );
+    assert_eq!(ToolKind::of("bash"), ToolKind::Command);
+    assert_eq!(ToolKind::of("read"), ToolKind::Read);
+    assert_eq!(ToolKind::of("mcp__magpie__search"), ToolKind::Other);
 }
 
 #[test]

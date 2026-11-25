@@ -88,6 +88,7 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                                 .flex_col()
                                 .min_w_0()
                                 .min_h_0()
+                                .relative()
                                 .child(
                                     row()
                                         .h(px(56.0))
@@ -114,7 +115,6 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                                             controller::close_settings,
                                         )),
                                 )
-                                .child(feedback_line())
                                 .child(dynamic(move || {
                                     page.get().map(|current| {
                                         let body = match current {
@@ -148,7 +148,9 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                                             )
                                             .into_element()
                                     })
-                                })),
+                                }))
+                                // Floats over the page: showing it never moves the page.
+                                .child(feedback_toast()),
                         ),
                 ),
         )
@@ -256,33 +258,83 @@ fn nav(page: Memo<Option<SettingsPage>>, catalogs: Memo<Catalogs>) -> impl IntoE
     })
 }
 
-/// The last operation's outcome, over the page.
-fn feedback_line() -> impl IntoElement {
+/// The last operation's outcome as a small pill; a success leaves by itself.
+fn feedback_pill(feedback: Memo<Option<crate::state::ui::Feedback>>) -> View {
     let colors = palette();
+    let ok = move || feedback.with(|f| f.as_ref().is_some_and(|f| f.ok));
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .pl_3()
+        .pr_1()
+        .py_1()
+        .max_w(px(520.0))
+        .rounded(px(10.0))
+        .bg(move || if ok() { colors.raised } else { colors.approval })
+        .border_1()
+        .border_color(move || if ok() { colors.line } else { colors.approval_border })
+        .shadow_md()
+        .child(super::dot(move || if ok() { colors.success } else { colors.danger }))
+        .child(
+            text(move || feedback.with(|f| f.as_ref().map(|f| f.text.clone()).unwrap_or_default()))
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
+                .number_of_lines(2u32)
+                .select_text()
+                .text_size(px(12.0))
+                .text_color(colors.ink),
+        )
+        .child(super::small_icon_button(
+            crate::icons::Icon::X,
+            "关闭提示",
+            controller::dismiss_feedback,
+        ))
+}
+
+fn feedback_memo() -> Memo<Option<crate::state::ui::Feedback>> {
     let feedback = computed(|| controller::ui().with(|u| u.forms.feedback.clone()));
+    // A success dismisses itself after a moment; an error stays until closed.
+    effect(move || {
+        let Some(shown) = feedback.get() else { return };
+        if !shown.ok {
+            return;
+        }
+        spawn(async move {
+            timer(std::time::Duration::from_millis(2600)).await;
+            if feedback.get_untracked().as_ref() == Some(&shown) {
+                controller::dismiss_feedback();
+            }
+        });
+    });
+    feedback
+}
+
+/// The outcome floating at the bottom of the settings page.
+fn feedback_toast() -> impl IntoElement {
+    let feedback = feedback_memo();
     when(
         move || feedback.with(Option::is_some),
         move || {
-            let ok = move || feedback.with(|f| f.as_ref().is_some_and(|f| f.ok));
             view()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(18.0))
                 .flex_row()
-                .items_center()
-                .gap_2()
-                .px_5()
-                .py_1p5()
-                .bg(move || if ok() { colors.soft } else { colors.approval })
-                .border_b_1()
-                .border_b_color(colors.line_soft)
-                .child(super::dot(move || if ok() { colors.success } else { colors.danger }))
-                .child(
-                    text(move || feedback.with(|f| f.as_ref().map(|f| f.text.clone()).unwrap_or_default()))
-                        .flex_1()
-                        .select_text()
-                        .text_size(px(12.0))
-                        .text_color(colors.ink),
-                )
-                .child(link_button("✕", controller::dismiss_feedback).accessibility_label("关闭提示"))
+                .justify_center()
+                .px_6()
+                .child(feedback_pill(feedback))
         },
+    )
+}
+
+/// The outcome inline (the dock's plugin and MCP lists).
+fn feedback_line() -> impl IntoElement {
+    let feedback = feedback_memo();
+    when(
+        move || feedback.with(Option::is_some),
+        move || view().flex_row().child(feedback_pill(feedback)),
     )
 }
 
@@ -737,7 +789,13 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                 .text_color(colors.faint)
                 .into_element();
             };
-            let ids: Vec<String> = data.models.models.iter().flatten().map(|m| m.id.clone()).collect();
+            let ids: Vec<String> = data
+                .models
+                .models
+                .iter()
+                .flatten()
+                .map(vantry_protocol::ModelInfo::key)
+                .collect();
             let mut column = view().flex_col().gap_2();
             for warning in &data.models.warnings {
                 column = column.child(text(warning.clone()).text_size(px(12.0)).text_color(colors.warning));
@@ -772,11 +830,18 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                 column = column.child(hint("目录为空：可在输入区的模型选择器中直接输入 provider/model。"));
             }
             for model in models {
-                let id = model.id.clone();
+                let id = model.key();
                 let ids = ids.clone();
                 let on = {
                     let id = id.clone();
-                    move || actions::split_thinking(&current.get(), &ids).0 == id
+                    move || {
+                        let cur = current.get();
+                        let base = actions::split_thinking(&cur, &ids).0;
+                        base == id
+                            || id
+                                .split_once('/')
+                                .is_some_and(|(_, local)| local == base)
+                    }
                 };
                 column = column.child(
                     card().child(
@@ -785,11 +850,11 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                                 view()
                                     .flex_1()
                                     .flex_col()
-                                    .child(text(if model.name.is_empty() { model.id.clone() } else { model.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
+                                    .child(text(if model.name.is_empty() { id.clone() } else { model.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
                                     .child(
                                         text(format!(
                                             "{} · 上下文 {}k{}",
-                                            model.id,
+                                            id,
                                             model.context_window / 1000,
                                             if model.reasoning { " · 推理" } else { "" }
                                         ))
@@ -798,7 +863,7 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
                                         .text_color(colors.faint),
                                     ),
                             )
-                            .child(when(data.models.default == model.id, || badge("Core 默认", colors.muted)))
+                            .child(when(data.models.default == id, || badge("Core 默认", colors.muted)))
                             .child(pill(
                                 {
                                     let on = on.clone();
@@ -1132,8 +1197,35 @@ fn remote_page(data: Data) -> impl IntoElement {
                         controller::reload_catalogs,
                     )),
             );
+            if !remote.t3_pairing_link.is_empty() {
+                let link = remote.t3_pairing_link.clone();
+                c = c.child(caption("Scan with Vantry on iPhone"));
+                let qr = qrcodegen::QrCode::encode_text(&link, qrcodegen::QrCodeEcc::Medium)
+                    .or_else(|_| qrcodegen::QrCode::encode_text(&link, qrcodegen::QrCodeEcc::Low));
+                if let Ok(qr) = qr {
+                    let scale = (320 / (qr.size() + 8)).max(1) as f32;
+                    let size = (qr.size() + 8) as f32 * scale;
+                    let mut painter = Painter::new().fill_color(white()).fill_rect(0., 0., size, size)
+                        .fill_color(black());
+                    for y in 0..qr.size() {
+                        let mut x = 0;
+                        while x < qr.size() {
+                            let start = x;
+                            while x < qr.size() && qr.get_module(x, y) { x += 1; }
+                            if x > start {
+                                painter = painter.fill_rect((start + 4) as f32 * scale, (y + 4) as f32 * scale,
+                                    (x - start) as f32 * scale, scale);
+                            }
+                            x += 1;
+                        }
+                    }
+                    c = c.child(canvas(painter).w(px(size)).h(px(size)).flex_shrink_0());
+                }
+                c = c.child(link_button("Copy iPhone pairing link", move || controller::copy(link.clone())));
+            }
             if !remote.pairing_code.is_empty() {
                 let code = remote.pairing_code.clone();
+                c = c.child(caption("Computer-to-computer pairing code"));
                 let copy = code.clone();
                 c = c.child(
                     row()

@@ -159,6 +159,38 @@ fn status(s: &Snapshot, key: &str) -> RunStatus {
         .status
 }
 #[tokio::test]
+async fn read_receipts_follow_results_and_ignore_a_stale_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let id = cmd(&core, "thread.create", json!({})).thread_id;
+    let marker = || core.snapshot().unwrap().threads.unwrap()[0].unread_sequence.unwrap();
+    let set = |unread, seen| {
+        cmd(&core, "thread.update", json!({"threadId":id,"readState":{"unread":unread,"observedSequence":seen}}));
+    };
+    assert_eq!(marker(), 0);
+    let mut results = Vec::new();
+    for _ in 0..2 {
+        let r = cmd(&core, "message.send", json!({"threadId":id,"message":"fixture"}));
+        h.next().await.done.send(Ok(())).unwrap();
+        h.wait(|s| status(s, &r.run_id) == RunStatus::Completed).await;
+        results.push(marker());
+    }
+    assert!(results[1] > results[0] && results[0] > 0);
+    set(false, results[0]);
+    assert_eq!(marker(), results[1]);
+    set(false, results[1]);
+    assert_eq!(marker(), 0);
+    set(true, 0);
+    let explicit = marker();
+    assert!(explicit > results[1]);
+    h.close().await;
+    drop(core);
+    let reopened = Core::open(dir.path()).unwrap();
+    assert_eq!(reopened.snapshot().unwrap().threads.unwrap()[0].unread_sequence, Some(explicit));
+}
+
+#[tokio::test]
 async fn image_only_message_reaches_the_provider_without_placeholder_text() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = Harness::open(dir.path(), true);

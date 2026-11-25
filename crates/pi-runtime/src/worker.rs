@@ -383,9 +383,10 @@ async fn execute(
         Some(&cwd),
     )?;
     let mut options = AppOptions {
-        agent_dir: agent,
+        agent_dir: agent.clone(),
         bind_mode: Some(ExtensionMode::Rpc),
         extension_mode: Some(ExtensionMode::Rpc),
+        settings: Some(crate::mcp::worker_settings(&cwd, &agent, job)),
         ..Default::default()
     };
     let model = [&req.model, &job.expected_model, &job.default_model]

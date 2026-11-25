@@ -51,7 +51,7 @@ pub use self::{
         ApprovalDecision, ApprovalView, DecisionError, RequestKind, Risk, approval_view,
         approval_view_with,
     },
-    timeline::{RunParts, TimelineIndex, TimelineItem, ToolStatus},
+    timeline::{RunParts, TimelineIndex, TimelineItem, ToolEntry, ToolKind, ToolStatus},
 };
 use crate::bridge::{BridgeError, events, new_command_id};
 
@@ -403,7 +403,20 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
 
 /// A title from a first message: its first line, at most 40 characters.
 pub fn title_from_message(text: &str) -> String {
-    let line = text.trim().lines().next().unwrap_or("").trim();
+    // What the text reads as: no `/skill:` prefix, thread links as their titles.
+    let (_, body) = thread_links::skill_prefix(text.trim());
+    let readable: String = thread_links::message_inlines(body)
+        .into_iter()
+        .map(|inline| match inline {
+            markdown::Inline::Link { text, .. } => text,
+            markdown::Inline::Text(text)
+            | markdown::Inline::Strong(text)
+            | markdown::Inline::Emphasis(text)
+            | markdown::Inline::Strike(text)
+            | markdown::Inline::Code(text) => text,
+        })
+        .collect();
+    let line = readable.trim().lines().next().unwrap_or("").trim();
     let mut title: String = line.chars().take(40).collect();
     if line.chars().count() > 40 {
         title.push('…');
@@ -751,7 +764,16 @@ impl AppState {
         self.inputs = snapshot.inputs;
         for thread in &mut self.threads {
             clear_zero_time(&mut thread.created_at);
+            if let Some(seq) = thread.unread_sequence {
+                if seq > 0 {
+                    self.unread.insert(thread.id.clone());
+                } else {
+                    self.unread.remove(&thread.id);
+                }
+            }
         }
+        let existing: HashSet<_> = self.threads.iter().map(|thread| thread.id.as_str()).collect();
+        self.unread.retain(|id| existing.contains(id.as_str()));
         for run in &mut self.runs {
             clear_zero_time(&mut run.created_at);
         }
@@ -949,6 +971,13 @@ impl AppState {
             return false;
         }
         let id = run.id.clone();
+        if matches!(event.r#type.as_str(), "run.completed" | "run.failed" | "run.interrupted")
+            && let Some(thread) = self.threads.iter_mut().find(|t| t.id == run.thread_id)
+            && thread.unread_sequence.is_some()
+        {
+            thread.unread_sequence = Some(event.sequence);
+            self.unread.insert(thread.id.clone());
+        }
         if matches!(
             run.status,
             RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
@@ -985,6 +1014,10 @@ impl AppState {
             return false;
         }
         clear_zero_time(&mut thread.created_at);
+        if let Some(seq) = thread.unread_sequence {
+            if seq > 0 { self.unread.insert(thread.id.clone()); }
+            else { self.unread.remove(&thread.id); }
+        }
         match self.threads.iter_mut().find(|t| t.id == thread.id) {
             Some(existing) => *existing = thread,
             None => self.threads.push(thread),
@@ -1228,11 +1261,8 @@ impl AppState {
             .filter(|id| self.local_order.contains(id))
             .cloned();
         self.selected = id.filter(|id| self.thread(id).is_some());
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|id| self.unread.remove(id))
-        {
+        let local_read_state = self.selected_thread().is_some_and(|t| t.unread_sequence.is_none());
+        if local_read_state && self.selected.as_ref().is_some_and(|id| self.unread.remove(id)) {
             self.sidebar_revision += 1;
         }
         self.notice = None;

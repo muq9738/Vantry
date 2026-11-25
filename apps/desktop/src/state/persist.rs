@@ -482,20 +482,21 @@ pub fn restore(file: &DesktopStateFile, app: &mut AppState, ui: &mut UiState) {
         app.selected = file.selected_thread.clone();
     }
     for (key, draft) in &file.drafts {
-        app.drafts.insert(
-            key.clone(),
-            Draft {
-                text: draft.text.clone(),
-                mode: if draft.plan {
-                    InteractionMode::Plan
-                } else {
-                    InteractionMode::Default
-                },
-                attachments: draft.attachments.clone(),
-                mentions: draft.mentions.clone(),
-                ..Default::default()
+        let mut draft = Draft {
+            text: draft.text.clone(),
+            mode: if draft.plan {
+                InteractionMode::Plan
+            } else {
+                InteractionMode::Default
             },
-        );
+            attachments: draft.attachments.clone(),
+            mentions: draft.mentions.clone(),
+            ..Default::default()
+        };
+        // Thread references the 0.2.1 preview kept ahead of the text read
+        // as `@title` where they stand; sending delivers the same links.
+        draft.collapse_thread_links(None);
+        app.drafts.insert(key.clone(), draft);
     }
     app.running_action = if file.running_action == "queue" {
         RunningAction::Queue

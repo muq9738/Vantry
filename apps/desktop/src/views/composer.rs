@@ -307,6 +307,10 @@ fn splice_text_at_selection(
 
 fn paste_into_composer(paste: &PasteEvent, editor: ElementRef, selection: Option<(u32, u32)>) {
     let has_images = paste.files.iter().any(|f| f.mime.starts_with("image/"));
+    // Pasted files put their `@` reference where the caret is.
+    if let Some((_, end)) = selection {
+        controller::note_composer_caret(end);
+    }
     if !paste.uris.is_empty() {
         controller::paste_file_uris(&paste.uris);
         return;
@@ -315,24 +319,31 @@ fn paste_into_composer(paste: &PasteEvent, editor: ElementRef, selection: Option
         controller::paste_images(paste);
         return;
     }
-    let copied = paste.text.trim();
-    if let Some(link) = vantry_protocol::ThreadLink::parse(copied)
-        && link.source == copied
-    {
-        let source = controller::state().with_untracked(|s| s.draft().text);
-        let (skill, mut links, body) = draft_parts(&source);
-        let (next_body, caret) = splice_text_at_selection(body, selection, "");
-        links.push(link);
-        controller::set_draft(&compose(skill, links.iter().map(|link| link.source), &next_body));
-        editor.set_selection(caret, caret);
-    } else if !paste.text.is_empty() {
+    if !paste.text.is_empty() {
         // nsh-platform-macos does not implement Command::InsertText yet; splice
-        // directly into the controlled draft and move the native caret.
+        // directly into the controlled draft and move the native caret. A
+        // thread link reads as its `@title` where it was pasted, as in v0.1.42.
         let source = controller::state().with_untracked(|s| s.draft().text);
         let (skill, links, body) = draft_parts(&source);
-        let (next_body, caret) = splice_text_at_selection(body, selection, &paste.text);
-        controller::set_draft(&compose(skill, links.iter().map(|link| link.source), &next_body));
+        // A copied thread link alone pastes without its surrounding whitespace.
+        let trimmed = paste.text.trim();
+        let pasted = if vantry_protocol::ThreadLink::parse(trimmed)
+            .is_some_and(|link| link.source == trimmed)
+        {
+            trimmed
+        } else {
+            paste.text.as_str()
+        };
+        let (next_body, caret) = splice_text_at_selection(body, selection, pasted);
+        let caret = controller::paste_draft_text(
+            &compose(skill, links.iter().map(|link| link.source), &next_body),
+            caret,
+        );
         editor.set_selection(caret, caret);
+        // When a copied message carries both text and embedded image(s), import the images too.
+        if has_images {
+            controller::paste_images(paste);
+        }
     } else if has_images {
         controller::paste_images(paste);
     }
@@ -400,6 +411,19 @@ pub(crate) fn composer() -> impl IntoElement {
         selection.set(None);
         dismissed.set(false);
         active.set(0);
+    });
+    // Text inserted for the composer (a pasted image's `@图1`) moves the
+    // native caret past it.
+    effect(move || {
+        let request = controller::caret_request().get();
+        if request.nonce == 0 || thread.get_untracked() != request.key {
+            return;
+        }
+        // After the input took the new value.
+        spawn(async move {
+            timer(std::time::Duration::from_millis(16)).await;
+            editor.set_selection(request.caret, request.caret);
+        });
     });
     let send_with_enter = computed(|| controller::ui().with(|u| u.send_with_enter));
     effect(move || {
@@ -595,6 +619,7 @@ pub(crate) fn composer() -> impl IntoElement {
                                 })
                                 .on_selection_change(move |e: &Selection| {
                                     let next = Some((e.start, e.end));
+                                    controller::note_composer_caret(e.end);
                                     if selection.get_untracked() != next {
                                         selection.set(next);
                                         active.set(0);
@@ -673,17 +698,26 @@ fn context_strip(
                 .flex_row()
                 .items_center()
                 .gap_2()
+                // The machine the thread runs on; its menu moves the window
+                // to another paired machine (v0.1.42's "运行机器").
                 .child(
-                    view()
+                    nsh_base::button()
+                        .accessibility_label(crate::tr("切换机器"))
+                        .on_press(|| controller::refresh_machines(super::sidebar::machine_menu))
                         .flex_row()
                         .items_center()
                         .gap_1()
+                        .px_1()
+                        .rounded(px(5.0))
+                        .hover(|s| s.bg(colors.soft))
+                        .active(|s| s.opacity(0.7))
                         .child(icon(Icon::Server, 12.0, colors.faint))
                         .child(
                             text(move || endpoint.get())
                                 .text_size(px(11.0))
                                 .text_color(colors.faint),
-                        ),
+                        )
+                        .child(icon(Icon::ChevronDown, 10.0, colors.faint)),
                 )
                 .child(text("|").text_size(px(11.0)).text_color(colors.line))
                 .child(
@@ -1290,22 +1324,24 @@ pub(super) fn attachment_thumbnail_labeled(
             .and_then(|d| d.image_paths.get(&item.id))
             .cloned()
     });
-    let show = signal(false);
     let title = short_label.clone().unwrap_or_else(|| item.name.clone());
-    let modal_title = if let Some(lbl) = &short_label {
-        format!("{lbl} · {}", item.name)
-    } else {
-        item.name.clone()
-    };
+    let click_item = item.clone();
+    let click_label = title.clone();
+    let copy_item = item.clone();
     spawn(async move {
-        preview.set(controller::attachment_preview(item, source).await);
+        preview.set(controller::attachment_preview_retrying(item, source).await);
     });
+    // The image itself, its number on it (`图1`, as the text's `@图1`
+    // reference names it) and a copy button.
     view()
         .relative()
-        .on_press(move || show.set(true))
+        .on_press(move || {
+            controller::open_attachment_preview(click_item.clone(), click_label.clone())
+        })
         .label("预览图片")
-        .w(px(62.0))
-        .h(px(54.0))
+        .cursor(Cursor::Pointer)
+        .w(px(68.0))
+        .h(px(56.0))
         .rounded(px(8.0))
         .overflow_hidden()
         .bg(colors.soft)
@@ -1313,83 +1349,46 @@ pub(super) fn attachment_thumbnail_labeled(
         .border_color(colors.line)
         .items_center()
         .justify_center()
-        .child(when(move || show.get(), move || {
-            let modal_title = modal_title.clone();
-            nsh_base::dialog()
-                .animation(ModalAnimation::Fade)
-                .on_cancel(move || show.set(false))
-                .child(
-                    view()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .bg(colors.scrim)
-                        .p_6()
-                        .on_press(move || show.set(false))
-                        .child(
-                            view()
-                                .flex_col()
-                                .p_3()
-                                .gap_2()
-                                .rounded(px(14.0))
-                                .bg(colors.raised)
-                                .border_1()
-                                .border_color(colors.line)
-                                .shadow_xl()
-                                .child(
-                                    view()
-                                        .flex_row()
-                                        .items_center()
-                                        .px_1()
-                                        .child(
-                                            text(modal_title)
-                                                .flex_1()
-                                                .number_of_lines(1u32)
-                                                .text_size(px(12.5))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(colors.ink),
-                                        )
-                                        .child(super::icon_button(
-                                            Icon::X,
-                                            "关闭",
-                                            move || show.set(false),
-                                        )),
-                                )
-                                .child(dynamic(move || match preview.get() {
-                                    Some(src) => image(src)
-                                        .w(move || px(nsh_core::element::window().width.0 * 0.72))
-                                        .h(move || px(nsh_core::element::window().height.0 * 0.66))
-                                        .object_fit(nsh_core::ResizeMode::Contain)
-                                        .into_element(),
-                                    None => super::caption("加载中…").into_element(),
-                                })),
-                        ),
-                )
-        }))
         .child(dynamic(move || match preview.get() {
             Some(src) => image(src)
                 .w_full()
                 .h_full()
                 .object_fit(nsh_core::ResizeMode::Cover)
                 .into_element(),
-            None => icon(Icon::File, 14.0, colors.muted).into_element(),
+            None => icon(Icon::File, 14.0, colors.faint).into_element(),
         }))
         .child(when(short_label.is_some(), move || {
             view()
                 .absolute()
-                .bottom(px(2.0))
-                .left(px(2.0))
+                .left(px(3.0))
+                .bottom(px(3.0))
                 .px_1()
                 .rounded(px(4.0))
                 .bg(colors.scrim)
                 .child(
                     text(title.clone())
                         .number_of_lines(1u32)
-                        .text_size(px(9.5))
-                        .font_weight(FontWeight::MEDIUM)
+                        .max_w(px(40.0))
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(colors.on_accent),
                 )
         }))
+        .child(
+            nsh_base::button()
+                .accessibility_label("复制图片")
+                .on_press(move || controller::copy_attachment_image(copy_item.clone()))
+                .absolute()
+                .bottom(px(3.0))
+                .right(px(3.0))
+                .w(px(18.0))
+                .h(px(18.0))
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .bg(colors.scrim)
+                .child(icon(Icon::Copy, 10.0, colors.on_accent)),
+        )
 }
 
 fn attachment_chips(
@@ -1405,7 +1404,8 @@ fn attachment_chips(
             let is_image = move || attachment.with(|a| a.mime.starts_with("image/"));
             let short = computed(move || {
                 let item = attachment.get();
-                draft.with(|d| d.attachment_short_label(&item))
+                let lang = controller::ui().with(|u| u.locale);
+                draft.with(|d| d.attachment_short_label(&item, lang))
             });
             dynamic(move || {
                 if is_image() {
@@ -1561,11 +1561,13 @@ fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
 }
 
 /// Extracts a clean display name and short provider tag from raw catalog labels
-/// such as `("qmt-ai/group/deepseek-v4.1-flash", "DeepSeek-V4.1-Flash · routing group · qmt-ai")`.
+/// such as `("magpie/qmt-ai/group/deepseek-v4.1-flash", "DeepSeek-V4.1-Flash · routing group · qmt-ai")`.
 fn clean_model_label(id: &str, name: &str) -> (String, String) {
-    let provider = id
+    let trimmed_id = id.strip_prefix("magpie/").unwrap_or(id);
+    let provider = trimmed_id
         .split_once('/')
         .map(|(p, _)| p.to_owned())
+        .or_else(|| id.split_once('/').map(|(p, _)| p.to_owned()))
         .unwrap_or_default();
     let clean_name = if !name.trim().is_empty() {
         name.split(" · ")
@@ -1669,7 +1671,12 @@ fn model_picker(anchor: ElementRef) -> impl IntoElement {
                                         let on = move || {
                                             let cur = current.get();
                                             let cid = choice.with(|c| c.0.clone());
-                                            cur == cid || cur.starts_with(&format!("{cid}:"))
+                                            cur == cid
+                                                || cur.starts_with(&format!("{cid}:"))
+                                                || cid.split_once('/').is_some_and(|(_, local)| {
+                                                    cur == local
+                                                        || cur.starts_with(&format!("{local}:"))
+                                                })
                                         };
                                         let parts = computed(move || {
                                             choice.with(|c| clean_model_label(&c.0, &c.1))

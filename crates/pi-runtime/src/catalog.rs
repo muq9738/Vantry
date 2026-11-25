@@ -40,21 +40,31 @@ impl MagpieSelection {
         ))
     }
     pub fn resolve(&self, requested: &str) -> Result<&str> {
-        self.0
-            .iter()
-            .find(|s| *s == requested)
+        let find = |candidate: &str| {
+            self.0
+                .iter()
+                .find(|s| *s == candidate)
+                .or_else(|| {
+                    self.0
+                        .iter()
+                        .filter(|s| {
+                            candidate
+                                .strip_prefix(s.as_str())
+                                .and_then(|v| v.strip_prefix(':'))
+                                .is_some_and(|v| !v.is_empty())
+                        })
+                        .max_by_key(|s| s.len())
+                })
+                .map(String::as_str)
+        };
+        find(requested)
             .or_else(|| {
-                self.0
-                    .iter()
-                    .filter(|s| {
-                        requested
-                            .strip_prefix(s.as_str())
-                            .and_then(|v| v.strip_prefix(':'))
-                            .is_some_and(|v| !v.is_empty())
-                    })
-                    .max_by_key(|s| s.len())
+                if requested.starts_with("magpie/") {
+                    None
+                } else {
+                    find(&format!("magpie/{requested}"))
+                }
             })
-            .map(String::as_str)
             .context("model outside Magpie selection")
     }
 }
@@ -253,14 +263,30 @@ pub async fn resolve_model_catalog(
             if let Some(selection) = magpie {
                 selection.resolve(s)?
             } else {
-                s.rsplit_once(':')
+                let base = s
+                    .rsplit_once(':')
                     .filter(|(_, level)| {
                         matches!(
                             *level,
                             "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
                         )
                     })
-                    .map_or(s, |(id, _)| id)
+                    .map_or(s, |(id, _)| id);
+                if order.iter().any(|id| id == base) {
+                    base
+                } else {
+                    // Tolerate legacy/unprefixed model IDs (e.g. `dmit-ai/group/claude-opus-5.5`
+                    // saved without `magpie/`) when they uniquely match one catalog entry's id.
+                    let mut matches = order.iter().filter(|entry| {
+                        entry
+                            .split_once('/')
+                            .is_some_and(|(_, local_id)| local_id == base || local_id == s)
+                    });
+                    match (matches.next(), matches.next()) {
+                        (Some(only), None) => only.as_str(),
+                        _ => base,
+                    }
+                }
             }
         }
         None => default.as_str(),
@@ -279,9 +305,15 @@ pub async fn resolve_model_catalog(
         })
         .unwrap_or_default();
     let thinking_level = available.get(chosen).map(|m| {
-        let suffix = selected
-            .and_then(|s| s.strip_prefix(chosen))
-            .and_then(|s| s.strip_prefix(':'));
+        let suffix = selected.and_then(|s| {
+            s.strip_prefix(chosen)
+                .or_else(|| {
+                    chosen
+                        .split_once('/')
+                        .and_then(|(_, local)| s.strip_prefix(local))
+                })
+                .and_then(|rest| rest.strip_prefix(':'))
+        });
         let model_default = settings
             .get("modelThinkingLevels")
             .and_then(|v| v[chosen].as_str());

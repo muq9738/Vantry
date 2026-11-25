@@ -169,6 +169,12 @@ async fn catalog_projects_authenticated_models_and_magpie_order() -> Result<()> 
     assert_eq!(default.thinking_level.unwrap().as_str(), "medium");
     let explicit = resolve_model_catalog(d, Some("magpie/model:high:high"), Some(&picked)).await?;
     assert_eq!(explicit.thinking_level.unwrap().as_str(), "high");
+    // Unprefixed legacy/picker selections resolve cleanly to canonical provider/id.
+    let unprefixed = resolve_model_catalog(d, Some("family/id:low"), None).await?;
+    assert_eq!(unprefixed.selected_model, "magpie/family/id");
+    let unprefixed_magpie = resolve_model_catalog(d, Some("family/id:low"), Some(&picked)).await?;
+    assert_eq!(unprefixed_magpie.selected_model, "magpie/family/id");
+    assert_eq!(unprefixed_magpie.catalog.models.as_ref().unwrap()[0].key(), "magpie/family/id");
     let general = model_catalog(d, None, None).await?;
     assert_eq!(general.models.unwrap()[0].id, "model:high");
     assert!(model_catalog(d, Some("other/missing"), None).await.is_err());

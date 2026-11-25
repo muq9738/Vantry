@@ -180,7 +180,7 @@ fn tool_dock() -> impl IntoElement {
                                 DockTab::Plugins => Icon::Blocks,
                             };
                             let label = crate::tr(t.label());
-                            view().tooltip(text(label)).child(
+                            view().tooltip(super::tip(label)).child(
                                 nsh_base::button()
                                     .accessibility_label(label)
                                     .selected(move || tab.get() == t)
@@ -326,12 +326,12 @@ fn files_panel() -> impl IntoElement {
                 .child(
                     crate::icons::icon(Icon::Folder, 14.0, colors.muted),
                 )
-                .child(view().flex_1().min_w_0().tooltip(text(move ||root.get())).child(
+                .child(view().flex_1().min_w_0().tooltip(super::tip(move ||root.get())).child(
                     text(move || root.with(|p| std::path::Path::new(p).file_name().map(|s|s.to_string_lossy().into_owned()).unwrap_or_else(||p.clone())))
                         .number_of_lines(1u32).font_weight(FontWeight::SEMIBOLD)
                         .text_size(px(13.0)).text_color(colors.ink)))
-                .child(view().tooltip(text("刷新")).child(icon_button(Icon::RefreshCw, "刷新", controller::refresh_files)))
-                .child(view().tooltip(text("在访达中显示")).child(icon_button(Icon::ExternalLink, "在访达中显示", controller::reveal_workspace))),
+                .child(view().tooltip(super::tip(crate::tr("刷新"))).child(icon_button(Icon::RefreshCw, "刷新", controller::refresh_files)))
+                .child(view().tooltip(super::tip(crate::tr("在访达中显示"))).child(icon_button(Icon::ExternalLink, "在访达中显示", controller::reveal_workspace))),
         )
         .child(
             view()
@@ -408,8 +408,8 @@ fn files_panel() -> impl IntoElement {
                             )
                             .child(link_button(move ||if tree.get(){"隐藏目录"}else{"显示目录"},||controller::bench().update(|b|b.files.show_tree=!b.files.show_tree)))
                             .child(when(move ||markdown.get(),move ||link_button(move ||if source.get(){"阅读预览"}else{"查看源码"},move ||controller::bench().update(|b|{let p=file();if !b.files.source_paths.remove(&p){b.files.source_paths.insert(p);}}))))
-                            .child(view().tooltip(text("复制路径")).child(super::small_icon_button(Icon::Copy,"复制路径",move ||controller::copy(file()))))
-                            .child(view().tooltip(text("引用到输入框")).child(super::small_icon_button(Icon::Quote,"引用到输入框",move ||controller::quote_to_draft(file())))),
+                            .child(view().tooltip(super::tip(crate::tr("复制路径"))).child(super::small_icon_button(Icon::Copy,"复制路径",move ||controller::copy(file()))))
+                            .child(view().tooltip(super::tip(crate::tr("引用到输入框"))).child(super::small_icon_button(Icon::Quote,"引用到输入框",move ||controller::quote_to_draft(file())))),
                     )
                     .child(when(move ||markdown.get() && !source.get(),move ||scroll().flex_1().child(dynamic(move ||markdown::static_document(&crate::state::markdown::MarkdownDoc::parse(&preview.with(|p|p.as_ref().map(|p|p.text.clone()).unwrap_or_default()))).into_element()))))
                     .child(when(move ||!markdown.get() || source.get(),move ||scroll().flex_1().child(code_lines(move || {
@@ -692,7 +692,7 @@ pub(super) fn git_panel() -> impl IntoElement {
                                 .child(crate::icons::icon(Icon::ChevronDown, 12.0, colors.faint)),
                         )
                         .child(
-                            view().tooltip(text("刷新 Git 状态")).child(
+                            view().tooltip(super::tip(crate::tr("刷新 Git 状态"))).child(
                                 super::small_icon_button(
                                     Icon::RefreshCw,
                                     "刷新",
@@ -1233,7 +1233,7 @@ fn change_group(
                         )
                         .child(view().flex_1())
                         .child(when(!staged && !untracked, move || {
-                            view().tooltip(text("撤销所有未暂存更改")).child(
+                            view().tooltip(super::tip(crate::tr("撤销所有未暂存更改"))).child(
                                 super::small_icon_button(
                                     Icon::Undo2,
                                     "撤销所有未暂存更改",

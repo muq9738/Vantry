@@ -24,17 +24,19 @@ pub(crate) fn render_fenced(lang_info: &str, source: &str, closed: bool) -> Opti
     };
     match kind.as_str() {
         "ask" => Some(ask_card(args, source, closed).into_element()),
-        "dispatch" => Some(dispatch_card(source, closed).into_element()),
+        "dispatch" | "orchestrate" => Some(dispatch_card(source, closed).into_element()),
         "callout" => Some(callout_card(args, source).into_element()),
         "kv" => Some(kv_card(source).into_element()),
         "limits" => Some(limits_card(source).into_element()),
         "timeline" => Some(timeline_card(source).into_element()),
         "tree" => Some(tree_card(source).into_element()),
         "api" => Some(api_card(source).into_element()),
-        "chart" => Some(chart_card(args, source).into_element()),
+        "chart" | "vantry-chart" => {
+            Some(super::charts::render_chart_card(args, source).into_element())
+        }
         "vantry-ui" => Some(vantry_ui_card(source).into_element()),
         "mermaid" | "flow" | "state" | "sequence" | "er" | "class" => {
-            Some(diagram_card(&kind, source).into_element())
+            Some(super::charts::render_diagram_card(&kind, args, source).into_element())
         }
         "math" | "latex" | "tex" => Some(math_card(source).into_element()),
         "svg" | "html" | "artifact" => Some(artifact_card(&kind, args, source).into_element()),
@@ -42,7 +44,7 @@ pub(crate) fn render_fenced(lang_info: &str, source: &str, closed: bool) -> Opti
     }
 }
 
-fn card_shell(header: impl IntoElement, body: impl IntoElement) -> View {
+pub(crate) fn card_shell(header: impl IntoElement, body: impl IntoElement) -> View {
     let colors = palette();
     view()
         .flex_col()
@@ -55,7 +57,7 @@ fn card_shell(header: impl IntoElement, body: impl IntoElement) -> View {
         .child(body)
 }
 
-fn card_header(tag: &str, title: &str, source: String) -> View {
+pub(crate) fn card_header(tag: &str, title: &str, source: String) -> View {
     let colors = palette();
     view()
         .flex_row()

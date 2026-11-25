@@ -340,7 +340,7 @@ pub(crate) fn header() -> impl IntoElement {
                     .rounded_full()
                     .border_1()
                     .border_color(colors.line)
-                    .tooltip(text(connection_reason).text_size(px(11.5)))
+                    .tooltip(super::tip(connection_reason))
                     .child(dot(connection_color))
                     .child(
                         text(move || {

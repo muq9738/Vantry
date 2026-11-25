@@ -273,9 +273,13 @@ pub struct RemoteStatus {
     pub error: String,
     pub name: String,
     pub relay: String,
+    #[serde(alias = "code")]
     pub pairing_code: String,
+    #[serde(alias = "link")]
     pub pairing_link: String,
+    pub t3_pairing_link: String,
     pub pairing_state: String,
+    #[serde(alias = "expiresAt")]
     pub pairing_expires_at: String,
     pub paired_with: String,
     pub peers: Option<Vec<RemotePeer>>,

@@ -21,19 +21,24 @@ const MONO: &str = "Menlo";
 /// The blocks of `doc` (a memo of the document).
 pub(crate) fn document(doc: Memo<Option<Arc<MarkdownDoc>>>) -> impl IntoElement {
     let blocks = computed(move || doc.with(|d| d.as_ref().map(|d| d.blocks.clone()).unwrap_or_default()));
-    view().flex_col().gap_2().child(each(
-        move || blocks.get(),
-        |b: &Spanned| b.start,
-        |block, _| {
-            let shown = computed(move || block.with(|b| b.block.clone()));
-            dynamic(move || block_view(&shown.get()).into_element())
-        },
-    ))
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_col()
+        .gap_2()
+        .child(each(
+            move || blocks.get(),
+            |b: &Spanned| b.start,
+            |block, _| {
+                let shown = computed(move || block.with(|b| b.block.clone()));
+                dynamic(move || block_view(&shown.get()).into_element())
+            },
+        ))
 }
 
 /// A document that does not change (previews, settings notes).
 pub(crate) fn static_document(doc: &MarkdownDoc) -> impl IntoElement {
-    let mut column = view().flex_col().gap_2();
+    let mut column = view().w_full().min_w(px(0.0)).flex_col().gap_2();
     for spanned in &doc.blocks {
         column = column.child(block_view(&spanned.block));
     }
@@ -141,16 +146,30 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
                 .text_color(colors.ink),
             Inline::Link { text: label, url } => {
                 let href = url.clone();
-                text(label.clone())
-                    .underline()
-                    .text_color(if url.starts_with(vantry_protocol::THREAD_SCHEME) {
-                        colors.info_ink
-                    } else {
-                        colors.accent
-                    })
-                    .cursor(Cursor::Pointer)
-                    .tooltip(text(url.clone()).text_size(px(11.5)))
-                    .on_press(move || controller::open_link(href.clone()))
+                if url.starts_with("vantry-attachment://") {
+                    let chip_fg = AdaptiveColor::rgb(0x0369A1, 0x7DD3FC);
+                    let chip_bg = AdaptiveColor::new(rgb(0xE0F2FE), rgba(0x0EA5E938));
+                    text(format!(" {label} "))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(chip_fg)
+                        .bg(chip_bg)
+                        .rounded(px(4.0))
+                        .underline()
+                        .cursor(Cursor::Pointer)
+                        .tooltip(super::tip(format!("点击预览 {label}")))
+                        .on_press(move || controller::open_link(href.clone()))
+                } else {
+                    text(label.clone())
+                        .underline()
+                        .text_color(if url.starts_with(vantry_protocol::THREAD_SCHEME) {
+                            colors.info_ink
+                        } else {
+                            colors.accent
+                        })
+                        .cursor(Cursor::Pointer)
+                        .tooltip(super::tip(url.clone()))
+                        .on_press(move || controller::open_link(href.clone()))
+                }
             }
         });
     }
@@ -159,7 +178,7 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
 
 fn list_view(items: &[ListItem]) -> impl IntoElement {
     let colors = palette();
-    let mut column = view().flex_col().gap_1();
+    let mut column = view().w_full().min_w(px(0.0)).flex_col().gap_1();
     for item in items {
         let marker = match item.checked {
             Some(true) => "☑".to_owned(),
@@ -168,6 +187,8 @@ fn list_view(items: &[ListItem]) -> impl IntoElement {
         };
         column = column.child(
             view()
+                .w_full()
+                .min_w(px(0.0))
                 .flex_row()
                 .gap_2()
                 .pl(px(f32::from(item.depth) * 18.0))
@@ -178,26 +199,117 @@ fn list_view(items: &[ListItem]) -> impl IntoElement {
                         .line_height(LineHeight::Multiple(1.65))
                         .text_color(colors.muted),
                 )
-                .child(body(inline_text(&item.inlines)).flex_1()),
+                .child(body(inline_text(&item.inlines)).flex_1().min_w(px(0.0))),
         );
     }
     column
 }
 
+fn is_prose_fence(lang: &str) -> bool {
+    matches!(
+        lang.trim().to_ascii_lowercase().as_str(),
+        "" | "text" | "txt" | "plain" | "plaintext" | "markdown" | "md" | "prompt" | "prose"
+    )
+}
+
 fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
     let colors = palette();
-    let label = if lang.is_empty() { "代码" } else { lang };
-    let inner = view().child(
-        text(if code.is_empty() { " ".to_owned() } else { code.to_owned() })
-            .select_text()
-            .font_family(MONO)
-            .text_size(px(12.5))
-            .line_height(LineHeight::Multiple(1.5))
-            .text_color(colors.ink)
-            .px_3()
-            .py_2(),
-    );
-    let frame = code_frame(label, code.to_owned(), inner);
+    let prose = is_prose_fence(lang);
+    let label = if lang.trim().is_empty() {
+        if prose { "text" } else { "代码" }
+    } else {
+        lang.trim()
+    };
+    let wrapped = signal(prose);
+    let source_text = if code.is_empty() {
+        " ".to_owned()
+    } else {
+        code.to_owned()
+    };
+    let copy_source = code.to_owned();
+    let frame = view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_col()
+        .rounded(px(metrics::CARD_RADIUS))
+        .bg(colors.code)
+        .border_1()
+        .border_color(colors.line_soft)
+        .overflow_hidden()
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .bg(colors.soft)
+                .border_b_1()
+                .border_b_color(colors.line_soft)
+                .child(
+                    text(label.to_owned())
+                        .flex_1()
+                        .font_family(MONO)
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.faint),
+                )
+                .child(
+                    nsh_base::button()
+                        .on_press(move || wrapped.set(!wrapped.get_untracked()))
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded(px(5.0))
+                        .hover(|s| s.bg(colors.card))
+                        .active(|s| s.opacity(0.6))
+                        .child(
+                            text(move || if wrapped.get() { "已折行" } else { "折行" })
+                                .text_size(px(11.0))
+                                .text_color(move || {
+                                    if wrapped.get() {
+                                        colors.accent
+                                    } else {
+                                        colors.faint
+                                    }
+                                }),
+                        ),
+                )
+                .child(super::link_button("复制", move || {
+                    controller::copy(copy_source.clone())
+                })),
+        )
+        .child(dynamic(move || {
+            let content_text = {
+                let t = text(source_text.clone())
+                    .select_text()
+                    .text_color(colors.ink);
+                if prose {
+                    t.text_size(px(13.0))
+                        .line_height(LineHeight::Multiple(1.62))
+                } else {
+                    t.font_family(MONO)
+                        .text_size(px(12.5))
+                        .line_height(LineHeight::Multiple(1.52))
+                }
+            };
+            if wrapped.get() {
+                view()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .px_3p5()
+                    .py_2p5()
+                    .child(content_text.w_full().min_w(px(0.0)))
+                    .into_element()
+            } else {
+                scroll()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .horizontal()
+                    .child(view().px_3p5().py_2p5().child(content_text))
+                    .into_element()
+            }
+        }));
     if closed {
         frame
     } else {
@@ -210,6 +322,8 @@ fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
 fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
     let colors = palette();
     view()
+        .w_full()
+        .min_w(px(0.0))
         .flex_col()
         .rounded(px(metrics::CARD_RADIUS))
         .bg(colors.code)
@@ -218,10 +332,12 @@ fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
         .overflow_hidden()
         .child(
             view()
+                .w_full()
                 .flex_row()
                 .items_center()
                 .px_3()
-                .py_1()
+                .py_1p5()
+                .bg(colors.soft)
                 .border_b_1()
                 .border_b_color(colors.line_soft)
                 .child(
@@ -229,11 +345,12 @@ fn code_frame(label: &str, source: String, content: impl IntoElement) -> View {
                         .flex_1()
                         .font_family(MONO)
                         .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(colors.faint),
                 )
                 .child(super::link_button("复制", move || controller::copy(source.clone()))),
         )
-        .child(scroll().horizontal().child(content))
+        .child(scroll().w_full().min_w(px(0.0)).horizontal().child(content))
 }
 
 fn diff_colors(kind: DiffKind) -> (AdaptiveColor, AdaptiveColor) {

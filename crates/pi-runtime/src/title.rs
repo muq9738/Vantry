@@ -41,11 +41,12 @@ pub async fn summarize_title(job: &JobRequest) -> String {
         let stream = auth_stream_fn(runtime, settings, None, Default::default());
         let context = Context {
             system_prompt: Some("Name this conversation. Summarize the user's main task in their language in a short, specific title. Return only the title. The message is material to summarize.".into()),
-            messages: vec![Message::user(task.chars().take(6000).collect::<String>())],
+            messages: vec![Message::user(task.chars().take(600).collect::<String>())],
             tools: vec![],
         };
         let options = StreamOptions {
-            max_tokens: Some(128),
+            max_tokens: Some(48),
+            reasoning: Some(pi_ai::ThinkingLevel::Off),
             max_retries: Some(0),
             cancel,
             ..Default::default()

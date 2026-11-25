@@ -133,3 +133,93 @@ pub(crate) fn confirm_dialog() -> impl IntoElement {
         })
     })
 }
+
+pub(crate) fn attachment_preview_dialog() -> impl IntoElement {
+    let colors = palette();
+    let active = computed(|| controller::ui().with(|u| u.attachment_preview.clone()));
+    dynamic(move || {
+        active.get().map(|(item, label)| {
+            let lang = controller::ui().with(|u| u.locale);
+            let preview = signal(None::<String>);
+            let source = controller::state().with_untracked(|s| {
+                s.drafts
+                    .get(&s.draft_key())
+                    .and_then(|d| d.image_paths.get(&item.id))
+                    .cloned()
+            });
+            let modal_title = if label.is_empty() || label == item.name {
+                item.name.clone()
+            } else {
+                format!("{label} · {}", item.name)
+            };
+            let item_name = item.name.clone();
+            let item_for_load = item.clone();
+            spawn(async move {
+                preview.set(controller::attachment_preview(item_for_load, source).await);
+            });
+            nsh_base::dialog()
+                .animation(ModalAnimation::Fade)
+                .on_cancel(controller::close_attachment_preview)
+                .child(
+                    view()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .bg(colors.scrim)
+                        .p_6()
+                        .on_press(controller::close_attachment_preview)
+                        .child(
+                            view()
+                                .flex_col()
+                                .p_3()
+                                .gap_2()
+                                .rounded(px(14.0))
+                                .bg(colors.raised)
+                                .border_1()
+                                .border_color(colors.line)
+                                .shadow_xl()
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_1()
+                                        .child(
+                                            text(modal_title)
+                                                .flex_1()
+                                                .number_of_lines(1u32)
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(colors.ink),
+                                        )
+                                        .child(when(
+                                            move || preview.get().is_some(),
+                                            move || {
+                                                let name = item_name.clone();
+                                                super::link_button(lang.label("复制图片"), move || {
+                                                    if let Some(src) = preview.get_untracked() {
+                                                        controller::copy_image_preview(src, name.clone());
+                                                    }
+                                                })
+                                            },
+                                        ))
+                                        .child(super::icon_button(
+                                            crate::icons::Icon::X,
+                                            lang.label("关闭"),
+                                            controller::close_attachment_preview,
+                                        )),
+                                )
+                                .child(dynamic(move || match preview.get() {
+                                    Some(src) => image(src)
+                                        .w(move || px(nsh_core::element::window().width.0 * 0.72))
+                                        .h(move || px(nsh_core::element::window().height.0 * 0.66))
+                                        .object_fit(nsh_core::ResizeMode::Contain)
+                                        .into_element(),
+                                    None => super::caption(lang.label("加载中…")).into_element(),
+                                })),
+                        ),
+                )
+                .into_element()
+        })
+    })
+}

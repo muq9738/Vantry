@@ -454,23 +454,46 @@ impl AppState {
         }
     }
 
-    /// Adds `attachment` and inserts its simplified inline mention (`@图1` / `@name`) into the draft.
+    /// Adds `attachment` and inserts its simplified inline mention (`@图1` / `@Image 1` / `@name`) into the draft.
     pub fn add_attachment_with_mention(
         &mut self,
         key: String,
         attachment: Attachment,
         path: Option<std::path::PathBuf>,
     ) {
+        self.add_attachment_with_mention_for_lang(
+            key,
+            attachment,
+            path,
+            super::language::Language::Zh,
+            None,
+        );
+    }
+
+    /// Adds `attachment` and its `@` reference (`@图1`, `@name`) in the
+    /// text at `caret` (UTF-16 in the body; `None`: the end), so the
+    /// reference reads, sends and copies with the words around it. Returns
+    /// the caret after the reference.
+    pub fn add_attachment_with_mention_for_lang(
+        &mut self,
+        key: String,
+        attachment: Attachment,
+        path: Option<std::path::PathBuf>,
+        lang: super::language::Language,
+        caret: Option<u32>,
+    ) -> Option<u32> {
         let draft = self.drafts.entry(key).or_default();
-        if !draft.attachments.iter().any(|a| a.id == attachment.id) {
-            if let Some(path) = path
-                && attachment.mime.starts_with("image/")
-            {
-                draft.image_paths.insert(attachment.id.clone(), path);
-            }
-            draft.insert_attachment_mention(&attachment);
-            draft.attachments.push(attachment);
+        if draft.attachments.iter().any(|a| a.id == attachment.id) {
+            return None;
         }
+        if let Some(path) = path
+            && attachment.mime.starts_with("image/")
+        {
+            draft.image_paths.insert(attachment.id.clone(), path);
+        }
+        let next = draft.insert_attachment_mention(&attachment, lang, caret);
+        draft.attachments.push(attachment);
+        next
     }
 
     pub fn remove_attachment(&mut self, id: &str) {

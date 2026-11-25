@@ -820,7 +820,8 @@ async fn a_conversation_against_the_mock_core_streams_asks_and_completes() {
     // The incremental rows equal rows built from scratch.
     assert_eq!(state.timeline(), rebuilt(&state));
     let rows = state.timeline();
-    assert!(rows.iter().any(|r| matches!(r, TimelineItem::Tool { status: ToolStatus::Completed, .. })));
+    assert!(rows.iter().any(|r| matches!(r, TimelineItem::Tools { calls, .. }
+        if calls.iter().any(|c| c.status == ToolStatus::Completed))));
     let markdown_blocks: usize = rows
         .iter()
         .filter_map(|r| match r {

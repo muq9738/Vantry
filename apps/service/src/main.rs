@@ -268,93 +268,91 @@ async fn serve(args: CoreArgs) -> Result<()> {
             }
         }
     }
-    let listener = if let Some(addr) = args.listen_remote {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        ext.identity.set_routes(
-            vec![listener.local_addr()?.to_string()],
-            ext.identity.snapshot().host.relays,
-        )?;
-        Some(listener)
-    } else if saved.enabled || !relay_targets.is_empty() || !saved.t3_listen().is_empty() {
-        let bind_direct = if saved.direct_port() > 0 {
-            format!("0.0.0.0:{}", saved.direct_port())
-        } else {
-            "0.0.0.0:0".to_owned()
-        };
-        let listener = match tokio::net::TcpListener::bind(&bind_direct).await {
-            Ok(l) => l,
-            Err(_) => tokio::net::TcpListener::bind("0.0.0.0:0").await?,
-        };
-        Some(listener)
-    } else {
-        None
-    };
     let remote = async {
-        if let Some(listener) = listener {
-            let t3 = vantry_connectivity::t3compat::T3Server::open(
-                vantry_connectivity::t3compat::T3Options {
-                    data_dir: data.clone(),
-                    core_socket: data.join("core.sock"),
-                    environment_id: ext.environment.clone(),
-                    name: ext.identity.snapshot().host.name,
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    provider: ext.options.provider_id.clone(),
-                    model: ext.options.model.clone(),
-                },
-            )?;
-            let configured_t3 = saved.t3_listen();
-            let (t3_listener, t3_addr) = t3
-                .bind_configured((!configured_t3.is_empty()).then_some(configured_t3))
-                .await?;
-            let t3_stop = stop.clone();
-            let t3_task = tokio::spawn(async move {
-                let _ = t3.serve(t3_listener, t3_stop).await;
-            });
-            let mut gateway = listener.local_addr()?;
-            if gateway.ip().is_unspecified() {
-                gateway.set_ip(if gateway.is_ipv4() {
-                    std::net::Ipv4Addr::LOCALHOST.into()
-                } else {
-                    std::net::Ipv6Addr::LOCALHOST.into()
-                });
+        let wait_for_pair = args.listen_remote.is_none() && !saved.enabled && saved.t3_listen().is_empty();
+        if wait_for_pair {
+            tokio::select! {
+                _ = stop.cancelled() => return Ok::<(), anyhow::Error>(()),
+                _ = ext.start_remote.notified() => {}
             }
-            let relay_stop = stop.child_token();
-            let mut hosts = tokio::task::JoinSet::new();
-            for (relay, key) in relay_targets {
-                let host = vantry_connectivity::peer::HostConfig {
-                    relay,
-                    key,
-                    gateway,
-                    route: saved.host.route.clone(),
-                    instance: saved.host.device_id.clone(),
-                    t3: Some(t3_addr),
-                };
-                let (status, _) = tokio::sync::watch::channel(vantry_connectivity::peer::HostState::Connecting);
-                let owner = relay_stop.clone();
-                hosts.spawn(async move {
-                    if host.run(status, owner).await.is_err() {
-                        tracing::warn!("saved IDE relay could not start");
-                    }
-                });
-            }
-            let res = vantry_connectivity::peer::serve_gateway_with_t3(
-                listener,
-                ext.identity.clone(),
-                data.join("core.sock"),
-                false,
-                Some(t3_addr),
-                stop.clone(),
-            )
-            .await;
-            relay_stop.cancel();
-            while hosts.join_next().await.is_some() {}
-            t3_task.abort();
-            let _ = t3_task.await;
-            res
-        } else {
-            stop.cancelled().await;
-            Ok(())
         }
+        let listener = if let Some(addr) = &args.listen_remote {
+            tokio::net::TcpListener::bind(addr).await?
+        } else {
+            match tokio::net::TcpListener::bind(("0.0.0.0", saved.direct_port())).await {
+                Ok(l) => l,
+                Err(_) => tokio::net::TcpListener::bind("0.0.0.0:0").await?,
+            }
+        };
+        let bound = listener.local_addr()?;
+        let direct = if bound.ip().is_unspecified() {
+            if_addrs::get_if_addrs()?.into_iter().map(|i| i.ip())
+                .filter(|ip| !ip.is_loopback() && ip.is_ipv4() == bound.is_ipv4())
+                .map(|ip| std::net::SocketAddr::new(ip, bound.port()).to_string()).collect()
+        } else { vec![bound.to_string()] };
+        ext.identity.remember_listener(direct, bound.port(), wait_for_pair)?;
+        let t3 = vantry_connectivity::t3compat::T3Server::open(
+            vantry_connectivity::t3compat::T3Options {
+                data_dir: data.clone(),
+                core_socket: data.join("core.sock"),
+                environment_id: ext.environment.clone(),
+                name: ext.identity.snapshot().host.name,
+                version: env!("CARGO_PKG_VERSION").into(),
+                provider: ext.options.provider_id.clone(),
+                model: ext.options.model.clone(),
+                identity: Some(ext.identity.clone()),
+            },
+        )?;
+        let configured_t3 = saved.t3_listen();
+        let (t3_listener, t3_addr) = t3
+            .bind_configured((!configured_t3.is_empty()).then_some(configured_t3))
+            .await?;
+        let t3_stop = stop.clone();
+        ext.mobile_server.send_replace(Some(t3.clone()));
+        let t3_task = tokio::spawn(async move {
+            let _ = t3.serve(t3_listener, t3_stop).await;
+        });
+        let mut gateway = listener.local_addr()?;
+        if gateway.ip().is_unspecified() {
+            gateway.set_ip(if gateway.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        let relay_stop = stop.child_token();
+        let mut hosts = tokio::task::JoinSet::new();
+        for (relay, key) in relay_targets {
+            let host = vantry_connectivity::peer::HostConfig {
+                relay,
+                key,
+                gateway,
+                route: saved.host.route.clone(),
+                instance: saved.host.device_id.clone(),
+                t3: Some(t3_addr),
+            };
+            let (status, _) = tokio::sync::watch::channel(vantry_connectivity::peer::HostState::Connecting);
+            let owner = relay_stop.clone();
+            hosts.spawn(async move {
+                if host.run(status, owner).await.is_err() {
+                    tracing::warn!("saved IDE relay could not start");
+                }
+            });
+        }
+        let res = vantry_connectivity::peer::serve_gateway_with_t3(
+            listener,
+            ext.identity.clone(),
+            data.join("core.sock"),
+            false,
+            Some(t3_addr),
+            stop.clone(),
+        )
+        .await;
+        relay_stop.cancel();
+        while hosts.join_next().await.is_some() {}
+        t3_task.abort();
+        let _ = t3_task.await;
+        res
     };
     let scheduler = core.run_scheduler(provider, stop.clone());
     let server = Server::bind_with_extension(core.clone(), ext.clone())

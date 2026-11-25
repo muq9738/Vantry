@@ -194,6 +194,60 @@ impl Configuration {
             .map(str::trim)
             .unwrap_or("")
     }
+    pub fn mobile_routes(&self) -> Option<Value> {
+        let cert_pem = self.mobile_certificate.trim();
+        if cert_pem.is_empty() {
+            return None;
+        }
+        let mut direct: Vec<String> = Vec::new();
+        for addr in &self.host.direct {
+            let trimmed = addr.trim();
+            let Ok(sock) = trimmed.parse::<std::net::SocketAddr>() else {
+                continue;
+            };
+            let ip = sock.ip();
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                continue;
+            }
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let octets = v4.octets();
+                    // Skip link-local (169.254/16), fake-IP TUN (198.18/15), and .0 network addresses.
+                    if (octets[0] == 169 && octets[1] == 254)
+                        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                        || octets[3] == 0
+                        || octets[0] >= 224
+                    {
+                        continue;
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                        continue;
+                    }
+                }
+            }
+            let url = format!("https://{trimmed}");
+            if !direct.contains(&url) {
+                direct.push(url);
+            }
+        }
+        if direct.is_empty() {
+            return None;
+        }
+        direct.sort_by_key(|u| u.contains('['));
+        direct.truncate(12);
+        let mut out = json!({
+            "direct": direct,
+            "certificates": [cert_pem],
+            "serverName": "vantry.mobile",
+        });
+        let relay = self.public_url();
+        if !relay.is_empty() {
+            out["relay"] = json!(relay);
+        }
+        Some(out)
+    }
 }
 fn cert(pem: &str) -> Result<CertificateDer<'static>> {
     rustls_pemfile::certs(&mut pem.as_bytes())
@@ -575,6 +629,17 @@ impl IdentityStore {
         let relays: Vec<_> = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
         json!({"deviceId":cfg.host.device_id,"certificate":cfg.host.certificate,"nextCertificate":cfg.next_certificate,"expiresAt":end,"direct":cfg.host.direct,"relays":relays})
     }
+    pub fn remember_listener(&self, direct: Vec<String>, port: u16, enable: bool) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let mut cfg = state.cfg.clone();
+        cfg.host.direct = direct;
+        cfg.extra.insert("directPort".into(), json!(port));
+        cfg.enabled |= enable;
+        persist(&self.path, &cfg)?;
+        state.cfg = cfg;
+        Ok(())
+    }
+
     pub fn set_routes(&self, direct: Vec<String>, relays: Vec<String>) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         let mut cfg = s.cfg.clone();

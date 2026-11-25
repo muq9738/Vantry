@@ -69,8 +69,22 @@ pub(crate) fn one<T: DeserializeOwned>(db: &Connection, sql: &str, args: impl Pa
     let mut rows = stmt.query(args)?;
     decode(rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?)
 }
+const THREAD_ROWS: &str = "SELECT threads.*, COALESCE(m.int_value, 0) AS unread_sequence
+    FROM threads LEFT JOIN core_metadata m ON m.key = 'thread.unread:' || threads.id";
+
 pub(crate) fn thread(db: &Connection, key: &str) -> Result<Thread> {
-    one(db, "SELECT * FROM threads WHERE id=?", [key])
+    one(db, &format!("{THREAD_ROWS} WHERE threads.id=?"), [key])
+}
+
+pub(crate) fn set_unread_sequence(db: &Connection, thread_id: &str, sequence: i64) -> Result<()> {
+    let key = format!("thread.unread:{thread_id}");
+    if sequence == 0 {
+        db.execute("DELETE FROM core_metadata WHERE key=?", [key])?;
+    } else {
+        db.execute("INSERT INTO core_metadata(key,int_value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET int_value=excluded.int_value", params![key, sequence])?;
+    }
+    Ok(())
 }
 pub(crate) fn run(db: &Connection, key: &str) -> Result<Run> {
     one(db, "SELECT * FROM runs WHERE id=?", [key])
@@ -127,7 +141,11 @@ pub(crate) fn sequence(db: &Connection) -> Result<i64> {
 }
 pub(crate) fn run_event(db: &Connection, key: &str, kind: &str) -> Result<i64> {
     let r = run(db, key)?;
-    event(db, kind, &r.thread_id, key, &r.attempt_id, json!({"run":r}))
+    let seq = event(db, kind, &r.thread_id, key, &r.attempt_id, json!({"run":r}))?;
+    if matches!(kind, "run.completed" | "run.failed" | "run.interrupted") {
+        set_unread_sequence(db, &r.thread_id, seq)?;
+    }
+    Ok(seq)
 }
 pub(crate) fn thread_event(db: &Connection, key: &str, kind: &str) -> Result<i64> {
     event(db, kind, key, "", "", json!({"thread":thread(db,key)?}))
@@ -220,7 +238,7 @@ pub(crate) fn snapshot(db: &Connection) -> Result<Snapshot> {
         sequence: sequence(db)?,
         threads: Some(rows(
             db,
-            "SELECT * FROM threads ORDER BY created_at,id",
+            &format!("{THREAD_ROWS} ORDER BY threads.created_at,threads.id"),
             [],
         )?),
         runs: Some(rows(db, "SELECT * FROM runs ORDER BY created_at,id", [])?),
@@ -380,7 +398,7 @@ pub(crate) fn thread_detail(
     limit_runs: i64,
 ) -> Result<ThreadDetail> {
     let seq = sequence(db)?;
-    let thread: Thread = match one(db, "SELECT * FROM threads WHERE id=?", [thread_id]) {
+    let thread: Thread = match thread(db, thread_id) {
         Ok(t) => t,
         Err(crate::Error::Sql(rusqlite::Error::QueryReturnedNoRows)) => {
             return Err(crate::Error::Api(

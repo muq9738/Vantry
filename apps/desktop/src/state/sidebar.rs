@@ -640,7 +640,8 @@ impl AppState {
                 0,
             ) {
                 Group::Running
-            } else if tree.status(&top.id) == ThreadStatus::Failed || self.unread.contains(&top.id)
+            } else if self.unread.contains(&top.id)
+                || (top.unread_sequence.is_none() && tree.status(&top.id) == ThreadStatus::Failed)
             {
                 Group::Attention
             } else if top.pinned {
