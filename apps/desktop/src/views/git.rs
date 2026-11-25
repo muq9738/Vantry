@@ -152,7 +152,7 @@ pub(crate) fn dialog() -> impl IntoElement {
                                     px(if kind == GitDialog::Changes {
                                         680.0
                                     } else {
-                                        nsh_core::element::window().height.0 - 40.0
+                                        crate::window_size().height.0 - 40.0
                                     })
                                 })
                                 .bg(colors.canvas)
@@ -929,7 +929,7 @@ fn history(page: Memo<GitPage>) -> impl IntoElement {
                         .child(
                             view()
                                 .h(move || {
-                                    px((nsh_core::element::window().height.0 * 0.4).max(200.0))
+                                    px((crate::window_size().height.0 * 0.4).max(200.0))
                                 })
                                 .rounded(px(10.0))
                                 .border_1()

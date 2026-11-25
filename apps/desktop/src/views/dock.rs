@@ -485,7 +485,7 @@ fn tool_dock() -> impl IntoElement {
                 .child(view().flex_1())
                 .child(when(
                     || {
-                        let w = nsh_core::element::window().width.0;
+                        let w = crate::window_size().width.0;
                         w - if !controller::narrow_window() && controller::sidebar_visible() {
                             crate::theme::metrics::sidebar_width(w)
                         } else {

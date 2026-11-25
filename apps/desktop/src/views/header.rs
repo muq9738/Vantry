@@ -4,7 +4,7 @@
 //! segmented dock switches, overflow menu, dock toggle).
 
 use nsh_core::{
-    element::desktop::{MenuItem, popup_menu, title_bar},
+    element::desktop::{MenuItem, current_window, popup_menu},
     prelude::*,
 };
 
@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) fn header() -> impl IntoElement {
+    let window = current_window();
     let colors = palette();
     let sidebar_open = computed(controller::sidebar_visible);
     let workspace = computed(|| controller::state().with(|s| s.current_project_key()));
@@ -97,7 +98,7 @@ pub(crate) fn header() -> impl IntoElement {
             if sidebar_open.get() {
                 px(20.0)
             } else {
-                let inset = title_bar().left.0;
+                let inset = window.title_bar().left.0;
                 px((inset + 10.0).max(20.0))
             }
         })
@@ -264,7 +265,7 @@ pub(crate) fn header() -> impl IntoElement {
             controller::focus_search,
         ))
         .child(when(
-            move || nsh_core::element::window().width.0 >= 760.0 && dock.get().is_none(),
+            move || crate::window_size().width.0 >= 760.0 && dock.get().is_none(),
             move || {
                 view()
                     .flex_row()
@@ -286,7 +287,7 @@ pub(crate) fn header() -> impl IntoElement {
             },
         ))
         .child(when(
-            || nsh_core::element::window().width.0 < 760.0,
+            || crate::window_size().width.0 < 760.0,
             move || {
                 icon_button(Icon::Blocks, "工具", move || {
                     let items = DockTab::ALL

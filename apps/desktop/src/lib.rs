@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 
 use nsh_core::{
     desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes},
-    element::desktop::current_window,
+    element::desktop::{self, WindowRef},
     prelude::*,
 };
 
@@ -61,17 +61,49 @@ fn native(registry: &mut Registry) {
     registry.register::<App>();
 }
 
-/// The window: sidebar | header / (timeline + composer | remote desktop |
-/// plugin panel) | dock; the approval modal, settings and dialogs over it.
+/// Owns the machine connections across workbench window opens and closes.
 #[component]
 pub fn App() -> impl IntoElement {
+    controller::machines::init(launch_config());
+    desktop::on_reopen(open_workbench);
+    open_workbench();
+    view()
+}
+
+const INITIAL_WINDOW_SIZE: Size<Points> = Size::new(px(1280.0), px(820.0));
+
+fn open_workbench() {
     let mut title_bar = TitleBarOptions::default();
     title_bar.style = TitleBarStyle::Hidden;
     title_bar.height = Some(px(theme::metrics::HEADER_HEIGHT));
     let mut attrs = WindowAttributes::default();
     attrs.title_bar = Some(title_bar);
-    current_window().set(attrs);
-    controller::machines::init(launch_config());
+    desktop::open_window(
+        desktop::window()
+            .id("workbench")
+            .title("Vantry".to_owned())
+            .default_size(INITIAL_WINDOW_SIZE)
+            .attributes(attrs)
+            .content(workbench_content),
+    );
+}
+
+// Layout and input callbacks share the size of the visible workbench.
+#[derive(Default)]
+struct WorkbenchWindow(Option<WindowRef>);
+
+fn window_size() -> Size<Points> {
+    global::<WorkbenchWindow>().with(|window| {
+        window
+            .0
+            .as_ref()
+            .and_then(WindowRef::state)
+            .map_or(INITIAL_WINDOW_SIZE, |state| state.content_bounds.size)
+    })
+}
+
+fn workbench_content() -> impl IntoElement {
+    global::<WorkbenchWindow>().set(WorkbenchWindow(Some(desktop::current_window())));
     let active = computed(|| controller::machines::navigation().with(|n| n.active.clone()));
     dynamic(move || {
         let machine = controller::machines::by_id(&active.get()).expect("active machine");
@@ -96,7 +128,7 @@ fn workbench() -> impl IntoElement {
     let sidebar_open = computed(controller::sidebar_visible);
     let nav_only = computed(move || controller::narrow_window() && sidebar_open.get());
     let stage_width = computed(move || {
-        let width = nsh_core::element::window().width.0;
+        let width = window_size().width.0;
         if !controller::narrow_window() && sidebar_open.get() {
             width - theme::metrics::sidebar_width(width)
         } else {

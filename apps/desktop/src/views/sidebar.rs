@@ -4,7 +4,7 @@
 //! quiet Lucide icon-only footer.
 
 use nsh_core::{
-    element::desktop::{MenuItem, popup_menu, popup_menu_at, title_bar},
+    element::desktop::{MenuItem, current_window, popup_menu, popup_menu_at},
     prelude::*,
 };
 
@@ -86,6 +86,7 @@ fn entry_key(entry: &Entry) -> String {
 }
 
 pub(crate) fn sidebar() -> impl IntoElement {
+    let window = current_window();
     let colors = palette();
     let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
     let filter = computed(|| controller::ui().with(|u| u.filter.clone()));
@@ -177,7 +178,7 @@ pub(crate) fn sidebar() -> impl IntoElement {
     });
 
     view()
-        .w(|| px(metrics::sidebar_width(nsh_core::element::window().width.0)))
+        .w(|| px(metrics::sidebar_width(crate::window_size().width.0)))
         .flex_shrink_0()
         .flex_col()
         .bg(colors.sidebar)
@@ -191,7 +192,7 @@ pub(crate) fn sidebar() -> impl IntoElement {
                 .items_center()
                 .gap_1p5()
                 .pl(move || {
-                    let inset = title_bar().left.0;
+                    let inset = window.title_bar().left.0;
                     px(if inset > 0.0 { inset + 6.0 } else { 12.0 })
                 })
                 .pr_3()

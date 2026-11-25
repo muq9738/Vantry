@@ -211,8 +211,8 @@ pub(crate) fn attachment_preview_dialog() -> impl IntoElement {
                                 )
                                 .child(dynamic(move || match preview.get() {
                                     Some(src) => image(src)
-                                        .w(move || px(nsh_core::element::window().width.0 * 0.72))
-                                        .h(move || px(nsh_core::element::window().height.0 * 0.66))
+                                        .w(move || px(crate::window_size().width.0 * 0.72))
+                                        .h(move || px(crate::window_size().height.0 * 0.66))
                                         .object_fit(nsh_core::ResizeMode::Contain)
                                         .into_element(),
                                     None => super::caption(lang.label("加载中…")).into_element(),

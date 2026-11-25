@@ -68,7 +68,7 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
                         .w_full()
                         .max_w(px(940.0))
                         .h(move || {
-                            px((nsh_core::element::window().height.0 - 40.0).clamp(1.0, 700.0))
+                            px((crate::window_size().height.0 - 40.0).clamp(1.0, 700.0))
                         })
                         .flex_row()
                         .style_when(compact, |s| s.flex_col())
@@ -157,7 +157,7 @@ fn dialog(page: Memo<Option<SettingsPage>>) -> impl IntoElement {
 }
 
 fn compact() -> bool {
-    nsh_core::element::window().width.0 - 32.0 < 680.0
+    crate::window_size().width.0 - 32.0 < 680.0
 }
 
 fn nav_items(page: Memo<Option<SettingsPage>>) -> impl Iterator<Item = impl IntoElement> {

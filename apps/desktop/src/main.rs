@@ -73,7 +73,6 @@ fn main() -> impl Termination {
                     title: "Vantry".to_owned(),
                     #[cfg(any(target_os = "linux", target_os = "windows"))]
                     app_id: "io.github.muq9738.vantry".to_owned(),
-                    size: (1280, 820),
                     ..Default::default()
                 },
             ))

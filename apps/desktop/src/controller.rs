@@ -1629,7 +1629,7 @@ pub(crate) fn current_machine() -> Option<String> { bridges(|b| b.peer_id.clone(
 // --------------------------------------------------------------------- ui
 
 pub(crate) fn narrow_window() -> bool {
-    nsh_core::element::window().width.0 < crate::theme::metrics::NARROW_WIDTH
+    crate::window_size().width.0 < crate::theme::metrics::NARROW_WIDTH
 }
 
 pub(crate) fn sidebar_visible() -> bool {
