@@ -126,6 +126,10 @@ fn summaries_paint_sidebar_before_authoritative_snapshot() {
     assert!(state.apply_thread_detail(token, bounded_detail("t1", "r1")));
     assert!(state.has_conversation());
     assert_eq!(state.timeline().len(), 2);
+    assert!(
+        state.notice.is_none(),
+        "loading notice should clear once bounded detail is applied"
+    );
     assert!(!state.snapshot_loaded, "full snapshot still owns global actions");
 }
 

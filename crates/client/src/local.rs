@@ -47,6 +47,27 @@ impl Drop for Driver {
     }
 }
 
+fn is_gzip_encoded(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all("content-encoding")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|s| s.trim().eq_ignore_ascii_case("gzip"))
+}
+
+fn decode_body(bytes: Bytes, gzip: bool) -> Result<Vec<u8>> {
+    if !gzip {
+        return Ok(bytes.to_vec());
+    }
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(bytes.as_ref());
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(anyhow::Error::from)?;
+    Ok(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreClient {
     socket: PathBuf,
@@ -66,13 +87,17 @@ impl CoreClient {
         method: Method,
         path: &str,
         body: Vec<u8>,
-    ) -> Result<(Incoming, Driver)> {
+        accept_gzip: bool,
+    ) -> Result<(Incoming, bool, Driver)> {
         let tcp_endpoint = read_tcp_endpoint(&self.socket);
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
             .header("host", "vantry.local")
             .header("content-type", "application/json");
+        if accept_gzip {
+            builder = builder.header("accept-encoding", "gzip");
+        }
         if let Some(ep) = &tcp_endpoint {
             builder = builder.header(LOCAL_TOKEN_HEADER, &ep.token);
         }
@@ -111,16 +136,18 @@ impl CoreClient {
             .send_request(request)
             .await
             .map_err(anyhow::Error::from)?;
+        let gzip = is_gzip_encoded(response.headers());
         if !response.status().is_success() {
             let bytes = Limited::new(response.into_body(), 1 << 20)
                 .collect()
                 .await
                 .map_err(anyhow::Error::from_boxed)?
                 .to_bytes();
-            let error: ApiError = serde_json::from_slice(&bytes).map_err(anyhow::Error::from)?;
+            let decoded = decode_body(bytes, gzip)?;
+            let error: ApiError = serde_json::from_slice(&decoded).map_err(anyhow::Error::from)?;
             return Err(error.into());
         }
-        Ok((response.into_body(), driver))
+        Ok((response.into_body(), gzip, driver))
     }
     async fn json<T: DeserializeOwned>(
         &self,
@@ -128,13 +155,14 @@ impl CoreClient {
         path: &str,
         payload: Vec<u8>,
     ) -> Result<T> {
-        let (body, _driver) = self.request(method, path, payload).await?;
+        let (body, gzip, _driver) = self.request(method, path, payload, true).await?;
         let bytes = body
             .collect()
             .await
             .map_err(anyhow::Error::from)?
             .to_bytes();
-        Ok(serde_json::from_slice(&bytes).map_err(anyhow::Error::from)?)
+        let decoded = decode_body(bytes, gzip)?;
+        Ok(serde_json::from_slice(&decoded).map_err(anyhow::Error::from)?)
     }
     pub async fn health(&self) -> Result<Health> {
         self.json(Method::GET, "/v1/health", vec![]).await
@@ -202,8 +230,13 @@ impl CoreClient {
         .await
     }
     pub async fn subscribe(&self, since: i64) -> Result<EventStream> {
-        let (body, driver) = self
-            .request(Method::GET, &format!("/v1/events?after={since}"), vec![])
+        let (body, _gzip, driver) = self
+            .request(
+                Method::GET,
+                &format!("/v1/events?after={since}"),
+                vec![],
+                false,
+            )
             .await?;
         Ok(EventStream {
             body,

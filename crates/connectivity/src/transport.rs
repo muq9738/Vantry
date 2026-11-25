@@ -217,7 +217,7 @@ impl Heartbeat {
     }
     pub async fn tick(&mut self) -> Result<()> {
         self.interval.tick().await;
-        if self.last.elapsed() > Duration::from_secs(65) {
+        if self.last.elapsed() > Duration::from_secs(90) {
             bail!("relay heartbeat expired")
         }
         Ok(())
@@ -226,7 +226,7 @@ impl Heartbeat {
 pub async fn bridge(ws: Ws, socket: impl Socket) -> Result<()> {
     let (mut sink, mut source) = ws.split();
     let (mut reader, mut writer) = tokio::io::split(socket);
-    let (control, mut control_rx) = tokio::sync::mpsc::channel(4);
+    let (control, mut control_rx) = tokio::sync::mpsc::channel(16);
     let activity = std::sync::atomic::AtomicU64::new(0);
     let start = Instant::now();
     let receive = async {
@@ -237,7 +237,9 @@ pub async fn bridge(ws: Ws, socket: impl Socket) -> Result<()> {
             );
             match message? {
                 Message::Binary(data) => writer.write_all(&data).await?,
-                Message::Ping(data) => control.send(Message::Pong(data)).await?,
+                Message::Ping(data) => {
+                    let _ = control.try_send(Message::Pong(data));
+                }
                 Message::Close(_) => break,
                 _ => {}
             }
@@ -250,15 +252,22 @@ pub async fn bridge(ws: Ws, socket: impl Socket) -> Result<()> {
         let mut timer = tokio::time::interval_at(start + period, period);
         loop {
             let message = tokio::select! {
+                biased;
+                control = control_rx.recv() => match control { Some(frame) => frame, None => break },
                 _ = timer.tick() => {
-                    let last=activity.load(std::sync::atomic::Ordering::Relaxed);
-                    ensure!(start.elapsed().as_secs().saturating_sub(last)<=65,"relay heartbeat expired");
+                    let last = activity.load(std::sync::atomic::Ordering::Relaxed);
+                    ensure!(start.elapsed().as_secs().saturating_sub(last) <= 90, "relay heartbeat expired");
                     Message::Ping(Bytes::new())
                 }
-                control = control_rx.recv() => match control {Some(frame)=>frame,None=>break},
-                n = reader.read(&mut buf) => {let n=n?;if n==0{break}Message::binary(Bytes::copy_from_slice(&buf[..n]))}
+                n = reader.read(&mut buf) => {
+                    let n = n?;
+                    if n == 0 {
+                        break;
+                    }
+                    Message::binary(Bytes::copy_from_slice(&buf[..n]))
+                }
             };
-            timeout(Duration::from_secs(10), sink.send(message)).await??;
+            timeout(Duration::from_secs(30), sink.send(message)).await??;
         }
         Ok::<_, anyhow::Error>(())
     };

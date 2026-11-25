@@ -41,6 +41,10 @@ pub trait CoreBridge: Send + Sync + 'static {
     fn label(&self) -> String;
     /// `GET /v1/health`.
     fn health(&self) -> BridgeFuture<Health>;
+    /// `GET /v1/status` (or `/v1/capabilities`). Default returns `None` for mocks/fakes.
+    fn status(&self) -> BridgeFuture<Option<vantry_protocol::ServerStatus>> {
+        Box::pin(async { Ok(None) })
+    }
     /// `GET /v1/snapshot`.
     fn snapshot(&self) -> BridgeFuture<Snapshot>;
     /// `GET /v1/threads/summaries`: a cheap projection for the first sidebar.

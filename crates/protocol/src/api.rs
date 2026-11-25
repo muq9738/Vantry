@@ -470,6 +470,8 @@ pub struct ServerStatus {
     pub schema_version: i64,
     pub pid: i64,
     pub active_runs: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     pub capabilities: Option<Vec<String>>,
 }
 

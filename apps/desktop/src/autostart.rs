@@ -29,6 +29,16 @@ pub enum Boot {
     Started,
 }
 
+/// Returns `true` when the running Core reports a different version than this
+/// desktop binary and has no active runs, so `ensure-core` should drain and
+/// replace it.
+pub async fn needs_upgrade_restart(core: Arc<dyn CoreBridge>) -> bool {
+    let Ok(Some(status)) = core.status().await else {
+        return false;
+    };
+    status.version != env!("CARGO_PKG_VERSION") && status.active_runs == 0
+}
+
 /// Makes sure the local Core answers: probes it, runs `command` when it
 /// does not (calling `on_starting` first), then waits for it.
 pub async fn ensure_core(
@@ -37,7 +47,11 @@ pub async fn ensure_core(
     on_starting: impl FnOnce(),
 ) -> Result<Boot, String> {
     match core.health().await {
-        Ok(_) => return Ok(Boot::AlreadyRunning),
+        Ok(_) => {
+            if !needs_upgrade_restart(core.clone()).await {
+                return Ok(Boot::AlreadyRunning);
+            }
+        }
         // Something answers (not ready, a version mismatch, …): the
         // connection loop reports it.
         Err(error) if error.code != ErrorCode::Unavailable => return Ok(Boot::AlreadyRunning),
@@ -222,6 +236,79 @@ mod tests {
             .await
             .unwrap_err();
         assert!(never.contains("未就绪"));
+        dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn outdated_idle_core_triggers_ensure_core_while_busy_or_current_stays() {
+        struct VersionedCore {
+            version: &'static str,
+            active_runs: i64,
+        }
+        impl CoreBridge for VersionedCore {
+            fn label(&self) -> String { "v".into() }
+            fn health(&self) -> BridgeFuture<Health> {
+                Box::pin(async { Ok(Health { version: 1, state: "ready".into() }) })
+            }
+            fn status(&self) -> BridgeFuture<Option<vantry_protocol::ServerStatus>> {
+                let status = vantry_protocol::ServerStatus {
+                    version: self.version.into(),
+                    active_runs: self.active_runs,
+                    ..Default::default()
+                };
+                Box::pin(async move { Ok(Some(status)) })
+            }
+            fn snapshot(&self) -> BridgeFuture<Snapshot> {
+                Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+            }
+            fn thread_summaries(&self) -> BridgeFuture<ThreadSummaries> {
+                Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+            }
+            fn thread_detail(&self, _: String, _: i64) -> BridgeFuture<ThreadDetail> {
+                Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+            }
+            fn dispatch(&self, _: Command) -> BridgeFuture<Receipt> {
+                Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+            }
+            fn subscribe(&self, _: i64, _: EventSink) -> BridgeFuture<()> {
+                Box::pin(async { Err(BridgeError::new(ErrorCode::NotReady, "x")) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let cmd = || ServiceCommand {
+            program: script(dir.path(), &format!("touch '{}'", ran.display())),
+            args: vec![],
+        };
+
+        // Current version stays untouched.
+        let current: Arc<dyn CoreBridge> = Arc::new(VersionedCore {
+            version: env!("CARGO_PKG_VERSION"),
+            active_runs: 0,
+        });
+        assert_eq!(ensure_core(current, Ok(cmd()), || {}).await.unwrap(), Boot::AlreadyRunning);
+        assert!(!ran.exists());
+
+        // Outdated version with active runs stays untouched.
+        let busy: Arc<dyn CoreBridge> = Arc::new(VersionedCore {
+            version: "0.1.42",
+            active_runs: 1,
+        });
+        assert_eq!(ensure_core(busy, Ok(cmd()), || {}).await.unwrap(), Boot::AlreadyRunning);
+        assert!(!ran.exists());
+
+        // Outdated idle Core triggers ensure-core.
+        let idle_old: Arc<dyn CoreBridge> = Arc::new(VersionedCore {
+            version: "",
+            active_runs: 0,
+        });
+        let mut started = false;
+        assert_eq!(
+            ensure_core(idle_old, Ok(cmd()), || started = true).await.unwrap(),
+            Boot::Started
+        );
+        assert!(started && ran.exists());
         dir.close().unwrap();
     }
 }

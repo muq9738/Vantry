@@ -426,6 +426,13 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_millis((250u64 << exp).min(8_000))
 }
 
+/// The delay before retrying a failed full snapshot (1-based): 1 s doubling,
+/// at most 30 s, so a congested relay is not saturated by back-to-back retries.
+pub fn snapshot_retry_delay(attempt: u32) -> Duration {
+    let exp = attempt.saturating_sub(1).min(5);
+    Duration::from_millis((1_000u64 << exp).min(30_000))
+}
+
 /// A title from a first message: its first line, at most 40 characters.
 pub fn title_from_message(text: &str) -> String {
     // What the text reads as: no `/skill:` prefix, thread links as their titles.
@@ -917,7 +924,13 @@ impl AppState {
         }
         self.snapshot_loaded = false;
         self.sidebar_revision += 1;
-        self.notice = Some(Notice::new(NoticeLevel::Info, "正在加载完整会话…"));
+        if self.selected.is_some() {
+            self.notice = Some(Notice::new(NoticeLevel::Info, "正在加载完整会话…"));
+        } else if self.notice.as_ref().is_some_and(|notice| {
+            notice.text == "正在加载完整会话…" || notice.text == "正在加载会话内容…"
+        }) {
+            self.notice = None;
+        }
     }
 
     /// Starts a bounded-detail request for a selected summary. The token is
@@ -976,6 +989,11 @@ impl AppState {
         self.inputs.extend(inputs.unwrap_or_default());
         self.tasks.extend(tasks.unwrap_or_default());
         self.sequence = self.sequence.max(sequence);
+        if self.notice.as_ref().is_some_and(|notice| {
+            notice.text == "正在加载完整会话…" || notice.text == "正在加载会话内容…"
+        }) {
+            self.notice = None;
+        }
         self.rebuild_timeline();
         self.sidebar_revision += 1;
         true
@@ -2024,7 +2042,7 @@ impl AppState {
             ));
         }
         Recovery::Resync {
-            delay: reconnect_delay(attempt),
+            delay: snapshot_retry_delay(attempt),
         }
     }
 

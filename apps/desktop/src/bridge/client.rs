@@ -41,6 +41,17 @@ impl CoreBridge for ClientBridge {
         Box::pin(async move { client.health().await.map_err(BridgeError::from) })
     }
 
+    fn status(&self) -> BridgeFuture<Option<vantry_protocol::ServerStatus>> {
+        let client = self.client();
+        Box::pin(async move {
+            client
+                .capabilities()
+                .await
+                .map(Some)
+                .map_err(BridgeError::from)
+        })
+    }
+
     fn snapshot(&self) -> BridgeFuture<Snapshot> {
         let client = self.client();
         Box::pin(async move { client.snapshot().await.map_err(BridgeError::from) })

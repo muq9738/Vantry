@@ -166,3 +166,58 @@ async fn v1_socket_command_replay_and_resync() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn client_sends_accept_encoding_gzip_and_decodes_gzip_response() {
+    let dir = SocketDir(PathBuf::from("/tmp").join(format!(
+        "vnt-gz-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    fs::create_dir(&dir.0).unwrap();
+    let listener = UnixListener::bind(dir.0.join("core.sock")).unwrap();
+    let server = tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(io);
+        let mut saw_accept_gzip = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if line.to_ascii_lowercase().starts_with("accept-encoding:")
+                && line.to_ascii_lowercase().contains("gzip")
+            {
+                saw_accept_gzip = true;
+            }
+        }
+        assert!(saw_accept_gzip, "expected Accept-Encoding: gzip header");
+        let payload = serde_json::to_vec(&json!({
+            "sequence": 42,
+            "threads": [],
+            "runs": [],
+            "tasks": [],
+            "cohorts": []
+        }))
+        .unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &payload).unwrap();
+        let gz = encoder.finish().unwrap();
+        let mut io = reader.into_inner();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gz.len()
+        );
+        io.write_all(header.as_bytes()).await.unwrap();
+        io.write_all(&gz).await.unwrap();
+    });
+    let client = CoreClient::from_data_dir(&dir.0);
+    let snap = client.snapshot().await.unwrap();
+    assert_eq!(snap.sequence, 42);
+    server.await.unwrap();
+}

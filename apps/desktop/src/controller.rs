@@ -265,11 +265,15 @@ async fn boot_then_connect(
     core: Arc<dyn CoreBridge>,
     command: Result<service::ServiceCommand, service::NotFound>,
 ) {
-    let down = matches!(
-        call(core.health()).await,
-        Err(BridgeError { code: ErrorCode::Unavailable, .. })
-    );
-    if down {
+    let needs_boot = match call(core.health()).await {
+        Err(BridgeError { code: ErrorCode::Unavailable, .. }) => true,
+        Ok(_) => matches!(
+            background(autostart::needs_upgrade_restart(core.clone())).await,
+            Ok(true)
+        ),
+        Err(_) => false,
+    };
+    if needs_boot {
         let detail = match &command {
             Ok(command) => format!("{} ensure-core", command.program.display()),
             Err(_) => "未找到 vantry-service".to_owned(),
@@ -342,18 +346,22 @@ async fn call<T: Send + 'static>(future: bridge::BridgeFuture<T>) -> Result<T, B
 /// `resync_required`, backing off between attempts.
 async fn run_connection(core: Arc<dyn CoreBridge>) {
     let mut need_snapshot = true;
+    let mut initial_painted = false;
     loop {
         if need_snapshot {
             // Paint the cheap sidebar projection and one bounded conversation
-            // first. The event stream still starts only after the full
-            // snapshot, so its sequence remains a safe cursor and no event
-            // buffering/race is needed.
-            if let Ok(summaries) = call(core.thread_summaries()).await {
+            // first. On subsequent snapshot retries keep the already-loaded
+            // conversation on screen instead of wiping it back to a loading state.
+            let should_paint =
+                !initial_painted || state().with_untracked(|s| s.threads.is_empty());
+            if should_paint && let Ok(summaries) = call(core.thread_summaries()).await {
                 let mut selected = None;
                 state().update(|s| {
                     s.apply_summaries(summaries);
                     selected = s.selected.clone();
                 });
+                initial_painted = true;
+                catalogs_after_connect();
                 if let Some(id) = selected {
                     let mut request = 0;
                     state().update(|s| request = s.begin_detail_load(&id));
@@ -371,6 +379,7 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
                         s.on_live();
                     });
                     need_snapshot = false;
+                    initial_painted = true;
                     catalogs_after_connect();
                 }
                 Err(error) => {

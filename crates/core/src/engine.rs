@@ -208,6 +208,7 @@ impl Core {
                 }
                 .into(),
                 active_runs,
+                version: env!("CARGO_PKG_VERSION").into(),
                 capabilities: Some(vec![
                     "status.v1".into(),
                     "admin.drain-shutdown.v1".into(),

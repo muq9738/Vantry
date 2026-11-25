@@ -291,11 +291,62 @@ impl Drop for Server {
         }
     }
 }
+fn accepts_gzip(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all("accept-encoding")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|part| {
+            let mut segments = part.split(';');
+            let Some(encoding) = segments.next().map(str::trim) else {
+                return false;
+            };
+            if !encoding.eq_ignore_ascii_case("gzip") {
+                return false;
+            }
+            for param in segments {
+                let Some((k, v)) = param.split_once('=') else {
+                    continue;
+                };
+                if k.trim().eq_ignore_ascii_case("q")
+                    && v.trim().parse::<f32>().is_ok_and(|q| q <= 0.0)
+                {
+                    return false;
+                }
+            }
+            true
+        })
+}
+
 fn response(status: StatusCode, v: impl serde::Serialize) -> Response<Body> {
+    response_encoded(status, v, false)
+}
+
+fn response_encoded(status: StatusCode, v: impl serde::Serialize, gzip: bool) -> Response<Body> {
+    let raw = serde_json::to_vec(&v).expect("protocol JSON");
+    if gzip && raw.len() >= 1024 {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        if encoder.write_all(&raw).is_ok()
+            && let Ok(compressed) = encoder.finish()
+            && compressed.len() < raw.len()
+        {
+            return Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .header("content-encoding", "gzip")
+                .header("vary", "accept-encoding")
+                .body(Full::new(Bytes::from(compressed)).boxed_unsync())
+                .unwrap();
+        }
+    }
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(serde_json::to_vec(&v).expect("protocol JSON"))).boxed_unsync())
+        .header("vary", "accept-encoding")
+        .body(Full::new(Bytes::from(raw)).boxed_unsync())
         .unwrap()
 }
 fn api_error(e: Error) -> ApiError {
@@ -322,6 +373,7 @@ async fn route(
     let path = req.uri().path().to_owned();
     let query = req.uri().query().map(str::to_owned);
     let method_str = req.method().as_str().to_owned();
+    let gzip = accepts_gzip(req.headers());
     let expected_method = match path.as_str() {
         "/v1/commands" | "/v1/admin/shutdown-if-idle" | "/v1/workbench" => Some("POST"),
         "/v1/health"
@@ -356,7 +408,7 @@ async fn route(
             .extra_route(&method_str, &path, query.as_deref(), body)
             .await
         {
-            return Ok(response(StatusCode::OK, result?));
+            return Ok(response_encoded(StatusCode::OK, result?, gzip));
         }
         return Err(Error::Api(ErrorCode::NotFound, "unknown endpoint".into()));
     } else {
@@ -385,13 +437,13 @@ async fn route(
                     }
                 }
             }
-            response(ok, status)
+            response_encoded(ok, status, gzip)
         }
-        "/v1/snapshot" | "/v1/state" => response(ok, core.snapshot()?),
-        "/v1/threads/summaries" => response(ok, core.thread_summaries()?),
+        "/v1/snapshot" | "/v1/state" => response_encoded(ok, core.snapshot()?, gzip),
+        "/v1/threads/summaries" => response_encoded(ok, core.thread_summaries()?, gzip),
         "/v1/threads/detail" => {
             let (thread_id, limit_runs) = parse_thread_detail_query(query.as_deref())?;
-            response(ok, core.thread_detail(&thread_id, limit_runs)?)
+            response_encoded(ok, core.thread_detail(&thread_id, limit_runs)?, gzip)
         }
         "/v1/workbench" => {
             let Some(ext) = extension else {
@@ -407,7 +459,7 @@ async fn route(
                 .to_bytes();
             let request: WorkbenchRequest =
                 serde_json::from_slice(&body).map_err(|e| invalid(&e.to_string()))?;
-            response(ok, ext.workbench(request).await?)
+            response_encoded(ok, ext.workbench(request).await?, gzip)
         }
         "/v1/commands" => {
             let body = Limited::new(req.into_body(), 1 << 20)

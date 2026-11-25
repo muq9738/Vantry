@@ -92,12 +92,50 @@ async fn replay_live_handoff_and_http_resync() {
     assert_eq!(snapshot["threads"].as_array().unwrap().len(), 4);
     let status = json_req(&socket, "/v1/status", None).await.1;
     assert_eq!(json_req(&socket, "/v1/capabilities", None).await.1, status);
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
     assert!(
         status["capabilities"]
             .as_array()
             .unwrap()
             .contains(&json!("provider.pi.embedded.v1"))
     );
+    // Verify gzip compression on a large (>1KB) snapshot when Accept-Encoding: gzip is sent.
+    {
+        let long_title = "压缩测试".repeat(400);
+        let (code, _) = json_req(
+            &socket,
+            "/v1/commands",
+            Some(json!({"version":1,"kind":"thread.create","commandId":"gz1","threadId":"gz1","title":long_title})),
+        )
+        .await;
+        assert_eq!(code, 200);
+        let large_snapshot = json_req(&socket, "/v1/snapshot", None).await.1;
+
+        let io = UnixStream::connect(&socket).await.unwrap();
+        let (mut client, conn) = http1::handshake(TokioIo::new(io)).await.unwrap();
+        let task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/snapshot")
+            .header("host", "localhost")
+            .header("accept-encoding", "gzip")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let res = client.send_request(req).await.unwrap();
+        drop(client);
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-encoding"], "gzip");
+        let gz_bytes = res.into_body().collect().await.unwrap().to_bytes();
+        task.await.unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(gz_bytes.as_ref());
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut plain).unwrap();
+        assert!(gz_bytes.len() < plain.len());
+        let decoded: Value = serde_json::from_slice(&plain).unwrap();
+        assert_eq!(decoded, large_snapshot);
+    }
     drop(stream);
     let (status, drain) = json_req(&socket, "/v1/admin/shutdown-if-idle", Some(json!({}))).await;
     assert_eq!(status, 200);

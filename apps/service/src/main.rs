@@ -408,6 +408,7 @@ async fn ensure_core(args: CoreArgs, raw: &[OsString]) -> Result<()> {
         Some(socket) => CoreClient::new(socket),
         None => CoreClient::from_data_dir(&data),
     };
+    let expected_version = env!("CARGO_PKG_VERSION");
     let ready = async || {
         tokio::time::timeout(Duration::from_secs(1), client.health())
             .await
@@ -416,7 +417,44 @@ async fn ensure_core(args: CoreArgs, raw: &[OsString]) -> Result<()> {
             .filter(|h| h.state == "ready")
     };
     if let Some(health) = ready().await {
-        return ctl::print(&health);
+        let status = tokio::time::timeout(Duration::from_secs(2), client.capabilities())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if status
+            .as_ref()
+            .is_some_and(|s| s.version == expected_version)
+        {
+            return ctl::print(&health);
+        }
+        let active_runs = status.as_ref().map_or(0, |s| s.active_runs);
+        if active_runs > 0 {
+            tracing::warn!(
+                running_version = status.as_ref().map_or("", |s| s.version.as_str()),
+                expected_version,
+                active_runs,
+                "existing Core version differs but has active runs; leaving it running"
+            );
+            return ctl::print(&health);
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.shutdown_if_idle()).await;
+        let stop_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < stop_deadline {
+            let still_up = tokio::time::timeout(Duration::from_millis(250), client.health())
+                .await
+                .is_ok_and(|r| r.is_ok());
+            if !still_up {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let lock_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < lock_deadline {
+            if vantry_core::lock::InstanceLock::acquire(&data).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
     hostfs::ensure_private_dir(&data)?;
     let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
