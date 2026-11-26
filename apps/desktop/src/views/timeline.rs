@@ -159,7 +159,7 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
                 .max_w(px(metrics::READING_WIDTH))
                 .child(dynamic(move || match kind.get() {
                     Some(Kind::User) => user_row(item).into_element(),
-                    Some(Kind::Reasoning) => reasoning_row(item).into_element(),
+                    Some(Kind::Reasoning) => reasoning_row(item, 2).into_element(),
                     Some(Kind::Text) => text_row(item).into_element(),
                     Some(Kind::Tools) => tools_row(item).into_element(),
                     Some(Kind::Approval) => approval_row(item).into_element(),
@@ -535,7 +535,7 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     })
 }
 
-pub(crate) fn reasoning_row(item: ItemMemo) -> impl IntoElement {
+pub(crate) fn reasoning_row(item: ItemMemo, preview_lines: u32) -> impl IntoElement {
     let colors = palette();
     let reasoning = computed(move || match item.get() {
         Some(TimelineItem::Reasoning {
@@ -579,17 +579,20 @@ pub(crate) fn reasoning_row(item: ItemMemo) -> impl IntoElement {
                     .into_element()
                 })),
         )
-        .child(
-            text(move || {
-                reasoning.with(|r| r.as_ref().map(|r| r.0.to_string()).unwrap_or_default())
-            })
-            .select_text()
-            .number_of_lines(move || if open.get() { 0u32 } else { 2u32 })
-            .italic()
-            .text_size(px(13.0))
-            .line_height(LineHeight::Multiple(1.5))
-            .text_color(colors.muted),
-        )
+        .child(when(
+            move || preview_lines > 0 || open.get(),
+            move || {
+                text(move || {
+                    reasoning.with(|r| r.as_ref().map(|r| r.0.to_string()).unwrap_or_default())
+                })
+                .select_text()
+                .number_of_lines(move || if open.get() { 0u32 } else { preview_lines })
+                .italic()
+                .text_size(px(13.0))
+                .line_height(LineHeight::Multiple(1.5))
+                .text_color(colors.muted)
+            },
+        ))
 }
 
 fn text_row(item: ItemMemo) -> impl IntoElement {
