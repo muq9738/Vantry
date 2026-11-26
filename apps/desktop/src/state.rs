@@ -373,6 +373,8 @@ pub struct AppState {
     /// A receipt was accepted, but no authoritative snapshot/event has
     /// arrived yet. Keep the composer blocked so a second send cannot race it.
     awaiting_refresh: BTreeSet<String>,
+    /// Child threads whose bounded detail was merged in summaries mode.
+    child_details: BTreeSet<String>,
     pub stats: FoldStats,
 }
 
@@ -415,6 +417,7 @@ impl Default for AppState {
             summary_active_runs: BTreeMap::new(),
             detail_readiness: None,
             awaiting_refresh: BTreeSet::new(),
+            child_details: BTreeSet::new(),
             stats: FoldStats::default(),
         }
     }
@@ -924,6 +927,7 @@ impl AppState {
             self.selected = self.visible_threads().first().map(|t| t.id.clone());
         }
         self.snapshot_loaded = false;
+        self.child_details.clear();
         self.sidebar_revision += 1;
         if self.selected.is_some() {
             self.notice = Some(Notice::new(NoticeLevel::Info, "正在加载完整会话…"));
@@ -1035,6 +1039,66 @@ impl AppState {
         }) {
             self.notice = None;
         }
+        self.rebuild_timeline();
+        self.sidebar_revision += 1;
+        true
+    }
+
+    /// Whether opening child `child` needs its bounded detail: summaries
+    /// mode carries only the selected thread's runs and tools.
+    pub fn needs_child_detail(&self, child: &str) -> bool {
+        !self.snapshot_loaded && !child.is_empty() && !self.child_details.contains(child)
+    }
+
+    /// Merges a child thread's bounded detail without touching the
+    /// selection: the parent stays shown, rows the event stream already
+    /// carries are kept (runs join, the newer text wins).
+    pub fn merge_child_detail(&mut self, detail: ThreadDetail) -> bool {
+        if self.snapshot_loaded || self.selected.as_deref() == Some(detail.thread.id.as_str()) {
+            return false;
+        }
+        let ThreadDetail {
+            mut thread,
+            runs,
+            tasks,
+            inputs,
+            tools,
+            requests,
+            ..
+        } = detail;
+        clear_zero_time(&mut thread.created_at);
+        let id = thread.id.clone();
+        if !self.threads.iter().any(|t| t.id == id) {
+            self.threads.push(thread);
+        }
+        for mut run in runs.unwrap_or_default() {
+            clear_zero_time(&mut run.created_at);
+            match self.runs.iter_mut().find(|r| r.id == run.id) {
+                Some(existing) => merge_run(existing, run),
+                None => self.runs.push(run),
+            }
+        }
+        for tool in tools.unwrap_or_default() {
+            if !self.tools.iter().any(|t| t.id == tool.id) {
+                self.tools.push(tool);
+            }
+        }
+        for request in requests.unwrap_or_default() {
+            if !self.requests.iter().any(|r| r.id == request.id) {
+                self.requests.push(request);
+            }
+        }
+        for input in inputs.unwrap_or_default() {
+            if !self.inputs.iter().any(|i| i.id == input.id) {
+                self.inputs.push(input);
+            }
+        }
+        for task in tasks.unwrap_or_default() {
+            if !self.tasks.iter().any(|t| t.id == task.id) {
+                self.tasks.push(task);
+            }
+        }
+        self.child_details.insert(id);
         self.rebuild_timeline();
         self.sidebar_revision += 1;
         true
@@ -1748,7 +1812,12 @@ impl AppState {
     /// Stops the shown thread's active run.
     pub fn stop(&mut self) -> Option<Command> {
         let thread_id = self.selected.clone()?;
-        let run = self.active_run(&thread_id)?.clone();
+        self.stop_thread(&thread_id)
+    }
+
+    /// Stops thread `thread_id`'s active run (a child shown in the dock).
+    pub fn stop_thread(&mut self, thread_id: &str) -> Option<Command> {
+        let run = self.active_run(thread_id)?.clone();
         let key = format!("stop:{}", run.id);
         if self.in_flight(&key) {
             return None;

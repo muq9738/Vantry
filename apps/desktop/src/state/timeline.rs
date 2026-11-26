@@ -406,6 +406,11 @@ impl TimelineIndex {
             .flat_map(|s| s.items.iter())
     }
 
+    /// Run `run_id`'s rows (a child's turn in the dock).
+    pub fn run_items(&self, run_id: &str) -> &[TimelineItem] {
+        self.segments.get(run_id).map_or(&[], |s| s.items.as_slice())
+    }
+
     /// The run ids of `thread`, oldest first.
     pub fn run_order(&self, thread: &str) -> &[String] {
         self.threads.get(thread).map_or(&[], |t| t.runs.as_slice())

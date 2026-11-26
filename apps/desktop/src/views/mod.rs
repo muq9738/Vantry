@@ -8,6 +8,7 @@
 
 pub(crate) mod approval_modal;
 pub(crate) mod charts;
+pub(crate) mod child_panel;
 pub(crate) mod composer;
 pub(crate) mod dialogs;
 pub(crate) mod dock;

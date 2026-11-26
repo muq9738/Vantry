@@ -169,7 +169,7 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
         )
 }
 
-type ItemMemo = Memo<Option<TimelineItem>>;
+pub(crate) type ItemMemo = Memo<Option<TimelineItem>>;
 
 fn attachment_short_name(
     item: &vantry_protocol::Attachment,
@@ -433,7 +433,7 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
         )
 }
 
-fn reasoning_row(item: ItemMemo) -> impl IntoElement {
+pub(crate) fn reasoning_row(item: ItemMemo) -> impl IntoElement {
     let colors = palette();
     let reasoning = computed(move || match item.get() {
         Some(TimelineItem::Reasoning {
@@ -706,7 +706,7 @@ fn tools_headline(calls: &[ToolEntry], lang: Language) -> String {
 /// Consecutive tool calls as one quiet, collapsible line (Claude's desktop):
 /// while they run it names the current call; once done it sums them up.
 /// Opened, it lists the calls, each opening to its arguments and output.
-fn tools_row(item: ItemMemo) -> impl IntoElement {
+pub(crate) fn tools_row(item: ItemMemo) -> impl IntoElement {
     let colors = palette();
     let lang = use_context::<Language>().unwrap_or_default();
     let calls = computed(move || match item.get() {
@@ -954,7 +954,7 @@ fn tool_details(entry: Memo<Option<ToolEntry>>) -> impl IntoElement {
         ))
 }
 
-fn approval_row(item: ItemMemo) -> impl IntoElement {
+pub(crate) fn approval_row(item: ItemMemo) -> impl IntoElement {
     let colors = palette();
     let view_of = computed(move || match item.get() {
         Some(TimelineItem::Approval { view, .. }) => Some(view),

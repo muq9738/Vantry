@@ -790,11 +790,29 @@ pub(crate) fn open_child(child: String) {
     };
     ui().update(|u| {
         u.expanded_task_parent = Some(parent.clone());
-        u.child_panel = Some((parent, child));
+        u.child_panel = Some((parent, child.clone()));
         u.dock_open = true;
         u.dock_maximized = false;
         u.view = MainView::Conversation;
     });
+    // Summaries mode carries only the selected thread's runs and tools: load
+    // the child's bounded detail beside it, keeping the parent selected.
+    if state().with_untracked(|s| s.needs_child_detail(&child))
+        && let Some(core) = core()
+    {
+        spawn_for_window(async move {
+            if let Ok(detail) = call(core.thread_detail(child, 20)).await {
+                state().update(|s| {
+                    s.merge_child_detail(detail);
+                });
+            }
+        });
+    }
+}
+
+/// Stops child `child`'s active run.
+pub(crate) fn stop_child(child: String) {
+    intent(move |s| s.stop_thread(&child));
 }
 
 pub(crate) fn submit_child(child: &str) {

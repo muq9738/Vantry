@@ -478,3 +478,57 @@ fn visual_fences_preserve_arguments_while_code_keeps_language() {
     assert!(matches!(&*doc.blocks[1].block, Block::Code { lang, .. } if lang == "chart bar unit=ms"));
     assert!(matches!(&*doc.blocks[2].block, Block::Code { lang, .. } if lang == "rust"));
 }
+
+#[test]
+fn child_detail_merges_beside_the_selected_parent() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 1,
+        threads: Some(vec![summary("parent", 0)]),
+    });
+    let token = state.begin_detail_load("parent");
+    assert!(state.apply_thread_detail(token, bounded_detail("parent", "pr1")));
+    assert!(state.needs_child_detail("child"));
+    assert!(!state.needs_child_detail(""));
+
+    let mut detail = bounded_detail("child", "cr1");
+    detail.thread.parent_thread_id = "parent".into();
+    detail.tools = Some(vec![ToolCall {
+        id: "tool1".into(),
+        thread_id: "child".into(),
+        run_id: "cr1".into(),
+        name: "bash".into(),
+        status: "completed".into(),
+        ..ToolCall::default()
+    }]);
+    assert!(state.merge_child_detail(detail.clone()));
+
+    assert_eq!(state.selected.as_deref(), Some("parent"), "the parent stays selected");
+    assert!(state.runs.iter().any(|r| r.id == "pr1"), "the parent's runs stay");
+    assert!(state.runs.iter().any(|r| r.id == "cr1"));
+    assert_eq!(state.tools.iter().filter(|t| t.run_id == "cr1").count(), 1);
+    assert_eq!(state.timeline.run_order("child"), ["cr1".to_owned()]);
+    assert!(state
+        .timeline
+        .run_items("cr1")
+        .iter()
+        .any(|i| matches!(i, TimelineItem::Tools { .. })));
+    assert!(!state.needs_child_detail("child"));
+
+    // A second merge does not duplicate rows.
+    assert!(state.merge_child_detail(detail));
+    assert_eq!(state.runs.iter().filter(|r| r.id == "cr1").count(), 1);
+    assert_eq!(state.tools.iter().filter(|t| t.id == "tool1").count(), 1);
+}
+
+#[test]
+fn a_child_detail_never_replaces_the_selected_thread() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 1,
+        threads: Some(vec![summary("t1", 0)]),
+    });
+    state.select_thread(Some("t1".into()));
+    assert!(!state.merge_child_detail(bounded_detail("t1", "r1")));
+    assert!(state.runs.is_empty());
+}

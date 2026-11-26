@@ -377,6 +377,14 @@ pub(crate) fn composer() -> impl IntoElement {
             crate::state::todo::latest(s.tools.iter(), thread)
         })
     });
+    let subagents = computed(|| {
+        controller::state().with(|s| {
+            s.selected
+                .as_deref()
+                .map(|parent| super::child_panel::subagent_rows(s, parent))
+                .unwrap_or_default()
+        })
+    });
     let plan = computed(move || draft.with(|d| d.mode == InteractionMode::Plan));
     let attachments = computed(move || draft.with(|d| d.attachments.clone()));
     let importing =
@@ -538,8 +546,8 @@ pub(crate) fn composer() -> impl IntoElement {
                     move || notice_line(notice),
                 ))
                 .child(when(
-                    move || todo.with(Option::is_some),
-                    move || todo_panel(todo),
+                    move || todo.with(Option::is_some) || subagents.with(|r| !r.is_empty()),
+                    move || work_strip(todo, subagents, card_width),
                 ))
                 .child(when(
                     move || queue.with(|q| !q.is_empty()),
@@ -1532,7 +1540,7 @@ fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
 
 /// Extracts a clean display name and short provider tag from raw catalog labels
 /// such as `("magpie/qmt-ai/group/deepseek-v4.1-flash", "DeepSeek-V4.1-Flash · routing group · qmt-ai")`.
-fn clean_model_label(id: &str, name: &str) -> (String, String) {
+pub(crate) fn clean_model_label(id: &str, name: &str) -> (String, String) {
     let trimmed_id = id.strip_prefix("magpie/").unwrap_or(id);
     let provider = trimmed_id
         .split_once('/')
@@ -1837,6 +1845,53 @@ mod tests {
             ("claude-opus-5.5".to_owned(), "dmit-ai".to_owned())
         );
     }
+}
+
+/// Above the composer: the thread's sub-agent card on the left and its
+/// compact task list beside it, both kept to a restrained width; narrow
+/// windows stack them.
+fn work_strip(
+    todo: Memo<Option<crate::state::todo::TodoList>>,
+    subagents: Memo<Vec<super::child_panel::SubagentRow>>,
+    width: Signal<f32>,
+) -> impl IntoElement {
+    use super::child_panel::{STACK_BELOW, subagent_card, subagent_width, todo_width};
+    let has_agents = computed(move || subagents.with(|r| !r.is_empty()));
+    let has_todo = computed(move || todo.with(Option::is_some));
+    let stacked = computed(move || width.get() < STACK_BELOW);
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_row()
+        .flex_wrap()
+        .items_start()
+        .gap_2()
+        .child(when(
+            move || has_agents.get(),
+            move || {
+                view()
+                    .flex_shrink_0()
+                    .min_w(px(0.0))
+                    .w(move || {
+                        let w = width.get();
+                        px(if stacked.get() { w } else { subagent_width(w) })
+                    })
+                    .child(subagent_card(subagents))
+            },
+        ))
+        .child(when(
+            move || has_todo.get(),
+            move || {
+                view()
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .w(move || {
+                        let w = width.get();
+                        px(if stacked.get() { w } else { todo_width(w, has_agents.get()) })
+                    })
+                    .child(todo_panel(todo))
+            },
+        ))
 }
 
 /// The agent's task list for the open thread (`vantry_todo_write`), pinned
