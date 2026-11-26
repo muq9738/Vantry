@@ -1546,7 +1546,11 @@ fn terminal_panel() -> impl IntoElement {
                         },
                     ))),
                 )
-                .child(link_button("＋", controller::new_terminal).accessibility_label("新建终端")),
+                .child(view()
+                    .tooltip(super::tip(|| controller::bench().with(|b| {
+                        if b.root.is_empty() { "新建终端".to_owned() } else { format!("在 {} 新建终端", b.root) }
+                    })))
+                    .child(link_button("＋", controller::new_terminal).accessibility_label("新建终端"))),
         )
         .child(dynamic(move || {
             active_task.get().map(|(req_id, cwd, is_running)| {
@@ -1602,7 +1606,13 @@ fn terminal_panel() -> impl IntoElement {
                 .child(
                     text(move || {
                         let text = output.get();
-                        if text.is_empty() { "（输入命令后按 Enter 运行）".to_owned() } else { text }
+                        if active.get().is_none() {
+                            "点击上方 ＋ 新建终端".to_owned()
+                        } else if text.is_empty() {
+                            "输入命令后按 Enter 运行".to_owned()
+                        } else {
+                            text
+                        }
                     })
                     .select_text()
                     .font_family(MONO)

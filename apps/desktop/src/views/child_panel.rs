@@ -656,7 +656,7 @@ fn reply(item: timeline::ItemMemo) -> impl IntoElement {
         .min_w_0()
         .flex_col()
         .gap_1p5()
-        .child(markdown::document(doc))
+        .child(markdown::document(doc, false))
         .child(when(streaming, move || {
             view()
                 .w(px(7.0))
