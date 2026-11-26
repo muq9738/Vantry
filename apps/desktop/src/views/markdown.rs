@@ -133,6 +133,18 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
     let colors = palette();
     let mut block = text("");
     for inline in inlines {
+        if let Inline::Link { text: title, url } = inline
+            && vantry_protocol::ThreadTarget::parse_url(url).is_some()
+        {
+            let href = url.clone();
+            block = block.child(view()
+                .copy_text(vantry_protocol::thread_markdown(title, url))
+                .cursor(Cursor::Pointer)
+                .tooltip(super::tip(url.clone()))
+                .on_press(move || controller::open_link(href.clone()))
+                .child(text(title.clone()).underline().text_color(colors.info_ink)));
+            continue;
+        }
         block = block.child(match inline {
             Inline::Text(t) => text(t.clone()),
             Inline::Strong(t) => text(t.clone()).font_weight(FontWeight::SEMIBOLD),
@@ -159,11 +171,7 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
                 } else {
                     text(label.clone())
                         .underline()
-                        .text_color(if url.starts_with(vantry_protocol::THREAD_SCHEME) {
-                            colors.info_ink
-                        } else {
-                            colors.accent
-                        })
+                        .text_color(colors.accent)
                         .cursor(Cursor::Pointer)
                         .tooltip(super::tip(url.clone()))
                         .on_press(move || controller::open_link(href.clone()))

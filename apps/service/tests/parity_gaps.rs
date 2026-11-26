@@ -322,7 +322,9 @@ async fn paired_cross_machine_subtask_delegation_and_restart() -> Result<()> {
     let environment = remote.workbench(&WorkbenchRequest {
         action: "environment.info".into(), ..Default::default()
     }).await?;
-    ensure!(!serde_json::from_str::<EnvironmentInfo>(&environment.output)?.id.is_empty());
+    let environment_b = serde_json::from_str::<EnvironmentInfo>(&environment.output)?.id;
+    assert_eq!(environment_b, std::fs::read_to_string(data_b.join("environment-id"))?.trim());
+    assert_ne!(environment_b, peer_id);
     std::fs::write(repo_b.join("remote.md"), "# Only on B")?;
     let file = remote.workbench(&WorkbenchRequest {
         action: "files.read".into(), workspace: repo_b.display().to_string(),
@@ -410,6 +412,17 @@ async fn paired_cross_machine_subtask_delegation_and_restart() -> Result<()> {
     let task_id = delegated["taskId"].as_str().unwrap().to_owned();
     let remote_thread_id = delegated["remoteThreadId"].as_str().unwrap().to_owned();
     assert!(!remote_thread_id.is_empty());
+
+    let url = format!("{THREAD_SCHEME}{remote_thread_id}?environmentId={environment_b}");
+    let copied = thread_markdown("Remote [B]", &url);
+    for client in [&client_a, &client_b] {
+        for input in [&url, &copied] {
+            let read: Value = client.post_json("/v1/orchestration/threads/read", &json!({"threadId": input})).await?;
+            assert_eq!(read["thread"]["threadId"], remote_thread_id);
+            let returned = ThreadLink::parse(read["thread"]["link"].as_str().unwrap()).unwrap();
+            assert_eq!(returned.url, url);
+        }
+    }
 
     // Confirm Core B actually executed the remote thread.
     let snap_b = client_b.snapshot().await?;

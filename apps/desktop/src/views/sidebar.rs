@@ -868,9 +868,10 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
         let branch = row.branch.clone();
         items.push(MenuItem::new("复制分支名").on_select(move || controller::copy(branch.clone())));
     }
-    items.push(action("复制会话链接", controller::copy_thread_link));
-    let title = row.title.clone();
-    items.push(MenuItem::new("复制会话标题").on_select(move || controller::copy(title.clone())));
+    for label in ["复制会话链接", "复制会话标题"] {
+        let (id, title) = (row.id.clone(), row.title.clone());
+        items.push(MenuItem::new(label).on_select(move || controller::copy_thread_title(id.clone(), title.clone())));
+    }
     let raw_id = row.id.clone();
     items.push(MenuItem::new("复制会话 ID").on_select(move || controller::copy(raw_id.clone())));
     if !row.project_key.is_empty() {

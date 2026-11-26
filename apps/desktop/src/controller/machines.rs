@@ -21,6 +21,7 @@ pub(crate) struct Machine {
     pub name: String,
     pub owner: Owner,
     pub session: Session,
+    environment: std::rc::Rc<std::cell::OnceCell<String>>,
     config: std::rc::Rc<LaunchConfig>,
     started: Signal<bool>,
     loading: Signal<bool>,
@@ -76,6 +77,7 @@ fn register(config: LaunchConfig, name: String) -> Machine {
         name,
         owner,
         session,
+        environment: Default::default(),
         config: std::rc::Rc::new(config),
         started,
         loading,
@@ -88,6 +90,51 @@ fn register(config: LaunchConfig, name: String) -> Machine {
 
 pub(crate) fn by_id(id: &str) -> Option<Machine> {
     records().with_untracked(|list| list.iter().find(|m| m.id == id).cloned())
+}
+
+impl Machine {
+    pub(super) async fn environment(&self) -> Result<String, BridgeError> {
+        if let Some(id) = self.environment.get() {
+            return Ok(id.clone());
+        }
+        let id = if self.id.is_empty() {
+            std::fs::read_to_string(self.config.data_dir.join("environment-id"))
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| BridgeError::unavailable("无法读取本机环境 ID"))?
+        } else {
+            let remote = bridge::RemoteBridge::new(
+                self.config.endpoint.clone(),
+                Some(self.config.data_dir.clone()),
+            );
+            call(remote.environment_id()).await?
+        };
+        let _ = self.environment.set(id.clone());
+        Ok(id)
+    }
+}
+
+pub(super) async fn link_machine(environment: &str) -> Option<Machine> {
+    if environment == "local" {
+        return by_id("");
+    }
+    if let Some(peer) = by_id(environment) {
+        return Some(peer);
+    }
+    let machines = records().get_untracked();
+    if let Some(m) = machines
+        .iter()
+        .find(|m| m.environment.get().is_some_and(|id| id == environment))
+    {
+        return Some(m.clone());
+    }
+    for m in machines {
+        if m.environment().await.ok().as_deref() == Some(environment) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 fn start_record(m: &Machine) {
@@ -191,7 +238,14 @@ pub(crate) fn refresh_summary(m: Machine) {
             let result = call(remote.thread_summaries()).await;
             if !m.started.get_untracked() {
                 match result {
-                    Ok(projection) => m.session.state.update(|s| s.apply_summaries(projection)),
+                    Ok(projection) => {
+                        m.session.state.update(|s| s.apply_summaries(projection));
+                        if m.environment.get().is_none()
+                            && let Ok(id) = call(remote.environment_id()).await
+                        {
+                            let _ = m.environment.set(id);
+                        }
+                    }
                     Err(e) => m.failure.set(e.message),
                 }
             }

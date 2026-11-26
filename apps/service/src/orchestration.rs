@@ -341,19 +341,24 @@ fn read(s: &Snapshot, q: ThreadReadQuery) -> Result<Value> {
     }))
 }
 fn format_env_thread_link(env_id: &str, link: &str) -> String {
-    if env_id.is_empty() || link.contains("environmentId=") {
+    if env_id.is_empty() {
         return link.to_owned();
     }
-    if let Some(pos) = link.rfind("](vantry-thread://") {
-        let prefix = &link[..pos];
-        let rest = &link[pos + 2..];
-        if let Some(end) = rest.rfind(')') {
-            let url = &rest[..end];
-            let sep = if url.contains('?') { '&' } else { '?' };
-            return format!("{prefix}]({url}{sep}environmentId={env_id})");
-        }
+    let Some(reference) = ThreadLink::parse(link).filter(|r| r.source == link) else {
+        return link.to_owned();
+    };
+    if ThreadTarget::parse_url(reference.url).is_some_and(|t| t.environment.is_some()) {
+        return link.to_owned();
     }
-    link.to_owned()
+    let sep = if reference.url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    thread_markdown(
+        &reference.title,
+        &format!("{}{sep}environmentId={env_id}", reference.url),
+    )
 }
 
 fn decorate_remote_links(val: &mut Value, env_id: &str) {
@@ -728,9 +733,39 @@ fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
     if !a.trim().is_empty() { a } else { b }
 }
 
+fn normalize_thread_reference(payload: &mut Value, field: &str) -> Result<()> {
+    let Some(input) = payload[field].as_str() else {
+        return Ok(());
+    };
+    let input = input.trim();
+    let url = ThreadLink::parse(input)
+        .filter(|l| l.source == input)
+        .map_or(input, |l| l.url);
+    let Some(target) = ThreadTarget::parse_url(url) else {
+        return Ok(());
+    };
+    let id = target.id.to_owned();
+    if let Some(environment) = target.environment {
+        ensure!(
+            payload["environmentId"]
+                .as_str()
+                .is_none_or(|e| e.is_empty() || e == environment),
+            "environmentId conflicts with thread link"
+        );
+        payload["environmentId"] = json!(environment);
+    }
+    payload[field] = json!(id);
+    Ok(())
+}
+
 pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
-    let payload: Value = serde_json::from_slice(body)?;
+    let mut payload: Value = serde_json::from_slice(body)?;
     ensure!(payload.is_object(), "expected request object");
+    match path {
+        "threads/read" | "threads/wait" | "threads/search" => normalize_thread_reference(&mut payload, "threadId")?,
+        "threads/send" => normalize_thread_reference(&mut payload, "targetThreadId")?,
+        _ => {}
+    }
     let env_id = payload["environmentId"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -748,12 +783,15 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
     let core = &w.core;
     let s = core.snapshot()?;
     match path {
-        "threads/list" => list(
-            &s,
-            serde_json::from_value(payload)?,
-            w.options.workspace.as_ref(),
-        ),
-        "threads/read" => read(&s, serde_json::from_value(payload)?),
+        "threads/list" | "threads/read" => {
+            let mut result = if path == "threads/read" {
+                read(&s, serde_json::from_value(payload)?)?
+            } else {
+                list(&s, serde_json::from_value(payload)?, w.options.workspace.as_ref())?
+            };
+            decorate_remote_links(&mut result, &w.environment);
+            Ok(result)
+        }
         "threads/wait" => Ok(json!(wait(core, serde_json::from_value(payload)?).await?)),
         "capabilities" => {
             let q: OrchestratorCapabilitiesQuery = serde_json::from_value(payload)?;
@@ -1200,5 +1238,23 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
             Ok(json!({"hits":hits}))
         }
         _ => Err(missing("orchestration endpoint").into()),
+    }
+}
+
+#[cfg(test)]
+mod thread_link_tests {
+    use super::*;
+
+    #[test]
+    fn read_and_send_extract_environment_before_routing() {
+        let link = thread_markdown("环境 [B]", "vantry-thread://th_B?environmentId=env_B");
+        for field in ["threadId", "targetThreadId"] {
+            let mut request = json!({field: link});
+            normalize_thread_reference(&mut request, field).unwrap();
+            assert_eq!(request[field], "th_B");
+            assert_eq!(request["environmentId"], "env_B");
+        }
+        let mut conflict = json!({"threadId": link, "environmentId": "env_A"});
+        assert!(normalize_thread_reference(&mut conflict, "threadId").is_err());
     }
 }

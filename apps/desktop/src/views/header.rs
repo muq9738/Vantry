@@ -85,8 +85,6 @@ pub(crate) fn header() -> impl IntoElement {
     };
     let dock = computed(|| controller::ui().with(|u| u.dock_open.then_some(u.dock_tab)));
     let remote = computed(|| controller::ui().with(|u| u.remote_target.clone()));
-    let more_open = signal(false);
-    let thread_id = move || selected.get_untracked().unwrap_or_default();
 
     view()
         .h(px(metrics::HEADER_HEIGHT))
@@ -303,85 +301,33 @@ pub(crate) fn header() -> impl IntoElement {
             },
         ))
         // Overflow menu (`…`) for session & app actions
-        .child(
-            view()
-                .relative()
-                .child(icon_button(Icon::Ellipsis, "更多操作", move || {
-                    more_open.set(!more_open.get_untracked());
-                }))
-                .child(when(
-                    move || more_open.get(),
-                    move || {
-                        view()
-                            .absolute()
-                            .top(px(34.0))
-                            .right(px(0.0))
-                            .w(px(180.0))
-                            .flex_col()
-                            .gap_0p5()
-                            .p_1p5()
-                            .rounded(px(10.0))
-                            .bg(colors.card)
-                            .border_1()
-                            .border_color(colors.line)
-                            .shadow_md()
-                            .child(when(
-                                move || selected.with(Option::is_some),
-                                move || {
-                                    view()
-                                        .flex_col()
-                                        .gap_0p5()
-                                        .child(menu_item(Icon::Copy, "复制会话链接", move || {
-                                            more_open.set(false);
-                                            controller::copy_thread_link(thread_id());
-                                        }))
-                                        .child(menu_item(
-                                            Icon::Pencil,
-                                            "重命名会话",
-                                            move || {
-                                                more_open.set(false);
-                                                controller::begin_rename(thread_id());
-                                            },
-                                        ))
-                                        .child(menu_item(
-                                            Icon::GitFork,
-                                            "分叉当前会话",
-                                            move || {
-                                                more_open.set(false);
-                                                controller::fork(thread_id(), None);
-                                            },
-                                        ))
-                                        .child(when(
-                                            move || can_merge.get(),
-                                            move || {
-                                                menu_item(
-                                                    Icon::GitPullRequest,
-                                                    "合并回原会话",
-                                                    move || {
-                                                        more_open.set(false);
-                                                        controller::merge_back(thread_id());
-                                                    },
-                                                )
-                                            },
-                                        ))
-                                },
-                            ))
-                            .child(menu_item(Icon::Monitor, "远程桌面", move || {
-                                more_open.set(false);
-                                let next = if view_kind.get_untracked() == MainView::RemoteDesktop {
-                                    MainView::Conversation
-                                } else {
-                                    MainView::RemoteDesktop
-                                };
-                                controller::show_view(next);
-                            }))
-                            .child(menu_item(Icon::Settings, "设置", move || {
-                                more_open.set(false);
-                                controller::open_settings(SettingsPage::General);
-                            }))
-                    },
-                )),
-        )
+        .child(icon_button(Icon::Ellipsis, "更多操作", move || {
+            let mut items = Vec::new();
+            if let Some(id) = selected.get_untracked() {
+                let action = |label, apply: fn(String)| {
+                    let id = id.clone();
+                    MenuItem::new(label).on_select(move || apply(id.clone()))
+                };
+                items.push(action("复制会话链接", controller::copy_thread_link));
+                items.push(action("重命名会话", controller::begin_rename));
+                items.push(action("分叉当前会话", |id| controller::fork(id, None)));
+                if can_merge.get_untracked() {
+                    items.push(action("合并回原会话", controller::merge_back));
+                }
+            } else {
+                items.push(MenuItem::new("新建会话").on_select(controller::new_thread));
+            }
+            items.push(MenuItem::separator());
+            items.push(MenuItem::new("远程桌面").on_select(move || {
+                controller::show_view(if view_kind.get_untracked() == MainView::RemoteDesktop {
+                    MainView::Conversation
+                } else {
+                    MainView::RemoteDesktop
+                });
+            }));
+            items.push(MenuItem::new("设置").on_select(|| controller::open_settings(SettingsPage::General)));
+            drop(popup_menu(items));
+        }))
         // Right panel open/close toggle
         .child(icon_button(
             Icon::PanelRight,
@@ -402,25 +348,4 @@ fn dock_icon_pill(
         move || dock.get() == Some(tab),
         move || controller::toggle_dock(tab),
     )
-}
-
-fn menu_item(
-    glyph: Icon,
-    label: &'static str,
-    on_press: impl Fn() + 'static,
-) -> nsh_base::ButtonElement {
-    let colors = palette();
-    nsh_base::button()
-        .on_press(on_press)
-        .w_full()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .px_2p5()
-        .py_1p5()
-        .rounded(px(6.0))
-        .hover(|s| s.bg(colors.soft))
-        .active(|s| s.opacity(0.7))
-        .child(icon(glyph, 14.0, colors.muted))
-        .child(text(label).text_size(px(12.5)).text_color(colors.ink))
 }

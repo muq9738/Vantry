@@ -386,6 +386,19 @@ impl RemoteBridge {
         self.tunnel.socket.clone()
     }
 
+    pub(crate) fn environment_id(&self) -> BridgeFuture<String> {
+        let remote = self.clone();
+        Box::pin(async move {
+            let socket = remote.ensure_tunnel().await?;
+            let response = vantry_client::CoreClient::new(socket)
+                .workbench(&workbench::actions::request("environment.info"))
+                .await.map_err(BridgeError::from)?;
+            serde_json::from_str::<serde_json::Value>(&response.output).ok()
+                .and_then(|info| info["id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
+                .ok_or_else(|| BridgeError::unavailable("无法读取远端环境 ID"))
+        })
+    }
+
     async fn ensure_tunnel(&self) -> Result<std::path::PathBuf, BridgeError> {
         if TUNNELS_STOPPING.load(Ordering::Acquire) {
             return Err(BridgeError::unavailable("应用正在退出"));

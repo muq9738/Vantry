@@ -325,24 +325,25 @@ pub(super) fn paste_into_composer(paste: &PasteEvent, editor: InputRef, selectio
         controller::paste_file_uris(&paste.uris);
         return;
     }
-    if has_images && paste.text.trim().is_empty() {
+    let text = crate::state::thread_links::clipboard_text(&paste.text, &paste.html);
+    if has_images && text.trim().is_empty() {
         controller::paste_images(paste);
         return;
     }
-    if !paste.text.is_empty() {
+    if !text.is_empty() {
         // nsh-platform-macos does not implement Command::InsertText yet; splice
         // directly into the controlled draft and move the native caret. A
         // thread link reads as its `@title` where it was pasted, as in v0.1.42.
         let source = controller::state().with_untracked(|s| s.draft().text);
         let (skill, links, body) = draft_parts(&source);
         // A copied thread link alone pastes without its surrounding whitespace.
-        let trimmed = paste.text.trim();
+        let trimmed = text.trim();
         let pasted = if vantry_protocol::ThreadLink::parse(trimmed)
             .is_some_and(|link| link.source == trimmed)
         {
             trimmed
         } else {
-            paste.text.as_str()
+            text.as_ref()
         };
         let (next_body, caret) = splice_text_at_selection(body, selection, pasted);
         let caret = controller::paste_draft_text(

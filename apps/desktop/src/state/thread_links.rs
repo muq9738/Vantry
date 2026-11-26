@@ -82,9 +82,101 @@ pub(crate) fn message_inlines(source: &str) -> Vec<Inline> {
     parts
 }
 
+pub(crate) fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+pub(crate) fn clipboard_html(source: &str) -> String {
+    let mut html = String::new();
+    for part in message_inlines(source) {
+        match part {
+            Inline::Text(text) => html.push_str(&escape_html(&text).replace('\n', "<br>")),
+            Inline::Link { text, url } => html.push_str(&format!(
+                "<a href=\"{}\">{}</a>",
+                escape_html(&url),
+                escape_html(&text)
+            )),
+            _ => unreachable!("message_inlines returns only literal text and thread links"),
+        }
+    }
+    html
+}
+
+/// Convert HTML clipboard anchors to draft Markdown before a plain-text editor drops their hrefs.
+pub(crate) fn pasted_thread_html(html: &str) -> Option<String> {
+    use html5ever::tendril::TendrilSink;
+    use markup5ever_rcdom::{Handle, NodeData, RcDom};
+    fn visit(node: &Handle, out: &mut String, found: &mut bool) {
+        let start = out.len();
+        let mut block = false;
+        let mut href = None;
+        match &node.data {
+            NodeData::Text { contents } => out.push_str(&contents.borrow()),
+            NodeData::Element { name, attrs, .. } => match name.local.as_ref() {
+                "head" | "script" | "style" => return,
+                "br" => out.push('\n'),
+                "p" | "div" | "li" => block = true,
+                "a" => {
+                    href = attrs
+                        .borrow()
+                        .iter()
+                        .find(|a| a.name.local.as_ref() == "href")
+                        .map(|a| a.value.to_string())
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        for child in node.children.borrow().iter() {
+            visit(child, out, found);
+        }
+        if let Some(url) = href.filter(|u| vantry_protocol::ThreadTarget::parse_url(u).is_some()) {
+            let label = out.split_off(start);
+            out.push_str(&vantry_protocol::thread_markdown(&label, &url));
+            *found = true;
+        } else if block && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !html.contains(vantry_protocol::THREAD_SCHEME) {
+        return None;
+    }
+    let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
+    let mut out = String::new();
+    let mut found = false;
+    visit(&dom.document, &mut out, &mut found);
+    found.then(|| out.trim_end_matches('\n').to_owned())
+}
+
+pub(crate) fn clipboard_text<'a>(text: &'a str, html: &str) -> std::borrow::Cow<'a, str> {
+    if !html.contains(vantry_protocol::THREAD_SCHEME)
+        || (text.contains(vantry_protocol::THREAD_SCHEME)
+            && message_inlines(text).iter().any(|i| matches!(i, Inline::Link { .. })))
+    {
+        return text.into();
+    }
+    pasted_thread_html(html).map_or_else(|| text.into(), Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_link_clipboard_flavors_round_trip() {
+        let url = "vantry-thread://th_B?environmentId=env_B";
+        let md = vantry_protocol::thread_markdown("问 [B] & <C>", url);
+        assert_eq!(clipboard_html(&md), format!("<a href=\"{url}\">问 [B] &amp; &lt;C&gt;</a>"));
+        let html = format!("<html><body><p>读 <A href='{url}'><b>问 [B]</b> &amp; &lt;C&gt;</A> 后继续</p></body></html>");
+        assert_eq!(pasted_thread_html(&html).unwrap(), format!("读 {md} 后继续"));
+        assert_eq!(clipboard_text("问 [B] & <C>", &clipboard_html(&md)), md);
+        assert_eq!(clipboard_text(&md, &clipboard_html(&md)), md);
+        assert_eq!(clipboard_text("", &clipboard_html(&md)), md);
+        assert!(pasted_thread_html("<a href='https://example.org'>标题</a>").is_none());
+    }
 
     #[test]
     fn selected_skill_is_a_name_chip_and_reaches_pi_as_a_leading_command() {
