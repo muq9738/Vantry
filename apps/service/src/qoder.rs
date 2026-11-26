@@ -1118,6 +1118,16 @@ pub async fn workbench(data: &Path, r: &WorkbenchRequest) -> Result<Option<Workb
     })
 }
 
+/// Gracefully stops the detached Qoder model plugin host when Core shuts down.
+pub async fn shutdown(data: &Path) {
+    let m = manager(data);
+    if let Some(host) = m.host_info()
+        && m.health(&host).await.is_some()
+    {
+        m.stop_host(&host, Duration::from_secs(3)).await;
+    }
+}
+
 /// Before a run on a `qoder/…` model: the host must be up for Pi to reach it.
 pub async fn prepare_run(data: &Path, model: &str) -> Result<()> {
     if model.split_once('/').is_some_and(|(p, _)| p == ID) {

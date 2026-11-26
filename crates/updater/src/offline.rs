@@ -30,6 +30,7 @@ struct LiveProcess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessKind {
     CoreWorker,
+    ModelPluginHost,
     Other,
 }
 fn service_subcommand<'a>(comm: &str, args: &'a str) -> Option<&'a str> {
@@ -60,7 +61,7 @@ fn processes(target: &Path) -> Result<Vec<LiveProcess>> {
         .filter(|(_, comm)| Path::new(comm).file_name().is_some_and(|n| n == "vantry-service"))
         .map(|(pid, _)| pid.to_string())
         .collect();
-    let mut worker_pids = std::collections::HashSet::new();
+    let mut subcommands = std::collections::HashMap::new();
     if !service_pids.is_empty() {
         let args_out = Command::new("/bin/ps")
             .args(["-ww", "-p", &service_pids.join(","), "-o", "pid=,args="])
@@ -70,9 +71,9 @@ fn processes(target: &Path) -> Result<Vec<LiveProcess>> {
                 if let Some((pid_str, args)) = line.trim().split_once(char::is_whitespace)
                     && let Ok(pid) = pid_str.parse::<u32>()
                     && let Some((_, comm)) = matched.iter().find(|(p, _)| *p == pid)
-                    && service_subcommand(comm, args.trim()) == Some("provider-worker")
+                    && let Some(sub) = service_subcommand(comm, args.trim())
                 {
-                    worker_pids.insert(pid);
+                    subcommands.insert(pid, sub.to_owned());
                 }
             }
         }
@@ -81,13 +82,25 @@ fn processes(target: &Path) -> Result<Vec<LiveProcess>> {
         .into_iter()
         .map(|(pid, _)| LiveProcess {
             pid,
-            kind: if worker_pids.contains(&pid) {
-                ProcessKind::CoreWorker
-            } else {
-                ProcessKind::Other
+            kind: match subcommands.get(&pid).map(String::as_str) {
+                Some("provider-worker") => ProcessKind::CoreWorker,
+                Some("model-plugin-host") => ProcessKind::ModelPluginHost,
+                _ => ProcessKind::Other,
             },
         })
         .collect())
+}
+fn terminate_orphan_plugin_host(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +146,7 @@ fn wait_for_exit(
     opts: &ApplyOptions,
     mut processes: impl FnMut() -> Result<Vec<LiveProcess>>,
     mut core: impl FnMut(&Path, bool) -> Result<Option<Status>>,
+    mut stop_orphan_plugin_host: impl FnMut(u32),
 ) -> Result<Option<u32>> {
     let timeout = if opts.wait_pid.is_some() && opts.wait_timeout.is_zero() {
         Duration::from_secs(20)
@@ -140,6 +154,7 @@ fn wait_for_exit(
         opts.wait_timeout
     };
     let start = Instant::now();
+    let mut signaled_orphans = std::collections::HashSet::new();
     loop {
         let live = processes()?;
         if live.is_empty() {
@@ -153,28 +168,48 @@ fn wait_for_exit(
             && let Ok(Some(status)) = core(dir, false)
             && Some(status.pid) != opts.wait_pid
         {
-            let only_core = live.len() == 1 && live[0].pid == status.pid;
-            let only_core_or_workers = live
+            let only_core_and_plugins = live
                 .iter()
-                .all(|p| p.pid == status.pid || p.kind == ProcessKind::CoreWorker);
-            if only_core && status.state == "ready" && status.active_runs == 0 {
+                .all(|p| p.pid == status.pid || p.kind == ProcessKind::ModelPluginHost);
+            let only_core_managed = live.iter().all(|p| {
+                p.pid == status.pid
+                    || matches!(p.kind, ProcessKind::CoreWorker | ProcessKind::ModelPluginHost)
+            });
+            if only_core_and_plugins && status.state == "ready" && status.active_runs == 0 {
                 match core(dir, true) {
                     Ok(_) => {
                         let start = Instant::now();
-                        while !processes()?.is_empty() {
+                        loop {
+                            let remaining = processes()?;
+                            if remaining.is_empty() {
+                                return Ok(None);
+                            }
+                            let core_gone = !remaining.iter().any(|p| p.pid == status.pid);
+                            if core_gone
+                                && remaining
+                                    .iter()
+                                    .all(|p| p.kind == ProcessKind::ModelPluginHost)
+                            {
+                                // Older Cores did not stop detached model-plugin-host processes on
+                                // shutdown; terminate any remaining orphans once Core has exited.
+                                for p in &remaining {
+                                    if signaled_orphans.insert(p.pid) {
+                                        stop_orphan_plugin_host(p.pid);
+                                    }
+                                }
+                            }
                             ensure!(
                                 start.elapsed() < Duration::from_secs(10),
                                 "Core did not exit"
                             );
                             std::thread::sleep(Duration::from_millis(100));
                         }
-                        return Ok(None);
                     }
                     Err(_) if opts.allow_busy_core => return Ok(Some(status.pid)),
                     Err(e) => return Err(e),
                 }
             }
-            if only_core_or_workers {
+            if only_core_managed {
                 if opts.allow_busy_core {
                     return Ok(Some(status.pid));
                 }
@@ -182,6 +217,17 @@ fn wait_for_exit(
                     status.state == "ready" && status.active_runs == 0,
                     "Core is busy"
                 );
+            }
+        } else if !desktop_alive
+            && live
+                .iter()
+                .all(|p| p.kind == ProcessKind::ModelPluginHost)
+        {
+            // Core is already gone and only orphaned model-plugin-host processes remain.
+            for p in &live {
+                if signaled_orphans.insert(p.pid) {
+                    stop_orphan_plugin_host(p.pid);
+                }
             }
         }
         ensure!(
@@ -200,6 +246,10 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
     let worker = |pid| LiveProcess {
         pid,
         kind: ProcessKind::CoreWorker,
+    };
+    let plugin_host = |pid| LiveProcess {
+        pid,
+        kind: ProcessKind::ModelPluginHost,
     };
     let opts = ApplyOptions {
         data_dir: Some("data".into()),
@@ -225,10 +275,44 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
                     }))
                 }
             },
+            |_| {},
         )?,
         None
     );
     assert!(drained);
+    // Idle Core with a detached model-plugin-host (e.g. older Core before shutdown cleanup):
+    // Core drains first, then the orphaned plugin host is signaled and exits cleanly.
+    let mut orphan_live = vec![
+        vec![proc(42), proc(13), plugin_host(77)],
+        vec![proc(13), plugin_host(77)],
+        vec![plugin_host(77)],
+        vec![],
+    ]
+    .into_iter();
+    let mut orphan_drained = false;
+    let mut terminated = Vec::new();
+    assert_eq!(
+        wait_for_exit(
+            &opts,
+            || Ok(orphan_live.next().unwrap()),
+            |_, shutdown| {
+                if shutdown {
+                    orphan_drained = true;
+                    Ok(None)
+                } else {
+                    Ok(Some(Status {
+                        pid: 13,
+                        state: "ready".into(),
+                        active_runs: 0,
+                    }))
+                }
+            },
+            |pid| terminated.push(pid),
+        )?,
+        None
+    );
+    assert!(orphan_drained);
+    assert_eq!(terminated, vec![77]);
     for (pids, active, refuse) in [
         (vec![proc(42), proc(13)], 0, false),
         (vec![proc(13)], 1, false),
@@ -253,11 +337,12 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
                     active_runs: active,
                 }))
             },
+            |_| {},
         );
         assert!(result.is_err());
         assert_eq!(shutdown_calls, usize::from(refuse));
     }
-    // With allow_busy_core: wait for desktop to exit, then leave busy Core + worker running.
+    // With allow_busy_core: wait for desktop to exit, then leave busy Core + worker + plugin host running.
     let busy_opts = ApplyOptions {
         data_dir: Some("data".into()),
         wait_pid: Some(42),
@@ -265,8 +350,8 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
         allow_busy_core: true,
     };
     let mut busy_live = vec![
-        vec![proc(42), proc(13), worker(99)],
-        vec![proc(13), worker(99)],
+        vec![proc(42), proc(13), worker(99), plugin_host(77)],
+        vec![proc(13), worker(99), plugin_host(77)],
     ]
     .into_iter();
     let mut busy_shutdown_calls = 0;
@@ -284,6 +369,7 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
                     active_runs: 1,
                 }))
             },
+            |_| panic!("must not kill plugin host while Core stays running"),
         )?,
         Some(13)
     );
@@ -298,7 +384,7 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
     assert_eq!(
         wait_for_exit(
             &refused_opts,
-            || Ok(vec![proc(13)]),
+            || Ok(vec![proc(13), plugin_host(77)]),
             |_, shutdown| {
                 if shutdown {
                     bail!("Core still has active work");
@@ -309,6 +395,7 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
                     active_runs: 0,
                 }))
             },
+            |_| panic!("must not kill plugin host when Core stays running"),
         )?,
         Some(13)
     );
@@ -324,6 +411,7 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
                     active_runs: 1,
                 }))
             },
+            |_| {},
         )
         .is_err()
     );
@@ -333,6 +421,13 @@ fn offline_core_drains_only_after_desktop_exit() -> Result<()> {
             "/Applications/Vantry.app/Contents/MacOS/vantry-service provider-worker --job-dir /tmp/x"
         ),
         Some("provider-worker")
+    );
+    assert_eq!(
+        service_subcommand(
+            "/Applications/Vantry.app/Contents/MacOS/vantry-service",
+            "/Applications/Vantry.app/Contents/MacOS/vantry-service model-plugin-host --dir /tmp/q"
+        ),
+        Some("model-plugin-host")
     );
     assert_eq!(
         service_subcommand(
@@ -369,12 +464,18 @@ pub fn apply_staged(staged: &Path, target: &Path, opts: &ApplyOptions) -> Result
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("app"))
     {
-        let kept_core = wait_for_exit(opts, || processes(&target), core)?;
+        let kept_core = wait_for_exit(
+            opts,
+            || processes(&target),
+            core,
+            terminate_orphan_plugin_host,
+        )?;
         let remaining = processes(&target)?;
         let blocking = match kept_core {
-            Some(core_pid) => remaining
-                .iter()
-                .any(|p| p.pid != core_pid && p.kind != ProcessKind::CoreWorker),
+            Some(core_pid) => remaining.iter().any(|p| {
+                p.pid != core_pid
+                    && !matches!(p.kind, ProcessKind::CoreWorker | ProcessKind::ModelPluginHost)
+            }),
             None => !remaining.is_empty(),
         };
         ensure!(!blocking, "application restarted");

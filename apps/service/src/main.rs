@@ -406,6 +406,7 @@ async fn serve(args: CoreArgs) -> Result<()> {
     remote.await?}
     }
 
+    qoder::shutdown(&data).await;
     Ok(())
 }
 async fn ensure_core(args: CoreArgs, raw: &[OsString]) -> Result<()> {
