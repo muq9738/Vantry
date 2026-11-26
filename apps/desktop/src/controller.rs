@@ -850,7 +850,7 @@ pub(crate) fn delegate_child(message: String) {
 pub(crate) fn select_thread(id: String) {
     set_thread_read_state(&id, false);
     if state().with_untracked(|s|s.tasks.iter().any(|t|Some(&t.parent_thread_id)==s.selected.as_ref() && t.child_thread_id==id)) { open_child(id); return; }
-    if ui().with_untracked(|u|u.child_panel.is_some()){close_dock();}
+    let close_child = ui().with_untracked(|u| u.child_panel.is_some());
     let mut request = None;
     state().update(|s| {
         if s.snapshot_loaded {
@@ -873,6 +873,10 @@ pub(crate) fn select_thread(id: String) {
             u.view = MainView::Conversation;
         }
     });
+    // Last: a press from the sub-agent drawer loses its owner when it closes.
+    if close_child {
+        close_dock();
+    }
 }
 
 pub(crate) fn new_thread() {
