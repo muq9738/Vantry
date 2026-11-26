@@ -645,6 +645,35 @@ impl Repo {
         let mut out = WorkbenchResponse::default();
         let settings = &mut self.settings;
         match request.action.as_str() {
+            "git.refs.list" => {
+                use vantry_platform::git::refs::{Branch, Catalog};
+                let branches = self
+                    .branches
+                    .iter()
+                    .map(|name| Branch {
+                        name: name.clone(),
+                        upstream: format!("origin/{name}"),
+                        ahead: if *name == self.branch { self.commits.len().saturating_sub(2) } else { 0 },
+                        ..Default::default()
+                    })
+                    .collect();
+                out.output = serde_json::to_string(&Catalog {
+                    current: self.branch.clone(),
+                    branches,
+                    ..Default::default()
+                })
+                .map_err(|e| invalid(e.to_string()))?;
+            }
+            "git.refs.checkout" => {
+                let branch = request
+                    .branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or_default();
+                if !self.branches.iter().any(|b| b == branch) {
+                    return Err(invalid("没有这个分支"));
+                }
+                self.branch = branch.into();
+            }
             names::MODELS => out.catalog = Some(settings.models.clone()),
             names::PI_STATUS => out.pi_runtime = settings.pi.clone(),
             names::PI_SETUP_SAVE => {

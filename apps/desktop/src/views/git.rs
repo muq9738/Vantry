@@ -15,6 +15,9 @@ use crate::{
     theme::palette,
 };
 
+mod branches;
+pub(crate) use branches::dialog as branch_dialog;
+
 const MONO: &str = "Menlo";
 const MAX_DIFF_BYTES: usize = 180 * 1024;
 const COMMIT_PAGE_SIZE: usize = 100;
@@ -86,7 +89,7 @@ pub(super) fn git_tools() -> impl IntoElement {
                 .child(
                     view().tooltip(super::tip(crate::tr("抓取远程更新 (Fetch)"))).child(
                         small_icon_button(Icon::RefreshCw, "抓取", || {
-                            controller::git_sync_action("git.fetch")
+                            controller::open_branch_filter("抓取远程更新")
                         })
                         .disabled(move || busy.get()),
                     ),
@@ -94,7 +97,7 @@ pub(super) fn git_tools() -> impl IntoElement {
                 .child(
                     view().tooltip(super::tip(crate::tr("拉取 (Pull)"))).child(
                         small_icon_button(Icon::Download, "拉取", || {
-                            controller::git_sync_action("git.pull")
+                            controller::open_branch_filter("更新项目")
                         })
                         .disabled(move || busy.get()),
                     ),
@@ -102,7 +105,7 @@ pub(super) fn git_tools() -> impl IntoElement {
                 .child(
                     view().tooltip(super::tip(crate::tr("推送 (Push)"))).child(
                         small_icon_button(Icon::Upload, "推送", || {
-                            controller::git_sync_action("git.push")
+                            controller::open_branch_filter("推送")
                         })
                         .disabled(move || busy.get()),
                     ),

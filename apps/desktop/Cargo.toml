@@ -25,6 +25,7 @@ serde_json.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 vantry-client.workspace = true
+vantry-platform.workspace = true
 vantry-protocol.workspace = true
 url.workspace = true
 

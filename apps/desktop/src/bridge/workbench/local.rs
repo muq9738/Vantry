@@ -612,6 +612,22 @@ impl WorkbenchBridge for LocalWorkbench {
     /// What the desktop answers without a Core: the command line's model,
     /// and this build’s version.
     fn workbench(&self, request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
+        if request.action.starts_with("git.refs.") {
+            let root = self.root.clone();
+            return Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    let repo = vantry_platform::git::Repository::discover(&root)?;
+                    let output = vantry_platform::git::refs::action(&repo, &request)?;
+                    Ok::<_, anyhow::Error>(WorkbenchResponse {
+                        output,
+                        ..Default::default()
+                    })
+                })
+                .await
+                .map_err(|e| BridgeError::unavailable(e.to_string()))?
+                .map_err(|e| BridgeError::new(ErrorCode::InvalidCommand, e.to_string()))
+            });
+        }
         let model = self.model.clone();
         Box::pin(async move {
             let mut response = WorkbenchResponse::default();
@@ -636,7 +652,7 @@ impl WorkbenchBridge for LocalWorkbench {
             if branch.is_empty() || branch.starts_with('-') {
                 return Err(BridgeError::new(ErrorCode::InvalidCommand, "分支名无效"));
             }
-            run_git(&root, &["checkout".into(), "-q".into(), branch]).await.map(|_| ())
+            run_git(&root, &["checkout".into(), "-q".into(), branch, "--".into()]).await.map(|_| ())
         })
     }
 

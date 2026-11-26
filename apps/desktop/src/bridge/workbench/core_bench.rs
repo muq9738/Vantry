@@ -410,7 +410,12 @@ impl WorkbenchBridge for CoreWorkbench {
         })
     }
 
-    fn workbench(&self, request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
+    fn workbench(&self, mut request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
+        if request.action.starts_with("git.refs.") {
+            if !self.core_fs { return self.local.workbench(request); }
+            request.workspace = self.root();
+            return Box::pin(Self::ask(self.socket.clone(), request));
+        }
         let socket = self.socket.clone();
         let local = self.local.clone();
         Box::pin(Self::call(socket, local, request))
@@ -531,6 +536,35 @@ mod tests {
             drop(self.bench);
             self.dir.close().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn branch_requests_use_the_project_host_even_if_the_core_rejects_them() {
+        let fx = Fixture::new(Arc::new(|request: &Value| {
+            assert_eq!(request["workspace"], "/paired/project");
+            api_error("invalid_command", "unknown action on paired Core")
+        }));
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(fx.dir.path())
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let list = actions::request("git.refs.list");
+        assert!(fx.bench.workbench(list.clone()).await.is_ok());
+        assert!(fx.seen().is_empty());
+        let remote = CoreWorkbench::for_core_workspace(
+            fx.bench.socket.clone(),
+            "/paired/project".into(),
+            fx.bench.local.clone(),
+            None,
+        );
+        let error = remote.workbench(list).await.unwrap_err();
+        assert!(error.message.contains("paired Core"));
+        assert_eq!(fx.seen(), ["git.refs.list"]);
+        fx.finish().await;
     }
 
     #[tokio::test]

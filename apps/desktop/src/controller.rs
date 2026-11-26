@@ -2955,30 +2955,6 @@ pub(crate) fn reveal_workspace() {
 
 // ------------------------------------------------------------ git extras
 
-/// Switches the workspace's branch.
-pub(crate) fn git_checkout(branch: String) {
-    let Some((project, workbench)) = project_workbench() else {
-        return;
-    };
-    let mut go = false;
-    bench().update(|b| go = b.git.begin());
-    if !go {
-        return;
-    }
-    spawn_for_window(async move {
-        let result = call(workbench.git_checkout(branch))
-            .await
-            .map(|()| None)
-            .map_err(|e| e.message);
-        let mut next = None;
-        bench().update(|b| b.apply_project_result(project, |b| next = Some(b.git.on_done(result))));
-        let mut loads: Vec<Load> = next.into_iter().collect();
-        // The tree may differ on the other branch.
-        bench().update(|b| b.apply_project_result(project, |b| loads.extend(b.files.refresh())));
-        run_loads(loads);
-    });
-}
-
 /// Asks before throwing away `path`'s unstaged changes.
 pub(crate) fn ask_discard(path: Option<String>) {
     bench().update(move |b| b.git.confirm_discard = path);
@@ -3005,10 +2981,6 @@ pub(crate) fn git_discard(paths: Vec<String>) {
         bench().update(|b| b.apply_project_result(project, |b| next = Some(b.git.on_done(result))));
         run_loads(next.into_iter().collect());
     });
-}
-
-pub(crate) fn toggle_branch_menu() {
-    bench().update(|b| b.git.branch_menu = !b.git.branch_menu);
 }
 
 // ------------------------------------------------------------- file search

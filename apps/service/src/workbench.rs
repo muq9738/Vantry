@@ -673,6 +673,7 @@ impl Workbench {
             paths.clone()
         };
         if !matches!(s, "git.status" | "git.branches" | "git.diff" | "git.fetch")
+            && !git::refs::read_only(s)
             && !r.thread_id.is_empty()
         {
             ensure!(
@@ -685,6 +686,10 @@ impl Workbench {
                     .any(|run| !run.status.terminal()),
                 "thread has active runs"
             );
+        }
+        if s.starts_with("git.refs.") {
+            out.output = git::refs::action(&repo, &r)?;
+            return Ok(out);
         }
         match s {
             "git.diff" => {
