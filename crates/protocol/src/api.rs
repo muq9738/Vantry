@@ -414,6 +414,53 @@ pub struct Cohort {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RunBlockKind {
+    #[default]
+    #[serde(rename = "")]
+    Unspecified,
+    #[serde(rename = "user")]
+    User,
+    #[serde(rename = "reasoning")]
+    Reasoning,
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "tool")]
+    Tool,
+    #[serde(rename = "steer")]
+    Steer,
+    #[serde(rename = "approval")]
+    Approval,
+    #[serde(rename = "status")]
+    Status,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBlock {
+    pub id: String,
+    pub thread_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attempt_id: String,
+    pub seq: i64,
+    pub kind: RunBlockKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ref_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+    #[serde(serialize_with = "go_time")]
+    pub created_at: String,
+    #[serde(serialize_with = "go_time")]
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -434,6 +481,8 @@ pub struct Snapshot {
     pub tools: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requests: Vec<PendingRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<RunBlock>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -550,6 +599,8 @@ pub struct ThreadDetail {
     pub inputs: Option<Vec<Input>>,
     pub tools: Option<Vec<ToolCall>>,
     pub requests: Option<Vec<PendingRequest>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<RunBlock>,
     pub run_count: i64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated_runs: bool,

@@ -94,6 +94,7 @@ pub(super) fn apply(db: &Connection, c: &Command, options: &CoreOptions) -> Resu
                 "steering_messages",
                 "provider_requests",
                 "tool_calls",
+                "run_blocks",
             ] {
                 db.execute(&format!("DELETE FROM {table} WHERE thread_id=?"), [&t.id])?;
             }
@@ -117,6 +118,7 @@ fn delete_run(db: &Connection, key: &str) -> Result<()> {
         "tool_calls",
         "provider_requests",
         "project_updates",
+        "run_blocks",
         "attempts",
     ] {
         db.execute(&format!("DELETE FROM {table} WHERE run_id=?"), [key])?;
@@ -187,7 +189,8 @@ fn fork(db: &Connection, c: &Command, t: Thread, options: &CoreOptions) -> Resul
              1,status,input,created_at,updated_at FROM runs WHERE id=?",
             params![att, run],
         )?;
-        run_event(db, &run, "run.completed")?;
+        let forked_blocks = crate::store::blocks::fork_run_blocks(db, &source, &child.id, &run, &att)?;
+        run_event_with_blocks(db, &run, "run.completed", &forked_blocks)?;
     }
     Ok(receipt(&child.id, ""))
 }

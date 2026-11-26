@@ -765,6 +765,8 @@ pub(crate) fn continuation(db: &Connection, parent: &str) -> Result<()> {
             "\n\n"
         };
         attempt(db, &p.thread_id, parent, &att, &prompt)?;
+        crate::store::blocks::clear_status(db, parent)?;
+        crate::store::blocks::close_streaming(db, parent)?;
         db.execute(
             "UPDATE runs SET attempt_id=?,active_attempt_id=?,status='queued',error='',updated_at=?,
                  output=output||? WHERE id=?",

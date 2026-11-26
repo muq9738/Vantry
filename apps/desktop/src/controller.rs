@@ -1404,9 +1404,9 @@ pub(crate) fn close_attachment_preview() {
     ui().update(|u| u.attachment_preview = None);
 }
 
-/// Copies a reply's text row.
-pub(crate) fn copy_reply(run_id: String, start: usize, end: usize) {
-    let text = state().with_untracked(|s| s.text_of(&run_id, start, end));
+/// Copies a run's reply text.
+pub(crate) fn copy_reply(run_id: String) {
+    let text = state().with_untracked(|s| s.reply_text(&run_id));
     copy_message_text(text);
 }
 

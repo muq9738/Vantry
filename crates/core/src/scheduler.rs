@@ -650,6 +650,7 @@ pub(crate) fn finish(db: &Connection, r: &Run, status: &str, reason: &str) -> Re
              AND status IN ('pending','claimed')",
         [&r.attempt_id],
     )?;
+    crate::store::blocks::close_streaming(db, &r.id)?;
     for key in strings(
         db,
         "SELECT id FROM provider_requests WHERE attempt_id=? AND status IN ('pending',
@@ -699,7 +700,9 @@ pub(crate) fn finish(db: &Connection, r: &Run, status: &str, reason: &str) -> Re
             row.get(0)
         })?;
     if attempt == r.attempt_id {
-        run_event(db, &r.id, &format!("run.{projected}"))?;
+        let updated_run = run(db, &r.id)?;
+        let status_block = crate::store::blocks::set_status(db, &updated_run, projected, reason)?;
+        run_event_with_block(db, &r.id, &format!("run.{projected}"), status_block.as_ref())?;
     }
     tasks::watches::deliver(db, &run(db, &r.id)?)?;
     tasks::sync_child(db, &r.id)?;

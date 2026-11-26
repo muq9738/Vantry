@@ -12,7 +12,7 @@ mod tasks;
 pub mod telemetry;
 pub use engine::{Core, CoreOptions};
 pub use runner::{DurableProvider, ProviderError};
-pub const SCHEMA_USER_VERSION: u32 = 11;
+pub const SCHEMA_USER_VERSION: u32 = 12;
 use vantry_protocol::ErrorCode;
 
 #[derive(Debug, thiserror::Error)]

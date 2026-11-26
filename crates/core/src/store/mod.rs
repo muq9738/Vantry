@@ -1,3 +1,4 @@
+pub(crate) mod blocks;
 pub(crate) mod projection;
 mod schema;
 #[cfg(test)]

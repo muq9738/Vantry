@@ -9,7 +9,10 @@
 
 use std::sync::Arc;
 
-use nsh_core::{LineHeight, ListAlignment, prelude::*};
+use nsh_core::{
+    LineHeight, ListAlignment, PointerEvents, element::ViewableItems, geometry::Percentage,
+    prelude::*,
+};
 
 use super::{dot, ghost_button, markdown, primary_button, small_icon_button};
 use crate::{
@@ -30,6 +33,7 @@ const FOLLOW_THRESHOLD: f32 = 120.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     User,
+    Steer,
     Reasoning,
     Text,
     Tools,
@@ -40,6 +44,7 @@ enum Kind {
 fn kind_of(item: &TimelineItem) -> Kind {
     match item {
         TimelineItem::User { .. } => Kind::User,
+        TimelineItem::Steer { .. } => Kind::Steer,
         TimelineItem::Reasoning { .. } => Kind::Reasoning,
         TimelineItem::Text { .. } => Kind::Text,
         TimelineItem::Tools { .. } => Kind::Tools,
@@ -77,7 +82,19 @@ fn thread_timeline(thread: Memo<Option<String>>) -> impl IntoElement {
                 .unwrap_or_default()
         })
     });
+    let turns = computed(move || {
+        let current = structure.get();
+        controller::state().with_untracked(|s| {
+            current
+                .map(|(t, _)| s.timeline.turns(&t))
+                .unwrap_or_default()
+        })
+    });
     let at_end = signal(true);
+    let viewable = signal::<Option<(usize, usize)>>(None);
+    let active_turn = computed(move || {
+        turns.with(|ts| crate::state::timeline::active_turn(ts, viewable.get(), at_end.get()))
+    });
     let list = element_ref();
     let opening = std::cell::Cell::new(true);
 
@@ -106,9 +123,18 @@ fn thread_timeline(thread: Memo<Option<String>>) -> impl IntoElement {
                         at_end.set(near);
                     }
                 })
+                .on_viewable_items_change(move |e: &ViewableItems| {
+                    if viewable.get_untracked() != e.viewable {
+                        viewable.set(e.viewable);
+                    }
+                })
                 .element_ref(&list)
                 .flex_1(),
         )
+        .child(when(
+            move || turns.with(|ts| ts.len() >= 2),
+            move || turn_rail(turns, active_turn, at_end, list.clone()),
+        ))
         .child(when(
             move || !at_end.get() && keys.with(|k| !k.is_empty()),
             move || {
@@ -136,6 +162,102 @@ fn thread_timeline(thread: Memo<Option<String>>) -> impl IntoElement {
         ))
 }
 
+/// Vertical turn-navigation dots pinned on the left edge of the timeline,
+/// matching Antigravity's conversation minimap rail.
+fn turn_rail(
+    turns: Memo<Vec<crate::state::timeline::TurnAnchor>>,
+    active: Memo<Option<usize>>,
+    at_end: Signal<bool>,
+    list: ElementRef,
+) -> impl IntoElement {
+    let colors = palette();
+    view()
+        .absolute()
+        .left_2()
+        .top_0()
+        .bottom_0()
+        .justify_center()
+        .items_center()
+        .pointer_events(PointerEvents::BoxNone)
+        .child(
+            scroll()
+                .max_h(px(280.0))
+                .pointer_events(PointerEvents::Auto)
+                .child(
+                    view()
+                        .flex_col()
+                        .items_center()
+                        .py_1()
+                        .child(each(
+                            move || {
+                                turns.with(|ts| {
+                                    ts.iter()
+                                        .enumerate()
+                                        .map(|(i, t)| (i, t.clone()))
+                                        .collect::<Vec<_>>()
+                                })
+                            },
+                            |(_, t): &(usize, crate::state::timeline::TurnAnchor)| t.run_id.clone(),
+                            move |entry, _| {
+                                let list = list.clone();
+                                let index = move || entry.with(|(i, _)| *i);
+                                let is_active = move || active.get() == Some(index());
+                                let label = entry.with_untracked(|(i, t)| {
+                                    if t.preview.is_empty() {
+                                        format!("第 {} 轮", i + 1)
+                                    } else {
+                                        format!("第 {} 轮 · {}", i + 1, t.preview)
+                                    }
+                                });
+                                view()
+                                    .tooltip(super::tip(label.clone()))
+                                    .child(
+                                        nsh_base::button()
+                                            .accessibility_label(label)
+                                            .on_press(move || {
+                                                let (i, row_index) = entry
+                                                    .with_untracked(|(i, t)| (*i, t.row_index));
+                                                let last = turns.with_untracked(|ts| {
+                                                    ts.len().saturating_sub(1)
+                                                });
+                                                at_end.set(i == last);
+                                                list.scroll_to_index(
+                                                    row_index as u32,
+                                                    Percentage(0.0),
+                                                    px(12.0),
+                                                    true,
+                                                );
+                                            })
+                                            .w(px(16.0))
+                                            .h(px(14.0))
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .hover(|s| s.bg(colors.soft))
+                                            .active(|s| s.opacity(0.6))
+                                            .child(
+                                                view()
+                                                    .w(px(5.5))
+                                                    .h(px(5.5))
+                                                    .rounded_full()
+                                                    .bg(move || {
+                                                        if is_active() {
+                                                            colors.ink
+                                                        } else {
+                                                            colors.faint
+                                                        }
+                                                    })
+                                                    .opacity(move || {
+                                                        if is_active() { 1.0_f32 } else { 0.55_f32 }
+                                                    }),
+                                            ),
+                                    )
+                            },
+                        )),
+                ),
+        )
+}
+
 /// A cell at `at`: its parts follow the row now at that position.
 fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
     let item = computed(move || {
@@ -159,6 +281,7 @@ fn row(at: Position, thread: Memo<Option<String>>) -> impl IntoElement {
                 .max_w(px(metrics::READING_WIDTH))
                 .child(dynamic(move || match kind.get() {
                     Some(Kind::User) => user_row(item).into_element(),
+                    Some(Kind::Steer) => steer_row(item).into_element(),
                     Some(Kind::Reasoning) => reasoning_row(item, 2).into_element(),
                     Some(Kind::Text) => text_row(item).into_element(),
                     Some(Kind::Tools) => tools_row(item).into_element(),
@@ -377,14 +500,6 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.clone()).unwrap_or_default());
     let visible_text = computed(move || text_of());
     let is_wake = computed(move || visible_text.with(|t| t.starts_with(DELEGATED_WAKE_PREFIX)));
-    let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
-    let inserted = computed(move || {
-        revision.get();
-        let id = user.with(|u| u.as_ref().map(|u| u.0.clone()));
-        controller::state().with_untracked(|s| s.inputs.iter().filter(|i| {
-            Some(i.run_id.as_str()) == id.as_deref() && i.kind == "steer" && matches!(i.status.as_str(), "delivered" | "failed")
-        }).map(|i| (i.id.clone(), i.message.clone(), i.status == "delivered", i.error.clone())).collect::<Vec<_>>())
-    });
     let run_id = move || user.with_untracked(|u| u.as_ref().map(|u| u.0.clone()).unwrap_or_default());
     // Rewind and fork need the run finished and the thread idle.
     let settled = computed(move || {
@@ -510,18 +625,14 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                                 })),
                         ),
                 )
-                .child(each(move || inserted.get(), |i| i.0.clone(), |item, _| {
-                    view().flex_col().items_end().gap_1().child(super::caption(move || item.with(|(_, _, ok, error)| {
-                        if *ok { "已插入本轮".to_owned() } else { format!("插入失败 · {error}") }
-                    }))).child(text(move || item.with(|i| i.1.clone())).select_text().text_color(colors.ink).text_size(px(metrics::BODY)))
-                }))
                 .child(when(
-                    move || hovered.get() && settled.get(),
+                    move || settled.get(),
                     move || {
                         view()
                             .flex_row()
                             .gap_0p5()
                             .pr_7()
+                            .opacity(move || if hovered.get() { 1.0_f32 } else { 0.0_f32 })
                             .child(small_icon_button(Icon::GitFork, "从此分叉", move || {
                                 controller::fork(thread_id(), Some(run_id()));
                             }))
@@ -533,6 +644,186 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
         )
         .into_element()
     })
+}
+
+/// First-class mid-run steering message rendered at its causal timeline position.
+fn steer_row(item: ItemMemo) -> impl IntoElement {
+    let colors = palette();
+    let steer = computed(move || match item.get() {
+        Some(TimelineItem::Steer {
+            text,
+            attachments,
+            delivered,
+            error,
+            ..
+        }) => Some((text, attachments, delivered, error)),
+        _ => None,
+    });
+    let text_of = move || steer.with(|s| s.as_ref().map(|s| s.0.to_string()).unwrap_or_default());
+    let attachments = move || steer.with(|s| s.as_ref().map(|s| s.1.clone()).unwrap_or_default());
+    let delivered = move || steer.with(|s| s.as_ref().is_none_or(|s| s.2));
+    let badge = move || {
+        steer.with(|s| match s {
+            Some((_, _, true, _)) => "已插入本轮".to_owned(),
+            Some((_, _, false, err)) if !err.trim().is_empty() => format!("插入失败 · {err}"),
+            Some((_, _, false, _)) => "插入失败".to_owned(),
+            None => String::new(),
+        })
+    };
+    let visible_text = computed(move || text_of());
+    let hovered = signal(false);
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_row()
+        .justify_end()
+        .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
+        .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
+        .child(
+            view()
+                .w_full()
+                .min_w(px(0.0))
+                .max_w(px(560.0))
+                .flex_col()
+                .items_end()
+                .gap_1()
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .pr_7()
+                        .child(
+                            text(badge)
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(move || {
+                                    if delivered() {
+                                        colors.muted
+                                    } else {
+                                        colors.danger
+                                    }
+                                }),
+                        ),
+                )
+                .child(when(
+                    move || !attachments().is_empty(),
+                    move || {
+                        let numbered = computed(move || {
+                            let lang = controller::ui().with(|u| u.locale);
+                            let mut img_seq = 0usize;
+                            attachments()
+                                .into_iter()
+                                .map(|item| {
+                                    let lbl = if item.mime.starts_with("image/") {
+                                        img_seq += 1;
+                                        attachment_short_name(&item, img_seq, lang)
+                                    } else {
+                                        attachment_short_name(&item, 0, lang)
+                                    };
+                                    (item, lbl)
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        view()
+                            .flex_row()
+                            .flex_wrap()
+                            .justify_end()
+                            .items_center()
+                            .gap_1p5()
+                            .pr(px(30.0))
+                            .child(each(
+                                move || numbered.get(),
+                                |(item, _): &(vantry_protocol::Attachment, String)| item.id.clone(),
+                                |entry, _| {
+                                    dynamic(move || {
+                                        let (item, label) = entry.get();
+                                        if item.mime.starts_with("image/") {
+                                            super::composer::attachment_thumbnail_labeled(
+                                                item,
+                                                Some(label),
+                                            )
+                                            .into_element()
+                                        } else {
+                                            super::caption(format!("@{label}")).into_element()
+                                        }
+                                    })
+                                },
+                            ))
+                    },
+                ))
+                .child(
+                    view()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex_row()
+                        .justify_end()
+                        .items_end()
+                        .gap_1p5()
+                        .child(when(
+                            move || !visible_text.get().trim().is_empty(),
+                            move || {
+                                view()
+                                    .flex_shrink(1.0)
+                                    .min_w(px(0.0))
+                                    .max_w(px(520.0))
+                                    .px_4()
+                                    .py_2p5()
+                                    .rounded(px(16.0))
+                                    .bg(colors.user)
+                                    .border_1()
+                                    .border_color(move || {
+                                        if delivered() {
+                                            colors.line_soft
+                                        } else {
+                                            colors.danger
+                                        }
+                                    })
+                                    .overflow_hidden()
+                                    .child(dynamic(move || {
+                                        let text = visible_text.get();
+                                        let files = attachments();
+                                        let lang = controller::ui().with(|u| u.locale);
+                                        let (skill, body) =
+                                            crate::state::thread_links::skill_prefix(&text);
+                                        let mut inlines = highlight_attachment_mentions(
+                                            crate::state::thread_links::message_inlines(body),
+                                            &files,
+                                            lang,
+                                        );
+                                        if let Some(name) = skill {
+                                            inlines.insert(
+                                                0,
+                                                crate::state::markdown::Inline::Text(" ".into()),
+                                            );
+                                            inlines.insert(
+                                                0,
+                                                crate::state::markdown::Inline::Code(
+                                                    name.to_owned(),
+                                                ),
+                                            );
+                                        }
+                                        markdown::inline_text(&inlines)
+                                            .w_full()
+                                            .min_w(px(0.0))
+                                            .select_text()
+                                            .text_size(px(metrics::BODY))
+                                            .line_height(LineHeight::Multiple(1.55))
+                                            .text_color(colors.ink)
+                                    }))
+                            },
+                        ))
+                        .child(
+                            view()
+                                .flex_shrink_0()
+                                .pb_1()
+                                .opacity(move || if hovered.get() { 1.0_f32 } else { 0.45_f32 })
+                                .child(small_icon_button(Icon::Copy, "复制消息", move || {
+                                    controller::copy_message(text_of(), attachments());
+                                })),
+                        ),
+                ),
+        )
 }
 
 pub(crate) fn reasoning_row(item: ItemMemo, preview_lines: u32) -> impl IntoElement {
@@ -610,10 +901,8 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
             })
         )
     };
-    let range = move || match item.get_untracked() {
-        Some(TimelineItem::Text {
-            run_id, start, end, ..
-        }) => Some((run_id, start, end)),
+    let run_id_of = move || match item.get_untracked() {
+        Some(TimelineItem::Text { run_id, .. }) => Some(run_id),
         _ => None,
     };
     let settled = computed(move || {
@@ -630,13 +919,12 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
     // Only the reply's last text carries the actions, and they act on the
     // whole reply, as Claude's desktop does: text between tool calls stays
     // quiet instead of repeating a bar after every step.
-    let last = computed(move || {
-        let Some(TimelineItem::Text { run_id, end, .. }) = item.get() else {
-            return false;
-        };
-        controller::state().with(|s| s.run(&run_id).is_some_and(|r| r.output.len() == end))
-    });
-    let reply = move || range().map(|(run, _, end)| (run, 0, end));
+    let last = move || {
+        matches!(
+            item.get(),
+            Some(TimelineItem::Text { is_last: true, .. })
+        )
+    };
     let hovered = signal(false);
     view()
         .flex_col()
@@ -655,7 +943,7 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
         }))
         // Quiet v0.1.42 reply action bar: copy / quote / fork / rewind / preview
         .child(when(
-            move || !streaming() && last.get(),
+            move || !streaming() && last(),
             move || {
                 view()
                     .flex_row()
@@ -663,20 +951,20 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
                     .gap_1()
                     .opacity(move || if hovered.get() { 1.0_f32 } else { 0.55_f32 })
                     .child(small_icon_button(Icon::Copy, "复制回复", move || {
-                        if let Some((run, start, end)) = reply() {
-                            controller::copy_reply(run, start, end);
+                        if let Some(run) = run_id_of() {
+                            controller::copy_reply(run);
                         }
                     }))
                     .child(small_icon_button(Icon::Quote, "引用到输入框", move || {
-                        if let Some((run, start, end)) = reply() {
+                        if let Some(run) = run_id_of() {
                             let snippet = controller::state()
-                                .with_untracked(|s| s.text_of(&run, start, end));
+                                .with_untracked(|s| s.reply_text(&run));
                             controller::quote_to_draft(snippet);
                         }
                     }))
                     .child(
                         small_icon_button(Icon::GitFork, "从此分叉", move || {
-                            if let Some((run, _, _)) = range() {
+                            if let Some(run) = run_id_of() {
                                 controller::fork(thread_id(), Some(run));
                             }
                         })
@@ -684,16 +972,16 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
                     )
                     .child(
                         small_icon_button(Icon::Undo2, "回退到此前", move || {
-                            if let Some((run, _, _)) = range() {
+                            if let Some(run) = run_id_of() {
                                 controller::ask_rewind(thread_id(), run);
                             }
                         })
                         .disabled(move || !settled.get()),
                     )
                     .child(small_icon_button(Icon::Eye, "在预览中打开", move || {
-                        if let Some((run, start, end)) = reply() {
+                        if let Some(run) = run_id_of() {
                             let text = controller::state()
-                                .with_untracked(|s| s.text_of(&run, start, end));
+                                .with_untracked(|s| s.reply_text(&run));
                             controller::preview_text(String::new(), text);
                         }
                     }))

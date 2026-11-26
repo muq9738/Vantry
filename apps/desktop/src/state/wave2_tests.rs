@@ -74,8 +74,10 @@ fn rebuilt(state: &AppState) -> Vec<TimelineItem> {
     let mut fresh = state.timeline.clone();
     fresh.rebuild_all(state.runs.iter().map(|run| RunParts {
         run,
+        blocks: state.blocks.iter().filter(|b| b.run_id == run.id).collect(),
         tools: state.tools.iter().filter(|t| t.run_id == run.id).collect(),
         requests: state.requests.iter().filter(|r| r.run_id == run.id).collect(),
+        inputs: state.inputs.iter().filter(|i| i.run_id == run.id).collect(),
     }));
     let thread = state.selected.clone().unwrap();
     fresh.rows(&thread).cloned().collect()

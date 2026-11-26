@@ -319,8 +319,10 @@ pub(crate) fn create_run(
         ],
     )?;
     attempt(db, &t.id, &run_id, &att, message)?;
-    run_event(db, &run_id, "run.queued")?;
-    run(db, &run_id)
+    let r = run(db, &run_id)?;
+    let user_block = crate::store::blocks::record_user(db, &r)?;
+    run_event_with_block(db, &run_id, "run.queued", user_block.as_ref())?;
+    Ok(r)
 }
 fn queued(db: &Connection, thread: &str) -> Result<Vec<String>> {
     strings(
@@ -356,6 +358,8 @@ pub(crate) fn settle_waiting_run(db: &Connection, run_id: &str) -> Result<bool> 
         params![now(), run_id],
     )? > 0
     {
+        crate::store::blocks::clear_status(db, run_id)?;
+        crate::store::blocks::close_streaming(db, run_id)?;
         run_event(db, run_id, "run.completed")?;
         Ok(true)
     } else {

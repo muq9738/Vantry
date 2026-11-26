@@ -384,7 +384,7 @@ pub(crate) fn composer(dragging: Signal<bool>) -> impl IntoElement {
     let todo = computed(|| {
         controller::state().with(|s| {
             let thread = s.selected.as_deref()?;
-            crate::state::todo::latest(s.tools.iter(), thread)
+            crate::state::todo::latest(s.tools.iter(), &s.runs, thread)
         })
     });
     let subagents = computed(|| {

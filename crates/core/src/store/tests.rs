@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use vantry_protocol::{Command, CommandKind};
 #[test]
 fn every_published_version_preserves_history_and_upgrades_idempotently() {
-    for v in 1..=11 {
+    for v in 1..=12 {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let db = Connection::open(&path).unwrap();
@@ -32,7 +32,7 @@ fn every_published_version_preserves_history_and_upgrades_idempotently() {
             assert_eq!(
                 db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                11
+                12
             );
             assert_eq!(
                 db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
@@ -172,11 +172,52 @@ fn newer_schema_is_refused_before_wal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite");
     let db = Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 12).unwrap();
+    db.pragma_update(None, "user_version", 13).unwrap();
     assert!(Core::open(dir.path()).is_err());
     assert_eq!(
         db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
             .unwrap(),
         "delete"
+    );
+}
+#[test]
+fn upgrading_v11_backfills_historical_run_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let db = Connection::open(&path).unwrap();
+    for ddl in &DDLS[..11] {
+        db.execute_batch(ddl).unwrap();
+    }
+    db.pragma_update(None, "user_version", 11i64).unwrap();
+    db.execute_batch(
+        "INSERT INTO threads(id,title,created_at) VALUES('th1','历史会话',10);
+         INSERT INTO runs(id,thread_id,attempt_id,active_attempt_id,status,input,output,reasoning,error,created_at,updated_at)
+           VALUES('run1','th1','att1','','completed','问问题','前半段后半段','历史思考','',11,20);
+         INSERT INTO tool_calls(id,thread_id,run_id,attempt_id,name,arguments,output,status,updated_at,output_offset)
+           VALUES('tc1','th1','run1','att1','read','{}','ok','completed',15,9);
+         INSERT INTO inputs(id,thread_id,run_id,attempt_id,kind,message,attachments,command_id,status,disposition,error,created_at,updated_at,queue_order)
+           VALUES('st1','th1','run1','att1','steer','中途引导','[]','cmd1','delivered','','',16,17,0);",
+    )
+    .unwrap();
+    drop(db);
+
+    let core = Core::open(dir.path()).unwrap();
+    let snap = core.snapshot().unwrap();
+    let summary: Vec<(vantry_protocol::RunBlockKind, String)> = snap
+        .blocks
+        .iter()
+        .filter(|b| b.run_id == "run1")
+        .map(|b| (b.kind, b.text.clone()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (vantry_protocol::RunBlockKind::User, "问问题".into()),
+            (vantry_protocol::RunBlockKind::Reasoning, "历史思考".into()),
+            (vantry_protocol::RunBlockKind::Text, "前半段".into()),
+            (vantry_protocol::RunBlockKind::Tool, "".into()),
+            (vantry_protocol::RunBlockKind::Text, "后半段".into()),
+            (vantry_protocol::RunBlockKind::Steer, "中途引导".into()),
+        ]
     );
 }

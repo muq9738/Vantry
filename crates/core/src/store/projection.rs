@@ -140,8 +140,38 @@ pub(crate) fn sequence(db: &Connection) -> Result<i64> {
     )?)
 }
 pub(crate) fn run_event(db: &Connection, key: &str, kind: &str) -> Result<i64> {
+    run_event_with_block(db, key, kind, None)
+}
+pub(crate) fn run_event_with_block(
+    db: &Connection,
+    key: &str,
+    kind: &str,
+    block: Option<&RunBlock>,
+) -> Result<i64> {
     let r = run(db, key)?;
-    let seq = event(db, kind, &r.thread_id, key, &r.attempt_id, json!({"run":r}))?;
+    let data = match block {
+        Some(block) => json!({"run": r, "block": block}),
+        None => json!({"run": r}),
+    };
+    let seq = event(db, kind, &r.thread_id, key, &r.attempt_id, data)?;
+    if matches!(kind, "run.completed" | "run.failed" | "run.interrupted") {
+        set_unread_sequence(db, &r.thread_id, seq)?;
+    }
+    Ok(seq)
+}
+pub(crate) fn run_event_with_blocks(
+    db: &Connection,
+    key: &str,
+    kind: &str,
+    blocks: &[RunBlock],
+) -> Result<i64> {
+    let r = run(db, key)?;
+    let data = if blocks.is_empty() {
+        json!({"run": r})
+    } else {
+        json!({"run": r, "blocks": blocks})
+    };
+    let seq = event(db, kind, &r.thread_id, key, &r.attempt_id, data)?;
     if matches!(kind, "run.completed" | "run.failed" | "run.interrupted") {
         set_unread_sequence(db, &r.thread_id, seq)?;
     }
@@ -188,13 +218,18 @@ fn legacy_steer(i: &Input, disposition: String) -> SteeringMessage {
 }
 pub(crate) fn input_event(db: &Connection, key: &str) -> Result<()> {
     let i = input(db, key)?;
+    let block = super::blocks::upsert_steer(db, &i)?;
+    let data = match block {
+        Some(block) => json!({"input": i, "block": block}),
+        None => json!({"input": i}),
+    };
     event(
         db,
         "input.updated",
         &i.thread_id,
         &i.run_id,
         &i.attempt_id,
-        json!({"input":i}),
+        data,
     )?;
     if i.kind == "queue" {
         event(
@@ -223,13 +258,14 @@ pub(crate) fn input_event(db: &Connection, key: &str) -> Result<()> {
 }
 pub(crate) fn request_event(db: &Connection, key: &str) -> Result<()> {
     let r: PendingRequest = one(db, "SELECT * FROM provider_requests WHERE id=?", [key])?;
+    let block = super::blocks::upsert_approval(db, &r)?;
     event(
         db,
         "request.updated",
         &r.thread_id,
         &r.run_id,
         &r.attempt_id,
-        json!({"request":r}),
+        json!({"request": r, "block": block}),
     )?;
     Ok(())
 }
@@ -253,6 +289,11 @@ pub(crate) fn snapshot(db: &Connection) -> Result<Snapshot> {
         requests: rows(
             db,
             "SELECT * FROM provider_requests ORDER BY created_at,id",
+            [],
+        )?,
+        blocks: rows(
+            db,
+            "SELECT * FROM run_blocks ORDER BY run_id,seq,id",
             [],
         )?,
         project_updates: rows(
@@ -455,6 +496,15 @@ pub(crate) fn thread_detail(
         "SELECT * FROM provider_requests WHERE thread_id=? ORDER BY created_at, id",
         [thread_id],
     )?;
+    let mut blocks: Vec<RunBlock> = rows(
+        db,
+        "SELECT * FROM run_blocks WHERE thread_id=? ORDER BY run_id, seq, id",
+        [thread_id],
+    )?;
+    if truncated_runs {
+        let keep: std::collections::HashSet<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        blocks.retain(|b| keep.contains(b.run_id.as_str()));
+    }
     let project_updates = rows(
         db,
         "SELECT * FROM project_updates ORDER BY source_sequence",
@@ -469,6 +519,7 @@ pub(crate) fn thread_detail(
         inputs: Some(inputs),
         tools: Some(tools),
         requests: Some(requests),
+        blocks,
         run_count,
         truncated_runs,
     })

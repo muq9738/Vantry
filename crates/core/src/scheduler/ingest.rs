@@ -29,6 +29,7 @@ pub(super) fn project(db: &Connection, r: &ProviderRequest, e: &ProviderEvent) -
         "message_start"
             if data.pointer("/message/role").and_then(Value::as_str) == Some("assistant") =>
         {
+            crate::store::blocks::close_streaming_kind(db, &r.run_id, "reasoning")?;
             let (len, tail, tools): (i64, String, bool) = db.query_row(
                 "SELECT length(CAST(output AS BLOB)),substr(output,-2),EXISTS(SELECT 1 FROM tool_calls
              WHERE run_id=runs.id AND output_offset=length(CAST(runs.output AS BLOB))) FROM runs
@@ -37,12 +38,8 @@ pub(super) fn project(db: &Connection, r: &ProviderRequest, e: &ProviderEvent) -
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             if len > 0 && tail != "\n\n" && !tools {
-                append(
-                    db,
-                    r,
-                    if tail.ends_with('\n') { "\n" } else { "\n\n" },
-                    false,
-                )?;
+                let sep = if tail.ends_with('\n') { "\n" } else { "\n\n" };
+                append_separator(db, r, sep)?;
             }
             Ok(())
         }
@@ -53,14 +50,22 @@ fn append(db: &Connection, r: &ProviderRequest, delta: &str, reasoning: bool) ->
     if delta.is_empty() {
         return Ok(());
     }
-    let (column, kind, key) = if reasoning {
-        ("reasoning", "run.reasoning", "reasoningDelta")
+    let (column, kind, block_kind, key) = if reasoning {
+        ("reasoning", "run.reasoning", "reasoning", "reasoningDelta")
     } else {
-        ("output", "run.output", "delta")
+        ("output", "run.output", "text", "delta")
     };
     db.execute(
         &format!("UPDATE runs SET {column}={column}||?,updated_at=? WHERE id=?"),
         params![delta, now(), r.run_id],
+    )?;
+    let (block_id, seq) = crate::store::blocks::append_stream(
+        db,
+        &r.thread_id,
+        &r.run_id,
+        &r.attempt_id,
+        block_kind,
+        delta,
     )?;
     event(
         db,
@@ -68,8 +73,20 @@ fn append(db: &Connection, r: &ProviderRequest, delta: &str, reasoning: bool) ->
         &r.thread_id,
         &r.run_id,
         &r.attempt_id,
-        json!({(key):delta}),
+        json!({(key): delta, "blockId": block_id, "seq": seq}),
     )?;
+    Ok(())
+}
+fn append_separator(db: &Connection, r: &ProviderRequest, sep: &str) -> Result<()> {
+    db.execute(
+        "UPDATE runs SET output=output||?,updated_at=? WHERE id=?",
+        params![sep, now(), r.run_id],
+    )?;
+    let data = match crate::store::blocks::append_open_text_separator(db, &r.run_id, sep)? {
+        Some((block_id, seq)) => json!({"delta": sep, "blockId": block_id, "seq": seq}),
+        None => json!({"delta": sep}),
+    };
+    event(db, "run.output", &r.thread_id, &r.run_id, &r.attempt_id, data)?;
     Ok(())
 }
 fn dialog(db: &Connection, r: &ProviderRequest, e: &ProviderEvent, d: &Value) -> Result<()> {
@@ -233,13 +250,14 @@ fn display_output(value: &Value) -> String {
 }
 pub(super) fn tool_event(db: &Connection, key: &str) -> Result<()> {
     let t: ToolCall = one(db, "SELECT * FROM tool_calls WHERE id=?", [key])?;
+    let block = crate::store::blocks::upsert_tool(db, &t)?;
     event(
         db,
         "tool.updated",
         &t.thread_id,
         &t.run_id,
         &t.attempt_id,
-        json!({"tool":t}),
+        json!({"tool": t, "block": block}),
     )?;
     Ok(())
 }

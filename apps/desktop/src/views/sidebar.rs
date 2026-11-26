@@ -739,30 +739,37 @@ fn entry_view(entry: ReadSignal<Entry>, selected: Memo<Option<String>>) -> AnyEl
                                 .text_color(colors.muted),
                         ),
                 )
-                .child(when(
-                    move || !hovered.get(),
-                    move || {
-                        caption(move || {
-                            entry.with(|e| match e {
-                                Entry::Project { count, .. } => count.to_string(),
-                                _ => String::new(),
-                            })
-                        })
-                        .px_1()
-                    },
-                ))
-                .child(when(
-                    move || hovered.get(),
-                    move || {
-                        let k = add_key.clone();
-                        let scope = machine.clone();
-                        view().tooltip(super::tip(crate::tr("在此项目新建会话"))).child(
-                            small_icon_button(Icon::Plus, "在此项目新建会话", move || {
-                                controller::machines::activate(&scope, || controller::new_thread_in_project(k.clone()));
-                            }),
-                        )
-                    },
-                ))
+                .child(
+                    view()
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .child(when(
+                            move || !hovered.get(),
+                            move || {
+                                caption(move || {
+                                    entry.with(|e| match e {
+                                        Entry::Project { count, .. } => count.to_string(),
+                                        _ => String::new(),
+                                    })
+                                })
+                            },
+                        ))
+                        .child(when(
+                            move || hovered.get(),
+                            move || {
+                                let k = add_key.clone();
+                                let scope = machine.clone();
+                                view().tooltip(super::tip(crate::tr("在此项目新建会话"))).child(
+                                    small_icon_button(Icon::Plus, "在此项目新建会话", move || {
+                                        controller::machines::activate(&scope, || controller::new_thread_in_project(k.clone()));
+                                    }),
+                                )
+                            },
+                        )),
+                )
                 .into_element()
         }
         Entry::More(machine, key, _) => nsh_base::button()
@@ -974,14 +981,12 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(colors.ink),
                         )
-                        .child(when(
-                            move || !hovered.get(),
-                            move || {
-                                text(label(|r| &r.date_label))
-                                    .text_size(px(11.0))
-                                    .text_color(colors.faint)
-                            },
-                        )),
+                        .child(
+                            text(label(|r| &r.date_label))
+                                .text_size(px(11.0))
+                                .text_color(colors.faint)
+                                .opacity(move || if hovered.get() { 0.0_f32 } else { 1.0_f32 }),
+                        ),
                 )
                 .child(
                     view()
@@ -1019,12 +1024,15 @@ fn thread_row(row: Memo<Option<SidebarRow>>, selected: Memo<Option<String>>) -> 
             move || hovered.get(),
             move || {
                 view()
-                    .flex_shrink_0()
+                    .absolute()
+                    .right_1()
+                    .top(px(12.0))
                     .flex_row()
                     .items_center()
                     .gap_0p5()
                     .px_0p5()
                     .rounded(px(6.0))
+                    .bg(background)
                     .child(small_icon_button(
                         Icon::Archive,
                         "归档",

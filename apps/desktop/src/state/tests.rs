@@ -94,10 +94,11 @@ fn texts(state: &AppState) -> Vec<String> {
         .iter()
         .map(|item| match item {
             TimelineItem::User { text, .. } => format!("user:{text}"),
+            TimelineItem::Steer {
+                text, delivered, ..
+            } => format!("steer:{}:{text}", if *delivered { "ok" } else { "err" }),
             TimelineItem::Reasoning { text, .. } => format!("think:{text}"),
-            TimelineItem::Text {
-                run_id, start, end, ..
-            } => format!("text:{}", state.text_of(run_id, *start, *end)),
+            TimelineItem::Text { text, .. } => format!("text:{text}"),
             TimelineItem::Tools { calls, .. } => calls
                 .iter()
                 .map(|c| format!("tool:{}:{}", c.name, c.status.label()))
@@ -860,4 +861,237 @@ fn titles_come_from_the_first_line() {
     assert_eq!(title_from_message("修复登录\n细节"), "修复登录");
     let long = "长".repeat(50);
     assert_eq!(title_from_message(&long).chars().count(), 41);
+}
+
+#[test]
+fn decoupled_run_blocks_preserve_causal_order_multi_reasoning_and_mid_run_steer() {
+    let mut state = AppState::default();
+    state.apply_snapshot(Snapshot {
+        sequence: 10,
+        threads: Some(vec![thread("t1", "2026-11-23T00:00:00Z")]),
+        ..Snapshot::default()
+    });
+    state.on_live();
+
+    // 1. Run queued with initial User block (seq=1).
+    let r1 = run("r1", "t1", RunStatus::Queued);
+    let user_block = RunBlock {
+        id: "user:r1".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        seq: 1,
+        kind: RunBlockKind::User,
+        text: "分析代码并修复 bug".into(),
+        status: "completed".into(),
+        ..RunBlock::default()
+    };
+    state.apply_event(&ev(
+        11,
+        "run.queued",
+        "t1",
+        "r1",
+        json!({ "run": r1, "block": user_block }),
+    ));
+    let mut r1_running = r1.clone();
+    r1_running.status = RunStatus::Running;
+    state.apply_event(&ev(12, "run.started", "t1", "r1", json!({ "run": r1_running })));
+
+    // 2. First reasoning segment (seq=2), streaming fast path on second delta.
+    state.apply_event(&ev(
+        13,
+        "run.reasoning",
+        "t1",
+        "r1",
+        json!({ "reasoningDelta": "先看", "blockId": "reasoning:r1:2", "seq": 2 }),
+    ));
+    let rebuilds_after_r1 = state.timeline.rebuilds;
+    let structure_after_r1 = state.timeline.structure("t1");
+    state.apply_event(&ev(
+        14,
+        "run.reasoning",
+        "t1",
+        "r1",
+        json!({ "reasoningDelta": "架构。", "blockId": "reasoning:r1:2", "seq": 2 }),
+    ));
+    assert_eq!(state.timeline.rebuilds, rebuilds_after_r1, "reasoning delta uses O(1) fast path");
+    assert_eq!(state.timeline.structure("t1"), structure_after_r1);
+
+    // 3. First text segment (seq=3), streaming fast path on second delta.
+    state.apply_event(&ev(
+        15,
+        "run.output",
+        "t1",
+        "r1",
+        json!({ "delta": "我先", "blockId": "text:r1:3", "seq": 3 }),
+    ));
+    let rebuilds_after_t1 = state.timeline.rebuilds;
+    let structure_after_t1 = state.timeline.structure("t1");
+    state.apply_event(&ev(
+        16,
+        "run.output",
+        "t1",
+        "r1",
+        json!({ "delta": "查一下。", "blockId": "text:r1:3", "seq": 3 }),
+    ));
+    assert_eq!(state.timeline.rebuilds, rebuilds_after_t1, "text delta uses O(1) fast path");
+    assert_eq!(state.timeline.structure("t1"), structure_after_t1);
+
+    // 4. Two consecutive tool calls (seq=4, seq=5) with output_offset intentionally stale (-1).
+    let tool1 = ToolCall {
+        id: "k1".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        name: "read".into(),
+        status: "completed".into(),
+        output_offset: -1,
+        ..ToolCall::default()
+    };
+    let tool1_block = RunBlock {
+        id: "tool:k1".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        seq: 4,
+        kind: RunBlockKind::Tool,
+        ref_id: "k1".into(),
+        status: "completed".into(),
+        ..RunBlock::default()
+    };
+    state.apply_event(&ev(
+        17,
+        "tool.updated",
+        "t1",
+        "r1",
+        json!({ "tool": tool1, "block": tool1_block }),
+    ));
+    let tool2 = ToolCall {
+        id: "k2".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        name: "grep".into(),
+        status: "running".into(),
+        output_offset: -1,
+        ..ToolCall::default()
+    };
+    let tool2_block = RunBlock {
+        id: "tool:k2".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        seq: 5,
+        kind: RunBlockKind::Tool,
+        ref_id: "k2".into(),
+        status: "running".into(),
+        ..RunBlock::default()
+    };
+    state.apply_event(&ev(
+        18,
+        "tool.updated",
+        "t1",
+        "r1",
+        json!({ "tool": tool2, "block": tool2_block }),
+    ));
+
+    // 5. Mid-run steer delivered (seq=6) -> lands BELOW existing tools!
+    let steer_input = Input {
+        id: "inp-1".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        kind: "steer".into(),
+        message: "只改 core，不动测试".into(),
+        status: "delivered".into(),
+        ..Input::default()
+    };
+    let steer_block = RunBlock {
+        id: "steer:inp-1".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        seq: 6,
+        kind: RunBlockKind::Steer,
+        ref_id: "inp-1".into(),
+        text: "只改 core，不动测试".into(),
+        status: "delivered".into(),
+        ..RunBlock::default()
+    };
+    state.apply_event(&ev(
+        19,
+        "input.updated",
+        "t1",
+        "r1",
+        json!({ "input": steer_input, "block": steer_block }),
+    ));
+
+    // Tool 2 finishes AFTER steer arrived -> updates in place at seq=5 (stays ABOVE steer!).
+    let mut tool2_done = tool2.clone();
+    tool2_done.status = "completed".into();
+    let mut tool2_block_done = tool2_block.clone();
+    tool2_block_done.status = "completed".into();
+    state.apply_event(&ev(
+        20,
+        "tool.updated",
+        "t1",
+        "r1",
+        json!({ "tool": tool2_done, "block": tool2_block_done }),
+    ));
+
+    // 6. Second reasoning segment (seq=7) -> independent block AND streaming=true even though run.output is non-empty!
+    state.apply_event(&ev(
+        21,
+        "run.reasoning",
+        "t1",
+        "r1",
+        json!({ "reasoningDelta": "根据引导聚焦 core。", "blockId": "reasoning:r1:7", "seq": 7 }),
+    ));
+    let mid = state.timeline();
+    assert!(
+        matches!(&mid[1], TimelineItem::Reasoning { text, streaming: false, .. } if text.as_str() == "先看架构。"),
+        "first reasoning must be closed: {:?}",
+        mid[1]
+    );
+    assert!(
+        matches!(&mid[5], TimelineItem::Reasoning { text, streaming: true, .. } if text.as_str() == "根据引导聚焦 core。"),
+        "second reasoning must stream independently of run.output: {:?}",
+        mid[5]
+    );
+
+    // 7. Second text segment (seq=8) + run completion.
+    state.apply_event(&ev(
+        22,
+        "run.output",
+        "t1",
+        "r1",
+        json!({ "delta": "好的，已只修改 core。", "blockId": "text:r1:8", "seq": 8 }),
+    ));
+    let mut r1_done = r1_running.clone();
+    r1_done.status = RunStatus::Completed;
+    state.apply_event(&ev(23, "run.completed", "t1", "r1", json!({ "run": r1_done })));
+
+    assert_eq!(
+        texts(&state),
+        vec![
+            "user:分析代码并修复 bug",
+            "think:先看架构。",
+            "text:我先查一下。",
+            "tool:read:已完成|tool:grep:已完成",
+            "steer:ok:只改 core，不动测试",
+            "think:根据引导聚焦 core。",
+            "text:好的，已只修改 core。",
+        ]
+    );
+    let final_rows = state.timeline();
+    assert!(matches!(&final_rows[2], TimelineItem::Text { is_last: false, streaming: false, .. }));
+    assert!(matches!(&final_rows[6], TimelineItem::Text { is_last: true, streaming: false, .. }));
+    assert_eq!(state.reply_text("r1"), "我先查一下。\n\n好的，已只修改 core。");
+
+    // 8. Live-folded timeline matches a cold snapshot rebuild 1:1.
+    let mut cold = AppState::default();
+    cold.apply_snapshot(Snapshot {
+        sequence: state.sequence,
+        threads: Some(state.threads.clone()),
+        runs: Some(state.runs.clone()),
+        tools: state.tools.clone(),
+        requests: state.requests.clone(),
+        inputs: state.inputs.clone(),
+        blocks: state.blocks.clone(),
+        ..Snapshot::default()
+    });
+    assert_eq!(state.timeline(), cold.timeline());
 }

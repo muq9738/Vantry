@@ -1020,3 +1020,163 @@ async fn grandchild_delegation_keeps_parent_waiting_until_child_synthesizes() {
     h.wait(|s| status(s, &parent) == RunStatus::Completed).await;
     h.close().await;
 }
+
+#[tokio::test]
+async fn run_blocks_project_causal_multi_reasoning_tools_and_mid_run_steer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let send = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "分析并修复"}),
+    );
+    let exec = h.next().await;
+
+    // 1. Reasoning segment 1 + text segment 1.
+    emit(
+        &exec,
+        1,
+        "thinking_delta",
+        json!({"assistantMessageEvent": {"delta": "思考一"}}),
+        "",
+    );
+    emit(
+        &exec,
+        2,
+        "thinking_delta",
+        json!({"assistantMessageEvent": {"delta": "继续"}}),
+        "",
+    );
+    emit(&exec, 3, "text_delta", Value::Null, "先查文件。");
+
+    // 2. Tool call starts.
+    emit(
+        &exec,
+        4,
+        "tool_execution_start",
+        json!({"toolCallId": "call-1", "toolName": "read", "args": {"path": "a.rs"}}),
+        "",
+    );
+
+    // 3. Mid-run steer submitted & delivered while tool is running.
+    let steer_rec = cmd(
+        &core,
+        "message.steer",
+        json!({"threadId": th, "runId": send.run_id, "message": "只看 core"}),
+    );
+    emit(
+        &exec,
+        5,
+        "control_result",
+        json!({"id": steer_rec.input_id, "status": "delivered"}),
+        "",
+    );
+
+    // 4. Tool finishes AFTER steer delivered -> must stay at its original seq ABOVE steer.
+    emit(
+        &exec,
+        6,
+        "tool_execution_end",
+        json!({"toolCallId": "call-1", "toolName": "read", "result": "ok", "isError": false}),
+        "",
+    );
+
+    // 5. Post-steer reasoning segment 2 + text segment 2.
+    emit(
+        &exec,
+        7,
+        "thinking_delta",
+        json!({"assistantMessageEvent": {"delta": "思考二"}}),
+        "",
+    );
+    emit(&exec, 8, "text_delta", Value::Null, "已聚焦 core。");
+
+    exec.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &send.run_id) == RunStatus::Completed)
+        .await;
+
+    let snap = core.snapshot().unwrap();
+    let run_blocks: Vec<&RunBlock> = snap
+        .blocks
+        .iter()
+        .filter(|b| b.run_id == send.run_id)
+        .collect();
+    let summary: Vec<(i64, RunBlockKind, &str, &str)> = run_blocks
+        .iter()
+        .map(|b| (b.seq, b.kind, b.text.as_str(), b.status.as_str()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (1, RunBlockKind::User, "分析并修复", "completed"),
+            (2, RunBlockKind::Reasoning, "思考一继续", "completed"),
+            (3, RunBlockKind::Text, "先查文件。", "completed"),
+            (4, RunBlockKind::Tool, "", "completed"),
+            (5, RunBlockKind::Steer, "只看 core", "delivered"),
+            (6, RunBlockKind::Reasoning, "思考二", "completed"),
+            (7, RunBlockKind::Text, "已聚焦 core。", "completed"),
+        ]
+    );
+
+    // ThreadDetail exposes the exact same blocks.
+    let detail = core.thread_detail(&th, 0).unwrap();
+    assert_eq!(detail.blocks.len(), run_blocks.len());
+    assert_eq!(detail.blocks[4].kind, RunBlockKind::Steer);
+    assert_eq!(detail.blocks[4].text, "只看 core");
+
+    // Fork copies content blocks (user, reasoning, text, steer) in causal order.
+    let forked = cmd(
+        &core,
+        "thread.fork",
+        json!({"threadId": th, "runId": send.run_id}),
+    );
+    let fork_detail = core.thread_detail(&forked.thread_id, 0).unwrap();
+    let fork_kinds: Vec<(RunBlockKind, &str)> = fork_detail
+        .blocks
+        .iter()
+        .map(|b| (b.kind, b.text.as_str()))
+        .collect();
+    assert_eq!(
+        fork_kinds,
+        vec![
+            (RunBlockKind::User, "分析并修复"),
+            (RunBlockKind::Reasoning, "思考一继续"),
+            (RunBlockKind::Text, "先查文件。"),
+            (RunBlockKind::Steer, "只看 core"),
+            (RunBlockKind::Reasoning, "思考二"),
+            (RunBlockKind::Text, "已聚焦 core。"),
+        ]
+    );
+
+    // StopRun records a terminal Status block at the end, and a subsequent run starts cleanly below.
+    let run2 = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "第二轮"}),
+    );
+    let exec2 = h.next().await;
+    emit(&exec2, 1, "text_delta", Value::Null, "进行中…");
+    cmd(&core, "run.stop", json!({"runId": run2.run_id}));
+    let _ = exec2.done.send(Err(ProviderError::ExecutionCancelled));
+    h.wait(|s| status(s, &run2.run_id) == RunStatus::Cancelled)
+        .await;
+    let detail2 = core.thread_detail(&th, 0).unwrap();
+    let run2_blocks: Vec<(RunBlockKind, &str)> = detail2
+        .blocks
+        .iter()
+        .filter(|b| b.run_id == run2.run_id)
+        .map(|b| (b.kind, b.status.as_str()))
+        .collect();
+    assert_eq!(
+        run2_blocks,
+        vec![
+            (RunBlockKind::User, "completed"),
+            (RunBlockKind::Text, "completed"),
+            (RunBlockKind::Status, "cancelled"),
+        ]
+    );
+
+    h.close().await;
+}

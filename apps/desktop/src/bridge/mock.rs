@@ -20,8 +20,8 @@ use serde_json::json;
 use tokio::sync::{Notify, oneshot};
 use vantry_protocol::{
     Command, CommandKind, CoreEvent, DeliveryStatus, Health, Input, PendingRequest,
-    PROTOCOL_VERSION, Receipt, Run, RunStatus, Snapshot, Task, Thread, ThreadDetail,
-    ThreadSummary, ThreadSummaries, ToolCall,
+    PROTOCOL_VERSION, Receipt, Run, RunBlock, RunBlockKind, RunStatus, Snapshot, Task, Thread,
+    ThreadDetail, ThreadSummary, ThreadSummaries, ToolCall,
 };
 
 use super::{BridgeError, BridgeFuture, CoreBridge, ErrorCode, EventSink, events};
@@ -49,6 +49,7 @@ struct MockCore {
     next_id: u64,
     threads: Vec<Thread>,
     runs: Vec<Run>,
+    blocks: Vec<RunBlock>,
     tools: Vec<ToolCall>,
     requests: Vec<PendingRequest>,
     inputs: Vec<Input>,
@@ -125,6 +126,63 @@ impl MockCore {
             .find(|r| r.thread_id == thread_id && !r.status.terminal())
     }
 
+    fn next_block_seq(&self, run_id: &str) -> i64 {
+        self.blocks
+            .iter()
+            .filter(|b| b.run_id == run_id)
+            .map(|b| b.seq)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    fn close_streaming_blocks(&mut self, run_id: &str) {
+        for block in &mut self.blocks {
+            if block.run_id == run_id && block.status == "streaming" {
+                block.status = "completed".into();
+            }
+        }
+    }
+
+    fn append_stream_block(
+        &mut self,
+        thread_id: &str,
+        run_id: &str,
+        kind: RunBlockKind,
+        delta: &str,
+    ) -> (String, i64) {
+        if let Some(last) = self
+            .blocks
+            .iter_mut()
+            .filter(|b| b.run_id == run_id)
+            .max_by_key(|b| b.seq)
+            && last.kind == kind
+            && last.status == "streaming"
+        {
+            last.text.push_str(delta);
+            return (last.id.clone(), last.seq);
+        }
+        self.close_streaming_blocks(run_id);
+        let seq = self.next_block_seq(run_id);
+        let prefix = match kind {
+            RunBlockKind::Reasoning => "reasoning",
+            _ => "text",
+        };
+        let id = format!("{prefix}:{run_id}:{seq}");
+        self.blocks.push(RunBlock {
+            id: id.clone(),
+            thread_id: thread_id.to_owned(),
+            run_id: run_id.to_owned(),
+            attempt_id: format!("{run_id}-a1"),
+            seq,
+            kind,
+            text: delta.to_owned(),
+            status: "streaming".into(),
+            ..RunBlock::default()
+        });
+        (id, seq)
+    }
+
     fn push_run(&mut self, thread_id: &str, input: &str, mode: &str) -> Run {
         let run = Run {
             id: self.id("run"),
@@ -136,12 +194,31 @@ impl MockCore {
             ..Run::default()
         };
         self.runs.push(run.clone());
-        self.emit(
-            events::RUN_QUEUED,
-            &run.thread_id,
-            &run.id,
-            json!({ "run": value(&run) }),
-        );
+        let user_block = if !run.input.is_empty() || !run.attachments.is_empty() {
+            let block = RunBlock {
+                id: format!("user:{}", run.id),
+                thread_id: run.thread_id.clone(),
+                run_id: run.id.clone(),
+                attempt_id: format!("{}-a1", run.id),
+                seq: 1,
+                kind: RunBlockKind::User,
+                text: run.input.clone(),
+                status: "completed".into(),
+                attachments: run.attachments.clone(),
+                created_at: run.created_at.clone(),
+                updated_at: run.created_at.clone(),
+                ..RunBlock::default()
+            };
+            self.blocks.push(block.clone());
+            Some(block)
+        } else {
+            None
+        };
+        let data = match user_block {
+            Some(block) => json!({ "run": value(&run), "block": value(&block) }),
+            None => json!({ "run": value(&run) }),
+        };
+        self.emit(events::RUN_QUEUED, &run.thread_id, &run.id, data);
         run
     }
 
@@ -155,12 +232,41 @@ impl MockCore {
         run.status = status;
         run.error = error.to_owned();
         let run = run.clone();
-        self.emit(
-            events::of_run_status(status),
-            &run.thread_id,
-            &run.id,
-            json!({ "run": value(&run) }),
-        );
+        if status.terminal() || status == RunStatus::Waiting {
+            self.close_streaming_blocks(run_id);
+        }
+        self.blocks
+            .retain(|b| !(b.run_id == run_id && b.kind == RunBlockKind::Status));
+        let status_block = match status {
+            RunStatus::Waiting
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted
+            | RunStatus::Failed => {
+                let seq = self.next_block_seq(run_id);
+                let block = RunBlock {
+                    id: format!("status:{run_id}"),
+                    thread_id: run.thread_id.clone(),
+                    run_id: run.id.clone(),
+                    attempt_id: format!("{run_id}-a1"),
+                    seq,
+                    kind: RunBlockKind::Status,
+                    status: serde_json::to_value(status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                    error: error.to_owned(),
+                    ..RunBlock::default()
+                };
+                self.blocks.push(block.clone());
+                Some(block)
+            }
+            _ => None,
+        };
+        let data = match status_block {
+            Some(block) => json!({ "run": value(&run), "block": value(&block) }),
+            None => json!({ "run": value(&run) }),
+        };
+        self.emit(events::of_run_status(status), &run.thread_id, &run.id, data);
     }
 
     fn output(&mut self, run_id: &str, delta: &str) {
@@ -172,11 +278,12 @@ impl MockCore {
         }
         run.output.push_str(delta);
         let thread_id = run.thread_id.clone();
+        let (block_id, seq) = self.append_stream_block(&thread_id, run_id, RunBlockKind::Text, delta);
         self.emit(
             events::RUN_OUTPUT,
             &thread_id,
             run_id,
-            json!({ "delta": delta }),
+            json!({ "delta": delta, "blockId": block_id, "seq": seq }),
         );
     }
 
@@ -189,11 +296,13 @@ impl MockCore {
         }
         run.reasoning.push_str(delta);
         let thread_id = run.thread_id.clone();
+        let (block_id, seq) =
+            self.append_stream_block(&thread_id, run_id, RunBlockKind::Reasoning, delta);
         self.emit(
             events::RUN_REASONING,
             &thread_id,
             run_id,
-            json!({ "reasoningDelta": delta }),
+            json!({ "reasoningDelta": delta, "blockId": block_id, "seq": seq }),
         );
     }
 
@@ -202,11 +311,35 @@ impl MockCore {
             Some(existing) => *existing = tool.clone(),
             None => self.tools.push(tool.clone()),
         }
+        let block = if let Some(existing) = self
+            .blocks
+            .iter_mut()
+            .find(|b| b.run_id == tool.run_id && b.kind == RunBlockKind::Tool && b.ref_id == tool.id)
+        {
+            existing.status = tool.status.clone();
+            existing.clone()
+        } else {
+            self.close_streaming_blocks(&tool.run_id);
+            let seq = self.next_block_seq(&tool.run_id);
+            let block = RunBlock {
+                id: format!("tool:{}", tool.id),
+                thread_id: tool.thread_id.clone(),
+                run_id: tool.run_id.clone(),
+                attempt_id: tool.attempt_id.clone(),
+                seq,
+                kind: RunBlockKind::Tool,
+                ref_id: tool.id.clone(),
+                status: tool.status.clone(),
+                ..RunBlock::default()
+            };
+            self.blocks.push(block.clone());
+            block
+        };
         self.emit(
             events::TOOL_UPDATED,
             &tool.thread_id,
             &tool.run_id,
-            json!({ "tool": value(&tool) }),
+            json!({ "tool": value(&tool), "block": value(&block) }),
         );
     }
 
@@ -215,11 +348,37 @@ impl MockCore {
             Some(existing) => *existing = request.clone(),
             None => self.requests.push(request.clone()),
         }
+        let block = if let Some(existing) = self.blocks.iter_mut().find(|b| {
+            b.run_id == request.run_id
+                && b.kind == RunBlockKind::Approval
+                && b.ref_id == request.id
+        }) {
+            existing.status = request.status.clone();
+            existing.error = request.error.clone();
+            existing.clone()
+        } else {
+            self.close_streaming_blocks(&request.run_id);
+            let seq = self.next_block_seq(&request.run_id);
+            let block = RunBlock {
+                id: format!("request:{}", request.id),
+                thread_id: request.thread_id.clone(),
+                run_id: request.run_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                seq,
+                kind: RunBlockKind::Approval,
+                ref_id: request.id.clone(),
+                status: request.status.clone(),
+                error: request.error.clone(),
+                ..RunBlock::default()
+            };
+            self.blocks.push(block.clone());
+            block
+        };
         self.emit(
             events::REQUEST_UPDATED,
             &request.thread_id,
             &request.run_id,
-            json!({ "request": value(&request) }),
+            json!({ "request": value(&request), "block": value(&block) }),
         );
     }
 
@@ -228,12 +387,44 @@ impl MockCore {
             Some(existing) => *existing = input.clone(),
             None => self.inputs.push(input.clone()),
         }
-        self.emit(
-            events::INPUT_UPDATED,
-            &input.thread_id,
-            &input.run_id,
-            json!({ "input": value(&input) }),
-        )
+        let block = if input.kind == "steer"
+            && !input.run_id.is_empty()
+            && matches!(input.status.as_str(), "delivered" | "failed")
+        {
+            if let Some(existing) = self.blocks.iter_mut().find(|b| {
+                b.run_id == input.run_id && b.kind == RunBlockKind::Steer && b.ref_id == input.id
+            }) {
+                existing.status = input.status.clone();
+                existing.error = input.error.clone();
+                Some(existing.clone())
+            } else {
+                self.close_streaming_blocks(&input.run_id);
+                let seq = self.next_block_seq(&input.run_id);
+                let block = RunBlock {
+                    id: format!("steer:{}", input.id),
+                    thread_id: input.thread_id.clone(),
+                    run_id: input.run_id.clone(),
+                    attempt_id: input.attempt_id.clone(),
+                    seq,
+                    kind: RunBlockKind::Steer,
+                    ref_id: input.id.clone(),
+                    text: input.message.clone(),
+                    status: input.status.clone(),
+                    error: input.error.clone(),
+                    attachments: input.attachments.clone(),
+                    ..RunBlock::default()
+                };
+                self.blocks.push(block.clone());
+                Some(block)
+            }
+        } else {
+            None
+        };
+        let data = match block {
+            Some(block) => json!({ "input": value(&input), "block": value(&block) }),
+            None => json!({ "input": value(&input) }),
+        };
+        self.emit(events::INPUT_UPDATED, &input.thread_id, &input.run_id, data)
     }
 
     /// The thread's queued inputs that have not started, in order.
@@ -294,6 +485,7 @@ impl MockCore {
             tools: self.tools.clone(),
             requests: self.requests.clone(),
             inputs: self.inputs.clone(),
+            blocks: self.blocks.clone(),
             ..Snapshot::default()
         }
     }
@@ -403,6 +595,15 @@ impl MockCore {
         } else {
             all_runs
         };
+        let blocks = self
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.thread_id == thread_id
+                    && (!truncated_runs || runs.iter().any(|r| r.id == block.run_id))
+            })
+            .cloned()
+            .collect();
         Ok(ThreadDetail {
             sequence: self.sequence,
             thread,
@@ -437,6 +638,7 @@ impl MockCore {
                     .cloned()
                     .collect(),
             ),
+            blocks,
             run_count,
             truncated_runs,
             ..ThreadDetail::default()
@@ -825,6 +1027,7 @@ impl MockBridge {
                 }
                 core.threads.retain(|t| t.id != id);
                 core.runs.retain(|r| r.thread_id != id);
+                core.blocks.retain(|b| b.thread_id != id);
                 core.tools.retain(|t| t.thread_id != id);
                 core.requests.retain(|r| r.thread_id != id);
                 core.inputs.retain(|i| i.thread_id != id);
@@ -909,6 +1112,7 @@ impl MockBridge {
                     return Err(BridgeError::new(ErrorCode::Conflict, "stop the run first"));
                 }
                 core.runs.retain(|r| !removed.contains(&r.id));
+                core.blocks.retain(|b| !removed.contains(&b.run_id));
                 core.tools.retain(|t| !removed.contains(&t.run_id));
                 core.requests.retain(|r| !removed.contains(&r.run_id));
                 receipt.run_id = target.clone();
@@ -1001,7 +1205,21 @@ impl MockBridge {
                 if core.runs.iter().all(|r| r.id != run_id || r.status.terminal()) {
                     return Err(BridgeError::new(ErrorCode::Conflict, "run is not active"));
                 }
-                let delta = format!("\n\n（已收到调整：{}）\n\n", command.message);
+                let input = Input {
+                    id: core.id("input"),
+                    command_id: command.command_id.clone(),
+                    thread_id: command.thread_id.clone(),
+                    run_id: run_id.clone(),
+                    attempt_id: format!("{run_id}-a1"),
+                    kind: "steer".into(),
+                    message: command.message.clone(),
+                    attachments: command.attachments.clone(),
+                    status: "delivered".into(),
+                    ..Input::default()
+                };
+                receipt.input_id = input.id.clone();
+                core.upsert_input(input);
+                let delta = format!("已收到调整：{}。", command.message);
                 core.output(&run_id, &delta);
                 receipt.run_id = run_id;
                 receipt.delivery = "delivered".into();

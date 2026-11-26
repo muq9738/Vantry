@@ -85,7 +85,7 @@ impl AgentTool for TodoWrite {
     }
     fn prompt_guidelines(&self) -> Vec<String> {
         vec![
-            "For work with three or more distinct steps, call vantry_todo_write first with the full plan, keep exactly one item in_progress while you work on it, mark items completed as soon as they are done, and finish with every item completed (or removed if no longer relevant). Skip it for single-step or conversational requests.".into(),
+            "For work with three or more distinct steps, call vantry_todo_write first with the full plan, keep exactly one item in_progress while you work on it, mark items completed as soon as they are done, and when the last step is finished call vantry_todo_write once more with every item completed (or removed if no longer relevant) before writing your final reply. Skip it for single-step or conversational requests.".into(),
         ]
     }
     fn parameters(&self) -> Value {

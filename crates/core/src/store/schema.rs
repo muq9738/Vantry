@@ -1,7 +1,7 @@
 use crate::{Error, Result, SCHEMA_USER_VERSION};
 use rusqlite::Connection;
 use vantry_protocol::ErrorCode;
-pub(super) const DDLS: [&str; 11] = [
+pub(super) const DDLS: [&str; 12] = [
     include_str!("sql/v1.sql"),
     include_str!("sql/v2.sql"),
     include_str!("sql/v3.sql"),
@@ -13,6 +13,7 @@ pub(super) const DDLS: [&str; 11] = [
     include_str!("sql/v9.sql"),
     include_str!("sql/v10.sql"),
     include_str!("sql/v11.sql"),
+    include_str!("sql/v12.sql"),
 ];
 fn column_exists(db: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     db.query_row(
@@ -78,10 +79,13 @@ pub(super) fn migrate(db: &mut Connection) -> Result<()> {
         }
     }
     tx.execute_batch(include_str!("sql/backfill.sql"))?;
+    if version > 0 && version < 12 {
+        super::blocks::backfill(&tx)?;
+    }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS core_metadata(key TEXT PRIMARY KEY,int_value INTEGER,
              text_value TEXT); INSERT OR IGNORE INTO core_metadata(key,int_value) VALUES('pruned_through_sequence',
-             0); PRAGMA user_version=11;",
+             0); PRAGMA user_version=12;",
     )?;
     for (table, index, cols) in [
         ("threads", "thread_search", vec!["title", "workspace"]),

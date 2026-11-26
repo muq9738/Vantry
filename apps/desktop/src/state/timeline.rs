@@ -2,12 +2,16 @@
 //! incrementally per run.
 //!
 //! [`TimelineIndex`] holds every run's rows (its *segment*) and, per thread,
-//! the order of its runs. An event rebuilds only the segment of the run it
-//! touched; a streamed output delta does less: it extends the run's last
-//! text row and re-parses only that row's last Markdown block. A thread's
-//! row ids (the virtual list's keys) change only when a segment's ids do,
-//! which [`TimelineIndex::structure`] counts, so the list re-keys on a new
-//! row, not on every delta.
+//! the order of its runs. When the Core supplies causal [`RunBlock`]s ordered
+//! by their monotonic `seq` axis, every row — user input, multi-segment
+//! reasoning, grouped tool calls, streaming text, mid-run steers, approvals,
+//! and terminal status — is projected strictly in `seq` order without slicing
+//! `run.output` by `output_offset`. When talking to an older Core that omits
+//! `blocks`, a legacy fallback projects the run's fields cleanly.
+//!
+//! A streamed text or reasoning delta extends the run's active tail block in
+//! place (re-parsing only the last Markdown block for text) without rebuilding
+//! the segment or bumping [`TimelineIndex::structure`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,7 +19,7 @@ use std::{
 };
 
 use serde_json::Value;
-use vantry_protocol::{PendingRequest, Run, RunStatus, ToolCall};
+use vantry_protocol::{Input, PendingRequest, Run, RunBlock, RunBlockKind, RunStatus, ToolCall};
 
 use super::{
     approval::{ApprovalView, approval_view},
@@ -99,7 +103,7 @@ impl ToolKind {
 /// One row of the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimelineItem {
-    /// The user's message (the run's input). `plan`: sent in plan mode.
+    /// The user's initial message (the run's input). `plan`: sent in plan mode.
     User {
         id: String,
         run_id: String,
@@ -107,29 +111,37 @@ pub enum TimelineItem {
         plan: bool,
         attachments: Vec<vantry_protocol::Attachment>,
     },
-    /// The model's thinking (collapsible).
+    /// A mid-run steering message inserted at its causal timeline position.
+    Steer {
+        id: String,
+        run_id: String,
+        text: Arc<str>,
+        attachments: Vec<vantry_protocol::Attachment>,
+        delivered: bool,
+        error: String,
+    },
+    /// One reasoning/thinking segment (collapsible; a run may have several).
     Reasoning {
         id: String,
-        text: Arc<str>,
+        text: Arc<String>,
         streaming: bool,
     },
-    /// Reply text between tool calls, as Markdown. `start..end` is its
-    /// byte range in the run's output.
+    /// One reply text block, as Markdown.
     Text {
         id: String,
         run_id: String,
-        start: usize,
-        end: usize,
+        text: Arc<String>,
         doc: Arc<MarkdownDoc>,
         streaming: bool,
+        is_last: bool,
     },
-    /// Consecutive tool calls (no reply text between them), shown as one
-    /// collapsible group as Claude's desktop does. Its id is its first
-    /// call's, so a call joining the group keeps the list's keys.
+    /// Consecutive tool calls (no reply text, reasoning, or steer between them),
+    /// shown as one collapsible group. Its id is its first call's, so a call
+    /// joining the group keeps the list's keys.
     Tools { id: String, calls: Vec<ToolEntry> },
     /// An unanswered (or failed) extension request, answerable in place.
     Approval { id: String, view: ApprovalView },
-    /// The run's end when it did not complete.
+    /// The run's end when it did not complete cleanly.
     Status {
         id: String,
         text: String,
@@ -142,6 +154,7 @@ impl TimelineItem {
     pub fn id(&self) -> &str {
         match self {
             TimelineItem::User { id, .. }
+            | TimelineItem::Steer { id, .. }
             | TimelineItem::Reasoning { id, .. }
             | TimelineItem::Text { id, .. }
             | TimelineItem::Tools { id, .. }
@@ -157,13 +170,17 @@ struct Segment {
     thread_id: String,
     created_at: String,
     items: Vec<TimelineItem>,
-    /// The index of the last text row when new output can extend it in
-    /// place (it is the last content row and every tool's offset is known).
-    tail: Option<usize>,
-    /// Whether the run is active (its last text row streams).
-    active: bool,
-    /// The output length the rows were built from.
+    /// Active streaming text row `(index, block_id)` in block-driven mode.
+    tail_text: Option<(usize, String)>,
+    /// Active streaming reasoning row `(index, block_id)` in block-driven mode.
+    tail_reasoning: Option<(usize, String)>,
+    /// Legacy fallback: index of the last text row + byte start when extending
+    /// `run.output` in place.
+    legacy_tail: Option<(usize, usize)>,
+    /// Legacy fallback: output length the rows were built from.
     output_len: usize,
+    /// When true, next rebuild must parse Markdown afresh (output was rewritten).
+    fresh_text: bool,
 }
 
 /// One thread's run order and row positions.
@@ -189,12 +206,13 @@ pub struct TimelineIndex {
     pub rebuilds: u64,
 }
 
-/// What a run's rows are built from. `tools` and `requests` are already
-/// grouped by `run.id`; callers must not pass rows belonging to another run.
+/// What a run's rows are built from. Callers pass only rows belonging to `run.id`.
 pub struct RunParts<'a> {
     pub run: &'a Run,
+    pub blocks: Vec<&'a RunBlock>,
     pub tools: Vec<&'a ToolCall>,
     pub requests: Vec<&'a PendingRequest>,
+    pub inputs: Vec<&'a Input>,
 }
 
 impl TimelineIndex {
@@ -205,8 +223,6 @@ impl TimelineIndex {
         let old_threads = std::mem::take(&mut self.threads);
         let mut order: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for part in parts {
-            // A snapshot's text is parsed afresh: it may differ from what
-            // was streamed.
             let segment = build_segment(&part, None);
             order
                 .entry(part.run.thread_id.clone())
@@ -230,8 +246,8 @@ impl TimelineIndex {
         self.revision += 1;
     }
 
-    /// Rebuilds run `parts.run`'s rows, reusing its Markdown where its text
-    /// rows kept their place.
+    /// Rebuilds run `parts.run`'s rows, reusing its Markdown where text blocks
+    /// kept their identity and prefix.
     pub fn refresh_run(&mut self, parts: RunParts<'_>) {
         let run = parts.run;
         let previous = self.segments.get(&run.id);
@@ -246,7 +262,6 @@ impl TimelineIndex {
         self.revision += 1;
         let rows = self.threads.entry(thread_id).or_default();
         if is_new {
-            // After every run created at or before it.
             let key = sort_key(&run.created_at);
             let segments = &self.segments;
             let at = rows
@@ -268,26 +283,74 @@ impl TimelineIndex {
         }
     }
 
-    /// Extends run `run`'s last text row with the output it gained, when
-    /// the rows allow it; false when the caller must [`Self::refresh_run`].
+    /// Fast path (block-driven): appends `delta` to run `run_id`'s open
+    /// streaming text block `block_id` in place without rebuilding or re-keying.
+    pub fn append_text_block(&mut self, run_id: &str, block_id: &str, delta: &str) -> bool {
+        let Some(segment) = self.segments.get_mut(run_id) else {
+            return false;
+        };
+        let Some((idx, ref tail_id)) = segment.tail_text else {
+            return false;
+        };
+        if tail_id != block_id {
+            return false;
+        }
+        let Some(TimelineItem::Text { id, text, doc, .. }) = segment.items.get_mut(idx) else {
+            return false;
+        };
+        if id != block_id {
+            return false;
+        }
+        let text = Arc::make_mut(text);
+        text.push_str(delta);
+        Arc::make_mut(doc).update(text);
+        self.revision += 1;
+        true
+    }
+
+    /// Fast path (block-driven): appends `delta` to run `run_id`'s open
+    /// streaming reasoning block `block_id` in place without rebuilding.
+    pub fn append_reasoning_block(&mut self, run_id: &str, block_id: &str, delta: &str) -> bool {
+        let Some(segment) = self.segments.get_mut(run_id) else {
+            return false;
+        };
+        let Some((idx, ref tail_id)) = segment.tail_reasoning else {
+            return false;
+        };
+        if tail_id != block_id {
+            return false;
+        }
+        let Some(TimelineItem::Reasoning { id, text, .. }) = segment.items.get_mut(idx) else {
+            return false;
+        };
+        if id != block_id {
+            return false;
+        }
+        Arc::make_mut(text).push_str(delta);
+        self.revision += 1;
+        true
+    }
+
+    /// Legacy fast path (older Core without `RunBlock`s): extends `run`'s last
+    /// text row with the output it gained; returns false if caller must refresh.
     pub fn append_output(&mut self, run: &Run) -> bool {
         let Some(segment) = self.segments.get_mut(&run.id) else {
             return false;
         };
-        let Some(tail) = segment.tail else {
+        let Some((tail, start)) = segment.legacy_tail else {
             return false;
         };
-        if run.output.len() < segment.output_len {
+        if run.output.len() < segment.output_len || !run.output.is_char_boundary(start) {
             return false;
         }
-        let Some(TimelineItem::Text { start, end, doc, .. }) = segment.items.get_mut(tail) else {
+        let Some(TimelineItem::Text { text, doc, .. }) = segment.items.get_mut(tail) else {
             return false;
         };
-        if !run.output.is_char_boundary(*start) {
-            return false;
-        }
-        *end = run.output.len();
-        Arc::make_mut(doc).update(&run.output[*start..]);
+        let slice = &run.output[start..];
+        let buf = Arc::make_mut(text);
+        buf.clear();
+        buf.push_str(slice);
+        Arc::make_mut(doc).update(buf);
         segment.output_len = run.output.len();
         self.revision += 1;
         true
@@ -297,16 +360,14 @@ impl TimelineIndex {
     /// parsed afresh on the next refresh instead of being followed.
     pub fn forget_text(&mut self, run_id: &str) {
         if let Some(segment) = self.segments.get_mut(run_id) {
-            segment.tail = None;
-            for item in &mut segment.items {
-                if let TimelineItem::Text { start, .. } = item {
-                    *start = usize::MAX;
-                }
-            }
+            segment.tail_text = None;
+            segment.legacy_tail = None;
+            segment.fresh_text = true;
         }
     }
 
-    /// Replaces run `run`'s reasoning text, when it has a reasoning row.
+    /// Legacy fast path (older Core without `RunBlock`s): replaces run `run`'s
+    /// single reasoning row in place.
     pub fn update_reasoning(&mut self, run: &Run) -> bool {
         let Some(segment) = self.segments.get_mut(&run.id) else {
             return false;
@@ -318,7 +379,9 @@ impl TimelineIndex {
         else {
             return false;
         };
-        *text = Arc::from(run.reasoning.as_str());
+        let buf = Arc::make_mut(text);
+        buf.clear();
+        buf.push_str(&run.reasoning);
         self.revision += 1;
         true
     }
@@ -376,10 +439,8 @@ impl TimelineIndex {
     /// Row `index` of `thread`.
     pub fn item(&self, thread: &str, index: usize) -> Option<&TimelineItem> {
         let rows = self.threads.get(thread)?;
-        // The run whose rows contain `index`.
         let run = match rows.starts.binary_search(&index) {
             Ok(mut at) => {
-                // Skip runs without rows (equal starts).
                 while at + 1 < rows.starts.len() && rows.starts[at + 1] == index {
                     at += 1;
                 }
@@ -415,6 +476,74 @@ impl TimelineIndex {
     pub fn run_order(&self, thread: &str) -> &[String] {
         self.threads.get(thread).map_or(&[], |t| t.runs.as_slice())
     }
+
+    /// One anchor per non-empty run of `thread`, oldest first, for the left
+    /// turn-navigation dot rail.
+    pub fn turns(&self, thread: &str) -> Vec<TurnAnchor> {
+        let Some(rows) = self.threads.get(thread) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(rows.runs.len());
+        for (i, id) in rows.runs.iter().enumerate() {
+            let start = rows.starts[i];
+            let end = rows.starts[i + 1];
+            if start == end {
+                continue;
+            }
+            let preview = self
+                .segments
+                .get(id)
+                .and_then(|seg| {
+                    seg.items.iter().find_map(|item| match item {
+                        TimelineItem::User { text, .. } => turn_preview(text),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
+            out.push(TurnAnchor {
+                run_id: id.clone(),
+                row_index: start,
+                preview,
+            });
+        }
+        out
+    }
+}
+
+/// One conversation turn's jump anchor in the flattened timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnAnchor {
+    pub run_id: String,
+    pub row_index: usize,
+    pub preview: String,
+}
+
+/// The active turn index for the left dot rail given the list's viewable row
+/// range and whether the viewport is scrolled to the bottom.
+pub fn active_turn(
+    turns: &[TurnAnchor],
+    viewable: Option<(usize, usize)>,
+    at_end: bool,
+) -> Option<usize> {
+    if turns.is_empty() {
+        return None;
+    }
+    if at_end {
+        return Some(turns.len() - 1);
+    }
+    let Some((first, _)) = viewable else {
+        return Some(turns.len() - 1);
+    };
+    Some(turns.iter().rposition(|t| t.row_index <= first).unwrap_or(0))
+}
+
+fn turn_preview(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut short: String = line.chars().take(36).collect();
+    if line.chars().count() > 36 {
+        short.push('…');
+    }
+    Some(short)
 }
 
 fn ids_of(items: &[TimelineItem]) -> Vec<String> {
@@ -445,9 +574,251 @@ fn shown_request(r: &PendingRequest) -> bool {
     matches!(r.status.as_str(), "pending" | "responding" | "failed")
 }
 
+fn build_tool_entry(tool: &ToolCall, has_pending_approval: bool) -> ToolEntry {
+    let awaiting = tool.status == "running" && has_pending_approval;
+    ToolEntry {
+        id: format!("tool:{}", tool.id),
+        name: tool.name.clone(),
+        summary: if super::todo::is_todo_tool(&tool.name) {
+            super::todo::summary(tool.arguments.as_ref())
+                .unwrap_or_else(|| summarize_arguments(tool.arguments.as_ref()))
+        } else {
+            summarize_arguments(tool.arguments.as_ref())
+        },
+        status: if awaiting {
+            ToolStatus::AwaitingApproval
+        } else {
+            ToolStatus::of(&tool.status)
+        },
+        arguments: pretty_arguments(tool.arguments.as_ref()),
+        output: tail_lines(&tool.output, 40),
+    }
+}
+
+fn status_display(status: RunStatus, error: &str) -> Option<(String, bool)> {
+    match status {
+        RunStatus::Waiting => Some(("等待子任务完成，结束后将自动唤醒并继续…".to_owned(), false)),
+        RunStatus::Cancelled => Some(("已停止".to_owned(), false)),
+        RunStatus::Interrupted => Some((
+            non_empty(error, "执行中断，现场已保留；可重新发送。"),
+            true,
+        )),
+        RunStatus::Failed => Some((non_empty(error, "执行失败"), true)),
+        _ => None,
+    }
+}
+
+fn status_from_str(status: &str, fallback: RunStatus) -> RunStatus {
+    match status {
+        "waiting_children" => RunStatus::Waiting,
+        "cancelled" => RunStatus::Cancelled,
+        "interrupted" => RunStatus::Interrupted,
+        "failed" => RunStatus::Failed,
+        "completed" => RunStatus::Completed,
+        "running" => RunStatus::Running,
+        "queued" => RunStatus::Queued,
+        _ => fallback,
+    }
+}
+
+fn reuse_markdown(previous: Option<&Segment>, id: &str, text: &str) -> Arc<MarkdownDoc> {
+    if let Some(prev) = previous.filter(|s| !s.fresh_text)
+        && let Some((old_text, mut doc)) = prev.items.iter().find_map(|item| match item {
+            TimelineItem::Text {
+                id: old_id,
+                text: old_text,
+                doc,
+                ..
+            } if old_id == id => Some((old_text.as_str(), doc.clone())),
+            _ => None,
+        })
+        && text.starts_with(old_text)
+    {
+        if doc.len != text.len() {
+            Arc::make_mut(&mut doc).update(text);
+        }
+        return doc;
+    }
+    Arc::new(MarkdownDoc::parse(text))
+}
+
+fn mark_last_text(items: &mut [TimelineItem]) {
+    if let Some(TimelineItem::Text { is_last, .. }) = items
+        .iter_mut()
+        .rev()
+        .find(|item| matches!(item, TimelineItem::Text { .. }))
+    {
+        *is_last = true;
+    }
+}
+
 fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
+    if !parts.blocks.is_empty() {
+        build_from_blocks(parts, previous)
+    } else {
+        build_legacy(parts, previous)
+    }
+}
+
+/// Decoupled block-driven projection: every block's order comes exclusively from
+/// its monotonic `seq` axis (DP0).
+fn build_from_blocks(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
+    let run = parts.run;
+    let executing = matches!(run.status, RunStatus::Queued | RunStatus::Running);
+    let mut blocks: Vec<&RunBlock> = parts.blocks.clone();
+    blocks.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.id.cmp(&b.id)));
+
+    let tools_by_id: HashMap<&str, &ToolCall> =
+        parts.tools.iter().map(|t| (t.id.as_str(), *t)).collect();
+    let requests_by_id: HashMap<&str, &PendingRequest> =
+        parts.requests.iter().map(|r| (r.id.as_str(), *r)).collect();
+    let has_pending_approval = parts
+        .requests
+        .iter()
+        .any(|r| shown_request(r) && r.status == "pending");
+
+    let mut items = Vec::with_capacity(blocks.len());
+    let mut tail_text: Option<(usize, String)> = None;
+    let mut tail_reasoning: Option<(usize, String)> = None;
+    let mut shown_requests: HashSet<&str> = HashSet::new();
+    let mut has_status_block = false;
+
+    for block in blocks {
+        match block.kind {
+            RunBlockKind::User => {
+                if !block.text.is_empty() || !block.attachments.is_empty() {
+                    items.push(TimelineItem::User {
+                        id: block.id.clone(),
+                        run_id: run.id.clone(),
+                        text: Arc::from(block.text.as_str()),
+                        plan: run.interaction_mode == "plan",
+                        attachments: block.attachments.clone(),
+                    });
+                }
+            }
+            RunBlockKind::Reasoning => {
+                if !block.text.is_empty() {
+                    let streaming = executing && block.status == "streaming";
+                    items.push(TimelineItem::Reasoning {
+                        id: block.id.clone(),
+                        text: Arc::new(block.text.clone()),
+                        streaming,
+                    });
+                    if streaming {
+                        tail_reasoning = Some((items.len() - 1, block.id.clone()));
+                    }
+                }
+            }
+            RunBlockKind::Text => {
+                if !block.text.trim().is_empty() {
+                    let streaming = executing && block.status == "streaming";
+                    let doc = reuse_markdown(previous, &block.id, &block.text);
+                    items.push(TimelineItem::Text {
+                        id: block.id.clone(),
+                        run_id: run.id.clone(),
+                        text: Arc::new(block.text.clone()),
+                        doc,
+                        streaming,
+                        is_last: false,
+                    });
+                    if streaming {
+                        tail_text = Some((items.len() - 1, block.id.clone()));
+                    }
+                }
+            }
+            RunBlockKind::Tool => {
+                let entry = match tools_by_id.get(block.ref_id.as_str()) {
+                    Some(tool) => build_tool_entry(tool, has_pending_approval),
+                    None => continue,
+                };
+                match items.last_mut() {
+                    Some(TimelineItem::Tools { calls, .. }) => calls.push(entry),
+                    _ => items.push(TimelineItem::Tools {
+                        id: block.id.clone(),
+                        calls: vec![entry],
+                    }),
+                }
+            }
+            RunBlockKind::Steer => {
+                items.push(TimelineItem::Steer {
+                    id: block.id.clone(),
+                    run_id: run.id.clone(),
+                    text: Arc::from(block.text.as_str()),
+                    attachments: block.attachments.clone(),
+                    delivered: block.status == "delivered",
+                    error: block.error.clone(),
+                });
+            }
+            RunBlockKind::Approval => {
+                if let Some(request) = requests_by_id.get(block.ref_id.as_str())
+                    && shown_request(request)
+                {
+                    shown_requests.insert(request.id.as_str());
+                    items.push(TimelineItem::Approval {
+                        id: block.id.clone(),
+                        view: approval_view(request),
+                    });
+                }
+            }
+            RunBlockKind::Status => {
+                let st = status_from_str(&block.status, run.status);
+                let err = if block.error.is_empty() {
+                    &run.error
+                } else {
+                    &block.error
+                };
+                if let Some((text, error)) = status_display(st, err) {
+                    has_status_block = true;
+                    items.push(TimelineItem::Status {
+                        id: block.id.clone(),
+                        text,
+                        error,
+                    });
+                }
+            }
+            RunBlockKind::Unspecified => {}
+        }
+    }
+
+    // Any shown request not yet backed by an Approval block (e.g. optimistic/synthetic).
+    for request in &parts.requests {
+        if shown_request(request) && !shown_requests.contains(request.id.as_str()) {
+            items.push(TimelineItem::Approval {
+                id: format!("request:{}", request.id),
+                view: approval_view(request),
+            });
+        }
+    }
+
+    if !has_status_block
+        && let Some((text, error)) = status_display(run.status, &run.error)
+    {
+        items.push(TimelineItem::Status {
+            id: format!("status:{}", run.id),
+            text,
+            error,
+        });
+    }
+
+    mark_last_text(&mut items);
+
+    Segment {
+        thread_id: run.thread_id.clone(),
+        created_at: run.created_at.clone(),
+        items,
+        tail_text: if executing { tail_text } else { None },
+        tail_reasoning: if executing { tail_reasoning } else { None },
+        legacy_tail: None,
+        output_len: run.output.len(),
+        fresh_text: false,
+    }
+}
+
+/// Legacy fallback when talking to an older Core that does not supply `RunBlock`s.
+fn build_legacy(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
     let run = parts.run;
     let active = !run.status.terminal();
+    let executing = matches!(run.status, RunStatus::Queued | RunStatus::Running);
     let mut items = Vec::new();
     if !run.input.is_empty() || !run.attachments.is_empty() {
         items.push(TimelineItem::User {
@@ -461,7 +832,7 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
     if !run.reasoning.is_empty() {
         items.push(TimelineItem::Reasoning {
             id: format!("reasoning:{}", run.id),
-            text: Arc::from(run.reasoning.as_str()),
+            text: Arc::new(run.reasoning.clone()),
             streaming: active && run.output.is_empty(),
         });
     }
@@ -471,15 +842,10 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         .copied()
         .filter(|r| shown_request(r))
         .collect();
+    let has_pending_approval = pending.iter().any(|r| r.status == "pending");
 
-    // Tools sit at the reply's byte offset where they started; unknown
-    // offsets (older records) go after the text.
-    let mut run_tools: Vec<(usize, &ToolCall)> = parts
-        .tools
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut run_tools: Vec<(usize, &ToolCall)> =
+        parts.tools.iter().copied().enumerate().collect();
     let offset_of = |tool: &ToolCall| -> usize {
         if tool.output_offset < 0 {
             run.output.len()
@@ -490,37 +856,21 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
     run_tools.sort_by_key(|(order, tool)| (offset_of(tool), *order));
     let all_known = run_tools.iter().all(|(_, t)| t.output_offset >= 0);
 
-    let previous_doc = |id: &str, start: usize| -> Option<Arc<MarkdownDoc>> {
-        previous?.items.iter().find_map(|item| match item {
-            TimelineItem::Text {
-                id: old, start: s, doc, ..
-            } if old == id && *s == start => Some(doc.clone()),
-            _ => None,
-        })
-    };
     let mut cursor = 0;
     let mut segment_no = 0;
-    let mut tail: Option<usize> = None;
+    let mut legacy_tail: Option<(usize, usize)> = None;
     let push_text = |items: &mut Vec<TimelineItem>, from: usize, to: usize, n: &mut usize| {
         let text = &run.output[from..to];
         if !text.trim().is_empty() {
             let id = format!("text:{}:{}", run.id, n);
-            let doc = match previous_doc(&id, from) {
-                Some(mut doc) => {
-                    if doc.len != text.len() {
-                        Arc::make_mut(&mut doc).update(text);
-                    }
-                    doc
-                }
-                None => Arc::new(MarkdownDoc::parse(text)),
-            };
+            let doc = reuse_markdown(previous, &id, text);
             items.push(TimelineItem::Text {
                 id,
                 run_id: run.id.clone(),
-                start: from,
-                end: to,
+                text: Arc::new(text.to_owned()),
                 doc,
                 streaming: false,
+                is_last: false,
             });
         }
         *n += 1;
@@ -529,25 +879,7 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         let at = offset_of(tool).max(cursor);
         push_text(&mut items, cursor, at, &mut segment_no);
         cursor = at;
-        let awaiting = tool.status == "running" && pending.iter().any(|r| r.status == "pending");
-        let entry = ToolEntry {
-            id: format!("tool:{}", tool.id),
-            name: tool.name.clone(),
-            summary: if super::todo::is_todo_tool(&tool.name) {
-                super::todo::summary(tool.arguments.as_ref())
-                    .unwrap_or_else(|| summarize_arguments(tool.arguments.as_ref()))
-            } else {
-                summarize_arguments(tool.arguments.as_ref())
-            },
-            status: if awaiting {
-                ToolStatus::AwaitingApproval
-            } else {
-                ToolStatus::of(&tool.status)
-            },
-            arguments: pretty_arguments(tool.arguments.as_ref()),
-            output: tail_lines(&tool.output, 40),
-        };
-        // A call right after another (no reply text between) joins its group.
+        let entry = build_tool_entry(tool, has_pending_approval);
         match items.last_mut() {
             Some(TimelineItem::Tools { calls, .. }) => calls.push(entry),
             _ => items.push(TimelineItem::Tools {
@@ -558,47 +890,56 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
     }
     let before = items.len();
     push_text(&mut items, cursor, run.output.len(), &mut segment_no);
-    // New output extends the last row only when it is text and no tool can
-    // land after it; otherwise it starts a row (a rebuild).
     if items.len() > before && all_known {
-        tail = Some(items.len() - 1);
+        legacy_tail = Some((items.len() - 1, cursor));
     }
-    // The last text row streams while the run is actively executing.
-    let executing = matches!(run.status, RunStatus::Queued | RunStatus::Running);
     if executing && let Some(TimelineItem::Text { streaming, .. }) = items.last_mut() {
         *streaming = true;
     }
+
+    // Legacy delivered/failed steers render as first-class Steer rows below existing content.
+    let mut steers: Vec<&Input> = parts
+        .inputs
+        .iter()
+        .copied()
+        .filter(|i| i.kind == "steer" && matches!(i.status.as_str(), "delivered" | "failed"))
+        .collect();
+    steers.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+    for steer in steers {
+        items.push(TimelineItem::Steer {
+            id: format!("steer:{}", steer.id),
+            run_id: run.id.clone(),
+            text: Arc::from(steer.message.as_str()),
+            attachments: steer.attachments.clone(),
+            delivered: steer.status == "delivered",
+            error: steer.error.clone(),
+        });
+    }
+
     for request in pending {
         items.push(TimelineItem::Approval {
             id: format!("request:{}", request.id),
             view: approval_view(request),
         });
     }
-    let end = match run.status {
-        RunStatus::Waiting => Some(("等待子任务完成，结束后将自动唤醒并继续…".to_owned(), false)),
-        RunStatus::Cancelled => Some(("已停止".to_owned(), false)),
-        RunStatus::Interrupted => Some((
-            non_empty(&run.error, "执行中断，现场已保留；可重新发送。"),
-            true,
-        )),
-        RunStatus::Failed => Some((non_empty(&run.error, "执行失败"), true)),
-        _ => None,
-    };
-    if let Some((text, error)) = end {
+    if let Some((text, error)) = status_display(run.status, &run.error) {
         items.push(TimelineItem::Status {
             id: format!("status:{}", run.id),
             text,
             error,
         });
     }
+    mark_last_text(&mut items);
+
     Segment {
         thread_id: run.thread_id.clone(),
         created_at: run.created_at.clone(),
         items,
-        // Only an active run's tail grows.
-        tail: if active { tail } else { None },
-        active,
+        tail_text: None,
+        tail_reasoning: None,
+        legacy_tail: if active { legacy_tail } else { None },
         output_len: run.output.len(),
+        fresh_text: false,
     }
 }
 

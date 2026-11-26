@@ -42,9 +42,9 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use vantry_protocol::{
-    Command, CommandKind, CoreEvent, Input, PendingRequest, Receipt, Run, RunStatus,
-    RunTelemetry, Snapshot, Task, Thread, ThreadDetail, ThreadSummary, ThreadSummaries, ToolCall,
-    WorkspaceSpec,
+    Command, CommandKind, CoreEvent, Input, PendingRequest, Receipt, Run, RunBlock, RunBlockKind,
+    RunStatus, RunTelemetry, Snapshot, Task, Thread, ThreadDetail, ThreadSummary, ThreadSummaries,
+    ToolCall, WorkspaceSpec,
 };
 
 pub use self::{
@@ -324,6 +324,7 @@ pub struct AppState {
     pub sequence: i64,
     pub threads: Vec<Thread>,
     pub runs: Vec<Run>,
+    pub blocks: Vec<RunBlock>,
     pub tools: Vec<ToolCall>,
     pub requests: Vec<PendingRequest>,
     pub inputs: Vec<Input>,
@@ -386,6 +387,7 @@ impl Default for AppState {
             sequence: 0,
             threads: Vec::new(),
             runs: Vec::new(),
+            blocks: Vec::new(),
             tools: Vec::new(),
             requests: Vec::new(),
             inputs: Vec::new(),
@@ -666,12 +668,23 @@ impl AppState {
         }
     }
 
-    /// The source text of a text row (copying).
-    pub fn text_of(&self, run_id: &str, start: usize, end: usize) -> String {
-        self.run(run_id)
-            .and_then(|r| r.output.get(start..end.min(r.output.len())))
-            .unwrap_or_default()
-            .to_owned()
+    /// The complete reply text of a run (copying, quoting, previewing): joins
+    /// the run's text blocks in causal `seq` order, falling back to `run.output`.
+    pub fn reply_text(&self, run_id: &str) -> String {
+        let mut text_blocks: Vec<&RunBlock> = self
+            .blocks
+            .iter()
+            .filter(|b| b.run_id == run_id && b.kind == RunBlockKind::Text && !b.text.trim().is_empty())
+            .collect();
+        if !text_blocks.is_empty() {
+            text_blocks.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.id.cmp(&b.id)));
+            return text_blocks
+                .into_iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+        }
+        self.run(run_id).map(|r| r.output.clone()).unwrap_or_default()
     }
 
     /// Unanswered requests, oldest first: the approval queue.
@@ -842,18 +855,27 @@ impl AppState {
         };
         let parts = RunParts {
             run,
+            blocks: self.blocks.iter().filter(|b| b.run_id == run_id).collect(),
             tools: self.tools.iter().filter(|t| t.run_id == run_id).collect(),
             requests: self
                 .requests
                 .iter()
                 .filter(|r| r.run_id == run_id)
                 .collect(),
+            inputs: self.inputs.iter().filter(|i| i.run_id == run_id).collect(),
         };
         self.timeline.refresh_run(parts);
     }
 
     fn rebuild_timeline(&mut self) {
         let mut timeline = std::mem::take(&mut self.timeline);
+        let mut blocks_by_run = std::collections::HashMap::<&str, Vec<&RunBlock>>::new();
+        for block in &self.blocks {
+            blocks_by_run
+                .entry(block.run_id.as_str())
+                .or_default()
+                .push(block);
+        }
         let mut tools_by_run = std::collections::HashMap::<&str, Vec<&ToolCall>>::new();
         for tool in &self.tools {
             tools_by_run
@@ -869,12 +891,63 @@ impl AppState {
                 .or_default()
                 .push(request);
         }
+        let mut inputs_by_run = std::collections::HashMap::<&str, Vec<&Input>>::new();
+        for input in &self.inputs {
+            if !input.run_id.is_empty() {
+                inputs_by_run
+                    .entry(input.run_id.as_str())
+                    .or_default()
+                    .push(input);
+            }
+        }
         timeline.rebuild_all(self.runs.iter().map(|run| RunParts {
             run,
+            blocks: blocks_by_run.remove(run.id.as_str()).unwrap_or_default(),
             tools: tools_by_run.remove(run.id.as_str()).unwrap_or_default(),
             requests: requests_by_run.remove(run.id.as_str()).unwrap_or_default(),
+            inputs: inputs_by_run.remove(run.id.as_str()).unwrap_or_default(),
         }));
         self.timeline = timeline;
+    }
+
+    fn has_blocks(&self, run_id: &str) -> bool {
+        self.blocks.iter().any(|b| b.run_id == run_id)
+    }
+
+    fn close_streaming_blocks(&mut self, run_id: &str, before_seq: Option<i64>) {
+        for block in &mut self.blocks {
+            if block.run_id == run_id
+                && block.status == "streaming"
+                && before_seq.is_none_or(|seq| block.seq < seq)
+            {
+                block.status = "completed".into();
+            }
+        }
+    }
+
+    fn upsert_block(&mut self, mut block: RunBlock) {
+        if block.id.is_empty() || block.run_id.is_empty() {
+            return;
+        }
+        clear_zero_time(&mut block.created_at);
+        clear_zero_time(&mut block.updated_at);
+        if matches!(
+            block.kind,
+            RunBlockKind::Tool
+                | RunBlockKind::Steer
+                | RunBlockKind::Approval
+                | RunBlockKind::Status
+        ) {
+            self.close_streaming_blocks(&block.run_id, Some(block.seq));
+        }
+        if block.kind == RunBlockKind::Status {
+            self.blocks
+                .retain(|b| !(b.run_id == block.run_id && b.kind == RunBlockKind::Status && b.id != block.id));
+        }
+        match self.blocks.iter_mut().find(|b| b.id == block.id) {
+            Some(existing) => *existing = block,
+            None => self.blocks.push(block),
+        }
     }
 }
 
@@ -888,6 +961,7 @@ impl AppState {
         let summaries = summaries.threads.unwrap_or_default();
         self.threads = summaries.iter().cloned().map(thread_from_summary).collect();
         self.runs.clear();
+        self.blocks.clear();
         self.tools.clear();
         self.requests.clear();
         self.inputs.clear();
@@ -1008,6 +1082,7 @@ impl AppState {
             inputs,
             tools,
             requests,
+            blocks,
             truncated_runs,
             ..
         } = detail;
@@ -1022,6 +1097,7 @@ impl AppState {
         self.summary_statuses.remove(&id);
         self.summary_activity.remove(&id);
         self.runs.retain(|run| run.thread_id != id);
+        self.blocks.retain(|block| block.thread_id != id);
         self.tools.retain(|tool| tool.thread_id != id);
         self.requests.retain(|request| request.thread_id != id);
         self.inputs.retain(|input| input.thread_id != id);
@@ -1031,6 +1107,7 @@ impl AppState {
             clear_zero_time(&mut run.created_at);
         }
         self.runs.extend(runs);
+        self.blocks.extend(blocks);
         self.tools.extend(tools.unwrap_or_default());
         self.requests.extend(requests.unwrap_or_default());
         self.inputs.extend(inputs.unwrap_or_default());
@@ -1072,6 +1149,7 @@ impl AppState {
             inputs,
             tools,
             requests,
+            blocks,
             ..
         } = detail;
         clear_zero_time(&mut thread.created_at);
@@ -1084,6 +1162,11 @@ impl AppState {
             match self.runs.iter_mut().find(|r| r.id == run.id) {
                 Some(existing) => merge_run(existing, run),
                 None => self.runs.push(run),
+            }
+        }
+        for block in blocks {
+            if !self.blocks.iter().any(|b| b.id == block.id) {
+                self.blocks.push(block);
             }
         }
         for tool in tools.unwrap_or_default() {
@@ -1116,6 +1199,7 @@ impl AppState {
         self.sequence = snapshot.sequence;
         self.threads = snapshot.threads.unwrap_or_default();
         self.runs = snapshot.runs.unwrap_or_default();
+        self.blocks = snapshot.blocks;
         self.tasks = snapshot.tasks.unwrap_or_default();
         self.tools = snapshot.tools;
         self.requests = snapshot.requests;
@@ -1247,33 +1331,47 @@ impl AppState {
     /// `decodeOutput`: a delta (`delta` / `text` / `chunk` / bare string) is
     /// appended; a full `output` without one reconciles the run's output.
     fn fold_output(&mut self, event: &CoreEvent) -> bool {
-        let (delta, full) = match &event.data {
-            Value::String(text) => (Some(text.clone()), None),
+        let (delta, full, block_meta) = match &event.data {
+            Value::String(text) => (Some(text.clone()), None, None),
             Value::Object(map) => {
                 let delta = ["delta", "text", "chunk"]
                     .iter()
                     .find_map(|k| map.get(*k).and_then(Value::as_str).map(str::to_owned));
                 let full = map.get("output").and_then(Value::as_str).map(str::to_owned);
-                (delta, full)
+                let meta = map
+                    .get("blockId")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|id| {
+                        map.get("seq")
+                            .and_then(Value::as_i64)
+                            .map(|seq| (id.to_owned(), seq))
+                    });
+                (delta, full, meta)
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
         let run_id = event.run_id.clone();
         let Some(run) = self.run_mut(&run_id) else {
             return false;
         };
-        let appended = match (delta, full) {
+        let thread_id = run.thread_id.clone();
+        let attempt_id = if event.attempt_id.is_empty() {
+            run.attempt_id.clone()
+        } else {
+            event.attempt_id.clone()
+        };
+        let appended = match (&delta, &full) {
             (Some(delta), _) if !delta.is_empty() => {
-                run.output.push_str(&delta);
+                run.output.push_str(delta);
                 true
             }
             (_, Some(full)) if !full.is_empty() => {
-                if run.output.starts_with(&full) {
+                if run.output.starts_with(full) {
                     return true;
                 }
-                // A rewrite, not an extension: rebuild the rows.
                 let extends = full.starts_with(&run.output);
-                run.output = full;
+                run.output = full.clone();
                 if !extends {
                     self.timeline.forget_text(&run_id);
                 }
@@ -1282,6 +1380,36 @@ impl AppState {
             (None, None) => return false,
             _ => return true,
         };
+        if let (Some((block_id, seq)), Some(delta)) = (block_meta, delta.filter(|d| !d.is_empty()))
+        {
+            if let Some(existing) = self.blocks.iter_mut().find(|b| b.id == block_id) {
+                existing.text.push_str(&delta);
+                existing.status = "streaming".into();
+                if !self.timeline.append_text_block(&run_id, &block_id, &delta) {
+                    self.refresh_run(&run_id);
+                }
+            } else {
+                self.close_streaming_blocks(&run_id, None);
+                self.blocks.push(RunBlock {
+                    id: block_id,
+                    thread_id,
+                    run_id: run_id.clone(),
+                    attempt_id,
+                    seq,
+                    kind: RunBlockKind::Text,
+                    text: delta,
+                    status: "streaming".into(),
+                    ..RunBlock::default()
+                });
+                self.refresh_run(&run_id);
+            }
+            return true;
+        }
+        // If this run is already block-backed and Core sent a legacy-only
+        // separator (no blockId), keep run.output updated without touching blocks.
+        if self.has_blocks(&run_id) && full.is_none() {
+            return true;
+        }
         let fast = appended && {
             let run = self.runs.iter().find(|r| r.id == run_id);
             run.is_some_and(|run| self.timeline.append_output(run))
@@ -1296,22 +1424,68 @@ impl AppState {
         let Some(delta) = event.data.get("reasoningDelta").and_then(Value::as_str) else {
             return false;
         };
+        let block_meta = event
+            .data
+            .get("blockId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .and_then(|id| {
+                event
+                    .data
+                    .get("seq")
+                    .and_then(Value::as_i64)
+                    .map(|seq| (id.to_owned(), seq))
+            });
         let delta = delta.to_owned();
         let run_id = event.run_id.clone();
-        match self.run_mut(&run_id) {
-            Some(run) => {
-                run.reasoning.push_str(&delta);
-                let updated = {
-                    let run = self.runs.iter().find(|r| r.id == run_id);
-                    run.is_some_and(|run| self.timeline.update_reasoning(run))
-                };
-                if !updated {
+        let Some(run) = self.run_mut(&run_id) else {
+            return false;
+        };
+        let thread_id = run.thread_id.clone();
+        let attempt_id = if event.attempt_id.is_empty() {
+            run.attempt_id.clone()
+        } else {
+            event.attempt_id.clone()
+        };
+        run.reasoning.push_str(&delta);
+        if let Some((block_id, seq)) = block_meta {
+            if let Some(existing) = self.blocks.iter_mut().find(|b| b.id == block_id) {
+                existing.text.push_str(&delta);
+                existing.status = "streaming".into();
+                if !self
+                    .timeline
+                    .append_reasoning_block(&run_id, &block_id, &delta)
+                {
                     self.refresh_run(&run_id);
                 }
-                true
+            } else {
+                self.close_streaming_blocks(&run_id, None);
+                self.blocks.push(RunBlock {
+                    id: block_id,
+                    thread_id,
+                    run_id: run_id.clone(),
+                    attempt_id,
+                    seq,
+                    kind: RunBlockKind::Reasoning,
+                    text: delta,
+                    status: "streaming".into(),
+                    ..RunBlock::default()
+                });
+                self.refresh_run(&run_id);
             }
-            None => false,
+            return true;
         }
+        if self.has_blocks(&run_id) {
+            return true;
+        }
+        let updated = {
+            let run = self.runs.iter().find(|r| r.id == run_id);
+            run.is_some_and(|run| self.timeline.update_reasoning(run))
+        };
+        if !updated {
+            self.refresh_run(&run_id);
+        }
+        true
     }
 
     fn fold_telemetry(&mut self, event: &CoreEvent) -> bool {
@@ -1375,14 +1549,41 @@ impl AppState {
             self.unread.insert(run.thread_id.clone());
         }
         let mut rewritten = false;
-        match self.run_mut(&id) {
+        let final_status = match self.run_mut(&id) {
             Some(existing) => {
                 rewritten = !run.output.is_empty()
                     && !run.output.starts_with(&existing.output)
                     && !existing.output.starts_with(&run.output);
                 merge_run(existing, run);
+                existing.status
             }
-            None => self.runs.push(run),
+            None => {
+                let st = run.status;
+                self.runs.push(run);
+                st
+            }
+        };
+        if matches!(
+            final_status,
+            RunStatus::Queued | RunStatus::Running | RunStatus::Completed
+        ) {
+            self.blocks
+                .retain(|b| !(b.run_id == id && b.kind == RunBlockKind::Status));
+        }
+        if final_status.terminal() || final_status == RunStatus::Waiting {
+            self.close_streaming_blocks(&id, None);
+        }
+        if let Some(block_val) = event.data.get("block")
+            && let Some(block) = decode::<RunBlock>(block_val)
+        {
+            self.upsert_block(block);
+        }
+        if let Some(blocks_val) = event.data.get("blocks").and_then(Value::as_array) {
+            for item in blocks_val {
+                if let Some(block) = decode::<RunBlock>(item) {
+                    self.upsert_block(block);
+                }
+            }
         }
         if rewritten {
             self.timeline.forget_text(&id);
@@ -1423,6 +1624,7 @@ impl AppState {
         }
         self.threads.retain(|t| t.id != id);
         self.runs.retain(|r| r.thread_id != id);
+        self.blocks.retain(|b| b.thread_id != id);
         self.tools.retain(|t| t.thread_id != id);
         self.requests.retain(|r| r.thread_id != id);
         self.inputs.retain(|i| i.thread_id != id);
@@ -1472,6 +1674,7 @@ impl AppState {
             return false;
         }
         self.runs.retain(|r| !removed.contains(&r.id));
+        self.blocks.retain(|b| !removed.contains(&b.run_id));
         self.tools.retain(|t| !removed.contains(&t.run_id));
         self.requests.retain(|r| !removed.contains(&r.run_id));
         self.timeline.remove_runs(&removed);
@@ -1501,6 +1704,11 @@ impl AppState {
         match self.tools.iter_mut().find(|t| t.id == tool.id) {
             Some(existing) => *existing = tool,
             None => self.tools.push(tool),
+        }
+        if let Some(block_val) = event.data.get("block")
+            && let Some(block) = decode::<RunBlock>(block_val)
+        {
+            self.upsert_block(block);
         }
         self.refresh_run(&run_id);
         true
@@ -1535,6 +1743,11 @@ impl AppState {
             Some(existing) => *existing = request,
             None => self.requests.push(request),
         }
+        if let Some(block_val) = event.data.get("block")
+            && let Some(block) = decode::<RunBlock>(block_val)
+        {
+            self.upsert_block(block);
+        }
         self.refresh_run(&run_id);
         true
     }
@@ -1565,9 +1778,27 @@ impl AppState {
                 "这条排队消息已开始或已取消，编辑已结束。",
             ));
         }
+        let steer_run_id = if input.kind == "steer"
+            && !input.run_id.is_empty()
+            && matches!(input.status.as_str(), "delivered" | "failed")
+        {
+            Some(input.run_id.clone())
+        } else {
+            None
+        };
         match self.inputs.iter_mut().find(|i| i.id == input.id) {
             Some(existing) => *existing = input,
             None => self.inputs.push(input),
+        }
+        let mut block_run_id = None;
+        if let Some(block_val) = event.data.get("block")
+            && let Some(block) = decode::<RunBlock>(block_val)
+        {
+            block_run_id = Some(block.run_id.clone());
+            self.upsert_block(block);
+        }
+        if let Some(run_id) = block_run_id.or(steer_run_id) {
+            self.refresh_run(&run_id);
         }
         true
     }

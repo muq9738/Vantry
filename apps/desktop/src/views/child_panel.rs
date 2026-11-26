@@ -486,6 +486,7 @@ fn turn_row(
             TimelineItem::Tools { .. } => 3,
             TimelineItem::Approval { .. } => 4,
             TimelineItem::Status { .. } => 5,
+            TimelineItem::Steer { .. } => 6,
         })
     });
     dynamic(move || match kind.get() {
@@ -494,8 +495,68 @@ fn turn_row(
         2 => reply(memo).into_element(),
         3 => timeline::tools_row(memo).into_element(),
         4 => timeline::approval_row(memo).into_element(),
+        6 => steer_card(memo).into_element(),
         _ => status_line(memo).into_element(),
     })
+}
+
+fn steer_card(item: timeline::ItemMemo) -> impl IntoElement {
+    let colors = palette();
+    let steer = computed(move || match item.get() {
+        Some(TimelineItem::Steer {
+            text,
+            delivered,
+            error,
+            ..
+        }) => (text.to_string(), delivered, error),
+        _ => (String::new(), true, String::new()),
+    });
+    view()
+        .w_full()
+        .min_w_0()
+        .flex_col()
+        .gap_0p5()
+        .px_2p5()
+        .py_1p5()
+        .rounded(px(8.0))
+        .bg(colors.user)
+        .border_1()
+        .border_color(move || {
+            if steer.with(|s| s.1) {
+                colors.line_soft
+            } else {
+                colors.danger
+            }
+        })
+        .child(
+            text(move || {
+                steer.with(|(_, ok, err)| {
+                    if *ok {
+                        "已插入本轮".to_owned()
+                    } else if err.trim().is_empty() {
+                        "插入失败".to_owned()
+                    } else {
+                        format!("插入失败 · {err}")
+                    }
+                })
+            })
+            .text_size(px(10.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(move || {
+                if steer.with(|s| s.1) {
+                    colors.muted
+                } else {
+                    colors.danger
+                }
+            }),
+        )
+        .child(
+            text(move || steer.with(|s| s.0.clone()))
+                .select_text()
+                .text_size(px(12.5))
+                .line_height(LineHeight::Multiple(1.5))
+                .text_color(colors.ink),
+        )
 }
 
 /// A folded instruction or follow-up in the child's timeline.
