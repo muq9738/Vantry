@@ -1848,163 +1848,148 @@ mod tests {
     }
 }
 
-/// Above the composer: the thread's sub-agent card on the left and its
-/// compact task list beside it, both kept to a restrained width; narrow
-/// windows stack them.
+/// One line stays in the layout. Both detail lists share a scrollable overlay.
 fn work_strip(
     todo: Memo<Option<crate::state::todo::TodoList>>,
     subagents: Memo<Vec<super::child_panel::SubagentRow>>,
     width: Signal<f32>,
 ) -> impl IntoElement {
-    use super::child_panel::{STACK_BELOW, subagent_card, subagent_width, todo_width};
-    let has_agents = computed(move || subagents.with(|r| !r.is_empty()));
-    let has_todo = computed(move || todo.with(Option::is_some));
-    let stacked = computed(move || width.get() < STACK_BELOW);
+    use super::child_panel::{subagent_list, subagent_summary};
+    let colors = palette();
+    let open = signal(false);
+    let anchor = element_ref();
+    let thread = computed(|| controller::state().with(|s| s.draft_key()));
+    effect(move || {
+        thread.get();
+        open.set(false);
+    });
+    let summary = computed(move || {
+        let agents = subagents.with(|rows| rows.iter().map(|r| r.status).collect::<Vec<_>>());
+        let children = (!agents.is_empty()).then(|| subagent_summary(&agents));
+        todo.with(|list| work_summary(children, list.as_ref()))
+    });
     view()
         .w_full()
-        .min_w(px(0.0))
-        .flex_row()
-        .flex_wrap()
-        .items_start()
-        .gap_2()
+        .min_w_0()
+        .child(
+            nsh_base::button()
+                .element_ref(&anchor)
+                .accessibility_label(move || Some(SharedString::from(summary.get())))
+                .on_press(move || open.set(!open.get_untracked()))
+                .w_full()
+                .h(px(30.0))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .rounded(px(6.0))
+                .bg(colors.soft)
+                .hover(|s| s.bg(colors.raised))
+                .active(|s| s.opacity(0.75))
+                .child(icon(Icon::ListChecks, 13.0, colors.muted))
+                .child(
+                    text(move || summary.get())
+                        .flex_1()
+                        .min_w_0()
+                        .number_of_lines(1u32)
+                        .text_size(px(12.0))
+                        .text_color(colors.ink),
+                )
+                .child(dynamic(move || {
+                    icon(
+                        if open.get() {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronUp
+                        },
+                        12.0,
+                        colors.muted,
+                    )
+                })),
+        )
         .child(when(
-            move || has_agents.get(),
+            move || open.get(),
             move || {
-                view()
-                    .flex_shrink_0()
-                    .min_w(px(0.0))
-                    .w(move || {
-                        let w = width.get();
-                        px(if stacked.get() { w } else { subagent_width(w) })
-                    })
-                    .child(subagent_card(subagents))
-            },
-        ))
-        .child(when(
-            move || has_todo.get(),
-            move || {
-                view()
-                    .flex_shrink(1.0)
-                    .min_w(px(0.0))
-                    .w(move || {
-                        let w = width.get();
-                        px(if stacked.get() { w } else { todo_width(w, has_agents.get()) })
-                    })
-                    .child(todo_panel(todo))
+                overlay()
+                    .anchor(&anchor)
+                    .placement(Placement::Top)
+                    .align(Align::Start)
+                    .offset(px(4.0))
+                    .margin(px(8.0))
+                    .w(move || px(width.get().min(420.0)))
+                    .on_press_outside(move |_: &Point<Points>| open.set(false))
+                    .on_cancel(move || open.set(false))
+                    .child(
+                        view()
+                            .flex_col()
+                            .rounded(px(10.0))
+                            .border_1()
+                            .border_color(colors.line)
+                            .bg(colors.raised)
+                            .shadow_lg()
+                            .child(
+                                scroll().max_h(px(300.0)).child(
+                                    view()
+                                        .flex_col()
+                                        .gap_2()
+                                        .p_2()
+                                        .child(when(
+                                            move || subagents.with(|r| !r.is_empty()),
+                                            move || {
+                                                view()
+                                                    .flex_col()
+                                                    .child(section_title("子代理"))
+                                                    .child(subagent_list(subagents, open))
+                                            },
+                                        ))
+                                        .child(when(
+                                            move || todo.with(Option::is_some),
+                                            move || todo_panel(todo),
+                                        )),
+                                ),
+                            ),
+                    )
             },
         ))
 }
 
-/// The agent's task list for the open thread (`vantry_todo_write`), pinned
-/// above the composer as Antigravity's task list.
+fn work_summary(children: Option<String>, list: Option<&crate::state::todo::TodoList>) -> String {
+    let mut parts = Vec::new();
+    if let Some(children) = children {
+        parts.push(format!("子代理 {children}"));
+    }
+    if let Some(list) = list {
+        parts.push(format!("任务 {}", list.progress()));
+        if let Some(current) = list.current() {
+            parts.push(format!("当前：{}", current.label()));
+        }
+    }
+    parts.join(" · ")
+}
+
+fn section_title(label: impl Into<String>) -> impl IntoElement {
+    text(label.into())
+        .px_1()
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(palette().muted)
+}
+
 fn todo_panel(list: Memo<Option<crate::state::todo::TodoList>>) -> impl IntoElement {
     use crate::state::todo::TodoStatus;
     let colors = palette();
-    // Folding follows the list: open while it runs, closed once all is done;
-    // the user's choice holds until the agent writes a new list.
-    let folded = signal(None::<(String, bool)>);
-    let is_folded = computed(move || {
-        let Some(l) = list.get() else { return true };
-        match folded.get() {
-            Some((call, f)) if call == l.call_id => f,
-            _ => l.all_done(),
-        }
-    });
-    let toggle = move || {
-        if let Some(l) = list.get_untracked() {
-            folded.set(Some((l.call_id.clone(), !is_folded.get_untracked())));
-        }
-    };
-    let header = nsh_base::button()
-        .accessibility_label("展开或收起任务清单")
-        .on_press(toggle)
-        .w_full()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .py_2()
-        .rounded(px(10.0))
-        .hover(|s| s.bg(colors.soft))
-        .child(icon(Icon::ListChecks, 14.0, colors.accent))
-        .child(
-            text(move || {
-                list.with(|l| {
-                    let l = l.as_ref();
-                    let title = l.map(|l| l.title.clone()).filter(|t| !t.is_empty());
-                    title.unwrap_or_else(|| "任务清单".to_owned())
-                })
-            })
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_size(px(12.5))
-            .text_color(colors.ink),
-        )
-        .child(
-            text(move || {
-                list.with(|l| {
-                    let Some(l) = l else { return String::new() };
-                    if !is_folded.get() {
-                        return String::new();
-                    }
-                    match l.current() {
-                        Some(now) => now.label().to_owned(),
-                        None if l.all_done() => "全部完成".to_owned(),
-                        None => String::new(),
-                    }
-                })
-            })
-            .flex_1()
-            .min_w_0()
-            .number_of_lines(1u32)
-            .text_size(px(12.0))
-            .text_color(colors.muted),
-        )
-        .child(
-            view()
-                .w(px(64.0))
-                .h(px(4.0))
-                .rounded_full()
-                .bg(colors.line)
-                .overflow_hidden()
-                .child(
-                    view()
-                        .h_full()
-                        .rounded_full()
-                        .bg(move || {
-                            if list.with(|l| l.as_ref().is_some_and(|l| l.all_done())) {
-                                colors.success
-                            } else {
-                                colors.accent
-                            }
-                        })
-                        .w(move || {
-                            px(list.with(|l| {
-                                l.as_ref().map_or(0.0, |l| {
-                                    64.0 * l.done() as f32 / l.items.len().max(1) as f32
-                                })
-                            }))
-                        }),
-                ),
-        )
-        .child(
-            text(move || list.with(|l| l.as_ref().map(|l| l.progress()).unwrap_or_default()))
-                .font_family("Menlo")
-                .text_size(px(11.5))
-                .text_color(colors.muted),
-        )
-        .child(dynamic(move || {
-            icon(
-                if is_folded.get() { Icon::ChevronDown } else { Icon::ChevronUp },
-                13.0,
-                colors.faint,
-            )
-        }));
-    let items = dynamic(move || {
-        if is_folded.get() {
+    dynamic(move || {
+        let Some(l) = list.get() else {
             return view().into_element();
-        }
-        let Some(l) = list.get() else { return view().into_element() };
-        let mut col = view().flex_col().gap_0p5().px_3().pb_2p5();
+        };
+        let mut col = view()
+            .flex_col()
+            .gap_0p5()
+            .child(section_title(if l.title.is_empty() {
+                "任务清单"
+            } else {
+                &l.title
+            }));
         for item in l.items {
             let (mark, ink) = match item.status {
                 TodoStatus::Completed => (
@@ -2062,7 +2047,11 @@ fn todo_panel(list: Memo<Option<crate::state::todo::TodoList>>) -> impl IntoElem
                 .min_w_0()
                 .text_size(px(12.5))
                 .line_height(nsh_core::LineHeight::Multiple(1.45))
-                .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
                 .text_color(ink);
             if done {
                 label = label.line_through().text_decoration_color(colors.faint);
@@ -2080,14 +2069,31 @@ fn todo_panel(list: Memo<Option<crate::state::todo::TodoList>>) -> impl IntoElem
                     .child(label),
             );
         }
-        scroll().max_h(px(220.0)).child(col).into_element()
-    });
-    view()
-        .flex_col()
-        .rounded(px(12.0))
-        .bg(colors.raised)
-        .border_1()
-        .border_color(colors.line)
-        .child(header)
-        .child(items)
+        col.into_element()
+    })
+}
+
+#[cfg(test)]
+mod work_strip_tests {
+    use super::work_summary;
+    use crate::state::todo::{TodoEntry, TodoList, TodoStatus};
+
+    #[test]
+    fn summary_combines_available_work_and_current_activity() {
+        let list = TodoList {
+            items: vec![TodoEntry {
+                content: "检查".into(),
+                active_form: "正在检查".into(),
+                status: TodoStatus::InProgress,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(work_summary(None, None), "");
+        assert_eq!(work_summary(Some("1 完成".into()), None), "子代理 1 完成");
+        assert_eq!(work_summary(None, Some(&list)), "任务 0/1 · 当前：正在检查");
+        assert_eq!(
+            work_summary(Some("2 运行中".into()), Some(&list)),
+            "子代理 2 运行中 · 任务 0/1 · 当前：正在检查"
+        );
+    }
 }
