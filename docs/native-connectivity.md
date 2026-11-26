@@ -33,6 +33,42 @@ Vantry 回连将 `core`／`stream` 通道接到 Core，将 `t3`／`http` 接到 
 
 局域网发现使用 Go 的 mDNS 实现，继续发布 `_vantry._tcp`。Vantry 配对保留证书信任与直连优先策略，直连不可用时按配置走中继。无中继的 LAN 配对通过携带公开主机证书的完整链接完成一次性兑换。
 
+### 用 Alma iOS 打开 Vantry 会话
+
+Vantry 0.2.18 的本机桌面可以把一条已有会话分享给 Alma iOS。右键点侧栏里的会话，选择「用 Alma iOS 打开…」→「生成配对码」。也可以先选中会话，再打开「设置 → 环境 → Alma iOS → 手机配对…」。让 iPhone 与 Mac 连到同一局域网，在 Alma iOS 的添加连接入口扫描二维码。手机发送的文本进入所选 Vantry 会话，由该会话的 Provider 执行。Alma 桌面可以同时运行。
+
+跨网络使用时，生成前展开「使用跨网中继…」，填写手机和电脑都能访问的 Alma 兼容 HTTPS 中继及其要求的注册凭据。中继完成登记后，界面会显示二维码。Vantry 会显示通过加密握手的手机连接数。关闭配对窗口后共享继续生效，Core 重启会恢复原配对。「停止共享」会断开连接并撤销旧码。要改为分享另一条会话，先停止当前共享。
+
+### Alma 手机接入联调
+
+已有 Alma 配对的 iPhone 可以直接核对真机版本和连接状态。在 Alma 桌面的远程访问页查看中继和手机在线状态。记录承接连接的桌面服务，验收 Vantry 收发时再核对所选 Core 线程的运行记录。
+
+以下参数适用于从 `v0.2.17` 基线加入 Alma 接入改动后构建的 Vantry Service。它主动连接 Alma 兼容中继，只向持有配对码的客户端开放指定 Core 线程。真机联调使用隔离的 Core 数据目录、已有的测试线程，以及手机能访问的 HTTPS 中继。启动该 Core 时传入两个参数。
+
+```sh
+vantry-service core --data-dir "$TEST_DATA" --provider controlled \
+  --alma-thread "$TEST_THREAD" --alma-relay "$TEST_RELAY"
+```
+
+中继开启注册鉴权时，将注册凭据存入该私有数据目录中的 `alma-registration-key` 文件，并限制为本人可读。在电脑上打开同目录的 `alma-pairing.svg` 供手机扫码。`alma-pairing.json` 和二维码均是配对凭据。相同线程与中继可复用配对。更换共享线程、中继或使用启动参数 `--alma-reset-pairing` 会生成新配对。
+
+此命令行入口支持中继协议 1、端到端加密、线程及分页历史、文本发送和流式回复。WebSocket 写入复用 Core 命令去重，重连后可从同一线程读取已提交内容。0.2.18 的桌面配对另外支持局域网直连。原版 iOS 的屏幕显示与实际换网行为需在真机验收。
+
+回环互测可使用 Node 22 或以上版本、已编译的 Service 和已安装运行依赖的官方 `alma-relay` 1.5.0 检出目录。测试自行创建数据目录、测试线程和临时中继，并在结束后清理。[官方中继](https://github.com/yetone/alma-relay)
+
+```sh
+cargo build --locked -p vantry-service
+node apps/service/tests/alma_interop.mjs target/debug/vantry-service /path/to/alma-relay
+```
+
+已通过云中继连接 Alma 桌面端的 iPhone 还可以在现有配对上调试。运行下面的命令会在本机 Alma 创建一个临时模型服务和一条独立的测试会话。电脑先自动发送一条测试文本。看到终端输出的会话名和手机测试文本后，在 iPhone 打开该会话并发送原文。
+
+```sh
+node apps/service/tests/alma_paired_phone.mjs target/debug/vantry-service /path/to/alma-relay
+```
+
+这条诊断路径经 Alma 桌面、回环模型服务和官方参照中继进入 Vantry 的加密入口，运行由隔离 Core 的受控 Provider 执行。探针只转发出现在专用会话里的测试文本，逐段核对 Core 输出与 Alma 保存的回复。退出时移除临时模型服务、停止测试进程，手机会话保留记录。加 `--desktop-only` 可以复验电脑发起的收发，该选项也会清理只有自动测试消息的临时会话。
+
 ### T3 手机访问 Vantry
 
 会话设置中的“T3 手机连接地址”必须是可达的根路径地址，例如 `https://studio.example.com:9443`。在中继 `sessions.routes` 中，把该主机名映射到设备高级设置显示的本机中继路由。手机会清除 URL 路径前缀，因此不能把旧 `/vantry-relay` 路径当作手机环境入口。

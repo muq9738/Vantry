@@ -1,7 +1,57 @@
 use super::schema::DDLS;
 use crate::{Core, ErrorCode};
 use rusqlite::Connection;
-use vantry_protocol::{Command, CommandKind};
+use vantry_protocol::{Command, CommandKind, ThreadDetailQuery};
+
+#[test]
+fn thread_detail_returns_requested_send_receipts_only_for_visible_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path()).unwrap();
+    for thread in ["one", "two"] {
+        let mut create = Command::new(format!("create/{thread}"), CommandKind::CreateThread);
+        create.thread_id = thread.into();
+        core.dispatch(&create).unwrap();
+    }
+    let send = |thread: &str, command_id: &str| {
+        let mut cmd = Command::new(command_id, CommandKind::SendMessage);
+        cmd.thread_id = thread.into();
+        cmd.message = "test".into();
+        let run_id = core.dispatch(&cmd).unwrap().run_id;
+        let mut stop = Command::new(format!("{command_id}/stop"), CommandKind::StopRun);
+        stop.run_id = run_id.clone();
+        core.dispatch(&stop).unwrap();
+        run_id
+    };
+    let first = send("one", "client/a/first");
+    send("one", "client/b/other");
+    send("two", "client/a/elsewhere");
+    let last = send("one", "client/a/last");
+    assert!(
+        core.thread_detail("one", 0)
+            .unwrap()
+            .send_command_ids
+            .is_empty()
+    );
+    let query = |limit_runs| {
+        core.query_thread_detail(&ThreadDetailQuery {
+            thread_id: "one".into(),
+            limit_runs,
+            command_prefix: "client/a/".into(),
+        })
+        .unwrap()
+        .send_command_ids
+    };
+    assert_eq!(query(1), [(last.clone(), "client/a/last".into())].into());
+    assert_eq!(
+        query(0),
+        [
+            (first, "client/a/first".into()),
+            (last, "client/a/last".into()),
+        ]
+        .into()
+    );
+}
+
 #[test]
 fn every_published_version_preserves_history_and_upgrades_idempotently() {
     for v in 1..=12 {

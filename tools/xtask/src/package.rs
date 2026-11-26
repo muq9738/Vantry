@@ -254,6 +254,7 @@ impl Bundle {
         let file = File::create(&path)?;
         if name.ends_with(".zip") {
             let mut zip = ZipWriter::new(file);
+            let level = (self.root.extension() == Some(std::ffi::OsStr::new("app"))).then_some(9);
             for entry in &self.files {
                 let src = self.root.join(&entry.path);
                 let mut input = File::open(src)?;
@@ -271,7 +272,8 @@ impl Bundle {
                         .replace('\\', "/"),
                     SimpleFileOptions::default()
                         .unix_permissions(mode)
-                        .compression_method(zip::CompressionMethod::Deflated),
+                        .compression_method(zip::CompressionMethod::Deflated)
+                        .compression_level(level),
                 )?;
                 io::copy(&mut input, &mut zip)?;
             }

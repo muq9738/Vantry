@@ -1,5 +1,6 @@
 //! Transport and device authorization shared by the headless relay and Core.
 pub mod acme;
+pub mod alma;
 pub mod bootstrap;
 pub mod desktop;
 pub mod desktop_client;

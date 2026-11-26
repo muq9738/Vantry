@@ -29,6 +29,7 @@ pub struct Workbench {
     pub federator: Arc<crate::federation::Federator>,
     invitations: vantry_connectivity::bootstrap::Publisher,
     pub start_remote: tokio::sync::Notify,
+    pub alma: crate::alma::Sharing,
     pub mobile_server: tokio::sync::watch::Sender<Option<vantry_connectivity::t3compat::T3Server>>,
     updater: AsyncMutex<UpdateManager>,
     updater_info: tokio::sync::watch::Receiver<AppUpdateInfo>,
@@ -83,7 +84,9 @@ impl Workbench {
             Err(e) => return Err(e.into()),
         };
         ensure!(!environment.is_empty(), "empty environment ID");
+        let alma = crate::alma::Sharing::new(core.clone());
         Ok(Self {
+            alma,
             core,
             options,
             magpie,
@@ -293,6 +296,17 @@ impl Workbench {
                 }).to_string();
             }
             "remote.pair.create" => return self.pair().await,
+            "remote.pair.alma.status" | "remote.pair.alma.show" | "remote.pair.alma.create" | "remote.pair.alma.revoke" => {
+                let input = r.input.as_ref().unwrap_or(&Value::Null);
+                let status = match action {
+                    "remote.pair.alma.create" => self.alma.create(&r.thread_id,
+                        input["relay"].as_str().unwrap_or(""), input["registrationKey"].as_str().unwrap_or("")).await?,
+                    "remote.pair.alma.revoke" => self.alma.revoke(&r.name).await?,
+                    "remote.pair.alma.show" => self.alma.status(Some(&r.thread_id)).await,
+                    _ => self.alma.status(None).await,
+                };
+                out.output = status.to_string();
+            }
             "remote.pair.redeem" => return self.redeem(r).await,
             "remote.pair.status" => return self.pairing_status(r).await,
             "remote.pair.cancel" => {

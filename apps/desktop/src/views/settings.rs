@@ -20,6 +20,9 @@ use crate::{
     theme::{metrics, palette},
 };
 
+mod alma;
+pub(crate) use alma::dialog as alma_pairing_dialog;
+
 const MONO: &str = "Menlo";
 
 type Data = Memo<Option<std::sync::Arc<SettingsData>>>;
@@ -1242,6 +1245,7 @@ fn remote_page(data: Data) -> impl IntoElement {
     view()
         .flex_col()
         .gap_3()
+        .child(when(move || target.get().is_none() && controller::current_machine().is_none(), alma::settings_entry))
         .child(dynamic(move || {
             let remote = data.with(|d| d.as_ref().and_then(|d| d.remote.clone()));
             let Some(remote) = remote else {
@@ -1288,27 +1292,7 @@ fn remote_page(data: Data) -> impl IntoElement {
             if !remote.t3_pairing_link.is_empty() {
                 let link = remote.t3_pairing_link.clone();
                 c = c.child(caption("Scan with Vantry on iPhone"));
-                let qr = qrcodegen::QrCode::encode_text(&link, qrcodegen::QrCodeEcc::Medium)
-                    .or_else(|_| qrcodegen::QrCode::encode_text(&link, qrcodegen::QrCodeEcc::Low));
-                if let Ok(qr) = qr {
-                    let scale = (320 / (qr.size() + 8)).max(1) as f32;
-                    let size = (qr.size() + 8) as f32 * scale;
-                    let mut painter = Painter::new().fill_color(white()).fill_rect(0., 0., size, size)
-                        .fill_color(black());
-                    for y in 0..qr.size() {
-                        let mut x = 0;
-                        while x < qr.size() {
-                            let start = x;
-                            while x < qr.size() && qr.get_module(x, y) { x += 1; }
-                            if x > start {
-                                painter = painter.fill_rect((start + 4) as f32 * scale, (y + 4) as f32 * scale,
-                                    (x - start) as f32 * scale, scale);
-                            }
-                            x += 1;
-                        }
-                    }
-                    c = c.child(canvas(painter).w(px(size)).h(px(size)).flex_shrink_0());
-                }
+                if let Some(qr) = alma::qr(&link, 320) { c = c.child(qr); }
                 c = c.child(link_button("Copy iPhone pairing link", move || controller::copy(link.clone())));
             }
             if !remote.pairing_code.is_empty() {

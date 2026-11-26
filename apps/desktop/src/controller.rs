@@ -39,6 +39,7 @@ const LIVE_AFTER: Duration = Duration::from_millis(300);
 const SAVE_AFTER: Duration = Duration::from_millis(600);
 
 pub(crate) mod machines;
+pub(crate) mod alma;
 
 fn session() -> Option<machines::Session> { use_context() }
 

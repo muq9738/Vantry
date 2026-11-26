@@ -442,8 +442,8 @@ async fn route(
         "/v1/snapshot" | "/v1/state" => response_encoded(ok, core.snapshot()?, gzip),
         "/v1/threads/summaries" => response_encoded(ok, core.thread_summaries()?, gzip),
         "/v1/threads/detail" => {
-            let (thread_id, limit_runs) = parse_thread_detail_query(query.as_deref())?;
-            response_encoded(ok, core.thread_detail(&thread_id, limit_runs)?, gzip)
+            let query = parse_thread_detail_query(query.as_deref())?;
+            response_encoded(ok, core.query_thread_detail(&query)?, gzip)
         }
         "/v1/workbench" => {
             let Some(ext) = extension else {
@@ -500,32 +500,41 @@ async fn route(
     })
 }
 
-fn parse_thread_detail_query(query: Option<&str>) -> Result<(String, i64)> {
-    let mut thread_id = String::new();
-    let mut limit_runs = 0i64;
+fn parse_thread_detail_query(query: Option<&str>) -> Result<ThreadDetailQuery> {
+    let mut detail = ThreadDetailQuery::default();
     if let Some(q) = query {
         for pair in q.split('&').filter(|s| !s.is_empty()) {
             let Some((k, v)) = pair.split_once('=') else {
                 return Err(invalid("invalid thread detail query"));
             };
             match k {
-                "threadId" | "thread" => thread_id = v.to_owned(),
+                "threadId" | "thread" => detail.thread_id = v.to_owned(),
                 "limitRuns" | "limit" => {
-                    limit_runs = v
+                    detail.limit_runs = v
                         .parse::<i64>()
                         .map_err(|_| invalid("invalid limitRuns query parameter"))?;
-                    if limit_runs < 0 {
+                    if detail.limit_runs < 0 {
                         return Err(invalid("limitRuns cannot be negative"));
                     }
+                }
+                "commandPrefix" => {
+                    if v.is_empty()
+                        || v.len() > 200
+                        || !v.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
+                    {
+                        return Err(invalid("invalid commandPrefix"));
+                    }
+                    detail.command_prefix = v.to_owned();
                 }
                 _ => return Err(invalid("unexpected query parameter")),
             }
         }
     }
-    if thread_id.is_empty() {
+    if detail.thread_id.is_empty() {
         return Err(invalid("threadId is required"));
     }
-    Ok((thread_id, limit_runs))
+    Ok(detail)
 }
 
 fn events(core: Core, after: i64, keepalive: bool) -> Result<Response<Body>> {

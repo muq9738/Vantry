@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 if-addrs = "0.15"
+qrcodegen = "1.8"
+url.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true

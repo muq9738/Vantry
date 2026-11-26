@@ -137,8 +137,39 @@ pub struct Feedback {
 }
 
 /// The settings' forms and running operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AlmaShareStatus {
+    pub enabled: bool,
+    pub share_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub ready: bool,
+    pub relay: String,
+    pub relay_rejected: bool,
+    pub phones: usize,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AlmaPairingForm {
+    pub dialog_id: u64,
+    pub thread_id: String,
+    pub title: String,
+    pub status: Option<AlmaShareStatus>,
+    pub link: Secret,
+    pub relay: String,
+    pub key: Secret,
+    pub advanced: bool,
+    pub confirm_stop: bool,
+    pub busy: bool,
+    pub refreshing: bool,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SettingsForms {
+    pub alma: Option<AlmaPairingForm>,
     /// Operations under way, by key (`mcp.probe:figma`): their buttons wait.
     pub busy: BTreeSet<String>,
     pub feedback: Option<Feedback>,

@@ -5,7 +5,10 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::time::{Instant, sleep};
+use tokio::{
+    task::JoinHandle,
+    time::{Instant, sleep},
+};
 use vantry_core::{
     DurableProvider, ProviderError,
     runner::{Emit, ProviderResult, StartMode},
@@ -76,7 +79,7 @@ impl Provider {
         );
         Ok(self.data.join("jobs").join(id))
     }
-    async fn submit(&self, mut request: ProviderRequest) -> Result<()> {
+    async fn submit(&self, mut request: ProviderRequest) -> Result<JoinHandle<()>> {
         if request.provider_id.is_empty() {
             request.provider_id.clone_from(&self.default_provider);
         }
@@ -244,10 +247,9 @@ impl Provider {
             .stderr(Stdio::null());
         crate::detach_tokio_command(&mut cmd);
         let mut child = cmd.spawn()?;
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             let _ = child.wait().await;
-        });
-        Ok(())
+        }))
     }
 
     fn schedule_initial_title(&self, request: &ProviderRequest, directory: &Path) {
@@ -268,12 +270,28 @@ impl Provider {
     }
 }
 fn live(dir: &Path) -> Result<bool> {
-    let file = File::open(dir.join("worker.lock"))?;
+    let file = match File::open(dir.join("worker.lock")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
     match file.try_lock() {
         Ok(()) => Ok(false),
         Err(std::fs::TryLockError::WouldBlock) => Ok(true),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
+}
+
+fn worker_gone(dir: &Path, child: Option<&JoinHandle<()>>, elapsed: Duration) -> Result<bool> {
+    // A cold executable can take several seconds to acquire its journal lock.
+    // The launching Core also has the actual process's completion handle.
+    if elapsed <= Duration::from_secs(3) || child.is_some_and(|handle| !handle.is_finished()) {
+        return Ok(false);
+    }
+    if child.is_none() && elapsed < Duration::from_secs(30) && !dir.join("worker.json").exists() {
+        return Ok(false);
+    }
+    Ok(!live(dir)? && !dir.join("result.json").is_file())
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -302,9 +320,11 @@ impl DurableProvider for Provider {
         }
         let dir = self.directory(&request).map_err(failed)?;
         let after = request.after_sequence;
-        if mode == StartMode::Submit {
-            self.submit(request.clone()).await.map_err(failed)?;
-        }
+        let child = if mode == StartMode::Submit {
+            Some(self.submit(request.clone()).await.map_err(failed)?)
+        } else {
+            None
+        };
         let start = Instant::now();
         let checkpoint = dir.join("observer-cursor.json");
         let mut title_pending = request.provider_id == "pi";
@@ -364,10 +384,7 @@ impl DurableProvider for Provider {
                     _ => Err(interrupted(end.error)),
                 };
             }
-            if start.elapsed() > Duration::from_secs(3)
-                && !live(&dir).map_err(interrupted)?
-                && !dir.join("result.json").is_file()
-            {
+            if worker_gone(&dir, child.as_ref(), start.elapsed()).map_err(interrupted)? {
                 return Err(interrupted("worker exited without a durable result"));
             }
             sleep(Duration::from_millis(15)).await;
@@ -438,6 +455,24 @@ impl DurableProvider for Provider {
 mod tests {
     use super::*;
     use vantry_protocol::ProviderEvent;
+
+    #[tokio::test]
+    async fn a_process_starting_before_its_journal_lock_is_still_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let (finish, wait) = tokio::sync::oneshot::channel::<()>();
+        let mut child = tokio::spawn(async move {
+            let _ = wait.await;
+        });
+        let elapsed = Duration::from_secs(5);
+        assert!(!worker_gone(dir, Some(&child), elapsed).unwrap());
+        assert!(!worker_gone(dir, None, elapsed).unwrap());
+        finish.send(()).unwrap();
+        (&mut child).await.unwrap();
+        assert!(worker_gone(dir, Some(&child), elapsed).unwrap());
+        std::fs::write(dir.join("result.json"), b"{}").unwrap();
+        assert!(!worker_gone(dir, Some(&child), elapsed).unwrap());
+    }
 
     #[test]
     fn journal_checkpoint_can_catch_up_from_a_valid_older_offset() {

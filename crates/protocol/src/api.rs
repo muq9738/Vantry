@@ -585,11 +585,16 @@ pub struct ThreadDetailQuery {
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub limit_runs: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_prefix: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadDetail {
+    /// Run ID to originating send command ID, populated only for the requested prefix.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub send_command_ids: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_updates: Vec<ProjectUpdate>,
     pub sequence: i64,

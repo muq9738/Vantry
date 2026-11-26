@@ -188,7 +188,12 @@ impl Core {
         self.read(thread_summaries)
     }
     pub fn thread_detail(&self, thread_id: &str, limit_runs: i64) -> Result<ThreadDetail> {
-        self.read(|db| thread_detail(db, thread_id, limit_runs))
+        self.read(|db| thread_detail(db, thread_id, limit_runs, ""))
+    }
+    pub(crate) fn query_thread_detail(&self, query: &ThreadDetailQuery) -> Result<ThreadDetail> {
+        self.read(|db| {
+            thread_detail(db, &query.thread_id, query.limit_runs, &query.command_prefix)
+        })
     }
     pub fn status(&self) -> Result<ServerStatus> {
         self.read(|db| {

@@ -438,6 +438,7 @@ pub(crate) fn thread_detail(
     db: &Connection,
     thread_id: &str,
     limit_runs: i64,
+    command_prefix: &str,
 ) -> Result<ThreadDetail> {
     let seq = sequence(db)?;
     let thread: Thread = match thread(db, thread_id) {
@@ -501,9 +502,22 @@ pub(crate) fn thread_detail(
         "SELECT * FROM run_blocks WHERE thread_id=? ORDER BY run_id, seq, id",
         [thread_id],
     )?;
+    let mut send_command_ids = std::collections::BTreeMap::new();
+    if !command_prefix.is_empty() {
+        let mut stmt = db.prepare(
+            "SELECT run_id,command_id FROM command_receipts WHERE command_id GLOB ?1
+             AND thread_id=?2 AND kind='message.send' AND accepted=1 AND run_id<>''",
+        )?;
+        send_command_ids = stmt
+            .query_map(params![format!("{command_prefix}*"), thread_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+    }
     if truncated_runs {
         let keep: std::collections::HashSet<&str> = runs.iter().map(|r| r.id.as_str()).collect();
         blocks.retain(|b| keep.contains(b.run_id.as_str()));
+        send_command_ids.retain(|id, _| keep.contains(id.as_str()));
     }
     let project_updates = rows(
         db,
@@ -511,6 +525,7 @@ pub(crate) fn thread_detail(
         [],
     )?;
     Ok(ThreadDetail {
+        send_command_ids,
         project_updates,
         sequence: seq,
         thread,

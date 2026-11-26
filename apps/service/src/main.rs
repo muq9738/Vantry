@@ -1,3 +1,4 @@
+mod alma;
 mod ctl;
 mod federation;
 mod image;
@@ -154,6 +155,15 @@ struct CoreArgs {
     magpie_settings: Option<PathBuf>,
     #[arg(long)]
     listen_remote: Option<String>,
+    /// Alma-compatible relay base URL for opt-in mobile access.
+    #[arg(long, requires = "alma_thread")]
+    alma_relay: Option<String>,
+    /// The single Core thread shared by this Alma pairing.
+    #[arg(long, requires = "alma_relay")]
+    alma_thread: Option<String>,
+    /// Invalidate the previous Alma pairing when starting this host.
+    #[arg(long, requires = "alma_relay")]
+    alma_reset_pairing: bool,
     #[command(flatten)]
     workspace: WorkspaceArgs,
 }
@@ -260,7 +270,6 @@ async fn serve(args: CoreArgs) -> Result<()> {
         federator: Some(ext.federator.clone()),
     });
     let stop = CancellationToken::new();
-    qoder::spawn_background(data.clone(), stop.clone());
     let shutdown = signal()?;
     let saved = ext.identity.snapshot();
     let mut relay_targets = Vec::new();
@@ -366,6 +375,19 @@ async fn serve(args: CoreArgs) -> Result<()> {
     let server = Server::bind_with_extension(core.clone(), ext.clone())
         .await?
         .serve(stop.clone());
+    ext.alma.restore().await;
+    let alma_task = if let (Some(relay), Some(thread)) = (&args.alma_relay, &args.alma_thread) {
+        let host = alma::prepare(&data, relay, thread, args.alma_reset_pairing)?;
+        let owner = stop.clone();
+        Some(tokio::spawn(async move {
+            if host.run(owner).await.is_err() {
+                tracing::warn!("Alma mobile host stopped");
+            }
+        }))
+    } else {
+        None
+    };
+    qoder::spawn_background(data.clone(), stop.clone());
     if warm_pi {
         let stop = stop.clone();
         let settings = data.join("pi-runtime.json");
@@ -406,7 +428,11 @@ async fn serve(args: CoreArgs) -> Result<()> {
     remote.await?}
     }
 
+    ext.alma.shutdown().await;
     qoder::shutdown(&data).await;
+    if let Some(task) = alma_task {
+        task.await?;
+    }
     Ok(())
 }
 async fn ensure_core(args: CoreArgs, raw: &[OsString]) -> Result<()> {

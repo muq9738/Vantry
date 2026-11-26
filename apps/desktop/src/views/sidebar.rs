@@ -809,6 +809,12 @@ fn thread_menu(row: &SidebarRow) -> Vec<MenuItem> {
     };
     let mut items = Vec::new();
     // Primary creation / branching actions (restoring full MyGo parity)
+    if row.machine.is_empty() && !row.archived {
+        let (id, title) = (row.id.clone(), row.title.clone());
+        items.push(MenuItem::new("用 Alma iOS 打开…").on_select(move || {
+            controller::machines::activate("", || controller::alma::open(id.clone(), title.clone()));
+        }));
+    }
     if row.has_completed_run {
         let fork_id = row.id.clone();
         let scope = row.machine.clone();
