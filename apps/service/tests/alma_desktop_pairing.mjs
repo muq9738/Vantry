@@ -1,9 +1,23 @@
 // Exercises the desktop's pairing actions against a normal Core with no Alma flags.
 import assert from 'node:assert/strict';
 import {once} from 'node:events';
+import {mkdir, writeFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {createServer} from 'node:http';
 import {deadline, routing, waitFor, withAlmaFixture} from './alma_interop_client.mjs';
 
 const thread = 'studio-selected-chat';
+const requestedModels = [];
+const modelApi = createServer(async (req,res) => {
+    const chunks = [];
+    for await (const part of req) chunks.push(part);
+    const {model} = JSON.parse(Buffer.concat(chunks));
+    requestedModels.push(model);
+    res.writeHead(200,{'content-type':'text/event-stream'});
+    const frame = (delta, finish) => 'data: ' + JSON.stringify({id:'fixture',object:'chat.completion.chunk',
+        created:1,model,choices:[{index:0,delta,finish_reason:finish}]}) + '\n\n';
+    res.end(frame({role:'assistant',content:'Chosen local model.'},null) + frame({},'stop') + 'data: [DONE]\n\n');
+});
 await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture => {
     const {ctl, connectTo, restart, relay, registrationKey} = fixture;
     const action = async (name, extra = {}) => {
@@ -41,7 +55,9 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
     assert.deepEqual(threads.map(t=>t.id), [thread]);
     assert.deepEqual(boot.workspaces.map(w=>w.id),[threads[0].workspaceId]);
     assert.equal(boot.settings.chat.defaultModel,threads[0].model);
-    assert.deepEqual(boot.models.data.map(m=>m.providerId+':'+m.id),[threads[0].model]);
+    const choices = boot.models.data.map(m=>m.providerId+':'+m.id);
+    assert(choices.includes(threads[0].model));
+    assert(choices.includes('vantry:fixture/second'));
     assert.equal(boot.models.data[0].id,'selected-thread-model');
     assert.equal(boot.personal.threadId,thread);
     assert.equal(boot.personal.settings.threadId,thread);
@@ -98,6 +114,22 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
     const history = (await resumed.http('/api/threads/' + thread + '/messages')).body;
     assert.equal(history[0].metadata.optimisticId, 'from-device');
     assert.equal(history[1].message.parts[0].text, streamed);
+    const change = (name, model) => resumed.http('/api/threads/'+name, {model,skipUpdatedAt:true}, 'PUT');
+    assert.equal((await change('unshared-thread','vantry:fixture/second')).status,404);
+    assert.equal((await change(thread,'vantry:missing')).status,400);
+    assert.equal((await change(thread,'vantry:fixture/second')).body.model,'vantry:fixture/second');
+    const selected = (await ctl('snapshot')).threads.find(t => t.id === thread);
+    assert.equal(selected.model, 'fixture/second');
+    assert.equal(selected.providerId, 'pi');
+    assert.equal((await resumed.http('/api/threads/'+thread)).body.model,'vantry:fixture/second');
+    assert.equal((await resumed.http('/api/threads/'+thread+'/send',
+        {text:'Model selection test',optimisticId:'chosen'})).status,202);
+    await waitFor(async () => {
+        const run = (await ctl('snapshot')).runs.find(r=>r.input==='Model selection test');
+        assert(!run?.error,run?.error);
+        return run?.status === 'completed' && run.output === 'Chosen local model.';
+    },20000);
+    assert.deepEqual(requestedModels,['second']);
     const closed = once(resumed.socket,'close');
     assert.equal((await action('revoke',{name:created.shareId})).enabled,false);
     await deadline(closed);
@@ -113,4 +145,12 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
     await action('revoke',{name:remote.shareId});
     console.log('PASS ' + fixture.version + ': desktop-created QR, LAN and relay, scoped chat, ' + deltas
         + ' streaming deltas, existing pairing after restart, and immediate revocation.');
-}, {cliHost:false});
+}, {cliHost:false, async setup({root}) {
+    modelApi.listen(0,'127.0.0.1');
+    await once(modelApi,'listening');
+    const dir = join(root,'pi');
+    await mkdir(dir);
+    await writeFile(join(dir,'models.json'),JSON.stringify({providers:{fixture:{baseUrl:'http://127.0.0.1:'+modelApi.address().port+'/v1',
+        api:'openai-completions',apiKey:'local-fixture',models:[{id:'first',name:'First'},{id:'second',name:'Second'}]}}}));
+    return {PI_CODING_AGENT_DIR:dir};
+}}).finally(()=>new Promise(resolve=>modelApi.close(resolve)));

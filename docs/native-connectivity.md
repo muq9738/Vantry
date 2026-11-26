@@ -39,6 +39,10 @@ Vantry 0.2.18 的本机桌面可以把一条已有会话分享给 Alma iOS。右
 
 跨网络使用时，生成前展开「使用跨网中继…」，填写手机和电脑都能访问的 Alma 兼容 HTTPS 中继及其要求的注册凭据。中继完成登记后，界面会显示二维码。Vantry 会显示通过加密握手的手机连接数。关闭配对窗口后共享继续生效，Core 重启会恢复原配对。「停止共享」会断开连接并撤销旧码。要改为分享另一条会话，先停止当前共享。
 
+在 Alma 会话标题中点模型名，可以选择这台 Core 已配置的 Pi 模型。选择会保存到共享线程，并用于下一次发送，重新连接后仍然有效。远程工作区显示该线程的现有选择。绑定 Gemini 网页的专用写作线程只显示「Gemini · Neon 高」。
+
+专用写作线程需要主机提供本地 Node 适配器。将 `gemini-writing.json` 放在该 Core 的私有数据目录，填写线程 ID（`threadId`）、Node 与适配器的绝对路径（`node`、`adapter`），以及交付方式（合成稿用 `synthetic`，Drive 归档用 `drive`）。通过 `vantry-service ctl create` 创建同一 ID 的线程，并指定 `--provider gemini-writing --model gemini-writing/neon-high`。手机重连后可在原线程发送「取回上次写作」。
+
 ### Alma 手机接入联调
 
 已有 Alma 配对的 iPhone 可以直接核对真机版本和连接状态。在 Alma 桌面的远程访问页查看中继和手机在线状态。记录承接连接的桌面服务，验收 Vantry 收发时再核对所选 Core 线程的运行记录。

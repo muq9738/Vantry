@@ -78,8 +78,8 @@ export class Phone {
         dec.setAuthTag(packet.subarray(-16));
         return JSON.parse(Buffer.concat([dec.update(packet.subarray(12,-16)), dec.final()]));
     }
-    async http(path, body) {
-        this.send({t:'hreq', id:'h1', method:body ? 'POST':'GET', path,
+    async http(path, body, method = body ? 'POST' : 'GET') {
+        this.send({t:'hreq', id:'h1', method, path,
             ...(body && {b:Buffer.from(JSON.stringify(body)).toString('base64url')})});
         const chunks = [];
         let status;
@@ -122,7 +122,7 @@ async function stopChild(child) {
     catch { child.kill('SIGKILL'); await deadline(exited, 5000); }
 }
 
-export async function withAlmaFixture(servicePath, relayDirectory, thread, exercise, {cliHost = true} = {}) {
+export async function withAlmaFixture(servicePath, relayDirectory, thread, exercise, {cliHost = true, setup, threadArgs = []} = {}) {
     const service = resolve(servicePath);
     const relayEntry = resolve(relayDirectory, 'index.mjs');
     const version = (await exec(service, ['--version'])).stdout.trim();
@@ -142,6 +142,7 @@ export async function withAlmaFixture(servicePath, relayDirectory, thread, exerc
     const ctl = async (...args) => JSON.parse((await exec(service, ['ctl', ...args, '--data-dir', data], {timeout:5000})).stdout);
     try {
         await mkdir(data, {mode:0o700});
+        const fixtureEnv = await setup?.({root, data}) || {};
         const gate = randomBytes(24).toString('base64url');
         await writeFile(join(data, 'alma-registration-key'), gate, {mode:0o600});
         const listener = createServer();
@@ -153,7 +154,7 @@ export async function withAlmaFixture(servicePath, relayDirectory, thread, exerc
         const agentCount = async () => (await (await fetch(relay + '/healthz', {signal:AbortSignal.timeout(3000)})).json()).agents;
         const relayProcess = start(process.execPath, [relayEntry], {HOST:'127.0.0.1', PORT:String(port), RELAY_REGISTRATION_KEY:gate, RELAY_TOKEN_SECRET:''});
         const startCore = () => start(service, ['core', '--data-dir', data, '--workspace', root, '--provider', 'controlled',
-            '--controlled-delay', '80ms', ...(cliHost ? ['--alma-thread', thread, '--alma-relay', relay] : [])]);
+            '--controlled-delay', '80ms', ...(cliHost ? ['--alma-thread', thread, '--alma-relay', relay] : [])], fixtureEnv);
         let core = startCore();
         const registered = () => waitFor(async () => {
             assert(core.exitCode === null && relayProcess.exitCode === null, 'Fixture process exited early');
@@ -165,7 +166,7 @@ export async function withAlmaFixture(servicePath, relayDirectory, thread, exerc
             } catch { return false; }
         }, 10000, cancel.signal);
         await registered();
-        await ctl('create', '--thread', thread, '--title', 'Alma interop');
+        await ctl('create', '--thread', thread, '--title', 'Alma interop', ...threadArgs);
         const code = cliHost ? JSON.parse(await readFile(join(data, 'alma-pairing.json'))).code : '';
         const url = cliHost ? relay + '/c/' + routing(code) : '';
         const connectTo = async (base, key) => {

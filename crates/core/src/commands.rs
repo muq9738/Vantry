@@ -63,7 +63,9 @@ pub(crate) fn apply(db: &Connection, c: &Command, options: &CoreOptions) -> Resu
             cancel(db, &r)?;
             Ok(receipt(&r.thread_id, &r.id))
         }
-        SendMessage | QueueMessage | InterThreadSend | SteerMessage | SteerRun => send(db, c),
+        SendMessage | QueueMessage | InterThreadSend | SteerMessage | SteerRun => {
+            send(db, c, options)
+        }
         Unspecified => Err(invalid("kind is required")),
     }
 }
@@ -183,6 +185,16 @@ fn switched_provider(
     requested: &str,
     options: &CoreOptions,
 ) -> Result<String> {
+    if t.provider_id == GEMINI_WRITING_PROVIDER {
+        if model != GEMINI_WRITING_MODEL
+            || !(requested.is_empty() || requested == GEMINI_WRITING_PROVIDER)
+        {
+            return Err(invalid(
+                "the writing thread uses its configured Gemini session",
+            ));
+        }
+        return Ok(t.provider_id.clone());
+    }
     if !requested.is_empty() {
         if !matches!(requested, "controlled" | "pi")
             || requested == "controlled"
@@ -431,7 +443,46 @@ fn input_receipt(i: &Input) -> Receipt {
         ..receipt(&i.thread_id, &i.run_id)
     }
 }
-fn send(db: &Connection, c: &Command) -> Result<Receipt> {
+fn retrieve_writing(db: &Connection, t: &Thread, target: &str) -> Result<Receipt> {
+    let original: String = db
+        .query_row(
+            "SELECT id FROM runs WHERE thread_id=?1 AND provider_id=?2 AND (?3='' OR id=?3)
+         ORDER BY rowid DESC LIMIT 1",
+            params![t.id, GEMINI_WRITING_PROVIDER, target],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| invalid("没有可取回的写作请求"))?;
+    let r = run(db, &original)?;
+    if target.is_empty()
+        && r.status.terminal()
+        && r.status != RunStatus::Completed
+        && !r.output.is_empty()
+    {
+        // Writing commits a single complete delivery. A crash can follow that commit.
+        crate::scheduler::finish(db, &r, "completed", "")?;
+        return Ok(receipt(&t.id, ""));
+    }
+    if r.status.terminal() && (r.status != RunStatus::Completed || !target.is_empty()) {
+        if active(db, &t.id)?.is_some() {
+            return Err(conflict("请等当前写作结束后再取回这一轮"));
+        }
+        let att = id("att");
+        attempt(db, &t.id, &r.id, &att, &r.input)?;
+        // Force Attach even on this attempt's first claim. Retrieving may only read the original turn.
+        db.execute(
+            "UPDATE effect_outbox SET attempt_count=1 WHERE attempt_id=? AND kind='provider.run'",
+            [&att],
+        )?;
+        db.execute("UPDATE runs SET attempt_id=?1,active_attempt_id=?1,status='queued',error='',updated_at=?2 WHERE id=?3",
+            params![att, now(), r.id])?;
+        crate::store::blocks::clear_status(db, &r.id)?;
+        run_event(db, &r.id, "run.queued")?;
+    }
+    Ok(receipt(&t.id, ""))
+}
+
+fn send(db: &Connection, c: &Command, options: &CoreOptions) -> Result<Receipt> {
     if c.message.trim().is_empty() && (c.kind != SendMessage || c.attachments.is_empty()) {
         return Err(invalid("message is required"));
     }
@@ -450,6 +501,26 @@ fn send(db: &Connection, c: &Command) -> Result<Receipt> {
     t.interaction_mode = first(&c.interaction_mode, &t.interaction_mode).into();
     match c.kind {
         SendMessage => {
+            if t.provider_id == GEMINI_WRITING_PROVIDER {
+                let text = c.message.trim();
+                if text == "取回上次写作" {
+                    return retrieve_writing(db, &t, "");
+                }
+                if let Some(target) = text
+                    .strip_prefix("取回写作 ")
+                    .filter(|s| s.starts_with("run_"))
+                {
+                    return retrieve_writing(db, &t, target);
+                }
+                if active(db, &t.id)?.is_some() {
+                    return Err(conflict("写作仍在进行，请等本轮结束后再提交"));
+                }
+            }
+            if !c.provider_id.is_empty() || !c.model.is_empty() {
+                let model = first(&c.model, &options.model);
+                t.provider_id = switched_provider(&t, model, &c.provider_id, options)?;
+                t.model = model.into();
+            }
             if let Some(active_id) = active(db, key)?
                 && run(db, &active_id)?.status == RunStatus::Waiting
             {

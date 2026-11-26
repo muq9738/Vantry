@@ -68,6 +68,14 @@ impl Core {
     pub fn directory(&self) -> &Path {
         &self.0.store.directory
     }
+    pub fn writing_input(&self, request: &ProviderRequest) -> Result<(String, String)> {
+        self.read(|db| Ok(db.query_row(
+            "SELECT COALESCE(c.command_id, r.id), r.input FROM runs r LEFT JOIN command_receipts c
+             ON c.thread_id=r.thread_id AND c.run_id=r.id AND c.kind='message.send' AND c.accepted=1
+             WHERE r.thread_id=? AND r.id=? AND r.provider_id=? LIMIT 1",
+            params![request.thread_id, request.run_id, GEMINI_WRITING_PROVIDER], |r| Ok((r.get(0)?, r.get(1)?))
+        )?))
+    }
     pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<()> {
         self.0.store.backup_to(path)
     }

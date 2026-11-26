@@ -9,6 +9,8 @@ pub use api::*;
 pub use provider::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const GEMINI_WRITING_PROVIDER: &str = "gemini-writing";
+pub const GEMINI_WRITING_MODEL: &str = "gemini-writing/neon-high";
 pub const EMBEDDED_PI_CAPABILITY: &str = "provider.pi.embedded.v1";
 pub const LEGACY_PI_RUNTIME_CAPABILITY: &str = "provider.pi.runtime.v1";
 /// Opt in to NDJSON keepalive records on `/v1/events`. Supporting servers echo `1`.

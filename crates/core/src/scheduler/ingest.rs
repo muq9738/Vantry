@@ -6,6 +6,39 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 pub(super) fn project(db: &Connection, r: &ProviderRequest, e: &ProviderEvent) -> Result<()> {
     let data = e.data.as_ref().unwrap_or(&Value::Null);
     match e.r#type.as_str() {
+        "writing_result" if r.provider_id == GEMINI_WRITING_PROVIDER => {
+            let previous: String =
+                db.query_row("SELECT output FROM runs WHERE id=?", [&r.run_id], |row| {
+                    row.get(0)
+                })?;
+            if previous.is_empty() {
+                return append(db, r, &e.delta, false);
+            }
+            if previous != e.delta {
+                // A fresh read of the original turn replaces its one completed text block.
+                let block_id: String = db.query_row(
+                    "UPDATE run_blocks SET text=?1,updated_at=?2 WHERE run_id=?3 AND kind='text' AND text=?4 RETURNING id",
+                    params![e.delta, now(), r.run_id, previous], |row| row.get(0))?;
+                db.execute(
+                    "UPDATE runs SET output=?,updated_at=? WHERE id=?",
+                    params![e.delta, now(), r.run_id],
+                )?;
+                let block = crate::store::blocks::block(db, &block_id)?;
+                run_event_with_block(db, &r.run_id, "run.updated", Some(&block))?;
+            }
+            Ok(())
+        }
+        "writing_progress" => {
+            event(
+                db,
+                "run.progress",
+                &r.thread_id,
+                &r.run_id,
+                &r.attempt_id,
+                data.clone(),
+            )?;
+            Ok(())
+        }
         "extension_ui_request" => dialog(db, r, e, data),
         "extension_ui_expired" => {
             let key = format!("{}:{}", r.attempt_id, text(data, "id"));

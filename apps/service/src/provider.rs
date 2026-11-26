@@ -311,6 +311,16 @@ impl DurableProvider for Provider {
         mode: StartMode,
         emit: Emit,
     ) -> ProviderResult {
+        if request.provider_id == vantry_protocol::GEMINI_WRITING_PROVIDER {
+            return crate::writing::run(
+                &self.core,
+                &self.directory(&request).map_err(failed)?,
+                &request,
+                mode,
+                emit,
+            )
+            .await;
+        }
         if Self::is_remote(&request) {
             let federator = self
                 .federator
@@ -391,6 +401,9 @@ impl DurableProvider for Provider {
         }
     }
     async fn recoverable(&self, request: &ProviderRequest) -> bool {
+        if request.provider_id == vantry_protocol::GEMINI_WRITING_PROVIDER {
+            return true;
+        }
         if Self::is_remote(request) {
             return self.federator.is_some();
         }
@@ -411,6 +424,11 @@ impl DurableProvider for Provider {
             || !dir.join("worker.json").exists())
     }
     async fn stop(&self, request: &ProviderRequest) -> ProviderResult {
+        if request.provider_id == vantry_protocol::GEMINI_WRITING_PROVIDER {
+            let dir = self.directory(request).map_err(failed)?;
+            hostfs::ensure_private_dir(&dir).map_err(failed)?;
+            return hostfs::atomic_write(&dir.join("stop.json"), b"{}").map_err(failed);
+        }
         if Self::is_remote(request) {
             let federator = self
                 .federator
@@ -439,6 +457,9 @@ impl DurableProvider for Provider {
         request: &ProviderRequest,
         control: &ControlResponse,
     ) -> ProviderResult {
+        if request.provider_id == vantry_protocol::GEMINI_WRITING_PROVIDER {
+            return Err(failed("写作要求已固定，请另发一轮"));
+        }
         if Self::is_remote(request) {
             let federator = self
                 .federator

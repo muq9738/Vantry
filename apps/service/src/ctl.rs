@@ -127,7 +127,10 @@ impl Ctl {
             "invalid event cursor or timeout"
         );
         ensure!(
-            matches!(self.provider.as_str(), "" | "controlled" | "pi"),
+            matches!(
+                self.provider.as_str(),
+                "" | "controlled" | "pi" | vantry_protocol::GEMINI_WRITING_PROVIDER
+            ),
             "unknown provider"
         );
         ensure!(

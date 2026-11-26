@@ -1,4 +1,4 @@
-use super::bootstrap::selection;
+use super::bootstrap::{Choice, selection};
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
@@ -16,6 +16,13 @@ pub(super) struct Scope {
 
 fn error(status: u16, message: &str) -> (u16, Value) {
     (status, json!({"error":message}))
+}
+
+fn body(request: &Value) -> Result<Value, (u16, Value)> {
+    B64.decode(request["b"].as_str().unwrap_or(""))
+        .ok()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .ok_or_else(|| error(400, "Invalid request body"))
 }
 
 fn core_error(e: ClientError) -> (u16, Value) {
@@ -136,6 +143,7 @@ impl Scope {
         &self,
         text: &str,
         operation: Option<&str>,
+        model: Option<&Value>,
     ) -> Result<vantry_protocol::Receipt, (u16, Value)> {
         if text.trim().is_empty() || text.len() > 256 * 1024 {
             return Err(error(400, "Invalid message text"));
@@ -145,12 +153,43 @@ impl Scope {
                 format!("{}{id}", self.operation_prefix())
             }
             Some(_) => return Err(error(400, "Invalid operation ID")),
-            None => format!("alma/{}/new/{}", self.pairing, uuid::Uuid::new_v4()),
+            None => {
+                let thread = self
+                    .core
+                    .thread_detail(&self.thread, 1)
+                    .await
+                    .map_err(core_error)?
+                    .thread;
+                if thread.provider_id == vantry_protocol::GEMINI_WRITING_PROVIDER {
+                    return Err(error(400, "写作消息缺少可用于重连的操作 ID"));
+                }
+                format!("alma/{}/new/{}", self.pairing, uuid::Uuid::new_v4())
+            }
         };
         let mut cmd = Command::new(command_id, CommandKind::SendMessage);
         cmd.thread_id = self.thread.clone();
         cmd.message = text.into();
+        if let Some(model) = model.filter(|m| !m.is_null()) {
+            let choice = self.resolve_model(model).await?;
+            cmd.model = choice.model;
+            cmd.provider_id = choice.provider;
+        }
         self.core.dispatch(&cmd).await.map_err(core_error)
+    }
+
+    async fn resolve_model(&self, value: &Value) -> Result<Choice, (u16, Value)> {
+        let selected = value.as_str().ok_or_else(|| error(400, "Invalid model"))?;
+        let thread = self
+            .core
+            .thread_detail(&self.thread, 1)
+            .await
+            .map_err(core_error)?
+            .thread;
+        self.choices(&thread)
+            .await
+            .into_iter()
+            .find(|c| selection(&c.model) == selected)
+            .ok_or_else(|| error(400, "Model unavailable on this thread"))
     }
 
     async fn http(&self, request: &Value) -> Result<(u16, Value), (u16, Value)> {
@@ -268,16 +307,42 @@ impl Scope {
             (Some("GET"), Some(_), Some("diff-stats")) => {
                 Ok((200, json!({"additions":0,"deletions":0,"filesChanged":0})))
             }
+            (Some("PUT"), Some(_), None) => {
+                let body = body(request)?;
+                if !body.as_object().is_some_and(|o| {
+                    o.keys()
+                        .all(|k| matches!(k.as_str(), "model" | "skipUpdatedAt"))
+                }) {
+                    return Err(error(400, "Only the shared thread model can be changed"));
+                }
+                let choice = self.resolve_model(&body["model"]).await?;
+                let mut cmd = Command::new(
+                    format!("alma/{}/model/{}", self.pairing, uuid::Uuid::new_v4()),
+                    CommandKind::SetThreadModel,
+                );
+                cmd.thread_id = self.thread.clone();
+                cmd.model = choice.model;
+                cmd.provider_id = choice.provider;
+                self.core.dispatch(&cmd).await.map_err(core_error)?;
+                let detail = self
+                    .core
+                    .thread_detail(&self.thread, 1)
+                    .await
+                    .map_err(core_error)?;
+                Ok((200, thread(&detail, &self.pairing)))
+            }
             (Some("POST"), Some(_), Some("send")) => {
-                let body = B64
-                    .decode(request["b"].as_str().unwrap_or(""))
-                    .ok()
-                    .and_then(|v| serde_json::from_slice::<Value>(&v).ok())
-                    .ok_or_else(|| error(400, "Invalid request body"))?;
-                if body.get("fromThreadId").is_some() || body.get("model").is_some() {
+                let body = body(request)?;
+                if body.get("fromThreadId").is_some() {
                     return Err(error(400, "This pairing uses the shared thread's settings"));
                 }
-                let receipt = self.send(body["text"].as_str().unwrap_or(""), None).await?;
+                let receipt = self
+                    .send(
+                        body["text"].as_str().unwrap_or(""),
+                        body["optimisticId"].as_str(),
+                        body.get("model"),
+                    )
+                    .await?;
                 Ok((
                     202,
                     json!({"ok":true,"started":receipt.accepted,"threadId":receipt.thread_id}),
@@ -485,9 +550,10 @@ impl Chat {
         let data = &payload["data"];
         let optimistic = data
             .pointer("/userMessageMetadata/optimisticId")
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+            .or_else(|| data.pointer("/userMessage/id").and_then(Value::as_str));
         let result = match user_text(payload, &self.scope.thread) {
-            Ok(text) => self.scope.send(&text, optimistic).await,
+            Ok(text) => self.scope.send(&text, optimistic, data.get("model")).await,
             Err(e) => Err(error(400, &e.to_string())),
         };
         let receipt = match result {
@@ -500,6 +566,10 @@ impl Chat {
                 )]);
             }
         };
+        if receipt.run_id.is_empty() {
+            let detail = self.scope.detail().await?;
+            return Ok(self.snapshot(socket, &detail));
+        }
         let Some(op) = optimistic else {
             return Ok(vec![]);
         };
@@ -538,7 +608,30 @@ impl Chat {
                 continue;
             }
             sub.cursor = event.sequence;
-            if event.r#type == "run.output" {
+            if event.r#type == "run.progress" {
+                frames.push(ws(
+                    id,
+                    "thread_generating",
+                    json!({"id":event.thread_id,"isGenerating":true,"status":event.data["status"]}),
+                ));
+            } else if event.r#type == "thread.updated" {
+                let t: vantry_protocol::Thread =
+                    serde_json::from_value(event.data["thread"].clone())?;
+                frames.push(ws(
+                    id,
+                    "thread_updated",
+                    thread_row(
+                        &self.scope.pairing,
+                        &t.id,
+                        &t.title,
+                        &t.model,
+                        &t.created_at,
+                        &event.timestamp,
+                        t.pinned,
+                        !sub.active.is_empty(),
+                    ),
+                ));
+            } else if event.r#type == "run.output" {
                 let delta = json!({"type":"text_append","threadId":event.thread_id,"messageId":event.run_id,
                     "seq":event.sequence,"partIndex":0,"partType":"text","text":event.data["delta"]});
                 frames.push(ws(
