@@ -268,6 +268,8 @@ pub struct ComposerStatus {
     pub can_submit: bool,
     /// What the primary button does.
     pub primary: PrimaryAction,
+    /// The current run accepts either steering or queued input.
+    pub can_choose_running_action: bool,
     /// A run is active and can be stopped.
     pub can_stop: bool,
     /// A submission from this draft is on its way.
@@ -801,6 +803,7 @@ impl AppState {
                 && self.early_submit_ready()
                 && !self.attachment_imports.contains_key(&self.draft_key()),
             primary,
+            can_choose_running_action: !editing && active.is_some_and(|run| run.status == RunStatus::Running),
             can_stop: active.is_some_and(|run| !self.in_flight(&format!("stop:{}", run.id))),
             sending: !editing && pending.is_some_and(|p| p.in_flight),
             retry: pending

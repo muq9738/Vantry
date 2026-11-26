@@ -170,7 +170,7 @@ pub(crate) fn start(config: &LaunchConfig) {
             let sock = remote.socket();
             (
                 Arc::new(remote),
-                Arc::new(CoreWorkbench::new(sock.clone(), local, config.model.clone())),
+                Arc::new(CoreWorkbench::new(sock.clone(), local, config.model.clone()).on_peer()),
                 Some(sock),
             )
         }
@@ -1558,16 +1558,21 @@ pub(crate) async fn composer_skills(thread_id: String, workspace: String) -> Vec
 }
 
 pub(crate) fn paste_images(paste: &PasteEvent) {
-    use base64::Engine;
     let Some(bridge) = workbench() else { return };
     let key = state().with_untracked(|s| s.draft_key());
+    paste_images_for(&key, &bridge, &paste.files);
+}
+
+fn paste_images_for(key: &str, bridge: &Arc<dyn WorkbenchBridge>, files: &[PastedFile]) {
+    let key = key.to_owned();
+    let bridge = bridge.clone();
     let mut seq = state().with_untracked(|s| {
         s.drafts
             .get(&key)
             .map_or(0, |d| d.attachments.len())
     });
     let mut images = Vec::new();
-    for file in paste.files.iter().filter(|f| f.mime.starts_with("image/")) {
+    for file in files.iter().filter(|f| f.mime.starts_with("image/")) {
         if !matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
             warn("仅支持 PNG、JPEG、GIF 或 WebP 图片。");
             continue;
@@ -1598,19 +1603,24 @@ pub(crate) fn paste_images(paste: &PasteEvent) {
     state().update(|s| s.begin_attachment_import(&key));
     spawn_for_window(async move {
         for (name, bytes) in images {
-            let mut req = actions::request(names::ATTACHMENT_IMPORT);
-            req.name = name;
-            req.data = base64::engine::general_purpose::STANDARD.encode(bytes);
-            match call(bridge.workbench(req)).await {
-                Ok(response) => match response.attachment {
-                    Some(item) => attach_to_draft(&key, item, None),
-                    None => warn("Core 没有返回图片附件。"),
-                },
-                Err(err) => warn(format!("无法粘贴图片：{}", err.message)),
-            }
+            import_bytes(&key, &bridge, name, &bytes).await;
         }
         state().update(|s| s.finish_attachment_import(&key));
     });
+}
+
+async fn import_bytes(key: &str, bridge: &Arc<dyn WorkbenchBridge>, name: String, bytes: &[u8]) {
+    use base64::Engine;
+    let mut req = actions::request(names::ATTACHMENT_IMPORT);
+    req.name = name;
+    req.data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    match call(bridge.workbench(req)).await {
+        Ok(response) => match response.attachment {
+            Some(item) => attach_to_draft(key, item, None),
+            None => warn("Core 没有返回附件。"),
+        },
+        Err(err) => warn(format!("无法导入附件：{}", err.message)),
+    }
 }
 
 fn decode_file_uri(uri: &str) -> PathBuf {
@@ -1637,6 +1647,15 @@ fn decode_file_uri(uri: &str) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out).into_owned())
 }
 
+fn local_file_path(uri: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(uri);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    let url = url::Url::parse(uri).ok()?;
+    (url.scheme() == "file").then(|| url.to_file_path().ok()).flatten()
+}
+
 /// Attaches local `file://` URIs pasted from Finder.
 pub(crate) fn paste_file_uris(uris: &[String]) {
     let Some(workbench) = workbench() else {
@@ -1644,7 +1663,7 @@ pub(crate) fn paste_file_uris(uris: &[String]) {
     };
     let paths: Vec<PathBuf> = uris
         .iter()
-        .map(|u| decode_file_uri(u))
+        .filter_map(|uri| local_file_path(uri))
         .filter(|p| p.is_file())
         .collect();
     if paths.is_empty() {
@@ -2753,6 +2772,8 @@ pub(crate) fn refresh_files() {
     run_loads(loads);
 }
 
+mod file_drop;
+pub(crate) use file_drop::drop_files;
 mod shell;
 pub(crate) use shell::*;
 mod pickers;

@@ -654,6 +654,18 @@ fn an_unconfirmed_send_offers_a_retry_and_abandoning_restores_the_draft() {
 }
 
 #[test]
+fn running_mode_picker_tracks_whether_the_run_accepts_steering() {
+    let mut state = live_state();
+    assert!(state.composer_status().can_choose_running_action);
+    state.runs[0].status = RunStatus::Waiting;
+    assert!(!state.composer_status().can_choose_running_action);
+    assert_eq!(state.composer_status().primary, PrimaryAction::Queue);
+    state.runs[0].status = RunStatus::Completed;
+    assert!(!state.composer_status().can_choose_running_action);
+    assert_eq!(state.composer_status().primary, PrimaryAction::Send);
+}
+
+#[test]
 fn while_running_the_draft_steers_or_queues() {
     let mut state = live_state();
     assert_eq!(state.composer_status().primary, PrimaryAction::Steer);

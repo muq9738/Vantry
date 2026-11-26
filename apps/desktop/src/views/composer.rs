@@ -13,7 +13,7 @@ use std::path::Path;
 use nsh_core::{LineHeight, prelude::*};
 use vantry_protocol::Attachment;
 
-use super::{dot, ghost_button, link_button, pill, reference_input::{InputRef, reference_input}};
+use super::{dot, ghost_button, link_button, reference_input::{InputRef, reference_input}};
 use crate::{
     bridge::workbench::actions::{split_thinking, thinking_label},
     controller,
@@ -359,7 +359,16 @@ pub(super) fn paste_into_composer(paste: &PasteEvent, editor: InputRef, selectio
     }
 }
 
-pub(crate) fn composer() -> impl IntoElement {
+pub(super) fn drop_target(target: View, dragging: Signal<bool>) -> View {
+    target.on_file_drag_enter(move || dragging.set(true))
+        .on_file_drag_leave(move || dragging.set(false))
+        .on_file_drop(move |event: &FileDropEvent| {
+            dragging.set(false);
+            controller::drop_files(event);
+        })
+}
+
+pub(crate) fn composer(dragging: Signal<bool>) -> impl IntoElement {
     let colors = palette();
     let draft = computed(|| controller::state().with(|s| s.draft()));
     let body = computed(move || draft.with(|d| draft_parts(&d.text).2.to_owned()));
@@ -526,7 +535,7 @@ pub(crate) fn composer() -> impl IntoElement {
         on_key_with("escape", options, move |_| dismissed.set(true));
     });
 
-    view()
+    drop_target(view(), dragging)
         .w_full()
         .flex_shrink_0()
         .flex_row()
@@ -577,6 +586,7 @@ pub(crate) fn composer() -> impl IntoElement {
                 // Main floating Claude-style composer card
                 .child(
                     view()
+                        .relative()
                         .element_ref(&card)
                         .on_layout(move |b: &Bounds<Points>| {
                             let w = b.size.width.0.floor();
@@ -727,7 +737,16 @@ pub(crate) fn composer() -> impl IntoElement {
                             effort_anchor,
                             compact,
                             tight,
-                        )),
+                        ))
+                        .child(when(move || dragging.get(), move || {
+                            view().absolute().top(px(0.0)).bottom(px(0.0)).left(px(0.0)).right(px(0.0))
+                                .pointer_events(nsh_core::PointerEvents::None)
+                                .rounded(px(metrics::COMPOSER_RADIUS)).border_1().border_dashed()
+                                .border_color(colors.accent).bg(colors.raised).flex_row().gap_2()
+                                .items_center().justify_center()
+                                .child(icon(Icon::Paperclip, 15.0, colors.accent))
+                                .child(text("松开以添加").text_size(px(13.0)).text_color(colors.ink))
+                        })),
                 )
                 // Quiet host / workspace context strip + turn indicator below the card (matches v0.1.42)
                 .child(super::pickers::context_strip(endpoint, workspace, branch, turn_count, compact)),
@@ -816,10 +835,6 @@ fn toolbar(
                     })
                 })),
         )
-        .child(when(
-            move || running.get(),
-            move || running_action_switch(running_action, tight),
-        ))
         .child(view().flex_1().min_w(px(0.0)))
         // Right: quiet permission toggle, Claude-style model + effort triggers, send button
         .child(policy_switch(policy, compact))
@@ -910,6 +925,10 @@ fn toolbar(
                     }))
             },
         ))
+        .child(when(
+            move || status.with(|s| s.can_choose_running_action),
+            move || running_action_switch(running_action),
+        ))
         // Circular send / stop button (exact v0.1.42 Stardust feel)
         .child(
             nsh_base::button()
@@ -917,7 +936,7 @@ fn toolbar(
                     Some(SharedString::from(if show_stop() {
                         "停止"
                     } else {
-                        "发送"
+                        status.with(|s| s.primary.label())
                     }))
                 })
                 .on_press(move || {
@@ -1232,57 +1251,37 @@ fn policy_switch(policy: Memo<String>, compact: Memo<bool>) -> impl IntoElement 
         }))
 }
 
-fn running_action_switch(action: Memo<RunningAction>, tight: Memo<bool>) -> impl IntoElement {
+fn running_action_switch(action: Memo<RunningAction>) -> impl IntoElement {
+    use nsh_core::element::desktop::{MenuItem, popup_menu};
     let colors = palette();
-    // Too narrow for both: one pill names the current choice and flips it.
-    let single = move || {
-        pill(
-            move || match action.get() {
-                RunningAction::Steer => PrimaryAction::Steer.label(),
-                RunningAction::Queue => PrimaryAction::Queue.label(),
-            },
-            || true,
-            move || {
-                controller::set_running_action(match action.get_untracked() {
-                    RunningAction::Steer => RunningAction::Queue,
-                    RunningAction::Queue => RunningAction::Steer,
-                })
-            },
-        )
-    };
-    dynamic(move || {
-        if tight.get() {
-            return view()
-                .flex_shrink_0()
-                .p_0p5()
-                .rounded_full()
-                .bg(colors.soft)
-                .child(single())
-                .into_element();
-        }
-        both(action).into_element()
-    })
-}
-
-fn both(action: Memo<RunningAction>) -> impl IntoElement {
-    let colors = palette();
-    view()
-        .flex_shrink_0()
-        .flex_row()
-        .items_center()
-        .p_0p5()
-        .rounded_full()
-        .bg(colors.soft)
-        .child(pill(
-            PrimaryAction::Steer.label(),
-            move || action.get() == RunningAction::Steer,
-            || controller::set_running_action(RunningAction::Steer),
-        ))
-        .child(pill(
-            PrimaryAction::Queue.label(),
-            move || action.get() == RunningAction::Queue,
-            || controller::set_running_action(RunningAction::Queue),
-        ))
+    let options = [
+        (RunningAction::Steer, PrimaryAction::Steer.label(), "立即插入 · 引导当前轮"),
+        (RunningAction::Queue, PrimaryAction::Queue.label(), "下一轮 · 排队等待发送"),
+    ];
+    let hint = super::tip(move || {
+            let shortcut = controller::ui().with(|u| {
+                if u.send_with_enter { "Enter" } else if cfg!(target_os = "macos") { "⌘Enter" } else { "Ctrl+Enter" }
+            });
+            format!("{shortcut} 按所选模式发送。立即插入会打断当前轮并插入引导，下一轮会排队等待。")
+    });
+    view().flex_shrink_0().tooltip(hint).child(nsh_base::button()
+        .accessibility_label("选择发送模式")
+        .on_press(move || {
+            let items = options.into_iter().map(|(mode, _, description)| {
+                MenuItem::new(description).checked(mode == action.get_untracked())
+                    .on_select(move || controller::set_running_action(mode))
+            }).collect();
+            drop(popup_menu(items));
+        })
+        .flex_row().flex_shrink_0().items_center().gap_1().h(px(28.0)).px_1p5()
+        .rounded(px(7.0)).hover(|s| s.bg(colors.soft)).active(|s| s.opacity(0.7))
+        .child(dynamic(move || {
+            let glyph = if action.get() == RunningAction::Steer { Icon::ArrowRight } else { Icon::ListTodo };
+            icon(glyph, 13.0, colors.muted).into_element()
+        }))
+        .child(text(move || if action.get() == RunningAction::Steer { options[0].1 } else { options[1].1 })
+            .text_size(px(11.5)).text_color(colors.ink))
+        .child(icon(Icon::ChevronDown, 10.0, colors.faint)))
 }
 
 pub(super) fn attachment_thumbnail(item: Attachment) -> impl IntoElement {
@@ -1473,6 +1472,10 @@ fn queue_list(queue: Memo<Vec<QueueItem>>) -> impl IntoElement {
         ))
 }
 
+fn queue_button(glyph: Icon, label: &'static str, action: impl Fn() + 'static, disabled: impl Fn() -> bool + 'static) -> View {
+    view().tooltip(super::tip(label)).child(super::small_icon_button(glyph, label, action).disabled(disabled))
+}
+
 fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
     let colors = palette();
     let id = move || item.with_untracked(|i| i.id.clone());
@@ -1516,6 +1519,7 @@ fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
                 })
             })
             .flex_1()
+            .min_w_0()
             .number_of_lines(1u32)
             .text_size(px(12.5))
             .text_color(colors.ink),
@@ -1525,16 +1529,14 @@ fn queue_row(item: ReadSignal<QueueItem>) -> impl IntoElement {
                 .flex_row()
                 .gap_0p5()
                 .child(when(move || item.with(|i| i.can_insert), move || {
-                    super::ghost_button("立即插入", move || controller::promote_queued(id())).disabled(busy)
+                    queue_button(Icon::ArrowRight, "立即插入当前轮", move || controller::promote_queued(id()), busy)
                 }))
-                .child(link_button("编辑", move || controller::edit_queued(id())).disabled(busy))
+                .child(queue_button(Icon::Pencil, "编辑消息", move || controller::edit_queued(id()), busy))
                 .child(when(move || item.with(|i| i.count > 1), move || view().flex_row()
-                    .child(link_button("上移", move || controller::move_queued(id(), -1))
-                        .disabled(move || busy() || first()))
-                    .child(link_button("下移", move || controller::move_queued(id(), 1))
-                        .disabled(move || busy() || last()))
+                    .child(queue_button(Icon::ChevronUp, "上移", move || controller::move_queued(id(), -1), move || busy() || first()))
+                    .child(queue_button(Icon::ChevronDown, "下移", move || controller::move_queued(id(), 1), move || busy() || last()))
                 ))
-                .child(link_button("取消", move || controller::cancel_queued(id())).disabled(busy))
+                .child(queue_button(Icon::Trash2, "从队列删除", move || controller::cancel_queued(id()), busy))
         }))
 }
 
