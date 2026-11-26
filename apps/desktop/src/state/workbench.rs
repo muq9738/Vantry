@@ -497,6 +497,8 @@ pub struct TerminalSession {
     pub history: Vec<String>,
     /// Where ↑ / ↓ is in the history.
     pub history_at: Option<usize>,
+    /// Thread and checkout in which this interactive shell was started.
+    pub shell_scope: Option<(String, String)>,
     /// Associated `vantry_terminal_run` request ID when launched for a tool task.
     pub request_id: Option<String>,
     /// Working directory reported back to the worker when the tool task exits.
@@ -525,11 +527,24 @@ impl TerminalState {
             last_exit: None,
             history: Vec::new(),
             history_at: None,
+            shell_scope: None,
             request_id: None,
             task_cwd: String::new(),
         });
         self.active = self.sessions.len() - 1;
         id
+    }
+
+    /// Prefer the active shell when multiple tabs belong to this thread.
+    pub fn select_shell(&mut self, scope: &(String, String)) -> String {
+        if let Some(session) = self.current().filter(|s| s.shell_scope.as_ref() == Some(scope)) {
+            return session.id.clone();
+        }
+        if let Some(pos) = self.sessions.iter().position(|s| s.shell_scope.as_ref() == Some(scope)) {
+            self.active = pos;
+            return self.sessions[pos].id.clone();
+        }
+        self.open()
     }
 
     /// Opens or activates a dedicated terminal tab for a `vantry_terminal_run` request.
@@ -553,6 +568,7 @@ impl TerminalState {
             last_exit: None,
             history: Vec::new(),
             history_at: None,
+            shell_scope: None,
             request_id: Some(request_id.to_owned()),
             task_cwd: cwd.to_owned(),
         });
@@ -845,6 +861,27 @@ mod tests {
         state.select_project("/work/one".into());
         state.apply_project_result(current, |b| b.files.error = Some("current".into()));
         assert_eq!(state.files.error.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn terminal_command_selects_only_a_shell_in_the_matching_checkout_and_thread() {
+        let mut state = TerminalState::default();
+        let owner = ("thread-a".into(), "/checkout".into());
+        let first = state.select_shell(&owner);
+        state.ensure().shell_scope = Some(owner.clone());
+        let second = state.open();
+        state.ensure().shell_scope = Some(owner.clone());
+        assert_eq!(state.select_shell(&owner), second);
+        state.open_task("request", "login", "/checkout");
+        assert_eq!(state.select_shell(&owner), first);
+        for scope in [("thread-b".into(), "/checkout".into()), ("thread-a".into(), "/other".into())] {
+            let id = state.select_shell(&scope);
+            assert_ne!(id, first);
+            assert_ne!(id, second);
+            assert!(!id.starts_with("task-"));
+        }
+        state.close(&first);
+        assert_eq!(state.select_shell(&owner), second);
     }
 
     fn entry(path: &str, is_dir: bool) -> DirEntry {

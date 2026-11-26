@@ -34,8 +34,10 @@ pub(crate) fn shell_start(id: String) {
     let (input, mut events) = unbounded_channel();
     SHELLS.with(|all| all.borrow_mut().insert(key.clone(), input));
     let (sink, mut output) = unbounded_channel();
+    let thread = state().with_untracked(|s| s.selected.clone());
     bench().update(|b| {
         if let Some(s) = b.terminal.sessions.iter_mut().find(|s| s.id == id) {
+            s.shell_scope = thread.map(|id| (id, b.root.clone()));
             s.running = true;
         }
     });
@@ -245,4 +247,56 @@ pub(crate) fn cancel_terminal_task(request_id: String) {
     let session_id = format!("task-{request_id}");
     shell_close(&session_id);
     super::respond(request_id, ApprovalDecision::Cancel);
+}
+
+/// Submit to the selected thread's interactive shell. shell_start queues early
+/// input until the first PTY output, including when the dock was just opened.
+pub(crate) fn run_in_terminal(command: String) {
+    let Some(thread) = state().with_untracked(|s| s.selected.clone()) else { return };
+    if !native_shell() || bench().with_untracked(|b| b.root.is_empty()) {
+        warn("此会话的工作区交互终端不可用");
+        return;
+    }
+    let mut id = String::new();
+    bench().update(|b| id = b.terminal.select_shell(&(thread, b.root.clone())));
+    super::select_dock_tab(DockTab::Terminal);
+    shell_start(id.clone());
+    shell_write(&id, terminal_input(&command));
+}
+
+fn terminal_input(command: &str) -> String {
+    if !command.contains(['\n', '\t']) {
+        return format!("{command}\r");
+    }
+    // Submit one physical line so foreground commands cannot consume later
+    // lines and the interactive editor cannot treat a literal tab as completion.
+    // eval runs in the existing shell, keeping changes such as cd and exports.
+    let quoted = command
+        .replace('\\', "\\\\")
+        .replace('\'', "'\\''")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    format!("eval \"$(printf '%b' '{quoted}')\"\r")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_input;
+
+    #[test]
+    fn terminal_command_submits_multiline_as_one_shell_input() {
+        assert_eq!(terminal_input("pwd"), "pwd\r");
+        let script = "cat <<'END'\n\t$literal \\n\nEND\nprintf '%s' \"$((1+2))\"";
+        let input = terminal_input(script);
+        assert!(!input.contains(['\n', '\t']));
+        #[cfg(unix)]
+        {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", input.strip_suffix('\r').unwrap()])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"\t$literal \\n\n3");
+        }
+    }
 }

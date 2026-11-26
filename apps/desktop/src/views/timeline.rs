@@ -355,7 +355,7 @@ fn delegated_wake_card(visible_text: Memo<String>) -> impl IntoElement {
                     .pt_1p5()
                     .border_t(px(1.0))
                     .border_t_color(colors.line)
-                    .child(markdown::document(doc))
+                    .child(markdown::document(doc, false))
             },
         ))
 }
@@ -640,7 +640,7 @@ fn text_row(item: ItemMemo) -> impl IntoElement {
         .gap_1p5()
         .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
         .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
-        .child(markdown::document(doc))
+        .child(markdown::document(doc, true))
         .child(when(streaming, || {
             view()
                 .mt_1()

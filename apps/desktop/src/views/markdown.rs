@@ -19,7 +19,7 @@ use crate::{
 const MONO: &str = "Menlo";
 
 /// The blocks of `doc` (a memo of the document).
-pub(crate) fn document(doc: Memo<Option<Arc<MarkdownDoc>>>) -> impl IntoElement {
+pub(crate) fn document(doc: Memo<Option<Arc<MarkdownDoc>>>, run_commands: bool) -> impl IntoElement {
     let blocks = computed(move || doc.with(|d| d.as_ref().map(|d| d.blocks.clone()).unwrap_or_default()));
     view()
         .w_full()
@@ -29,9 +29,9 @@ pub(crate) fn document(doc: Memo<Option<Arc<MarkdownDoc>>>) -> impl IntoElement 
         .child(each(
             move || blocks.get(),
             |b: &Spanned| b.start,
-            |block, _| {
+            move |block, _| {
                 let shown = computed(move || block.with(|b| b.block.clone()));
-                dynamic(move || block_view(&shown.get()).into_element())
+                dynamic(move || block_view(&shown.get(), run_commands).into_element())
             },
         ))
 }
@@ -40,12 +40,12 @@ pub(crate) fn document(doc: Memo<Option<Arc<MarkdownDoc>>>) -> impl IntoElement 
 pub(crate) fn static_document(doc: &MarkdownDoc) -> impl IntoElement {
     let mut column = view().w_full().min_w(px(0.0)).flex_col().gap_2();
     for spanned in &doc.blocks {
-        column = column.child(block_view(&spanned.block));
+        column = column.child(block_view(&spanned.block, false));
     }
     column
 }
 
-fn block_view(block: &Block) -> AnyElement {
+fn block_view(block: &Block, run_commands: bool) -> AnyElement {
     let colors = palette();
     match block {
         Block::Heading { level, inlines } => {
@@ -68,7 +68,7 @@ fn block_view(block: &Block) -> AnyElement {
             if let Some(el) = super::visuals::render_fenced(lang, code, *closed) {
                 el
             } else {
-                code_view(lang, code, *closed).into_element()
+                code_view(lang, code, *closed, run_commands).into_element()
             }
         }
         Block::Diff { lines, .. } => {
@@ -210,7 +210,47 @@ fn is_prose_fence(lang: &str) -> bool {
     )
 }
 
-fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
+fn terminal_command(lang: &str, code: &str) -> Option<String> {
+    let code = code.trim_end_matches(['\r', '\n']);
+    let has_control = code.chars().any(|c| c.is_control() && !matches!(c, '\r' | '\n' | '\t'));
+    if code.trim().is_empty() || has_control {
+        return None;
+    }
+    let lang = lang.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let code = code.replace("\r\n", "\n");
+    if code.contains('\r') {
+        return None;
+    }
+    match lang.as_str() {
+        "bash" | "sh" | "zsh" | "shell" => Some(code),
+        "console" if code.lines().any(|line| line.starts_with("$ ")) => {
+            // Prompted transcripts can also contain output. Only submit the prompts.
+            let commands = code.lines()
+                .filter_map(|line| line.strip_prefix("$ ").or_else(|| line.strip_prefix("> ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!commands.trim().is_empty()).then_some(commands)
+        }
+        "console" => Some(code),
+        "" if !code.contains('\n') => {
+            let line = code.trim_start();
+            if let Some(command) = line.strip_prefix("$ ") {
+                return (!command.trim().is_empty()).then(|| command.to_owned());
+            }
+            let program = line.split_whitespace().next()?;
+            let known = matches!(program,
+                "ls" | "pwd" | "cd" | "echo" | "printf" | "cat" | "grep" | "rg" | "git"
+                | "cargo" | "rustc" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "deno"
+                | "node" | "python" | "python3" | "pip" | "pip3" | "uv" | "go" | "make"
+                | "cmake" | "docker" | "kubectl" | "curl" | "bash" | "sh" | "zsh"
+            );
+            (known || program.starts_with("./")).then_some(code)
+        }
+        _ => None,
+    }
+}
+
+fn code_view(lang: &str, code: &str, closed: bool, run_commands: bool) -> impl IntoElement {
     let colors = palette();
     let prose = is_prose_fence(lang);
     let label = if lang.trim().is_empty() {
@@ -225,6 +265,7 @@ fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
         code.to_owned()
     };
     let copy_source = code.to_owned();
+    let run_command = if run_commands && closed { terminal_command(lang, code) } else { None };
     let frame = view()
         .w_full()
         .min_w(px(0.0))
@@ -273,6 +314,9 @@ fn code_view(lang: &str, code: &str, closed: bool) -> impl IntoElement {
                                 }),
                         ),
                 )
+                .child(run_command.map(|command| {
+                    super::link_button("在终端运行", move || controller::run_in_terminal(command.clone()))
+                }))
                 .child(super::link_button("复制", move || {
                     controller::copy(copy_source.clone())
                 })),
@@ -464,4 +508,40 @@ fn table_view(header: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> impl IntoEle
         .min_w_0()
         .on_layout(move |b: &Bounds<Points>| width.set(b.size.width.0.floor() as u32))
         .child(grid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_command;
+
+    #[test]
+    fn terminal_command_uses_the_fence_language() {
+        for lang in ["bash", "SH", " zsh ", "shell", "console", "bash title=demo"] {
+            assert_eq!(terminal_command(lang, "pwd\n").as_deref(), Some("pwd"));
+        }
+        for lang in ["text", "python", "diff", "shellscript"] {
+            assert_eq!(terminal_command(lang, "pwd"), None);
+        }
+        assert_eq!(terminal_command("sh", " \n"), None);
+        assert_eq!(terminal_command("sh", "echo a\x03b"), None);
+    }
+
+    #[test]
+    fn terminal_command_recognizes_only_single_unlabelled_commands() {
+        for code in ["git status", "pwd", "./setup.sh"] {
+            assert_eq!(terminal_command("", code).as_deref(), Some(code));
+        }
+        assert_eq!(terminal_command("", "$ my-tool check").as_deref(), Some("my-tool check"));
+        assert_eq!(terminal_command("", "ordinary text"), None);
+        assert_eq!(terminal_command("", "echo a\necho b"), None);
+    }
+
+    #[test]
+    fn terminal_command_preserves_shell_lines_and_extracts_console_prompts() {
+        let command = "cat <<'EOF'\n  $ literal\n\nEOF";
+        assert_eq!(terminal_command("bash", command).as_deref(), Some(command));
+        assert_eq!(terminal_command("console", "$ echo $HOME\r\n/tmp\r\n$ pwd\r\n/tmp").as_deref(), Some("echo $HOME\npwd"));
+        assert_eq!(terminal_command("console", "$ if true; then\n>   pwd\n> fi\n/tmp").as_deref(), Some("if true; then\n  pwd\nfi"));
+        assert_eq!(terminal_command("console", "pwd\nls").as_deref(), Some("pwd\nls"));
+    }
 }
