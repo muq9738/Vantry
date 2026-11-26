@@ -414,6 +414,27 @@ fn details(w: &Workbench, s: &Snapshot, t: &Task) -> Result<TaskDetail> {
         .as_ref()
         .map(|h| h.remote_run_id.clone())
         .unwrap_or_default();
+    let has_pending_question = requests.iter().any(|r| r.method != "confirm");
+    let pending_approval = requests.iter().find(|r| r.method == "confirm").map(|r| {
+        PendingApprovalSummary {
+            request_id: r.id.clone(),
+            method: r.method.clone(),
+            title: r.title.clone(),
+            run_id: r.run_id.clone(),
+        }
+    });
+    let has_pending_child_runs = s
+        .tasks
+        .iter()
+        .flatten()
+        .any(|v| v.parent_thread_id == child.id && !v.status.terminal());
+    let next = if pending_approval.is_some() || has_pending_question {
+        "Child is waiting for user approval or input.".to_owned()
+    } else if !t.status.terminal() || has_pending_child_runs {
+        "Completion wakes this thread, so end your turn. Do not wait on it or poll it.".to_owned()
+    } else {
+        String::new()
+    };
     Ok(TaskDetail {
         task_id: t.id.clone(),
         title: t.title.clone(),
@@ -430,22 +451,12 @@ fn details(w: &Workbench, s: &Snapshot, t: &Task) -> Result<TaskDetail> {
         status: t.status,
         work_state: status(t.status),
         delivery_status: t.delivery_status,
-        has_pending_question: requests.iter().any(|r| r.method != "confirm"),
-        pending_approval: requests.iter().find(|r| r.method == "confirm").map(|r| {
-            PendingApprovalSummary {
-                request_id: r.id.clone(),
-                method: r.method.clone(),
-                title: r.title.clone(),
-                run_id: r.run_id.clone(),
-            }
-        }),
-        has_pending_child_runs: s
-            .tasks
-            .iter()
-            .flatten()
-            .any(|v| v.parent_thread_id == child.id && !v.status.terminal()),
+        has_pending_question,
+        pending_approval,
+        has_pending_child_runs,
         summary: t.result.clone(),
         error: t.error.clone(),
+        next,
         updated_at: t.updated_at.clone(),
         ..Default::default()
     })
@@ -1018,14 +1029,50 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                 let waited = wait(
                     core,
                     ThreadWaitQuery {
+                        caller_thread_id: parent.thread_id.clone(),
                         thread_id: task.child_thread_id.clone(),
                         run_id: task.child_run_id.clone(),
                         timeout_ms: q.timeout_ms,
+                        until_delegated_work_settled: true,
                         ..Default::default()
                     },
                 )
                 .await?;
-                let s = core.snapshot()?;
+                let mut s = core.snapshot()?;
+                if !waited.timed_out
+                    && !waited.has_pending_question
+                    && waited.pending_approval.is_none()
+                    && let Some(settled_task) = s
+                        .tasks
+                        .iter()
+                        .flatten()
+                        .find(|v| v.id == r.task_id)
+                        .cloned()
+                    && settled_task.status.terminal()
+                    && settled_task.delivery_status == DeliveryStatus::Delivered
+                {
+                    let is_manual = s.cohorts.iter().flatten().any(|c| {
+                        c.parent_run_id == settled_task.parent_run_id
+                            && c.generation == settled_task.generation
+                            && c.resume_policy == "manual"
+                    });
+                    if is_manual {
+                        let _ = core.dispatch(&Command {
+                            task_id: settled_task.id.clone(),
+                            parent_run_id: settled_task.parent_run_id.clone(),
+                            generation: settled_task.generation,
+                            delivery_message_id: settled_task.delivery_message_id.clone(),
+                            ..command(
+                                CommandKind::DisposeTask,
+                                format!(
+                                    "wait-observed:{}:{}",
+                                    settled_task.id, settled_task.generation
+                                ),
+                            )
+                        });
+                        s = core.snapshot()?;
+                    }
+                }
                 let mut d = details(
                     w,
                     &s,
@@ -1036,6 +1083,9 @@ pub async fn call(w: &Workbench, path: &str, body: &[u8]) -> Result<Value> {
                         .ok_or_else(|| missing("task"))?,
                 )?;
                 d.wait_timed_out = waited.timed_out;
+                if waited.timed_out && waited.auto_wake_registered {
+                    d.next = "Wait timed out; auto-wake is now enabled. End your turn and Core will wake this thread when the child settles. Do not poll it.".to_owned();
+                }
                 return Ok(json!(d));
             }
             Ok(json!(details(w, &initial, task)?))

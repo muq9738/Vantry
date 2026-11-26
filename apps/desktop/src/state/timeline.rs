@@ -563,8 +563,9 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
     if items.len() > before && all_known {
         tail = Some(items.len() - 1);
     }
-    // The last text row streams while the run is active.
-    if active && let Some(TimelineItem::Text { streaming, .. }) = items.last_mut() {
+    // The last text row streams while the run is actively executing.
+    let executing = matches!(run.status, RunStatus::Queued | RunStatus::Running);
+    if executing && let Some(TimelineItem::Text { streaming, .. }) = items.last_mut() {
         *streaming = true;
     }
     for request in pending {
@@ -574,6 +575,7 @@ fn build_segment(parts: &RunParts<'_>, previous: Option<&Segment>) -> Segment {
         });
     }
     let end = match run.status {
+        RunStatus::Waiting => Some(("等待子任务完成，结束后将自动唤醒并继续…".to_owned(), false)),
         RunStatus::Cancelled => Some(("已停止".to_owned(), false)),
         RunStatus::Interrupted => Some((
             non_empty(&run.error, "执行中断，现场已保留；可重新发送。"),

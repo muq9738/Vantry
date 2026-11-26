@@ -138,7 +138,7 @@ fn user_steer_queues_inactive_targets_and_preserves_strict_conflicts() {
             );
         }
         let receipt = core.dispatch(&steer).unwrap();
-        if matches!(status, "queued" | "waiting_children") {
+        if status == "queued" {
             assert!(receipt.run_id.is_empty());
             assert!(
                 core.snapshot()

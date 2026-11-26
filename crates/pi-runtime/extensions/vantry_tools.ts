@@ -2098,10 +2098,14 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
       if (!rawTask.trim()) {
         throw new Error("vantry_delegate_task requires a non-empty task (or message)");
       }
-      const resumePolicy = validateEnumValue("resumePolicy", params.resumePolicy ?? "auto", RESUME_POLICIES) ?? "auto";
       const role = validateEnumValue("role", params.role, DELEGATE_ROLES);
       const isolation = validateEnumValue("isolation", params.isolation, ISOLATION_MODES);
       const mode = validateEnumValue("mode", params.mode, DELEGATE_MODES);
+      const resumePolicy = validateEnumValue(
+        "resumePolicy",
+        params.resumePolicy ?? (mode === "wait" ? undefined : "auto"),
+        RESUME_POLICIES,
+      );
       const timeoutMs = validatePositiveInt("timeoutMs", params.timeoutMs);
       const approvalPolicy = validateEnumValue("approvalPolicy", params.approvalPolicy, APPROVAL_POLICIES);
       const interactionMode = validateEnumValue("interactionMode", params.interactionMode, INTERACTION_MODES);
@@ -2119,8 +2123,8 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
         const body: Record<string, unknown> = {
           parentRunId,
           task: rawTask,
-          resumePolicy,
         };
+        if (resumePolicy) body.resumePolicy = resumePolicy;
         if (params.environmentId?.trim()) body.environmentId = params.environmentId.trim();
         if (params.workspace) body.workspace = params.workspace;
         if (clientRequestId) body.clientRequestId = clientRequestId;
@@ -2151,7 +2155,7 @@ export default function vantryToolsExtension(pi: ExtensionAPI) {
       if (parentAttemptId) {
         args.push("--parent-attempt", parentAttemptId);
       }
-      args.push("--message", rawTask, "--resume-policy", resumePolicy);
+      args.push("--message", rawTask, "--resume-policy", resumePolicy ?? (mode === "wait" ? "manual" : "auto"));
       if (params.provider?.trim()) args.push("--provider", params.provider.trim());
       if (title) {
         args.push("--title", title);

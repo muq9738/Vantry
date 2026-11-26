@@ -1574,9 +1574,13 @@ impl AppState {
         if task.id.is_empty() {
             return false;
         }
+        let parent_run_id = task.parent_run_id.clone();
         match self.tasks.iter_mut().find(|t| t.id == task.id) {
             Some(existing) => *existing = task,
             None => self.tasks.push(task),
+        }
+        if !parent_run_id.is_empty() && self.run(&parent_run_id).is_some() {
+            self.refresh_run(&parent_run_id);
         }
         true
     }
@@ -1612,8 +1616,13 @@ fn merge_run(existing: &mut Run, incoming: Run) {
         incoming.attachments.clone()
     };
     let telemetry = incoming.telemetry.clone().or(existing.telemetry.take());
-    // A terminal status never goes back to an active one (a late event).
-    let status = if existing.status.terminal() && !incoming.status.terminal() {
+    // A terminal status never goes back to an active one for the same attempt
+    // (a stale late event), whereas a new continuation attempt on the same run
+    // legitimately moves it back to queued/running/waiting.
+    let new_attempt = !incoming.attempt_id.is_empty()
+        && !existing.attempt_id.is_empty()
+        && incoming.attempt_id != existing.attempt_id;
+    let status = if !new_attempt && existing.status.terminal() && !incoming.status.terminal() {
         existing.status
     } else {
         incoming.status

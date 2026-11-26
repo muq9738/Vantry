@@ -532,3 +532,101 @@ fn a_child_detail_never_replaces_the_selected_thread() {
     assert!(!state.merge_child_detail(bounded_detail("t1", "r1")));
     assert!(state.runs.is_empty());
 }
+
+#[test]
+fn continuation_new_attempt_transitions_completed_run_back_to_active() {
+    let mut state = AppState::default();
+    state.apply_snapshot(Snapshot {
+        sequence: 10,
+        threads: Some(vec![Thread {
+            id: "t1".into(),
+            title: "parent".into(),
+            ..Thread::default()
+        }]),
+        runs: Some(vec![Run {
+            id: "r1".into(),
+            thread_id: "t1".into(),
+            attempt_id: "att_1".into(),
+            status: RunStatus::Completed,
+            input: "parent prompt".into(),
+            output: "first reply".into(),
+            ..Run::default()
+        }]),
+        ..Snapshot::default()
+    });
+    state.select_thread(Some("t1".into()));
+
+    // Same-attempt late event must NOT revert Completed back to Running.
+    state.apply_event(&CoreEvent {
+        sequence: 11,
+        r#type: "run.started".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        data: serde_json::json!({
+            "run": Run {
+                id: "r1".into(),
+                thread_id: "t1".into(),
+                attempt_id: "att_1".into(),
+                status: RunStatus::Running,
+                ..Run::default()
+            }
+        }),
+        ..Default::default()
+    });
+    assert_eq!(state.runs[0].status, RunStatus::Completed);
+
+    // New continuation attempt (att_2 != att_1) MUST transition back to Running.
+    state.apply_event(&CoreEvent {
+        sequence: 12,
+        r#type: "run.started".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        data: serde_json::json!({
+            "run": Run {
+                id: "r1".into(),
+                thread_id: "t1".into(),
+                attempt_id: "att_2".into(),
+                status: RunStatus::Running,
+                ..Run::default()
+            }
+        }),
+        ..Default::default()
+    });
+    assert_eq!(state.runs[0].status, RunStatus::Running);
+    assert_eq!(state.runs[0].attempt_id, "att_2");
+}
+
+#[test]
+fn waiting_children_shows_status_row_and_delegated_wake_titles_parse() {
+    let mut state = AppState::default();
+    state.apply_snapshot(Snapshot {
+        sequence: 1,
+        threads: Some(vec![Thread {
+            id: "t1".into(),
+            title: "parent".into(),
+            ..Thread::default()
+        }]),
+        runs: Some(vec![Run {
+            id: "r1".into(),
+            thread_id: "t1".into(),
+            attempt_id: "att_1".into(),
+            status: RunStatus::Waiting,
+            input: "delegate".into(),
+            output: "dispatched".into(),
+            ..Run::default()
+        }]),
+        ..Snapshot::default()
+    });
+    state.select_thread(Some("t1".into()));
+    assert!(state.timeline().iter().any(|item| matches!(
+        item,
+        TimelineItem::Status { text, error: false, .. } if text.contains("等待子任务")
+    )));
+
+    assert!(crate::views::timeline::delegated_wake_titles("normal prompt").is_none());
+    let titles = crate::views::timeline::delegated_wake_titles(
+        "父任务等待期间，Vantry 收到并已接受以下子任务结果：\n\n### 子任务 任务 A\n结果\n\n### 子任务 任务 B\n结果",
+    )
+    .unwrap();
+    assert_eq!(titles, vec!["任务 A", "任务 B"]);
+}

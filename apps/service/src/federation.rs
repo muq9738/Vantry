@@ -334,13 +334,15 @@ impl Federator {
 
         let mut cursor = handle.initial_sequence;
         let mut ordinal: i64 = 0;
+        let mut emitted_text = request.after_sequence > 0;
         let mut last_snapshot_check = tokio::time::Instant::now() - Duration::from_secs(2);
 
         loop {
             // Check snapshot first if handle is already terminal or reconnect fallback.
             if last_snapshot_check.elapsed() >= Duration::from_millis(800) {
                 last_snapshot_check = tokio::time::Instant::now();
-                if let Ok(snap) = target.snapshot().await
+                if let Ok(Ok(snap)) =
+                    tokio::time::timeout(Duration::from_secs(10), target.snapshot()).await
                     && let Some(run) = snap
                         .runs
                         .iter()
@@ -348,7 +350,7 @@ impl Federator {
                         .find(|r| r.id == handle.remote_run_id)
                     && run.status.terminal()
                 {
-                    if ordinal == 0 && !run.output.is_empty() && request.after_sequence == 0 {
+                    if !emitted_text && !run.output.is_empty() {
                         ordinal += 1;
                         let ev = ProviderEvent {
                             sequence: ordinal,
@@ -384,6 +386,9 @@ impl Federator {
                         ordinal += 1;
                         if ordinal > request.after_sequence {
                             let pe = map_remote_event(&event, ordinal);
+                            if pe.r#type == "text_delta" && !pe.delta.is_empty() {
+                                emitted_text = true;
+                            }
                             emit(pe).map_err(|err| match err.code() {
                                 ErrorCode::Conflict | ErrorCode::NotReady => {
                                     ProviderError::Detached
@@ -395,6 +400,16 @@ impl Federator {
                             && let Ok(run) = serde_json::from_value::<Run>(event.data["run"].clone())
                             && run.status.terminal()
                         {
+                            if !emitted_text && !run.output.is_empty() {
+                                ordinal += 1;
+                                let _ = emit(ProviderEvent {
+                                    sequence: ordinal,
+                                    occurred_at: Utc::now().to_rfc3339(),
+                                    r#type: "text_delta".into(),
+                                    delta: run.output.clone(),
+                                    data: None,
+                                });
+                            }
                             self.record_terminal(&request.attempt_id, cursor, &run);
                             return terminal_result(&run);
                         }
@@ -405,7 +420,8 @@ impl Federator {
                     }
                     Err(_) => {
                         // Periodic snapshot reconciliation while stream is quiet.
-                        if let Ok(snap) = target.snapshot().await
+                        if let Ok(Ok(snap)) =
+                            tokio::time::timeout(Duration::from_secs(10), target.snapshot()).await
                             && let Some(run) = snap
                                 .runs
                                 .iter()
@@ -413,7 +429,7 @@ impl Federator {
                                 .find(|r| r.id == handle.remote_run_id)
                             && run.status.terminal()
                         {
-                            if ordinal == 0 && !run.output.is_empty() && request.after_sequence == 0 {
+                            if !emitted_text && !run.output.is_empty() {
                                 ordinal += 1;
                                 let _ = emit(ProviderEvent {
                                     sequence: ordinal,

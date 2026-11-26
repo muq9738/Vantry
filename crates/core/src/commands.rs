@@ -219,7 +219,9 @@ fn update_thread(db: &Connection, c: &Command, options: &CoreOptions) -> Result<
     }
     if c.kind == UpdateThread
         && (!c.model.is_empty() || !c.interaction_mode.is_empty() || c.archived == Some(true))
-        && (active(db, &t.id)?.is_some() || !queued(db, &t.id)?.is_empty())
+        && (active(db, &t.id)?.is_some()
+            || !queued(db, &t.id)?.is_empty()
+            || (c.archived == Some(true) && tasks::has_active_for_thread(db, &t.id)?))
     {
         return Err(conflict("thread has active work"));
     }
@@ -348,30 +350,50 @@ fn config(t: &Thread) -> InputConfiguration {
         approval_policy: t.approval_policy.clone(),
     }
 }
-pub(crate) fn dequeue(db: &Connection, thread_id: &str) -> Result<()> {
-    if active(db, thread_id)?.is_some() {
-        return Ok(());
+pub(crate) fn settle_waiting_run(db: &Connection, run_id: &str) -> Result<bool> {
+    if db.execute(
+        "UPDATE runs SET status='completed',updated_at=? WHERE id=? AND status='waiting_children'",
+        params![now(), run_id],
+    )? > 0
+    {
+        run_event(db, run_id, "run.completed")?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    if let Some(key) = queued(db, thread_id)?.first() {
-        let i = input(db, key)?;
-        let mut t = thread(db, thread_id)?;
-        if t.archived {
+}
+pub(crate) fn dequeue(db: &Connection, thread_id: &str) -> Result<()> {
+    let Some(key) = queued(db, thread_id)?.into_iter().next() else {
+        return Ok(());
+    };
+    if let Some(active_id) = active(db, thread_id)? {
+        if run(db, &active_id)?.status == RunStatus::Waiting {
+            // A waiting_children run has no active provider attempt. Settle it cleanly
+            // without cancelling background children so the user's message runs immediately
+            // (matching T3 Code's non-blocking parent thread semantics).
+            settle_waiting_run(db, &active_id)?;
+        } else {
             return Ok(());
         }
-        if let Some(cfg) = i.configuration {
-            t.provider_id = cfg.provider_id;
-            t.model = cfg.model;
-            t.approval_policy = cfg.approval_policy;
-            t.interaction_mode = first(&cfg.interaction_mode, "default").into();
-        }
-        let r = create_run(db, &t, &i.message, &i.sender_thread_id, &i.attachments)?;
-        db.execute(
-            "UPDATE inputs SET status='started',run_id=?,attempt_id=?,updated_at=? WHERE id=?",
-            params![r.id, r.attempt_id, now(), key],
-        )?;
-        input_event(db, key)?;
-        order(db, &queued(db, thread_id)?)?;
     }
+    let i = input(db, &key)?;
+    let mut t = thread(db, thread_id)?;
+    if t.archived {
+        return Ok(());
+    }
+    if let Some(cfg) = i.configuration {
+        t.provider_id = cfg.provider_id;
+        t.model = cfg.model;
+        t.approval_policy = cfg.approval_policy;
+        t.interaction_mode = first(&cfg.interaction_mode, "default").into();
+    }
+    let r = create_run(db, &t, &i.message, &i.sender_thread_id, &i.attachments)?;
+    db.execute(
+        "UPDATE inputs SET status='started',run_id=?,attempt_id=?,updated_at=? WHERE id=?",
+        params![r.id, r.attempt_id, now(), key],
+    )?;
+    input_event(db, &key)?;
+    order(db, &queued(db, thread_id)?)?;
     Ok(())
 }
 pub(crate) fn queue(db: &Connection, t: &Thread, c: &Command) -> Result<Receipt> {
@@ -424,6 +446,11 @@ fn send(db: &Connection, c: &Command) -> Result<Receipt> {
     t.interaction_mode = first(&c.interaction_mode, &t.interaction_mode).into();
     match c.kind {
         SendMessage => {
+            if let Some(active_id) = active(db, key)?
+                && run(db, &active_id)?.status == RunStatus::Waiting
+            {
+                settle_waiting_run(db, &active_id)?;
+            }
             let r = create_run(db, &t, &c.message, &c.sender_thread_id, &c.attachments)?;
             Ok(receipt(key, &r.id))
         }
@@ -582,15 +609,20 @@ fn edit_queue(db: &Connection, c: &Command) -> Result<Receipt> {
             }
             if let Some(target) = target {
                 let r = run(db, &target)?;
-                if r.status != RunStatus::Running {
+                if r.status == RunStatus::Waiting {
+                    settle_waiting_run(db, &r.id)?;
+                    db.execute("UPDATE inputs SET queue_order=-1 WHERE id=?", [key])?;
+                    dequeue(db, &i.thread_id)?;
+                } else if r.status != RunStatus::Running {
                     return Err(conflict("no running attempt"));
+                } else {
+                    db.execute(
+                        "UPDATE inputs SET kind='steer',status='pending',run_id=?,attempt_id=?,command_id=?,
+                 queue_order=0,updated_at=? WHERE id=?",
+                        params![r.id, r.attempt_id, c.command_id, now(), key],
+                    )?;
+                    steer(db, key, &r)?;
                 }
-                db.execute(
-                    "UPDATE inputs SET kind='steer',status='pending',run_id=?,attempt_id=?,command_id=?,
-             queue_order=0,updated_at=? WHERE id=?",
-                    params![r.id, r.attempt_id, c.command_id, now(), key],
-                )?;
-                steer(db, key, &r)?;
             } else {
                 db.execute("UPDATE inputs SET queue_order=-1 WHERE id=?", [key])?;
                 dequeue(db, &i.thread_id)?;
@@ -686,6 +718,7 @@ pub(crate) fn cancel(db: &Connection, r: &Run) -> Result<()> {
              AND status IN ('pending','claimed')",
         [&r.id],
     )?;
+    tasks::dispose_parent_deliveries(db, r)?;
     crate::scheduler::finish(db, r, "cancelled", "")?;
     for key in strings(db, "SELECT id FROM tasks WHERE parent_run_id=?", [&r.id])? {
         tasks::cancel_task(db, &task(db, &key)?)?;

@@ -265,6 +265,101 @@ fn highlight_attachment_mentions(
     out
 }
 
+const DELEGATED_WAKE_PREFIX: &str = "父任务等待期间，Vantry 收到并已接受以下子任务结果：";
+
+pub(crate) fn delegated_wake_titles(text: &str) -> Option<Vec<String>> {
+    if !text.starts_with(DELEGATED_WAKE_PREFIX) {
+        return None;
+    }
+    let titles: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("### 子任务 ").map(|s| s.trim().to_owned()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    Some(titles)
+}
+
+fn delegated_wake_card(visible_text: Memo<String>) -> impl IntoElement {
+    let colors = palette();
+    let expanded = signal(false);
+    let summary = computed(move || {
+        let raw = visible_text.get();
+        let titles = delegated_wake_titles(&raw).unwrap_or_default();
+        if titles.is_empty() {
+            "已接收子任务结果 · 自动唤醒主代理".to_owned()
+        } else if titles.len() == 1 {
+            format!("已接收子任务结果：{}", titles[0])
+        } else {
+            format!(
+                "已接收 {} 个子任务结果：{}",
+                titles.len(),
+                titles.join("、")
+            )
+        }
+    });
+    let doc = computed(move || {
+        let raw = visible_text.get();
+        let body = raw
+            .strip_prefix(DELEGATED_WAKE_PREFIX)
+            .unwrap_or(&raw)
+            .trim();
+        Some(Arc::new(MarkdownDoc::parse(body)))
+    });
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_col()
+        .gap_1p5()
+        .px_3p5()
+        .py_2p5()
+        .rounded(px(12.0))
+        .bg(colors.card)
+        .border_1()
+        .border_color(colors.line)
+        .child(
+            nsh_base::button()
+                .accessibility_label("展开子任务回传结果")
+                .on_press(move || expanded.set(!expanded.get_untracked()))
+                .w_full()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .active(|s| s.opacity(0.7))
+                .child(icon(Icon::Bot, 14.0, colors.accent))
+                .child(
+                    text(move || summary.get())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1u32)
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.ink),
+                )
+                .child(
+                    text(move || if expanded.get() { "收起" } else { "查看详情" })
+                        .text_size(px(11.5))
+                        .text_color(colors.muted),
+                )
+                .child(icon(
+                    Icon::ChevronRight,
+                    12.0,
+                    colors.faint,
+                )),
+        )
+        .child(when(
+            move || expanded.get(),
+            move || {
+                view()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .pt_1p5()
+                    .border_t(px(1.0))
+                    .border_t_color(colors.line)
+                    .child(markdown::document(doc))
+            },
+        ))
+}
+
 fn user_row(item: ItemMemo) -> impl IntoElement {
     let colors = palette();
     let user = computed(move || match item.get() {
@@ -281,6 +376,7 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     let plan = move || user.with(|u| u.as_ref().is_some_and(|u| u.2));
     let attachments = move || user.with(|u| u.as_ref().map(|u| u.3.clone()).unwrap_or_default());
     let visible_text = computed(move || text_of());
+    let is_wake = computed(move || visible_text.with(|t| t.starts_with(DELEGATED_WAKE_PREFIX)));
     let revision = computed(|| controller::state().with(|s| s.sidebar_revision));
     let inserted = computed(move || {
         revision.get();
@@ -300,7 +396,11 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
     });
     let thread_id = move || controller::state().with_untracked(|s| s.selected.clone().unwrap_or_default());
     let hovered = signal(false);
-    view()
+    dynamic(move || {
+        if is_wake.get() {
+            return delegated_wake_card(visible_text).into_element();
+        }
+        view()
         .w_full()
         .min_w(px(0.0))
         .flex_row()
@@ -431,6 +531,8 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                     },
                 )),
         )
+        .into_element()
+    })
 }
 
 pub(crate) fn reasoning_row(item: ItemMemo) -> impl IntoElement {

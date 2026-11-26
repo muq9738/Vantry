@@ -671,3 +671,352 @@ async fn restart_preserves_cursor_and_handles_unknown_submission() {
         second.close().await;
     }
 }
+
+#[tokio::test]
+async fn parallel_auto_children_deliver_incrementally_without_waiting_for_slow_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let parent = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "launch two"}),
+    )
+    .run_id;
+    let p = h.next().await;
+    let c1 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "fast child", "message": "fast", "resumePolicy": "auto"}),
+    );
+    let _c2 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "slow child", "message": "slow", "resumePolicy": "auto"}),
+    );
+    let e1 = h.next().await;
+    let e2 = h.next().await;
+    let (fast, slow) = if e1.req.run_id == c1.run_id {
+        (e1, e2)
+    } else {
+        (e2, e1)
+    };
+    p.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Waiting).await;
+
+    // Fast child finishes while slow child is STILL running -> parent wakes immediately!
+    emit(&fast, 1, "", Value::Null, "fast output");
+    fast.done.send(Ok(())).unwrap();
+    let wake1 = h.next().await;
+    assert_eq!(wake1.req.run_id, parent);
+    assert!(wake1.req.message.contains("fast output"));
+    assert!(
+        wake1.req.message.contains("slow child"),
+        "wake prompt should note still-running sibling: {}",
+        wake1.req.message
+    );
+    assert_ne!(wake1.req.attempt_id, p.req.attempt_id);
+    wake1.done.send(Ok(())).unwrap();
+    // Slow child is still running -> parent returns cleanly to waiting_children.
+    h.wait(|s| status(s, &parent) == RunStatus::Waiting).await;
+
+    // Slow child finishes -> parent wakes again with slow child's result!
+    emit(&slow, 1, "", Value::Null, "slow output");
+    slow.done.send(Ok(())).unwrap();
+    let wake2 = h.next().await;
+    assert_eq!(wake2.req.run_id, parent);
+    assert!(wake2.req.message.contains("slow output"));
+    assert!(!wake2.req.message.contains("fast output"));
+    wake2.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Completed).await;
+    h.close().await;
+}
+
+#[tokio::test]
+async fn user_message_while_waiting_children_runs_immediately_and_child_wakes_parent_in_new_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let parent = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "delegate one"}),
+    )
+    .run_id;
+    let p = h.next().await;
+    let c1 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "bg child", "message": "bg", "resumePolicy": "auto"}),
+    );
+    let child = h.next().await;
+    p.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Waiting).await;
+
+    // User sends a new message while parent is waiting_children:
+    // parent settles to completed, user run starts immediately, and child keeps running.
+    let user_msg = cmd(
+        &core,
+        "message.queue",
+        json!({"threadId": th, "message": "side question"}),
+    );
+    assert!(!user_msg.run_id.is_empty());
+    assert_ne!(user_msg.run_id, parent);
+    let user_exec = h.next().await;
+    assert_eq!(user_exec.req.run_id, user_msg.run_id);
+    assert_eq!(user_exec.req.message, "side question");
+
+    // Child completes WHILE the user's new run is actively executing (must not crash or violate unique index!).
+    emit(&child, 1, "", Value::Null, "bg child result");
+    child.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &c1.run_id) == RunStatus::Completed)
+        .await;
+
+    // As soon as the user's run settles, parent automatically wakes in a fresh run at the bottom!
+    user_exec.done.send(Ok(())).unwrap();
+    let wake = h.next().await;
+    assert_eq!(wake.req.thread_id, th);
+    assert_ne!(wake.req.run_id, parent);
+    assert_ne!(wake.req.run_id, user_msg.run_id);
+    assert!(wake.req.message.contains("bg child result"));
+    wake.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &wake.req.run_id) == RunStatus::Completed)
+        .await;
+    h.close().await;
+}
+
+#[tokio::test]
+async fn failed_continuation_does_not_strand_remaining_sibling_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let parent = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "two siblings"}),
+    )
+    .run_id;
+    let p = h.next().await;
+    let c1 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "first", "message": "one", "resumePolicy": "auto"}),
+    );
+    let _c2 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "second", "message": "two", "resumePolicy": "auto"}),
+    );
+    let e1 = h.next().await;
+    let e2 = h.next().await;
+    let (first, second) = if e1.req.run_id == c1.run_id {
+        (e1, e2)
+    } else {
+        (e2, e1)
+    };
+    p.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Waiting).await;
+
+    emit(&first, 1, "", Value::Null, "first done");
+    first.done.send(Ok(())).unwrap();
+    let wake1 = h.next().await;
+    assert!(wake1.req.message.contains("first done"));
+    // Transient failure on the first continuation attempt.
+    wake1
+        .done
+        .send(Err(ProviderError::Failed("transient api error".into())))
+        .unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Failed).await;
+
+    // Second sibling finishes later -> must NOT be stranded; wakes parent in a fresh run!
+    emit(&second, 1, "", Value::Null, "second done");
+    second.done.send(Ok(())).unwrap();
+    let wake2 = h.next().await;
+    assert_eq!(wake2.req.thread_id, th);
+    assert_ne!(wake2.req.run_id, parent);
+    assert!(wake2.req.message.contains("second done"));
+    wake2.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &wake2.req.run_id) == RunStatus::Completed)
+        .await;
+    h.close().await;
+}
+
+#[tokio::test]
+async fn mixed_auto_and_manual_delegates_and_archive_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let parent = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "mixed"}),
+    )
+    .run_id;
+    let p = h.next().await;
+    let auto_task = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "message": "auto child", "resumePolicy": "auto"}),
+    );
+    let manual_task = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "message": "manual child", "resumePolicy": "manual"}),
+    );
+    assert_ne!(auto_task.generation, manual_task.generation);
+    let e1 = h.next().await;
+    let e2 = h.next().await;
+    let (auto_exec, manual_exec) = if e1.req.run_id == auto_task.run_id {
+        (e1, e2)
+    } else {
+        (e2, e1)
+    };
+    p.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Waiting).await;
+
+    // Archiving a thread with active delegated children must be refused.
+    let archive = Command {
+        thread_id: th.clone(),
+        archived: Some(true),
+        ..Command::new("archive-while-delegated", CommandKind::UpdateThread)
+    };
+    assert_eq!(core.dispatch(&archive).unwrap_err().code(), ErrorCode::Conflict);
+
+    // Auto child finishes and wakes immediately without waiting for manual child.
+    emit(&auto_exec, 1, "", Value::Null, "auto ok");
+    auto_exec.done.send(Ok(())).unwrap();
+    let wake = h.next().await;
+    assert!(wake.req.message.contains("auto ok"));
+    wake.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Waiting).await;
+
+    // Manual child completes -> waits in delivered until disposed.
+    emit(&manual_exec, 1, "", Value::Null, "manual ok");
+    manual_exec.done.send(Ok(())).unwrap();
+    h.wait(|s| {
+        s.cohorts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|c| c.generation == manual_task.generation && c.status == DeliveryStatus::Delivered)
+    })
+    .await;
+    cmd(
+        &core,
+        "task.dispose",
+        json!({"taskId": manual_task.task_id, "generation": manual_task.generation, "deliveryMessageId": manual_task.delivery_message_id}),
+    );
+    h.wait(|s| status(s, &parent) == RunStatus::Completed).await;
+
+    // Once all delegated work settled, archiving succeeds.
+    core.dispatch(&Command {
+        thread_id: th,
+        archived: Some(true),
+        ..Command::new("archive-after-settled", CommandKind::UpdateThread)
+    })
+    .unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
+async fn siblings_finishing_while_parent_runs_coalesce_into_single_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let parent = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "coalesce"}),
+    )
+    .run_id;
+    let p = h.next().await;
+    let c1 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "A", "message": "a", "resumePolicy": "auto"}),
+    );
+    let c2 = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "B", "message": "b", "resumePolicy": "auto"}),
+    );
+    let e1 = h.next().await;
+    let e2 = h.next().await;
+    // Both children complete WHILE parent turn 1 is still running.
+    emit(&e1, 1, "", Value::Null, "alpha");
+    e1.done.send(Ok(())).unwrap();
+    emit(&e2, 1, "", Value::Null, "beta");
+    e2.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &c1.run_id) == RunStatus::Completed && status(s, &c2.run_id) == RunStatus::Completed)
+        .await;
+
+    // Parent turn 1 ends -> receives BOTH results in a SINGLE coalesced wake!
+    p.done.send(Ok(())).unwrap();
+    let wake = h.next().await;
+    assert_eq!(wake.req.run_id, parent);
+    assert!(wake.req.message.contains("alpha"));
+    assert!(wake.req.message.contains("beta"));
+    wake.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Completed).await;
+    h.close().await;
+}
+
+#[tokio::test]
+async fn grandchild_delegation_keeps_parent_waiting_until_child_synthesizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = Harness::open(dir.path(), true);
+    let core = h.core.clone();
+    let th = cmd(&core, "thread.create", json!({})).thread_id;
+    let parent = cmd(
+        &core,
+        "message.send",
+        json!({"threadId": th, "message": "root"}),
+    )
+    .run_id;
+    let p = h.next().await;
+    let child_rec = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": parent, "parentAttemptId": p.req.attempt_id, "title": "child", "message": "spawn grandchild", "resumePolicy": "auto"}),
+    );
+    let child_exec = h.next().await;
+    let grandchild_rec = cmd(
+        &core,
+        "task.delegate",
+        json!({"parentRunId": child_rec.run_id, "parentAttemptId": child_exec.req.attempt_id, "title": "grandchild", "message": "leaf", "resumePolicy": "auto"}),
+    );
+    let grandchild_exec = h.next().await;
+    p.done.send(Ok(())).unwrap();
+    emit(&child_exec, 1, "", Value::Null, "interim child text");
+    child_exec.done.send(Ok(())).unwrap();
+
+    // Child is waiting_children -> parent MUST still be waiting_children (no premature wake!).
+    h.wait(|s| {
+        status(s, &child_rec.run_id) == RunStatus::Waiting
+            && status(s, &parent) == RunStatus::Waiting
+    })
+    .await;
+
+    // Grandchild finishes -> wakes child -> child emits final synthesized output -> wakes parent!
+    emit(&grandchild_exec, 1, "", Value::Null, "leaf answer");
+    grandchild_exec.done.send(Ok(())).unwrap();
+    let child_wake = h.next().await;
+    assert_eq!(child_wake.req.run_id, child_rec.run_id);
+    assert!(child_wake.req.message.contains("leaf answer"));
+    emit(&child_wake, 1, "", Value::Null, "final synthesized answer");
+    child_wake.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &grandchild_rec.run_id) == RunStatus::Completed)
+        .await;
+
+    let parent_wake = h.next().await;
+    assert_eq!(parent_wake.req.run_id, parent);
+    assert!(parent_wake.req.message.contains("final synthesized answer"));
+    parent_wake.done.send(Ok(())).unwrap();
+    h.wait(|s| status(s, &parent) == RunStatus::Completed).await;
+    h.close().await;
+}

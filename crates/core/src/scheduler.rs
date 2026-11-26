@@ -324,6 +324,7 @@ impl Core {
             for g in groups {
                 tasks::sync(db, &run(db, &g.parent_run_id)?, g.generation)?;
             }
+            tasks::sweep_ready(db)?;
             db.execute("UPDATE effect_outbox SET status='abandoned',claim_token='',last_error='stale attempt' WHERE kind='provider.run' AND status IN ('claimed','pending') AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.id=effect_outbox.run_id AND r.active_attempt_id=effect_outbox.attempt_id AND r.status IN ('queued','running'))", [])?;
             tasks::watches::recover(db)?;
             for t in strings(db, "SELECT DISTINCT thread_id FROM inputs WHERE kind='queue' AND status='queued'", [])? {
@@ -381,11 +382,18 @@ impl Core {
         jobs: &mut JoinSet<Result<()>>,
     ) -> Result<()> {
         let mut changes = self.0.changed.subscribe();
+        let mut last_sweep = Instant::now();
         loop {
             if stop.is_cancelled() || self.0.shutdown.is_cancelled() {
                 break;
             }
             self.write(expire_requests)?;
+            if last_sweep.elapsed() >= Duration::from_secs(1) {
+                last_sweep = Instant::now();
+                if self.read(tasks::has_sweepable)? {
+                    self.write(|db| tasks::sweep_ready(db))?;
+                }
+            }
             for _ in 0..32 {
                 let side = self.claim_side()?;
                 if let Some(side) = side {
@@ -695,6 +703,7 @@ pub(crate) fn finish(db: &Connection, r: &Run, status: &str, reason: &str) -> Re
     }
     tasks::watches::deliver(db, &run(db, &r.id)?)?;
     tasks::sync_child(db, &r.id)?;
+    tasks::deliver_pending_for_thread(db, &r.thread_id)?;
     commands::dequeue(db, &r.thread_id)?;
     Ok(())
 }
