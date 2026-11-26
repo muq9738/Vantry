@@ -11,6 +11,9 @@ pub use provider::*;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const EMBEDDED_PI_CAPABILITY: &str = "provider.pi.embedded.v1";
 pub const LEGACY_PI_RUNTIME_CAPABILITY: &str = "provider.pi.runtime.v1";
+/// Opt in to NDJSON keepalive records on `/v1/events`. Supporting servers echo `1`.
+pub const EVENT_KEEPALIVE_HEADER: &str = "x-vantry-event-keepalive";
+pub const EVENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub const LOCAL_TOKEN_HEADER: &str = "x-vantry-local-token";
 
 /// Loopback TCP descriptor written to `core.sock` on platforms without Unix

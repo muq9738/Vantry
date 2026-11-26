@@ -448,9 +448,16 @@ fn send(db: &Connection, c: &Command) -> Result<Receipt> {
             };
             if mode != "queue" {
                 if let Some(target) = target {
-                    let r = run(db, &target)?;
+                    let mut r = run(db, &target)?;
                     if r.thread_id != key {
                         return Err(conflict("run belongs to another thread"));
+                    }
+                    let user_steer = c.kind == SteerMessage && c.parent_attempt_id.is_empty();
+                    if user_steer
+                        && r.status.terminal()
+                        && let Some(current) = active(db, key)?
+                    {
+                        r = run(db, &current)?;
                     }
                     if r.status == RunStatus::Running {
                         if !c.parent_attempt_id.is_empty() && c.parent_attempt_id != r.attempt_id {
@@ -470,9 +477,11 @@ fn send(db: &Connection, c: &Command) -> Result<Receipt> {
                         return Ok(rec);
                     }
                     if mode == "steer"
-                        && !(inter && c.fallback_to_queue
-                            || r.status == RunStatus::Completed
-                                && (c.parent_attempt_id.is_empty() || c.fallback_to_queue))
+                        && !(user_steer
+                            || c.fallback_to_queue
+                            || !inter
+                                && r.status == RunStatus::Completed
+                                && c.parent_attempt_id.is_empty())
                     {
                         return Err(conflict("target has no running attempt"));
                     }

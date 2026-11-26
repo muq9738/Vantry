@@ -98,6 +98,82 @@ fn completed_steer_fallback_and_stop_cancel_fifo() {
     core.drain_and_shutdown().unwrap();
 }
 #[test]
+fn user_steer_queues_inactive_targets_and_preserves_strict_conflicts() {
+    for status in [
+        "completed",
+        "cancelled",
+        "failed",
+        "interrupted",
+        "queued",
+        "waiting_children",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let thread = core
+            .dispatch(&Command::new("create", CommandKind::CreateThread))
+            .unwrap()
+            .thread_id;
+        let db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        db.execute("INSERT INTO runs(id,thread_id,attempt_id,active_attempt_id,status,input,created_at,updated_at) VALUES('target',?,'old','',?,'test',1,2)", params![thread, status]).unwrap();
+        let steer = Command {
+            thread_id: thread,
+            run_id: "target".into(),
+            message: "next".into(),
+            ..Command::new("user", CommandKind::SteerMessage)
+        };
+        let anchored = Command {
+            parent_attempt_id: "old".into(),
+            ..steer.clone()
+        };
+        let inter = Command {
+            kind: CommandKind::InterThreadSend,
+            delivery_mode: "steer".into(),
+            ..steer.clone()
+        };
+        for strict in [anchored, inter] {
+            assert_eq!(
+                core.dispatch(&strict).unwrap_err().code(),
+                ErrorCode::Conflict,
+                "{status}"
+            );
+        }
+        let receipt = core.dispatch(&steer).unwrap();
+        if matches!(status, "queued" | "waiting_children") {
+            assert!(receipt.run_id.is_empty());
+            assert!(
+                core.snapshot()
+                    .unwrap()
+                    .inputs
+                    .iter()
+                    .any(|i| i.id == receipt.input_id && i.is_queued())
+            );
+        } else {
+            assert!(!receipt.run_id.is_empty());
+            assert_ne!(receipt.run_id, "target");
+            db.execute(
+                "UPDATE runs SET status='running' WHERE id=?",
+                [&receipt.run_id],
+            )
+            .unwrap();
+            let redirected = core
+                .dispatch(&Command {
+                    command_id: "next".into(),
+                    ..steer
+                })
+                .unwrap();
+            assert_eq!(redirected.run_id, receipt.run_id);
+            assert!(
+                core.snapshot()
+                    .unwrap()
+                    .inputs
+                    .iter()
+                    .any(|i| i.id == redirected.input_id && i.kind == "steer")
+            );
+        }
+    }
+}
+
+#[test]
 fn session_fork_keeps_active_branch_tool_result_and_rewind_discards_tail() {
     let dir = tempfile::tempdir().unwrap();
     let core = Core::open(dir.path()).unwrap();

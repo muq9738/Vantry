@@ -163,6 +163,88 @@ fn late_detail_from_an_old_selection_is_discarded() {
 }
 
 #[test]
+fn detail_in_flight_cannot_revert_cancelled_run_or_interrupted_tool() {
+    let mut state = with_requests(vec![], vec![]);
+    let request = state.begin_detail_load("t1");
+    let mut stale = detail_variant("t1", "r1", 3, false);
+    stale.runs.as_mut().unwrap()[0].status = RunStatus::Running;
+    let tool = ToolCall {
+        id: "bash".into(),
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        status: "interrupted".into(),
+        ..Default::default()
+    };
+    let run = Run {
+        status: RunStatus::Cancelled,
+        ..state.runs[0].clone()
+    };
+    for (sequence, kind, data) in [
+        (4, "tool.updated", serde_json::json!({"tool":tool})),
+        (5, "run.cancelled", serde_json::json!({"run":run})),
+    ] {
+        state.apply_event(&CoreEvent {
+            sequence,
+            r#type: kind.into(),
+            thread_id: "t1".into(),
+            run_id: "r1".into(),
+            data,
+            ..Default::default()
+        });
+    }
+    assert!(!state.apply_thread_detail(request, stale));
+    assert_eq!(state.runs[0].status, RunStatus::Cancelled);
+    assert_eq!(state.tools[0].status, "interrupted");
+    assert!(state.current_detail_request(request, "t1"));
+    state.detail_load_failed(request, "t1", &BridgeError::unavailable("offline"));
+    assert_eq!(state.notice.unwrap().level, NoticeLevel::Error);
+}
+
+#[test]
+fn reconnect_replay_does_not_reopen_a_run_already_in_the_detail() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries { sequence: 5, threads: Some(vec![summary("t1", 1)]) });
+    let request = state.begin_detail_load("t1");
+    assert!(state.apply_thread_detail(request, bounded_detail("t1", "r1")));
+    let old = Run { status: RunStatus::Running, ..state.runs[0].clone() };
+    state.apply_event(&CoreEvent {
+        sequence: 6, r#type: "run.started".into(), thread_id: "t1".into(), run_id: "r1".into(),
+        data: serde_json::json!({"run":old}), ..Default::default()
+    });
+    assert_eq!(state.sequence, 6);
+    assert_eq!(state.runs[0].status, RunStatus::Completed);
+}
+
+#[test]
+fn stale_run_conflicts_request_selected_thread_refresh() {
+    let mut state = with_requests(vec![], vec![]);
+    let conflict = Err(BridgeError::new(
+        crate::bridge::ErrorCode::Conflict,
+        "no running attempt",
+    ));
+    for kind in [
+        CommandKind::SteerMessage,
+        CommandKind::SteerRun,
+        CommandKind::StopRun,
+    ] {
+        let request = state.begin_conflict_refresh(kind, "t1", &conflict).unwrap();
+        assert!(state.current_detail_request(request, "t1"));
+        assert!(
+            state
+                .begin_conflict_refresh(kind, "t1", &Ok(Receipt::default()))
+                .is_none()
+        );
+        state.select_thread(None);
+        assert!(
+            state
+                .begin_conflict_refresh(kind, "t1", &conflict)
+                .is_none()
+        );
+        state.select_thread(Some("t1".into()));
+    }
+}
+
+#[test]
 fn summary_stage_allows_a_local_draft_but_blocks_before_summary() {
     let mut state = AppState::default();
     state.set_draft_text("先发一条");

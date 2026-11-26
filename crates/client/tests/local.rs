@@ -90,7 +90,8 @@ async fn v1_socket_command_replay_and_resync() {
         .await;
         let (mut io, _) = request(&listener, "GET", "/v1/events?after=7").await;
         io.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-ndjson\r\n\r\n").await.unwrap();
-        chunk(&mut io, "{\"event\":").await;
+        chunk(&mut io, "\n  \r\n{\"keepal").await;
+        chunk(&mut io, "ive\":true}\n{\"event\":").await;
         chunk(&mut io,"{\"sequence\":8,\"id\":\"e\",\"threadId\":\"t1\",\"type\":\"run.output\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"data\":{\"delta\":\"文\"}}}\n").await;
         wait.await.unwrap();
         chunk(
@@ -165,6 +166,60 @@ async fn v1_socket_command_replay_and_resync() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn silent_stream_detects_missing_heartbeat_or_legacy_cursor_drift() {
+    for (heartbeat, sequence) in [(true, 7), (false, 7), (false, 8)] {
+        let dir = SocketDir(PathBuf::from(format!(
+            "/tmp/vnt-idle-{}",
+            std::process::id()
+        )));
+        fs::create_dir(&dir.0).unwrap();
+        let listener = UnixListener::bind(dir.0.join("core.sock")).unwrap();
+        let (done, wait) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut io, _) = request(&listener, "GET", "/v1/events?after=7").await;
+            let header = if heartbeat {
+                "x-vantry-event-keepalive: 1\r\n"
+            } else {
+                ""
+            };
+            io.write_all(
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{header}\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            if !heartbeat {
+                let (probe, _) = request(&listener, "GET", "/v1/threads/summaries").await;
+                reply(probe, "200 OK", json!({"sequence":sequence,"threads":[]})).await;
+                if sequence == 7 {
+                    chunk(&mut io, "{\"event\":{\"sequence\":8,\"id\":\"e\",\"threadId\":\"t\",\"type\":\"run.cancelled\",\"timestamp\":\"now\",\"data\":{}}}\n").await;
+                }
+            }
+            wait.await.unwrap();
+        });
+        let mut stream = CoreClient::from_data_dir(&dir.0)
+            .subscribe(7)
+            .await
+            .unwrap();
+        let mut next = Box::pin(stream.next_event());
+        tokio::time::pause();
+        assert!(futures::poll!(&mut next).is_pending());
+        tokio::time::advance(EVENT_IDLE_TIMEOUT).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(3), next)
+            .await
+            .unwrap();
+        if !heartbeat && sequence == 7 {
+            assert_eq!(result.unwrap().unwrap().sequence, 8);
+        } else {
+            assert!(matches!(result, Err(ClientError::Transport(_))));
+            assert_eq!(stream.cursor(), 7);
+        }
+        done.send(()).unwrap();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]

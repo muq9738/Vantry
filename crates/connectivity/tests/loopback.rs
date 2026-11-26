@@ -50,6 +50,10 @@ async fn core_fixture(listener: UnixListener, stop: CancellationToken) {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n{\"version\":\"old\"}",
                     )
                     .await;
+            } else if buf.starts_with(b"GET /v1/events?") {
+                assert!(String::from_utf8_lossy(&buf).contains("x-vantry-event-keepalive: 1"));
+                let body = "\n{\"keepalive\":true}\n{\"event\":{\"sequence\":4,\"id\":\"e\",\"type\":\"run.cancelled\",\"threadId\":\"t\",\"timestamp\":\"now\",\"data\":{}}}\n";
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nx-vantry-event-keepalive: 1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             } else {
                 let _ = socket
                     .write_all(
@@ -128,6 +132,10 @@ async fn run_two_devices() -> Result<()> {
     let client = PeerConnection::connect(peer, None, Route::Auto, stop.clone()).await?;
     ensure!(client.mode == "relay");
     ensure!(client.health().await?["version"] == "old");
+    let client = PeerConnection::connect(peer, None, Route::Relay, stop.clone()).await?;
+    let mut stream = client.subscribe_events(3).await?;
+    ensure!(stream.next_event().await?.unwrap().sequence == 4);
+    ensure!(stream.next_event().await?.is_none());
     let publisher = vantry_connectivity::bootstrap::Publisher::new(host.clone())?;
     let short = publisher.issue(&key).await?;
     let other = IdentityStore::open(&tmp.path().join("other"), "Second")?;

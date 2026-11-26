@@ -353,6 +353,17 @@ async fn call<T: Send + 'static>(future: bridge::BridgeFuture<T>) -> Result<T, B
     }
 }
 
+async fn read_projection<T: Send + 'static>(
+    future: bridge::BridgeFuture<T>,
+) -> Result<T, BridgeError> {
+    call(Box::pin(async move {
+        tokio::time::timeout(vantry_protocol::EVENT_IDLE_TIMEOUT, future)
+            .await
+            .map_err(|_| BridgeError::unavailable("读取 Core 状态超时"))?
+    }))
+    .await
+}
+
 /// Loads the snapshot, follows the event stream, and recovers: resubscribes
 /// after the last applied event, or reloads the snapshot on
 /// `resync_required`, backing off between attempts.
@@ -364,7 +375,7 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
             // active thread, then subscribe directly to `/v1/events` without
             // downloading the multi-megabyte full `/v1/snapshot`. Fall back to
             // `/v1/snapshot` only on older Cores that do not serve summaries.
-            match call(core.thread_summaries()).await {
+            match read_projection(core.thread_summaries()).await {
                 Ok(summaries) => {
                     let mut selected = None;
                     state().update(|s| {
@@ -374,18 +385,14 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
                     if let Some(id) = selected {
                         let mut request = 0;
                         state().update(|s| request = s.begin_detail_load(&id));
-                        if let Ok(detail) = call(core.thread_detail(id, 20)).await {
-                            state().update(|s| {
-                                s.apply_thread_detail(request, detail);
-                            });
-                        }
+                        load_detail(&core, id, request).await;
                     }
                     state().update(AppState::on_live);
                     need_snapshot = false;
                     catalogs_after_connect();
                 }
                 Err(error) if error.code == ErrorCode::NotFound => {
-                    match call(core.snapshot()).await {
+                    match read_projection(core.snapshot()).await {
                         Ok(snapshot) => {
                             state().update(|s| {
                                 s.apply_snapshot(snapshot);
@@ -466,7 +473,18 @@ async fn run_connection(core: Arc<dyn CoreBridge>) {
                 need_snapshot = true;
                 timer(delay).await;
             }
-            Some(Recovery::Resubscribe { delay, .. }) => timer(delay).await,
+            Some(Recovery::Resubscribe { delay, .. }) => {
+                timer(delay).await;
+                let selected = state().with_untracked(|s| {
+                    s.selected.clone().filter(|_| !s.snapshot_loaded)
+                });
+                if let Some(id) = selected {
+                    let mut request = 0;
+                    state().update(|s| request = s.begin_detail_load(&id));
+                    let core = core.clone();
+                    spawn_for_window(async move { load_detail(&core, id, request).await });
+                }
+            }
             None => {}
         }
     }
@@ -513,6 +531,40 @@ fn acknowledge_visible_completion(events: &[CoreEvent]) {
     if let Some(id) = selected { set_thread_read_state(&id, false); }
 }
 
+async fn load_detail(core: &Arc<dyn CoreBridge>, id: String, request: u64) {
+    while state().with_untracked(|s| s.current_detail_request(request, &id)) {
+        let full = state().with_untracked(|s| s.snapshot_loaded);
+        let mut stale = false;
+        let result = if full {
+            read_projection(core.snapshot()).await.map(|snapshot| {
+                state().update(|s| {
+                    stale = snapshot.sequence < s.sequence;
+                    if !stale && s.current_detail_request(request, &id) {
+                        s.apply_snapshot(snapshot);
+                    }
+                });
+            })
+        } else {
+            read_projection(core.thread_detail(id.clone(), 20))
+                .await
+                .map(|detail| {
+                    state().update(|s| {
+                        stale = detail.sequence < s.sequence;
+                        s.apply_thread_detail(request, detail);
+                    });
+                })
+        };
+        if stale {
+            timer(Duration::from_millis(150)).await;
+            continue;
+        }
+        if let Err(error) = result {
+            state().update(|s| s.detail_load_failed(request, &id, &error));
+        }
+        break;
+    }
+}
+
 /// Sends `command`; its result goes back into the state, which may name a
 /// follow-up (the first message after its thread was created).
 fn dispatch(command: Command) {
@@ -521,9 +573,18 @@ fn dispatch(command: Command) {
     };
     spawn_for_window(async move {
         let id = command.command_id.clone();
+        let kind = command.kind;
+        let thread = command.thread_id.clone();
         let result = call(core.dispatch(command)).await;
         let mut follow_up = None;
-        state().update(|s| follow_up = s.on_command_result(&id, result));
+        let mut refresh = None;
+        state().update(|s| {
+            refresh = s.begin_conflict_refresh(kind, &thread, &result);
+            follow_up = s.on_command_result(&id, result);
+        });
+        if let Some(request) = refresh {
+            load_detail(&core, thread, request).await;
+        }
         if let Some(next) = follow_up {
             dispatch(next);
         }
@@ -790,11 +851,7 @@ pub(crate) fn select_thread(id: String) {
     {
         let thread_id = id.clone();
         spawn_for_window(async move {
-            if let Ok(detail) = call(core.thread_detail(thread_id, 20)).await {
-                state().update(|s| {
-                    s.apply_thread_detail(request, detail);
-                });
-            }
+            load_detail(&core, thread_id, request).await;
         });
     }
     ui().update(|u| {

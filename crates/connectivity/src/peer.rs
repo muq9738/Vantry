@@ -293,6 +293,11 @@ impl PeerConnection {
                 .header("content-type", "application/json"),
             value.map(|v| v.to_string()).unwrap_or_default(),
         );
+        let req = if path.starts_with("/v1/events?") {
+            req.header(vantry_protocol::EVENT_KEEPALIVE_HEADER, "1")
+        } else {
+            req
+        };
         let req = if self.secret.is_empty() {
             req
         } else {
@@ -343,9 +348,11 @@ impl PeerConnection {
     }
     pub async fn subscribe_events(self, after: i64) -> Result<PeerEventStream> {
         let tasks = self.tasks.clone();
-        let res = self
-            .request(Method::GET, &format!("/v1/events?after={after}"), None)
-            .await?;
+        let res = timeout(
+            vantry_protocol::EVENT_IDLE_TIMEOUT,
+            self.request(Method::GET, &format!("/v1/events?after={after}"), None),
+        )
+        .await??;
         let status = res.status();
         if !status.is_success() {
             let bytes = Limited::new(res.into_body(), 64 << 10)
@@ -361,6 +368,10 @@ impl PeerConnection {
             bail!("Core rejected event stream (HTTP {status})");
         }
         Ok(PeerEventStream {
+            keepalive: res
+                .headers()
+                .get(vantry_protocol::EVENT_KEEPALIVE_HEADER)
+                .is_some_and(|v| v == "1"),
             body: res.into_body(),
             buf: Vec::new(),
             _tasks: tasks,
@@ -402,6 +413,7 @@ impl PeerConnection {
 }
 
 pub struct PeerEventStream {
+    keepalive: bool,
     body: Incoming,
     buf: Vec<u8>,
     _tasks: Tasks,
@@ -409,27 +421,38 @@ pub struct PeerEventStream {
 
 impl PeerEventStream {
     pub async fn next_event(&mut self) -> Result<Option<vantry_protocol::CoreEvent>> {
-        fn parse_line(trimmed: &str) -> Result<vantry_protocol::CoreEvent> {
+        fn parse_line(trimmed: &str) -> Result<Option<vantry_protocol::CoreEvent>> {
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
             let val: Value = serde_json::from_str(trimmed)?;
+            if val == json!({"keepalive":true}) {
+                return Ok(None);
+            }
             if let Some(err) = val.get("error") {
                 let msg = err["message"].as_str().unwrap_or("event stream error");
                 bail!("{msg}");
             }
             if let Some(ev) = val.get("event") {
-                return Ok(serde_json::from_value(ev.clone())?);
+                return Ok(Some(serde_json::from_value(ev.clone())?));
             }
-            Ok(serde_json::from_value(val)?)
+            Ok(Some(serde_json::from_value(val)?))
         }
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = self.buf.drain(..=pos).collect();
                 let trimmed = std::str::from_utf8(&line)?.trim();
-                if trimmed.is_empty() {
-                    continue;
+                if let Some(event) = parse_line(trimmed)? {
+                    return Ok(Some(event));
                 }
-                return Ok(Some(parse_line(trimmed)?));
+                continue;
             }
-            match self.body.frame().await {
+            let frame = if self.keepalive {
+                timeout(vantry_protocol::EVENT_IDLE_TIMEOUT, self.body.frame()).await?
+            } else {
+                self.body.frame().await
+            };
+            match frame {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         self.buf.extend_from_slice(&data);
@@ -442,10 +465,7 @@ impl PeerEventStream {
                     }
                     let tail = std::mem::take(&mut self.buf);
                     let trimmed = std::str::from_utf8(&tail)?.trim();
-                    if trimmed.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(parse_line(trimmed)?));
+                    return parse_line(trimmed);
                 }
             }
         }

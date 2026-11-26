@@ -491,7 +491,11 @@ async fn route(
                 .and_then(|q| q.strip_prefix("after="))
                 .and_then(|s| s.parse::<i64>().ok())
                 .ok_or_else(|| invalid("events requires one integer after cursor"))?;
-            events(core, after)?
+            let keepalive = req
+                .headers()
+                .get(EVENT_KEEPALIVE_HEADER)
+                .is_some_and(|v| v == "1");
+            events(core, after, keepalive)?
         }
     })
 }
@@ -524,11 +528,13 @@ fn parse_thread_detail_query(query: Option<&str>) -> Result<(String, i64)> {
     Ok((thread_id, limit_runs))
 }
 
-fn events(core: Core, after: i64) -> Result<Response<Body>> {
+fn events(core: Core, after: i64, keepalive: bool) -> Result<Response<Body>> {
     let changed = core.0.changed.subscribe();
     let page = VecDeque::from(core.events_after(after, 128)?);
-    let frames = stream::unfold(Some((core, changed, after, page)), |state| async move {
+    let frames = stream::unfold(Some((core, changed, after, page)), move |state| async move {
         let (core, mut changed, mut cursor, mut page) = state?;
+        let heartbeat = tokio::time::sleep(std::time::Duration::from_secs(15));
+        tokio::pin!(heartbeat);
         loop {
             if let Some(e) = page.pop_front() {
                 cursor = e.sequence;
@@ -537,15 +543,24 @@ fn events(core: Core, after: i64) -> Result<Response<Body>> {
             }
             match core.events_after(cursor, 128) {
                 Ok(batch) if batch.is_empty() => {
-                    tokio::select! {_=core.0.shutdown.cancelled()=>return None,result=changed.changed()=>{
-                    result.ok()?;}}
+                    tokio::select! {
+                        _ = core.0.shutdown.cancelled() => return None,
+                        result = changed.changed() => result.ok()?,
+                        _ = &mut heartbeat, if keepalive => {
+                            return Some((ndjson(json!({"keepalive":true})), Some((core, changed, cursor, page))));
+                        }
+                    }
                 }
                 Ok(batch) => page = batch.into(),
                 Err(e) => return Some((ndjson(json!({"error":api_error(e)})), None)),
             }
         }
     });
-    Ok(Response::builder()
+    let mut response = Response::builder();
+    if keepalive {
+        response = response.header(EVENT_KEEPALIVE_HEADER, "1");
+    }
+    Ok(response
         .header("content-type", "application/x-ndjson")
         .header("cache-control", "no-cache")
         .body(StreamBody::new(frames).boxed_unsync())
@@ -555,4 +570,35 @@ fn ndjson(v: serde_json::Value) -> std::result::Result<Frame<Bytes>, Infallible>
     let mut bytes = v.to_string().into_bytes();
     bytes.push(b'\n');
     Ok(Frame::data(bytes.into()))
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn negotiated_heartbeats_leave_the_event_cursor_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path()).unwrap();
+        let response = events(core.clone(), 0, true).unwrap();
+        assert_eq!(response.headers()[EVENT_KEEPALIVE_HEADER], "1");
+        let mut stream = response.into_body();
+        let mut legacy = events(core.clone(), 0, false).unwrap().into_body();
+        let idle = tokio::time::timeout(Duration::from_secs(31), legacy.frame());
+        let beats = async {
+            for _ in 0..2 {
+                let frame = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(frame.as_ref(), b"{\"keepalive\":true}\n");
+            }
+        };
+        assert!(tokio::join!(idle, beats).0.is_err());
+        core.dispatch(&Command::new("test", CommandKind::CreateThread))
+            .unwrap();
+        for mut body in [stream, legacy] {
+            let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            let line: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(line["event"]["sequence"], 1);
+        }
+    }
 }

@@ -946,11 +946,45 @@ impl AppState {
         request
     }
 
+    pub fn current_detail_request(&self, request: u64, id: &str) -> bool {
+        self.detail_request == request && self.selected.as_deref() == Some(id)
+    }
+
+    pub fn begin_conflict_refresh(
+        &mut self,
+        kind: CommandKind,
+        thread: &str,
+        result: &Result<Receipt, BridgeError>,
+    ) -> Option<u64> {
+        if self.selected.as_deref() == Some(thread)
+            && matches!(
+                kind,
+                CommandKind::SteerMessage | CommandKind::SteerRun | CommandKind::StopRun
+            )
+            && result
+                .as_ref()
+                .is_err_and(|e| e.code == crate::bridge::ErrorCode::Conflict)
+        {
+            self.detail_request = self.detail_request.wrapping_add(1);
+            return Some(self.detail_request);
+        }
+        None
+    }
+
+    pub fn detail_load_failed(&mut self, request: u64, id: &str, error: &BridgeError) {
+        if self.current_detail_request(request, id) {
+            self.notice = Some(Notice::new(
+                NoticeLevel::Error,
+                format!("无法加载会话内容：{}", error.message),
+            ));
+        }
+    }
+
     /// Applies bounded detail only when it still belongs to the current
     /// selection. The later full snapshot remains the authoritative source.
     pub fn apply_thread_detail(&mut self, request: u64, detail: ThreadDetail) -> bool {
-        if request != self.detail_request
-            || self.selected.as_deref() != Some(detail.thread.id.as_str())
+        if !self.current_detail_request(request, &detail.thread.id)
+            || detail.sequence < self.sequence
         {
             return false;
         }
@@ -1089,6 +1123,14 @@ impl AppState {
             if let Some((detail_id, detail_seq, _)) = &mut self.detail_readiness
                 && detail_id == &event.thread_id
             {
+                // The detail can be ahead of the global cursor. Its run and tool
+                // projections already include these records (including output deltas).
+                if event.sequence <= *detail_seq
+                    && (event.r#type.starts_with("run.") || event.r#type == events::TOOL_UPDATED)
+                {
+                    self.stats.stale += 1;
+                    return Applied::Stale;
+                }
                 *detail_seq = (*detail_seq).max(event.sequence);
             }
         }
@@ -2027,7 +2069,13 @@ impl AppState {
     pub fn on_live(&mut self) {
         if matches!(self.connection, Connection::Starting { .. }) {
             self.connection = Connection::Live;
-            self.notice = Some(Notice::new(NoticeLevel::Info, "本地 Core 已启动。"));
+            if self
+                .notice
+                .as_ref()
+                .is_none_or(|notice| notice.level != NoticeLevel::Error)
+            {
+                self.notice = Some(Notice::new(NoticeLevel::Info, "本地 Core 已启动。"));
+            }
             return;
         }
         let was_recovering = !matches!(self.connection, Connection::Live | Connection::Connecting);

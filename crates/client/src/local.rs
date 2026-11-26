@@ -88,13 +88,16 @@ impl CoreClient {
         path: &str,
         body: Vec<u8>,
         accept_gzip: bool,
-    ) -> Result<(Incoming, bool, Driver)> {
+    ) -> Result<(hyper::Response<Incoming>, bool, Driver)> {
         let tcp_endpoint = read_tcp_endpoint(&self.socket);
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
             .header("host", "vantry.local")
             .header("content-type", "application/json");
+        if path.starts_with("/v1/events?") {
+            builder = builder.header(EVENT_KEEPALIVE_HEADER, "1");
+        }
         if accept_gzip {
             builder = builder.header("accept-encoding", "gzip");
         }
@@ -147,7 +150,7 @@ impl CoreClient {
             let error: ApiError = serde_json::from_slice(&decoded).map_err(anyhow::Error::from)?;
             return Err(error.into());
         }
-        Ok((response.into_body(), gzip, driver))
+        Ok((response, gzip, driver))
     }
     async fn json<T: DeserializeOwned>(
         &self,
@@ -157,6 +160,7 @@ impl CoreClient {
     ) -> Result<T> {
         let (body, gzip, _driver) = self.request(method, path, payload, true).await?;
         let bytes = body
+            .into_body()
             .collect()
             .await
             .map_err(anyhow::Error::from)?
@@ -230,16 +234,24 @@ impl CoreClient {
         .await
     }
     pub async fn subscribe(&self, since: i64) -> Result<EventStream> {
-        let (body, _gzip, driver) = self
-            .request(
+        let (response, _, driver) = tokio::time::timeout(
+            EVENT_IDLE_TIMEOUT,
+            self.request(
                 Method::GET,
                 &format!("/v1/events?after={since}"),
                 vec![],
                 false,
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(anyhow::Error::from)??;
+        let keepalive = response
+            .headers()
+            .get(EVENT_KEEPALIVE_HEADER)
+            .is_some_and(|v| v == "1");
         Ok(EventStream {
-            body,
+            legacy: (!keepalive).then(|| self.clone()),
+            body: response.into_body(),
             driver: Some(driver),
             chunk: Bytes::new(),
             line: vec![],
@@ -250,6 +262,7 @@ impl CoreClient {
 
 /// Drop the stream to disconnect. The cursor advances only after a complete event is decoded.
 pub struct EventStream {
+    legacy: Option<CoreClient>,
     body: Incoming,
     driver: Option<Driver>,
     chunk: Bytes,
@@ -261,6 +274,7 @@ pub struct EventStream {
 struct Envelope {
     event: Option<CoreEvent>,
     error: Option<ApiError>,
+    keepalive: Option<bool>,
 }
 impl EventStream {
     pub fn cursor(&self) -> i64 {
@@ -278,18 +292,47 @@ impl EventStream {
         }
         result
     }
+    async fn legacy_cursor_unchanged(&self) -> Result<bool> {
+        let Some(client) = &self.legacy else {
+            return Ok(false);
+        };
+        let probe = async {
+            match client.thread_summaries().await {
+                Ok(summaries) => Ok(summaries.sequence),
+                Err(ClientError::Api {
+                    code: ErrorCode::NotFound,
+                    ..
+                }) => client.snapshot().await.map(|s| s.sequence),
+                Err(error) => Err(error),
+            }
+        };
+        let sequence = tokio::time::timeout(std::time::Duration::from_secs(10), probe)
+            .await
+            .map_err(anyhow::Error::from)??;
+        Ok(sequence == self.cursor)
+    }
+
     async fn read_event(&mut self) -> Result<Option<CoreEvent>> {
         loop {
             if self.chunk.is_empty() {
-                match self.body.frame().await {
+                let frame = match tokio::time::timeout(EVENT_IDLE_TIMEOUT, self.body.frame()).await
+                {
+                    Ok(frame) => frame,
+                    Err(_) if self.legacy_cursor_unchanged().await? => continue,
+                    Err(_) => return Err(anyhow::anyhow!("Core event stream timed out").into()),
+                };
+                match frame {
                     Some(frame) => {
                         self.chunk = frame
                             .map_err(anyhow::Error::from)?
                             .into_data()
                             .unwrap_or_default();
+                        if self.chunk.is_empty() {
+                            continue;
+                        }
                     }
                     None if self.line.is_empty() => return Ok(None),
-                    None => break,
+                    None => {}
                 }
             }
             let newline = self.chunk.iter().position(|b| *b == b'\n');
@@ -300,15 +343,22 @@ impl EventStream {
             self.line.extend_from_slice(&self.chunk.split_to(size));
             if newline.is_some() {
                 self.chunk.advance(1);
-                break;
+            } else if size > 0 {
+                continue;
             }
-        }
-        let envelope: Envelope = serde_json::from_slice(&self.line).map_err(anyhow::Error::from)?;
-        self.line.clear();
-        match (envelope.event, envelope.error) {
-            (Some(event), None) => Ok(Some(event)),
-            (None, Some(error)) => Err(error.into()),
-            _ => Err(anyhow::anyhow!("expected one event or error in NDJSON envelope").into()),
+            if self.line.iter().all(u8::is_ascii_whitespace) {
+                self.line.clear();
+                continue;
+            }
+            let envelope: Envelope =
+                serde_json::from_slice(&self.line).map_err(anyhow::Error::from)?;
+            self.line.clear();
+            match (envelope.event, envelope.error, envelope.keepalive) {
+                (Some(event), None, None) => return Ok(Some(event)),
+                (None, Some(error), None) => return Err(error.into()),
+                (None, None, Some(true)) => continue,
+                _ => return Err(anyhow::anyhow!("invalid NDJSON event envelope").into()),
+            }
         }
     }
 }
