@@ -136,13 +136,7 @@ pub(crate) fn header() -> impl IntoElement {
                         move || {
                             nsh_base::button()
                                 .accessibility_label("分支操作")
-                                .on_press(|| {
-                                    controller::select_dock_tab(DockTab::Git);
-                                    controller::bench().update(|b| {
-                                        b.git.page = crate::state::workbench::GitPage::Commit;
-                                        b.git.branch_menu = true;
-                                    });
-                                })
+                                .on_press(controller::open_branch_menu)
                                 .flex_row()
                                 .items_center()
                                 .gap_1()

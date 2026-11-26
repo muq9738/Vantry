@@ -9,12 +9,14 @@ use std::{
     time::Duration,
 };
 pub use vantry_protocol::GitFile;
+pub mod refs;
 
 pub(crate) fn execute(root: &Path, args: &[&str]) -> Result<hostprocess::Output> {
     let mut command = Command::new("git");
     hostprocess::clean_environment(&mut command);
     command
         .current_dir(root)
+        .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_MERGE_AUTOEDIT", "no")
         .arg("--literal-pathspecs")

@@ -118,34 +118,111 @@ pub(crate) fn swap_compare_direction() {
     }
 }
 
-pub(crate) fn git_sync_action(action: &'static str) {
-    let Some(wb) = workbench() else { return };
-    let root = bench().with_untracked(|b| b.root.clone());
-    if root.is_empty() {
+pub(crate) fn open_branch_menu() {
+    open_branch_filter("");
+}
+
+pub(crate) fn open_branch_filter(filter: &'static str) {
+    bench().update(|b| {
+        if !b.git.busy {
+            b.git.branch_catalog = None;
+        }
+        b.git.branch_filter = filter;
+        b.git.branch_menu = true;
+        b.git.branch_output.clear();
+        b.git.unmerged_branch = None;
+        b.git.branch_feedback.clear();
+    });
+    branch_action("list", String::new(), String::new(), "");
+}
+
+pub(crate) fn close_branch_menu() {
+    bench().update(|b| b.git.branch_menu = false);
+}
+
+pub(crate) fn branch_action(op: &'static str, branch: String, name: String, label: &'static str) {
+    let Some((project, bridge)) = project_workbench() else {
+        bench().update(|b| b.git.branch_feedback = "请先选择工作区".into());
+        return;
+    };
+    let mut req = actions::request(&format!("git.refs.{op}"));
+    req.branch = branch.clone();
+    req.name = name;
+    let mut started = false;
+    bench().update(|b| {
+        started = b.git.begin();
+        if started {
+            if op != "list"
+                && let Some(catalog) = &b.git.branch_catalog
+            {
+                req.input = Some(serde_json::json!({"current":catalog.current}));
+            }
+            b.git.branch_feedback = "正在读取 Git…".into();
+            b.git.branch_output.clear();
+            b.git.unmerged_branch = None;
+        }
+    });
+    if !started {
         return;
     }
-    bench().update(|b| {
-        b.git.busy = true;
-        b.git.error = None;
-    });
     spawn_for_window(async move {
-        let mut req = actions::request(action);
-        req.workspace = root;
-        let res = call(wb.workbench(req)).await;
-        bench().update(|b| {
-            b.git.busy = false;
-            match res {
-                Ok(resp) => {
-                    if let Some(state) = resp.git {
-                        b.git.status = Some(state);
-                        b.git.status_version += 1;
-                    }
-                    b.git.error = None;
-                }
-                Err(e) => b.git.error = Some(e.message),
-            }
+        let result = call(bridge.workbench(req)).await.map(|r| r.output);
+        let listing = if op == "list" {
+            result.clone()
+        } else {
+            call(bridge.workbench(actions::request("git.refs.list")))
+                .await
+                .map(|r| r.output)
+        };
+        let catalog = listing.and_then(|text| {
+            serde_json::from_str(&text).map_err(|e| BridgeError::protocol(e.to_string()))
         });
-        refresh_git();
+        let mut loads = Vec::new();
+        bench().update(|b| {
+            b.apply_project_result(project, |b| {
+                b.git.busy = false;
+                b.git.branch_feedback = match result {
+                    Ok(output) => {
+                        if op != "list" {
+                            b.git.branch_output = output;
+                        }
+                        if op == "diff" && b.git.branch_output.is_empty() {
+                            "工作区中的已跟踪文件与该修订一致".into()
+                        } else if matches!(op, "compare" | "history") {
+                            format!("{label} · 每组最多 200 条提交")
+                        } else if label.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{label}已完成")
+                        }
+                    }
+                    Err(e) => {
+                        if op == "delete" && e.message.contains("UNMERGED:") {
+                            b.git.unmerged_branch = Some(branch);
+                        }
+                        e.message
+                    }
+                };
+                match catalog {
+                    Ok(c) => b.git.branch_catalog = Some(c),
+                    Err(e) => {
+                        b.git.branch_catalog = None;
+                        if op == "list" {
+                            b.git.branch_feedback = e.message;
+                        } else {
+                            b.git
+                                .branch_feedback
+                                .push_str(&format!(" · 刷新失败：{}", e.message));
+                        }
+                    }
+                }
+                if op != "list" {
+                    loads.push(b.git.refresh());
+                    loads.extend(b.files.refresh());
+                }
+            })
+        });
+        run_loads(loads);
     });
 }
 

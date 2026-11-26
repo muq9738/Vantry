@@ -304,6 +304,11 @@ pub struct GitPanel {
     pub confirm_discard: Option<String>,
     /// The branch list is open.
     pub branch_menu: bool,
+    pub branch_filter: &'static str,
+    pub branch_catalog: Option<vantry_platform::git::refs::Catalog>,
+    pub branch_feedback: String,
+    pub branch_output: String,
+    pub unmerged_branch: Option<String>,
 }
 
 impl GitPanel {

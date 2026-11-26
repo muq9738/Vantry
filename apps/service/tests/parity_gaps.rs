@@ -214,6 +214,21 @@ async fn workbench_parity_git_files_skills_and_environments() -> Result<()> {
             .any(|f| f["path"] == "src/feature.rs")
     );
 
+    let branch_request = |op: &str, target: &str, name: &str| WorkbenchRequest {
+        action: format!("git.refs.{op}"),
+        workspace: repo.display().to_string(),
+        branch: target.into(),
+        name: name.into(),
+        ..Default::default()
+    };
+    client.workbench(&branch_request("create", "refs/heads/feature", "topic/ui")).await?;
+    let refs = client.workbench(&branch_request("list", "", "")).await?;
+    let catalog: vantry_platform::git::refs::Catalog = serde_json::from_str(&refs.output)?;
+    assert_eq!(catalog.current, "topic/ui");
+    assert_eq!(catalog.recent.first().map(String::as_str), Some("topic/ui"));
+    client.workbench(&branch_request("checkout", "refs/heads/main", "")).await?;
+    assert!(client.workbench(&branch_request("delete", "refs/heads/topic/ui", "")).await.is_err());
+
     // 7. git.checkpoints.capture + list + diff
     std::fs::write(repo.join("src/app.rs"), "fn main() { println!(\"hi\"); }\n")?;
     let cap = client
