@@ -41,7 +41,8 @@ pub(crate) fn conversation(sheet: Memo<bool>) -> impl IntoElement {
         !sheet.get() && crate::controller::state().with(|s| !s.has_conversation())
     });
     let project = computed(|| crate::controller::state().with(|s| s.current_project_key()));
-    view()
+    let dragging = signal(false);
+    composer::drop_target(view(), dragging)
         .flex_1()
         .min_w_0()
         .min_h_0()
@@ -85,7 +86,7 @@ pub(crate) fn conversation(sheet: Memo<bool>) -> impl IntoElement {
             move || !home.get() && !sheet.get(),
             timeline::timeline,
         ))
-        .child(composer::composer())
+        .child(composer::composer(dragging))
         .child(when(
             move || home.get(),
             || view().flex_1().min_h_0().mb_8(),

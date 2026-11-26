@@ -55,6 +55,7 @@ pub struct CoreWorkbench {
     model: Option<String>,
     /// Route checkout and terminal operations through the selected Core.
     core_fs: bool,
+    peer: bool,
     workspace_override: Option<String>,
     terminal_thread: String,
     terminal_cwd: String,
@@ -70,6 +71,7 @@ impl CoreWorkbench {
             local,
             model,
             core_fs: false,
+            peer: false,
             workspace_override: None,
             terminal_thread: String::new(),
             terminal_cwd: String::new(),
@@ -86,9 +88,15 @@ impl CoreWorkbench {
     ) -> Self {
         CoreWorkbench {
             core_fs: true,
+            peer: true,
             workspace_override: Some(workspace),
             ..Self::new(socket, local, model)
         }
+    }
+
+    pub(crate) fn on_peer(mut self) -> Self {
+        self.peer = true;
+        self
     }
 
     fn ws_request(&self, action: &str) -> WorkbenchRequest {
@@ -398,6 +406,7 @@ impl WorkbenchBridge for CoreWorkbench {
     /// a Core without it gets the local reference.
     fn attach(&self, path: PathBuf) -> BridgeFuture<Attachment> {
         let socket = self.socket.clone();
+        let peer = self.peer;
         let local = self.local.clone();
         Box::pin(async move {
             let meta = tokio::fs::metadata(&path)
@@ -427,7 +436,7 @@ impl WorkbenchBridge for CoreWorkbench {
                     ..
                 }) => Ok(attachment),
                 Ok(_) => Err(BridgeError::protocol("Core 没有返回附件信息")),
-                Err(error) if actions::unsupported(&error) => local.attach(path).await,
+                Err(error) if !peer && actions::unsupported(&error) => local.attach(path).await,
                 Err(error) => Err(error),
             }
         })
@@ -436,6 +445,9 @@ impl WorkbenchBridge for CoreWorkbench {
     fn workbench(&self, request: WorkbenchRequest) -> BridgeFuture<WorkbenchResponse> {
         let socket = self.socket.clone();
         let local = self.local.clone();
+        if self.peer && request.action == names::ATTACHMENT_IMPORT {
+            return Box::pin(Self::ask(socket, request));
+        }
         Box::pin(Self::call(socket, local, request))
     }
 }
@@ -725,7 +737,9 @@ mod tests {
         let attachment = bench.attach(dir.path().join("a.md")).await.unwrap();
         assert_eq!(attachment.mime, "text/markdown");
         assert_eq!(bench.list_dir(String::new()).await.unwrap()[0].name, "a.md");
-        drop(bench);
+        let peer = bench.on_peer();
+        assert!(peer.attach(dir.path().join("a.md")).await.is_err(), "peer cannot use this Mac's fallback attachment");
+        drop(peer);
         dir.close().unwrap();
     }
 }

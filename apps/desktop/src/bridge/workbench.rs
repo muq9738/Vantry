@@ -28,7 +28,7 @@ mod mock;
 
 use std::path::{Component, Path, PathBuf};
 
-pub use core_bench::CoreWorkbench;
+pub use core_bench::{CoreWorkbench, MAX_ATTACHMENT_BYTES};
 pub use local::LocalWorkbench;
 pub use mock::MockWorkbench;
 use vantry_protocol::{
