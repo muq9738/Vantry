@@ -5,6 +5,7 @@ mod mcp_probe;
 mod orchestration;
 mod plugin_source;
 mod provider;
+mod qoder;
 #[cfg(target_os = "macos")]
 mod rd_macos;
 mod relay;
@@ -47,6 +48,8 @@ enum Role {
     WorkerControl(JobDir),
     WorkerStop(JobDir),
     SmokeWorker,
+    #[command(hide = true)]
+    ModelPluginHost(qoder::host::HostArgs),
     PiSetup,
     ApplyUpdate {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -255,6 +258,7 @@ async fn serve(args: CoreArgs) -> Result<()> {
         federator: Some(ext.federator.clone()),
     });
     let stop = CancellationToken::new();
+    qoder::spawn_background(data.clone(), stop.clone());
     let shutdown = signal()?;
     let saved = ext.identity.snapshot();
     let mut relay_targets = Vec::new();
@@ -519,6 +523,7 @@ async fn main() -> Result<()> {
         .init();
     let raw = arguments();
     match Cli::parse_from(&raw).command {
+        Role::ModelPluginHost(args) => qoder::host::run(args).await?,
         Role::Core(a) => serve(a).await?,
         Role::EnsureCore(a) => ensure_core(a, &raw[2..]).await?,
         Role::Ctl(c) => c.run().await?,

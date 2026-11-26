@@ -1485,7 +1485,17 @@ pub struct QueuedMessage {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModelPluginSource {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_multiplier: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_source: Option<ModelPluginSource>,
     pub id: String,
     pub provider: String,
     pub name: String,
@@ -1650,6 +1660,9 @@ pub struct PluginInfo {
     pub has_update: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub latest_version: String,
+    /// An official plugin this Core offers but has not installed yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub installable: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_process_grant: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

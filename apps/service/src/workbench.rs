@@ -132,7 +132,7 @@ impl Workbench {
             .as_ref()
             .map(|p| vantry_pi_runtime::MagpieSelection::load(Some(p)))
             .transpose()?;
-        vantry_pi_runtime::model_catalog(
+        Ok(vantry_pi_runtime::resolve_with_plugins(
             &vantry_pi_runtime::agent_dir(),
             Some(if model.is_empty() {
                 &self.options.model
@@ -140,8 +140,8 @@ impl Workbench {
                 model
             }),
             selection.as_ref(),
-        )
-        .await
+            &crate::qoder::catalog_models(self.core.directory()),
+        ).await?.catalog)
     }
     async fn handle(&self, r: WorkbenchRequest) -> Result<WorkbenchResponse> {
         let mut out = WorkbenchResponse::default();
@@ -244,6 +244,18 @@ impl Workbench {
             }
             "environment.directories" => return self.directories(r),
             s if s.starts_with("plugins.") => {
+                if r.plugin_id == crate::qoder::ID || crate::qoder::directory_import(&r).is_some() {
+                    let before = crate::qoder::catalog_models(data);
+                    let response = crate::qoder::workbench(data, &r).await?;
+                    let mut out = if let Some(panel) = response { panel } else {
+                        let list = WorkbenchRequest { action: "plugins.list".into(), ..Default::default() };
+                        tokio::task::block_in_place(|| self.plugins(list))?
+                    };
+                    if before != crate::qoder::catalog_models(data) {
+                        out.catalog = Some(self.models("").await?);
+                    }
+                    return Ok(out);
+                }
                 return tokio::task::block_in_place(|| self.plugins(r));
             }
             "remote.status" | "remote.peers.list" | "access.status" | "access.discover" => return self.remote_status(),
@@ -925,7 +937,7 @@ impl Workbench {
             }
             out.plugins.push(p);
         }
-
+        out.plugins.push(crate::qoder::plugin_info(data));
         Ok(out)
     }
     fn remote_status(&self) -> Result<WorkbenchResponse> {

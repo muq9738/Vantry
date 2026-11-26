@@ -467,11 +467,41 @@ pub struct PanelField {
     pub kind: String,
 }
 
+/// A subscription's allowance windows share one account header and refresh time.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct QuotaCard {
+    pub account: String,
+    pub plan: String,
+    pub expires: String,
+    pub updated: String,
+    pub message: String,
+    pub windows: Vec<QuotaWindow>,
+    /// Models the account offers; the card links to the model catalog.
+    pub models: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuotaWindow {
+    pub name: String,
+    pub amount: Option<f64>,
+    pub limit: Option<f64>,
+    pub unit: String,
+    pub used: Option<f64>,
+    pub display: String,
+    pub reset: String,
+}
+
 /// One widget of a panel (schema v1: text, markdown, badge, kv, list,
 /// code; plus group, actions and form).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PanelWidget {
+    pub quota: Option<QuotaCard>,
+    /// Percentage displayed by a meter widget (0–100).
+    pub percent: u8,
+    pub detail: String,
     pub kind: String,
     pub key: String,
     pub title: String,
@@ -498,6 +528,14 @@ pub struct PanelView {
     pub tone: String,
     pub widgets: Vec<PanelWidget>,
     pub actions: Vec<PanelAction>,
+    /// An `https://` page to open in the browser on this computer once
+    /// (a sign-in page), sent only in an action's answer.
+    #[serde(rename = "openUrl")]
+    pub open_url: String,
+    /// Reload the panel after this many milliseconds (0: don't), while it
+    /// waits on something outside the app.
+    #[serde(rename = "pollMs")]
+    pub poll_ms: u64,
 }
 
 /// The most widgets a panel shows (as the Core's schema bounds it).

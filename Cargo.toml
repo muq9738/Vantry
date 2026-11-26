@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.12"
+version = "0.2.13"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -36,6 +36,7 @@ pi-coding-agent = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d"
 pi-agent = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 pi-ai = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 pi-mcp = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
+pi-js = { git = "https://github.com/yannelli/pi-rust", rev = "f11ea9d" }
 
 # Upstream NSH UI
 nsh-core = { git = "https://github.com/longbridge/nsh", tag = "v0.7.0" }

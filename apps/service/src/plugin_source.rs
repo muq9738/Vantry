@@ -1,4 +1,6 @@
+mod github;
 use anyhow::{Context, Result, ensure};
+pub use github::GitHubDirectory;
 use serde_json::Value;
 use std::{fs, io::ErrorKind, path::Path, process::Command, time::Duration};
 use vantry_platform::{hostfs, hostprocess, plugins::Host};
@@ -52,6 +54,57 @@ pub fn install(host: &mut Host, source: &str, data: &Path) -> Result<()> {
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
+    }
+    if let Some(dir) = GitHubDirectory::parse(source) {
+        let (status, bytes) = download(
+            &format!(
+                "https://api.github.com/repos/{}/tarball/{}",
+                dir.repo, dir.revision
+            ),
+            32 << 20,
+        )?;
+        ensure!(status == 200, "GitHub archive returned {status}");
+        // Strip the archive root and package directory, preserving executable modes.
+        use std::io::Read;
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()).take(256 << 20));
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut total = 0u64;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            let Some(root) = path.components().next() else {
+                continue;
+            };
+            let Ok(rel) = path
+                .strip_prefix(root.as_os_str())
+                .and_then(|p| p.strip_prefix(&dir.directory))
+            else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let header = entry.header();
+            ensure!(
+                header.entry_type().is_file() || header.entry_type().is_dir(),
+                "unsupported plugin archive entry"
+            );
+            total = total
+                .checked_add(entry.size())
+                .context("archive too large")?;
+            ensure!(total <= 64 << 20, "archive too large");
+            builder.append_data(&mut header.clone(), rel, &mut entry)?;
+        }
+        let manifest = host.install(&builder.into_inner()?.finish()?)?;
+        hostfs::atomic_write(
+            &data.join("plugins").join(manifest.id).join(".origin.json"),
+            &serde_json::to_vec(&serde_json::json!({"repo": source, "version": manifest.version}))?,
+        )?;
+        return Ok(());
     }
     let repo = source
         .trim()

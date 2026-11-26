@@ -1863,11 +1863,20 @@ pub(crate) fn toggle_archived_group() {
 }
 
 pub(crate) fn open_settings(page: SettingsPage) {
+    let owner = bridges(|b| b.owner);
     let mut load = false;
     ui().update(|u| load = u.open_settings(page));
-    if load {
-        load_catalogs(true);
-    }
+    in_session(owner, || {
+        if load {
+            load_catalogs(true);
+        } else if page == SettingsPage::Models && let Some(wb) = workbench() {
+            spawn_for_window(async move {
+                if let Ok(response) = call(wb.workbench(actions::request(actions::names::MODELS))).await {
+                    panel_output(response);
+                }
+            });
+        }
+    });
 }
 
 pub(crate) fn close_settings() {
@@ -1928,28 +1937,43 @@ pub(crate) fn toggle_extensions() {
     ui().update(|u| u.extensions_enabled = !u.extensions_enabled);
 }
 
+/// Runs `f` in the window session's owner. A view switch can dispose the
+/// element whose press started it, and with it the press's context; what
+/// follows the switch runs here so it still finds the session's bridges.
+fn in_session(owner: Option<Owner>, f: impl FnOnce()) {
+    match owner {
+        Some(owner) => owner.run(f),
+        None => f(),
+    }
+}
+
 pub(crate) fn show_view(view: MainView) {
     let remote = view == MainView::RemoteDesktop;
+    let owner = bridges(|b| b.owner);
     ui().update(move |u| {
         u.mobile_nav = false;
         u.view = view;
     });
     if remote {
-        refresh_rd_status();
+        in_session(owner, refresh_rd_status);
     }
 }
 
 pub(crate) fn open_plugin(id: String, page: String) {
+    let owner = bridges(|b| b.owner);
+    let ui = ui();
     let mut load = false;
-    ui().update(|u| {
+    ui.update(|u| {
         u.mobile_nav = false;
         load = u.open_plugin(&id, &page);
     });
-    if load {
-        load_plugin_panel();
-    } else if ui().with_untracked(|u| u.view == MainView::RemoteDesktop) {
-        refresh_rd_status();
-    }
+    in_session(owner, || {
+        if load {
+            load_plugin_panel();
+        } else if ui.with_untracked(|u| u.view == MainView::RemoteDesktop) {
+            refresh_rd_status();
+        }
+    });
 }
 
 // ------------------------------------------------------------- settings ops
@@ -2327,13 +2351,57 @@ fn load_plugin_panel() {
     spawn_for_window(async move {
         let result = call(workbench.workbench(actions::plugin_panel(&id, &page)))
             .await
-            .map(|r| r.output)
+            .map(panel_output)
             .map_err(|e| e.message);
+        let poll = panel_poll(&result);
+        let (shown_id, shown_page) = (id.clone(), page.clone());
         ui().update(move |u| {
-            if let Some(panel) = u.plugin_panel.as_mut().filter(|p| p.plugin_id == id && p.page == page) {
+            if let Some(panel) = u.plugin_panel.as_mut().filter(|p| p.plugin_id == shown_id && p.page == shown_page) {
                 panel.on_loaded(result);
             }
         });
+        schedule_panel_poll(id, page, poll);
+    });
+}
+
+/// Apply model contributions to the same catalog used by settings and the composer.
+fn panel_output(response: vantry_protocol::WorkbenchResponse) -> String {
+    if let Some(catalog) = response.catalog {
+        ui().update(move |u| {
+            if let crate::state::ui::Catalogs::Loaded(data) = &mut u.catalogs {
+                Arc::make_mut(data).models = catalog;
+            }
+        });
+    }
+    response.output
+}
+
+/// How long until a panel answer wants reloading (0: never).
+fn panel_poll(result: &Result<String, String>) -> u64 {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|o| actions::PanelView::parse(o))
+        .map_or(0, |v| v.poll_ms.clamp(0, 60_000))
+}
+
+/// Reloads plugin `id`'s `page` after `ms` if it is still the shown panel
+/// and nothing runs on it.
+fn schedule_panel_poll(id: String, page: String, ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    spawn_for_window(async move {
+        timer(Duration::from_millis(ms.max(1000))).await;
+        let still = ui().with_untracked(|u| {
+            u.view == MainView::Plugin(id.clone())
+                && u.plugin_panel
+                    .as_ref()
+                    .is_some_and(|p| p.plugin_id == id && p.page == page && p.running.is_none() && !p.loading)
+        });
+        if still {
+            load_plugin_panel();
+        }
     });
 }
 
@@ -2378,13 +2446,21 @@ pub(crate) fn run_panel_action(action_id: String) {
         return;
     };
     let id = request.plugin_id.clone();
-    spawn(async move {
-        let result = call(workbench.workbench(request)).await.map(|r| r.output).map_err(|e| e.message);
+    let page = request.name.clone();
+    spawn_for_window(async move {
+        let result = call(workbench.workbench(request)).await.map(panel_output).map_err(|e| e.message);
+        let view = result.as_ref().ok().and_then(|o| actions::PanelView::parse(o));
+        let poll = panel_poll(&result);
+        let shown_id = id.clone();
         ui().update(move |u| {
-            if let Some(panel) = u.plugin_panel.as_mut().filter(|p| p.plugin_id == id) {
+            if let Some(panel) = u.plugin_panel.as_mut().filter(|p| p.plugin_id == shown_id) {
                 panel.on_ran(&action_id, result);
             }
         });
+        if let Some(url) = view.map(|v| v.open_url).filter(|u| u.starts_with("https://")) {
+            open_link(url);
+        }
+        schedule_panel_poll(id, page, poll);
     });
 }
 

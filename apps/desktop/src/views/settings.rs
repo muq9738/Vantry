@@ -598,7 +598,7 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
     let pi_key_set = computed(|| controller::ui().with(|u| !u.forms.pi_key.is_empty()));
     let saving = computed(busy("pi.setup"));
     let setup = signal(false);
-    let catalog_open = signal(false);
+    let catalog_open = signal(true);
     let model_count = computed(move || {
         data.with(|d| {
             d.as_ref()
@@ -829,51 +829,67 @@ fn models_page(data: Data, catalogs: Memo<Catalogs>) -> impl IntoElement {
             if models.is_empty() {
                 column = column.child(hint("目录为空：可在输入区的模型选择器中直接输入 provider/model。"));
             }
+            let mut groups = std::collections::BTreeMap::<String, Vec<_>>::new();
             for model in models {
-                let id = model.key();
-                let ids = ids.clone();
-                let on = {
-                    let id = id.clone();
-                    move || {
-                        let cur = current.get();
-                        let base = actions::split_thinking(&cur, &ids).0;
-                        base == id
-                            || id
-                                .split_once('/')
-                                .is_some_and(|(_, local)| local == base)
-                    }
-                };
-                column = column.child(
-                    card().child(
-                        row()
-                            .child(
-                                view()
-                                    .flex_1()
-                                    .flex_col()
-                                    .child(text(if model.name.is_empty() { id.clone() } else { model.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
-                                    .child(
-                                        text(format!(
-                                            "{} · 上下文 {}k{}",
-                                            id,
-                                            model.context_window / 1000,
-                                            if model.reasoning { " · 推理" } else { "" }
-                                        ))
-                                        .font_family(MONO)
-                                        .text_size(px(11.0))
-                                        .text_color(colors.faint),
-                                    ),
-                            )
-                            .child(when(data.models.default == id, || badge("Core 默认", colors.muted)))
-                            .child(pill(
-                                {
-                                    let on = on.clone();
-                                    move || if on() { "新会话默认" } else { "设为默认" }
-                                },
-                                on,
-                                move || controller::set_default_model(id.clone()),
-                            )),
-                    ),
-                );
+                let source = model.plugin_source.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+                groups.entry(source).or_default().push(model);
+            }
+            for (plugin, entries) in groups {
+                let title = if plugin.is_empty() { "Pi 配置".to_owned() } else { format!("模型插件 · {plugin}") };
+                let mut section = card().gap_1().child(row()
+                    .child(text(title).flex_1().font_weight(FontWeight::SEMIBOLD).text_size(px(14.0)).text_color(colors.ink))
+                    .child(caption(format!("{} 个模型", entries.len()))));
+                for model in entries {
+                    let id = model.key();
+                    let ids = ids.clone();
+                    let on = {
+                        let id = id.clone();
+                        move || {
+                            let cur = current.get();
+                            let base = actions::split_thinking(&cur, &ids).0;
+                            base == id
+                                || id
+                                    .split_once('/')
+                                    .is_some_and(|(_, local)| local == base)
+                        }
+                    };
+                    let rate = model.plugin_source.as_ref().and_then(|s| s.credit_multiplier).map(|n| {
+                        if n == 0.0 { "免费".to_owned() } else { format!("{n}× 额度") }
+                    });
+                    let has_images = model.input.as_deref().is_some_and(|inputs| inputs.iter().any(|i| i == "image"));
+                    section = section.child(
+                            row().py_2().border_t_1().border_t_color(colors.line_soft)
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .flex_col()
+                                        .child(text(if model.name.is_empty() { id.clone() } else { model.name.clone() }).text_size(px(13.0)).text_color(colors.ink))
+                                        .child(
+                                            text(format!(
+                                                "{} · 上下文 {}k{}{}",
+                                                id,
+                                                model.context_window / 1000,
+                                                if model.reasoning { " · 推理" } else { "" },
+                                                if has_images { " · 图像" } else { "" }
+                                            ))
+                                            .font_family(MONO)
+                                            .text_size(px(11.0))
+                                            .text_color(colors.faint),
+                                        ),
+                                )
+                                .children(rate.map(caption))
+                                .child(when(data.models.default == id, || badge("Core 默认", colors.muted)))
+                                .child(pill(
+                                    {
+                                        let on = on.clone();
+                                        move || if on() { "新会话默认" } else { "设为默认" }
+                                    },
+                                    on,
+                                    move || controller::set_default_model(id.clone()),
+                                )),
+                    );
+                }
+                column = column.child(section);
             }
             column.into_element()
         }))
@@ -1044,10 +1060,10 @@ fn plugins_page(data: Data) -> impl IntoElement {
                 .child(field(
                     move || source.get(),
                     move |s| source.set(s.into()),
-                    "本地路径或 GitHub 仓库",
+                    "GitHub 仓库、插件目录链接或本地路径",
                 ))
                 .child(
-                    ghost_button("安装", move || {
+                    ghost_button("导入", move || {
                         let mut request = actions::request("plugins.install");
                         request.name = source.get_untracked().trim().to_owned();
                         controller::settings_op("plugin.install", request, "已安装插件");
@@ -1073,6 +1089,9 @@ fn plugins_page(data: Data) -> impl IntoElement {
 
 fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
     let colors = palette();
+    if plugin.installable {
+        return installable_plugin_row(plugin).into_element();
+    }
     let id = plugin.id.clone();
     let enabled = !plugin.disabled;
     let mut opens: Vec<(String, String)> = plugin
@@ -1153,6 +1172,41 @@ fn plugin_row(plugin: PluginInfo) -> impl IntoElement {
                         .disabled(move || !enabled)
                 })),
         )
+        .into_element()
+}
+
+/// An official plugin the Core offers but has not installed: one button.
+fn installable_plugin_row(plugin: PluginInfo) -> impl IntoElement {
+    let key = format!("plugin.install:{}", plugin.id);
+    let busy_key = key.clone();
+    let id = plugin.id.clone();
+    card().gap_2().child(
+        row()
+            .child(
+                view()
+                    .flex_1()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        text(plugin.name.clone())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(px(13.0))
+                            .text_color(palette().ink),
+                    )
+                    .child(hint(plugin.description.clone())),
+            )
+            .child(
+                primary_button(
+                    move || if busy(busy_key.clone())() { "安装中…" } else { "安装" },
+                    move || {
+                        let mut request = actions::request("plugins.install");
+                        request.plugin_id = id.clone();
+                        controller::settings_op(key.clone(), request, "已安装，点「账号与模型」登录");
+                    },
+                )
+                .disabled(busy(format!("plugin.install:{}", plugin.id))),
+            ),
+    )
 }
 
 pub(crate) fn pairing_dialog() -> impl IntoElement {

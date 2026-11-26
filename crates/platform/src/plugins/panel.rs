@@ -51,6 +51,9 @@ impl Tree {
             "badge" => &["kind", "key", "label", "text", "tone"],
             "code" => &["kind", "key", "title", "code", "text", "language"],
             "kv" => &["kind", "key", "title", "entries", "items"],
+            "quotaCard" => &["kind", "key", "quota"],
+            "meter" => &["kind", "key", "title", "text", "percent", "detail"],
+            "modelCatalog" => &["kind", "key", "title", "text"],
             "list" => &["kind", "key", "title", "items", "children"],
             _ => bail!("unknown widget kind {kind}"),
         };
@@ -73,7 +76,25 @@ impl Tree {
             );
         }
         match kind {
-            "text" => ensure!(
+            "quotaCard" => {
+                let card = &item["quota"];
+                fields(card, &["account", "plan", "expires", "updated", "message", "windows", "models"])?;
+                ensure!(card["models"].is_null() || card["models"].is_u64(), "expected a model count");
+                for key in ["account", "plan", "expires", "updated", "message"] { string(card, key, 1024)?; }
+                let windows = card["windows"].as_array().context("expected quota windows")?;
+                self.count(windows.len())?;
+                for w in windows {
+                    fields(w, &["name", "amount", "limit", "unit", "used", "display", "reset"])?;
+                    for key in ["name", "unit", "display", "reset"] { string(w, key, 256)?; }
+                    for key in ["amount", "limit", "used"] { ensure!(w[key].is_null() || w[key].is_number(), "expected numeric quota value"); }
+                }
+            }
+            "meter" => {
+                ensure!(item["percent"].as_u64().is_some_and(|v| v <= 100), "invalid meter percentage");
+                string(item, "detail", 256)?;
+                ensure!(string(item, "text", TEXT)?.is_some(), "missing meter value");
+            }
+            "text" | "modelCatalog" => ensure!(
                 string(item, "text", TEXT)?.is_some_and(|s| !s.is_empty()),
                 "empty text"
             ),

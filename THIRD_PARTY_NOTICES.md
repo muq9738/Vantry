@@ -15,6 +15,7 @@ Rust workspace dependencies are recorded in `Cargo.toml` and `Cargo.lock`. The d
 
 External runtime integrations (not bundled with Vantry binaries):
 
+- **Qoder model provider** (`@magpie-community/opencode-qoder-auth`, MIT) is imported on demand from the [community plugin repository](https://github.com/magpie-community/plugins/tree/main/packages/qoder). Its package metadata and CLIProxyAPI license notice are retained in the installed directory.
 - **Vantry Remote Desktop Plugin** (`github.com/muq9738/vantry-plugin-remote-desktop`): platform native H.264 / input helper maintained in its own repository with its own license terms.
 
 Historical license files in `third_party/licenses/` (including MyGo, modernc/sqlite, Gorilla WebSocket, Pion TURN, go-qrcode, Ghostty, Alma Relay, bonjour-service, moejs and moego) remain for attribution of earlier Go/MyGo implementations (`v0.1.42` and prior). Their Go/MyGo packages are no longer part of the Rust workspace build.

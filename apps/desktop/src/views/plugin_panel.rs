@@ -15,6 +15,8 @@ use crate::{
     theme::{metrics, palette},
 };
 
+mod quota;
+
 const MONO: &str = "Menlo";
 
 fn tone_color(tone: &str) -> AdaptiveColor {
@@ -30,6 +32,7 @@ fn tone_color(tone: &str) -> AdaptiveColor {
 
 pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
     let colors = palette();
+    let remaining = signal(false);
     let panel = computed(|| controller::ui().with(|u| u.plugin_panel.clone()));
     let view_memo = computed(move || panel.with(|p| p.as_ref().and_then(|p| p.view.clone())));
     let loading = computed(move || panel.with(|p| p.as_ref().is_some_and(|p| p.loading)));
@@ -120,7 +123,7 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
                                 Some(panel) => {
                                     let mut column = view().flex_col().gap_3();
                                     for widget in panel.widgets {
-                                        column = column.child(render(widget));
+                                        column = column.child(render(widget, remaining));
                                     }
                                     if !panel.actions.is_empty() {
                                         column = column.child(actions_row(panel.actions));
@@ -158,34 +161,65 @@ pub(crate) fn plugin_panel(id: String) -> impl IntoElement {
 }
 
 /// One widget (recursively for groups).
-fn render(widget: PanelWidget) -> AnyElement {
+fn render(widget: PanelWidget, remaining: Signal<bool>) -> AnyElement {
     let colors = palette();
     let heading = (!widget.title.is_empty()).then(|| caption(widget.title.clone()));
     let body: AnyElement = match widget.kind.as_str() {
+        "quotaCard" => return quota::card(widget.quota.unwrap_or_default(), widget.actions, remaining),
+        "modelCatalog" => view().flex_row().items_center().gap_2()
+            .child(text(widget.text.clone()).flex_1().text_size(px(14.0)).text_color(colors.ink))
+            .child(link_button("查看模型目录", || controller::open_settings(crate::state::ui::SettingsPage::Models)))
+            .into_element(),
+        "meter" => {
+            let share = f32::from(widget.percent.min(100)) / 100.0;
+            view().flex_col().gap_2()
+                .child(view().flex_row().items_center().gap_3()
+                    .child(text(widget.text.clone()).flex_1().font_weight(FontWeight::SEMIBOLD).text_size(px(18.0)).text_color(colors.ink))
+                    .child(caption(format!("已用 {}%", widget.percent))))
+                .child(view().h(px(5.0)).flex_row().rounded_full().bg(colors.soft)
+                    .child(view().flex_grow(share).h(px(5.0)).rounded_full().bg(colors.accent))
+                    .child(view().flex_grow(1.0 - share)))
+                .children((!widget.detail.is_empty()).then(||caption(widget.detail.clone())))
+                .into_element()
+        }
         "markdown" => super::markdown::static_document(&MarkdownDoc::parse(&widget.text)).into_element(),
         "badge" => view()
             .flex_row()
             .child(badge(widget.text.clone(), tone_color(&widget.tone)))
             .into_element(),
         "kv" => {
-            let mut card = view()
-                .flex_col()
-                .gap_1()
-                .p_3()
-                .rounded(px(metrics::CARD_RADIUS))
-                .bg(colors.card)
-                .border_1()
-                .border_color(colors.line);
+            let mut rows = view().flex_1().min_w(px(240.0)).flex_col().gap_1();
             for entry in widget.entries {
-                card = card.child(
+                rows = rows.child(
                     view()
                         .flex_row()
                         .gap_3()
-                        .child(text(entry.key).w(px(140.0)).text_size(px(12.0)).text_color(colors.muted))
+                        .child(text(entry.key).w(px(120.0)).text_size(px(12.0)).text_color(colors.muted))
                         .child(text(entry.value).flex_1().select_text().text_size(px(12.5)).text_color(colors.ink)),
                 );
             }
-            card.into_element()
+            // Its actions sit inside the card, beside the rows they act on.
+            let actions = (!widget.actions.is_empty()).then(|| actions_row(widget.actions));
+            return view()
+                .flex_col()
+                .gap_1()
+                .children(heading)
+                .child(
+                    view()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .px_4()
+                        .py_3()
+                        .rounded(px(metrics::CARD_RADIUS))
+                        .bg(colors.card)
+                        .border_1()
+                        .border_color(colors.line)
+                        .child(rows)
+                        .children(actions),
+                )
+                .into_element();
         }
         "list" => {
             let mut list = view().flex_col().gap_0p5();
@@ -227,7 +261,7 @@ fn render(widget: PanelWidget) -> AnyElement {
                 group = group.child(text(widget.text.clone()).text_size(px(12.0)).text_color(colors.muted));
             }
             for child in widget.children {
-                group = group.child(render(child));
+                group = group.child(render(child, remaining));
             }
             if !widget.actions.is_empty() {
                 group = group.child(actions_row(widget.actions));

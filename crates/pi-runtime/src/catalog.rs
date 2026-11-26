@@ -157,6 +157,17 @@ pub async fn resolve_model_catalog(
     selected: Option<&str>,
     magpie: Option<&MagpieSelection>,
 ) -> Result<ResolvedModelCatalog> {
+    resolve_with_plugins(dir, selected, magpie, &BTreeMap::new()).await
+}
+
+/// Resolve Pi's configured selection together with the models actually contributed
+/// by enabled plugins on this Core. Keys are full provider/model identifiers.
+pub async fn resolve_with_plugins(
+    dir: &Path,
+    selected: Option<&str>,
+    magpie: Option<&MagpieSelection>,
+    plugin_models: &BTreeMap<String, vantry_protocol::ModelPluginSource>,
+) -> Result<ResolvedModelCatalog> {
     let settings = crate::config::object(&dir.join("settings.json"))
         .map_err(|_| anyhow::anyhow!("invalid Pi settings"))?;
     let provider = settings
@@ -173,10 +184,13 @@ pub async fn resolve_model_catalog(
         .unwrap_or_default();
     let selected = selected.filter(|s| !s.is_empty());
     if let Some(selection) = magpie {
-        if let Some(s) = selected {
+        if let Some(s) = selected
+            && !plugin_models.contains_key(s)
+            && !plugin_models.contains_key(split_model_thinking(s).0)
+        {
             selection.resolve(s)?;
         }
-        if selection.0.is_empty() {
+        if selection.0.is_empty() && plugin_models.is_empty() {
             return Ok(ResolvedModelCatalog {
                 selected_model: String::new(),
                 thinking_level: None,
@@ -226,8 +240,13 @@ pub async fn resolve_model_catalog(
         if order.len() != selection.0.len() || order.is_empty() {
             warnings.push("Magpie 已选模型尚未就绪".into());
         }
+        for key in plugin_models.keys() {
+            if available.contains_key(key) && !order.contains(key) {
+                order.push(key.clone());
+            }
+        }
         if !order.contains(&default) {
-            default.clear();
+            default = if plugin_models.is_empty() { String::new() } else { order.first().cloned().unwrap_or_default() };
         }
     } else {
         let models = crate::config::object(&dir.join("models.json"))
@@ -259,6 +278,7 @@ pub async fn resolve_model_catalog(
     }
     let chosen = match selected {
         Some(s) if order.iter().any(|id| id == s) => s,
+        Some(s) if plugin_models.contains_key(split_model_thinking(s).0) => split_model_thinking(s).0,
         Some(s) => {
             if let Some(selection) = magpie {
                 selection.resolve(s)?
@@ -330,6 +350,7 @@ pub async fn resolve_model_catalog(
         .iter()
         .filter_map(|k| available.remove(k))
         .map(|m| ModelInfo {
+            plugin_source: plugin_models.get(&key(&m.provider, &m.id)).cloned(),
             id: m.id,
             provider: m.provider,
             name: m.name,

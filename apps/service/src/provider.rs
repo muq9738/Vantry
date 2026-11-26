@@ -153,10 +153,11 @@ impl Provider {
                     .as_ref()
                     .map(|p| MagpieSelection::load(Some(p)))
                     .transpose()?;
-                let model = vantry_pi_runtime::resolve_model_catalog(
+                let model = vantry_pi_runtime::resolve_with_plugins(
                     &vantry_pi_runtime::agent_dir(),
                     Some(selected),
                     selection.as_ref(),
+                    &crate::qoder::catalog_models(&self.data),
                 )
                 .await?;
                 ensure!(!model.selected_model.is_empty(), "no Pi model configured");
@@ -169,6 +170,9 @@ impl Provider {
         };
         let (model_res, _) = tokio::join!(model_fut, checkpoint_fut);
         let (expected_model, thinking_level) = model_res?;
+        if !controlled {
+            crate::qoder::prepare_run(&self.data, &expected_model).await?;
+        }
         if !controlled {
             if thinking_level.is_empty() {
                 request.model.clone_from(&expected_model);

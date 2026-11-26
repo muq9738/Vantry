@@ -198,7 +198,7 @@ for line in sys.stdin:
         assert wb('plugins.disable',pluginId='panel')['plugins'][0]['disabled']
         api('workbench',{'action':'plugins.run','pluginId':'panel'},False)
         wb('plugins.enable',pluginId='panel'); assert wb('plugins.run',pluginId='panel')['output']
-        assert not wb('plugins.uninstall',pluginId='panel').get('plugins')
+        assert not [p for p in wb('plugins.uninstall',pluginId='panel').get('plugins',[]) if not p.get('installable')]
         assert ctl('diff','--thread',thread)['isGit']
         assert 'changed' in api('workspace?thread='+thread)['diff']
         assert json.loads(wb('sandbox.set',input={'mode':'off'})['output'])['mode']=='off'

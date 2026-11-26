@@ -52,6 +52,31 @@ fn child<'a>(parent: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut Ma
         .as_object_mut()
         .with_context(|| format!("expected object for {key}"))
 }
+/// Update only this provider's entry. A plugin contributes models independently
+/// of the user's Pi default and Magpie selection.
+pub fn set_managed_provider(dir: &Path, id: &str, provider: Option<Value>) -> Result<bool> {
+    ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+        "invalid provider ID"
+    );
+    disk::directory(dir)?;
+    let path = dir.join("models.json");
+    let _lock = FileLock::acquire_blocking(&path)?;
+    let mut doc = object(&path)?;
+    let providers = child(&mut doc, "providers")?;
+    if providers.get(id) == provider.as_ref() {
+        return Ok(false);
+    }
+    match provider {
+        Some(value) => { providers.insert(id.into(), value); }
+        None => { providers.remove(id); }
+    }
+    disk::write_json(&path, &doc)?;
+    Ok(true)
+}
 pub fn save_setup(dir: &Path, req: &PiSetupRequest) -> Result<()> {
     let provider = req.provider_id.trim();
     ensure!(
