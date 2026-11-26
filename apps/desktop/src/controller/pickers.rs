@@ -144,35 +144,44 @@ pub(crate) async fn list_folders(dir: String) -> Result<Listing, String> {
 /// Makes `path` the project of the draft. A sent conversation keeps its
 /// folder: a new draft starts in `path` and takes the unsent text along.
 pub(crate) fn use_folder(path: String) {
-    let path = path.trim().trim_end_matches('/').to_owned();
-    let path = if path.is_empty() { "/".to_owned() } else { path };
-    let spec = vantry_protocol::WorkspaceSpec {
-        kind: "directory".into(),
-        path,
-        ..Default::default()
-    };
-    close_folder_picker();
-    if state().with_untracked(|s| s.selected_thread().is_some()) {
-        let mut carried = None;
-        state().update(|s| {
-            let key = s.draft_key();
-            carried = s.drafts.remove(&key).filter(|d| !d.text.trim().is_empty() || !d.attachments.is_empty());
-        });
-        start_in_workspace(Some(spec));
-        if let Some(draft) = carried {
-            state().update(|s| {
+    // Closing the dialog disposes its callback owner synchronously. Keep the
+    // originating machine's signals through both the selection and dismissal.
+    let app = state();
+    let window = ui();
+    let path = path.trim().trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    let fixed = app.with_untracked(|s| s.selected_thread().is_some());
+    batch(|| {
+        app.update(|s| {
+            if fixed {
                 let key = s.draft_key();
-                s.drafts.insert(key, draft);
+                let carried = s.drafts.remove(&key);
+                s.start_local_draft();
+                if let Some(draft) = carried {
+                    s.drafts.insert(s.draft_key(), draft);
+                }
+            }
+            s.new_thread.workspace = Some(vantry_protocol::WorkspaceSpec {
+                kind: "directory".into(),
+                path: path.into(),
+                ..Default::default()
             });
-        }
-    } else {
-        state().update(|s| s.new_thread.workspace = Some(spec));
-    }
+            let message = if fixed { "已在所选目录新建草稿" } else { "已设置草稿项目目录" };
+            s.notice = Some(Notice::new(NoticeLevel::Info, format!("{message}：{path}")));
+        });
+        window.update(|u| {
+            u.folder_picker = false;
+            if fixed {
+                u.view = MainView::Conversation;
+                u.mobile_nav = false;
+                u.filter.project = None;
+            }
+        });
+    });
 }
 
 /// Picks the folder with the system's dialog (this computer only).
 pub(crate) fn pick_folder_natively() {
-    close_folder_picker();
     spawn_for_window(async {
         match pick_paths(nsh_core::file_dialog::OpenDialog::folders().title("选择项目目录")).await {
             Ok(Some(paths)) => {
@@ -184,19 +193,21 @@ pub(crate) fn pick_folder_natively() {
             Err(error) => warn(format!("无法打开目录选择器：{error}")),
         }
     });
+    close_folder_picker();
 }
 
 /// Runs the draft on machine `id`: a new draft there, with the unsent text
 /// of a draft (not of a sent conversation, which stays where it is).
 pub(crate) fn use_machine(id: String) {
-    close_machine_picker();
-    if machines::navigation().with_untracked(|n| n.active == id) {
-        return;
-    }
+    // Read the draft before closing: closing disposes this handler's owner.
     let text = (!conversation_fixed_untracked())
         .then(|| state().with_untracked(|s| s.draft()))
         .filter(|d| d.attachments.is_empty() && !d.text.trim().is_empty())
         .map(|d| d.text);
+    close_machine_picker();
+    if machines::navigation().with_untracked(|n| n.active == id) {
+        return;
+    }
     machines::activate(&id, move || {
         new_thread();
         if let Some(text) = text {

@@ -295,3 +295,70 @@ pub(crate) fn new_draft() {
         activate(&draft_target(), super::new_thread);
     }
 }
+
+#[cfg(test)]
+mod folder_picker_tests {
+    use super::*;
+    use nsh_core::element::Runtime;
+
+    fn choose_directory(sent: bool) {
+        let runtime = Runtime::default();
+        let _entered = runtime.enter();
+        let config = LaunchConfig::default_for(PathBuf::new());
+        let local = register(config.clone(), "Local".into());
+        let peer = register(LaunchConfig {
+            target: Target::Peer { id: "peer".into(), mode: "auto".into() },
+            ..config
+        }, "Peer".into());
+        let session = peer.session;
+        session.state.update(|s| {
+            if sent {
+                s.threads.push(vantry_protocol::Thread {
+                    id: "sent".into(), project_path: "/original".into(), ..Default::default()
+                });
+                s.select_thread(Some("sent".into()));
+            } else {
+                s.start_local_draft();
+            }
+            s.set_draft_text("未发送的正文");
+        });
+        let original = session.state.with_untracked(AppState::draft_key);
+        session.ui.update(|u| u.folder_picker = true);
+        let (panel, ()) = create_root(|| provide_context(session));
+        // The mounted dialog tears down the press handler's owner as soon as it closes.
+        let (_window, ()) = create_root(|| {
+            effect(move || {
+                if !session.ui.with(|u| u.folder_picker) {
+                    panel.dispose();
+                }
+            });
+        });
+        panel.run(|| use_folder("/remote/Develop/".into()));
+        assert!(!panel.is_live());
+        session.state.with_untracked(|s| {
+            assert_eq!(s.current_project_key(), "/remote/Develop");
+            assert_eq!(s.local_order.len(), 1);
+            assert_eq!(s.draft().text, "未发送的正文");
+            assert!(s.notice.as_ref().unwrap().text.contains("/remote/Develop"));
+            if sent {
+                assert!(s.selected.is_none() && s.local_selected.is_some());
+                assert_eq!(s.thread("sent").unwrap().project_path, "/original");
+                assert!(!s.drafts.contains_key(&original));
+            } else {
+                assert_eq!(s.draft_key(), original);
+            }
+        });
+        assert!(local.session.state.with_untracked(|s| s.new_thread.workspace.is_none()));
+        assert!(global::<AppState>().with_untracked(|s| s.new_thread.workspace.is_none()));
+    }
+
+    #[test]
+    fn sent_conversation_moves_unsent_text_to_a_draft_on_its_machine() {
+        choose_directory(true);
+    }
+
+    #[test]
+    fn existing_draft_changes_project_on_its_machine() {
+        choose_directory(false);
+    }
+}
