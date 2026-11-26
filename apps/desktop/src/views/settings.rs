@@ -1578,11 +1578,15 @@ fn security_page(data: Data) -> impl IntoElement {
 fn update_page(data: Data) -> impl IntoElement {
     let colors = palette();
     let working = busy("update");
+    let live_update = computed(|| controller::ui().with(|u| u.update_info.clone()));
+    let skipped = computed(|| controller::ui().with(|u| u.skipped_update_version.clone()));
     view()
         .flex_col()
         .gap_3()
         .child(dynamic(move || {
-            let update = data.with(|d| d.as_ref().map(|d| d.update.clone()));
+            let update = live_update
+                .get()
+                .or_else(|| data.with(|d| d.as_ref().map(|d| d.update.clone())));
             let Some(update) = update else {
                 return card()
                     .child(
@@ -1604,10 +1608,10 @@ fn update_page(data: Data) -> impl IntoElement {
             let desktop_version = env!("CARGO_PKG_VERSION");
             let core_version = update.current_version.trim();
             let already_updated = !update.latest_version.is_empty()
-                && version_at_least(desktop_version, &update.latest_version);
+                && super::update_dialog::version_at_least(desktop_version, &update.latest_version);
             let core_behind = !core_version.is_empty()
                 && core_version != desktop_version
-                && !version_at_least(core_version, desktop_version);
+                && !super::update_dialog::version_at_least(core_version, desktop_version);
             if !update.available || already_updated {
                 return card()
                     .gap_2()
@@ -1641,15 +1645,13 @@ fn update_page(data: Data) -> impl IntoElement {
                     .into_element();
             }
             let current = desktop_version;
-            let size = if update.delta_available && (!update.staged || update.used_delta) {
-                let saved = update.asset_size.saturating_sub(update.delta_size);
-                let size = format!("增量 {:.1} MB", update.delta_size as f64 / 1_000_000.0);
-                if saved > 0 { format!("{size}，节省 {:.1} MB", saved as f64 / 1_000_000.0) } else { size }
-            } else if update.asset_size > 0 {
-                format!("完整包 {:.1} MB", update.asset_size as f64 / 1_000_000.0)
-            } else {
-                String::new()
-            };
+            let size = super::update_dialog::update_size_badge(&update);
+            let is_progress = working()
+                || matches!(
+                    update.phase.as_str(),
+                    "downloading" | "applying_delta" | "verifying"
+                );
+            let is_skipped = skipped.with(|s| !s.is_empty() && s == &update.latest_version);
             card()
                 .gap_2p5()
                 .child(
@@ -1666,13 +1668,14 @@ fn update_page(data: Data) -> impl IntoElement {
                             let size = size.clone();
                             move || badge(size.clone(), colors.muted)
                         }))
+                        .child(ghost_button("查看详情", controller::open_update_dialog))
                         .child(if update.staged && !update.can_auto_restart {
                             let path = if update.installer_path.is_empty() { update.staged_path.clone() } else { update.installer_path.clone() };
                             ghost_button("复制安装路径", move || controller::copy(path.clone())).into_element()
                         } else if update.staged {
                             let is_working = working.clone();
                             primary_button(
-                                move || SharedString::from(if is_working() { "正在重启…" } else { "重启更新" }),
+                                move || SharedString::from(if is_working() { "正在重启…" } else { "立即重启" }),
                                 || controller::update_op(names::UPDATE_INSTALL),
                             )
                                 .disabled(busy("update"))
@@ -1680,50 +1683,26 @@ fn update_page(data: Data) -> impl IntoElement {
                         } else {
                             let is_working = working.clone();
                             primary_button(
-                                move || SharedString::from(if is_working() { "下载中…" } else { "下载更新" }),
+                                move || SharedString::from(if is_working() { "下载中…" } else { "立即更新" }),
                                 || controller::update_op(names::UPDATE_DOWNLOAD),
                             )
                                 .disabled(busy("update"))
                                 .into_element()
                         }),
                 )
+                .child(when(is_progress, {
+                    let info = update.clone();
+                    move || super::update_dialog::progress_banner(info.clone())
+                }))
+                .child(when(is_skipped, || {
+                    hint("你此前已选择跳过此版本，仍可随时点击「查看详情」或「立即更新」进行升级。")
+                }))
                 .child(when(!update.notes.is_empty(), {
                     let notes = update.notes.clone();
                     move || hint(notes.clone())
                 }))
                 .into_element()
         }))
-}
-
-/// True when `current` is at least `target` (numeric dot-separated prefix,
-/// stripping any leading `v` and build metadata).
-fn version_at_least(current: &str, target: &str) -> bool {
-    fn parse(v: &str) -> Option<(Vec<u64>, bool)> {
-        let v = v.trim().trim_start_matches(['v', 'V']);
-        let v = v.split('+').next().unwrap_or(v);
-        let (core, pre) = match v.split_once('-') {
-            Some((c, p)) => (c, !p.is_empty()),
-            None => (v, false),
-        };
-        let parts: Vec<u64> = core
-            .split('.')
-            .map(|p| p.parse::<u64>().ok())
-            .collect::<Option<Vec<_>>>()?;
-        (!parts.is_empty()).then_some((parts, pre))
-    }
-    let (Some((a, a_pre)), Some((b, b_pre))) = (parse(current), parse(target)) else {
-        return current.trim().trim_start_matches(['v', 'V'])
-            == target.trim().trim_start_matches(['v', 'V']);
-    };
-    let len = a.len().max(b.len());
-    for i in 0..len {
-        let av = a.get(i).copied().unwrap_or(0);
-        let bv = b.get(i).copied().unwrap_or(0);
-        if av != bv {
-            return av > bv;
-        }
-    }
-    !a_pre || b_pre
 }
 
 fn usage_page(data: Data) -> impl IntoElement {
@@ -1908,7 +1887,7 @@ fn appearance_page() -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::version_at_least;
+    use crate::views::update_dialog::version_at_least;
 
     #[test]
     fn version_comparison_handles_prefixes_and_prereleases() {

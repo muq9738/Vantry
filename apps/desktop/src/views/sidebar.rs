@@ -1123,52 +1123,135 @@ fn archived_drawer(
         ))
 }
 
+fn update_banner() -> impl IntoElement {
+    let colors = palette();
+    let badge_state = computed(|| {
+        controller::ui().with(|u| {
+            let info = u.active_update()?;
+            if !super::update_dialog::has_newer_update(info) {
+                return None;
+            }
+            if !u.skipped_update_version.is_empty()
+                && u.skipped_update_version == info.latest_version
+                && !info.staged
+            {
+                return None;
+            }
+            let (frac, _, _) = super::update_dialog::progress_metrics(info);
+            let in_progress = u.op_busy("update")
+                || matches!(
+                    info.phase.as_str(),
+                    "downloading" | "applying_delta" | "verifying"
+                );
+            Some((
+                info.latest_version.clone(),
+                info.staged,
+                in_progress,
+                (frac * 100.0).round() as u32,
+            ))
+        })
+    });
+    dynamic(move || {
+        badge_state.get().map(|(latest, staged, in_progress, pct)| {
+            let (glyph, tint, label) = if staged {
+                (
+                    Icon::CircleCheck,
+                    colors.success,
+                    format!("v{latest} 已就绪 · 点击重启"),
+                )
+            } else if in_progress {
+                (
+                    Icon::Download,
+                    colors.accent,
+                    format!("正在更新 v{latest} ({pct}%)"),
+                )
+            } else {
+                (Icon::Download, colors.accent, format!("发现新版本 v{latest}"))
+            };
+            view()
+                .px_2p5()
+                .pt_1p5()
+                .child(
+                    nsh_base::button()
+                        .on_press(controller::open_update_dialog)
+                        .w_full()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded(px(8.0))
+                        .bg(if staged { colors.success_bg } else { colors.soft })
+                        .border_1()
+                        .border_color(colors.line)
+                        .hover(|s| s.opacity(0.88))
+                        .active(|s| s.opacity(0.72))
+                        .child(icon(glyph, 13.5, tint))
+                        .child(
+                            text(label)
+                                .flex_1()
+                                .number_of_lines(1u32)
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if staged { colors.success } else { colors.ink }),
+                        ),
+                )
+                .into_element()
+        })
+    })
+}
+
 fn footer() -> impl IntoElement {
     let colors = palette();
     let theme = computed(|| controller::ui().with(|u| u.theme));
     let remote = computed(|| controller::ui().with(|u| u.view == MainView::RemoteDesktop));
     view()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2p5()
-        .py_2()
-        .border_t_1()
-        .border_t_color(colors.line_soft)
-        .child(icon_button(Icon::Settings, "设置", || {
-            controller::open_settings(SettingsPage::General);
-        }))
-        .child(icon_button(Icon::GitBranch, "Git 工作台", || {
-            controller::toggle_dock(DockTab::Git);
-        }))
-        .child(icon_button(Icon::ChartBar, "用量统计", || {
-            controller::open_settings(SettingsPage::Usage);
-        }))
-        .child(icon_button(Icon::Monitor, "远程桌面", move || {
-            controller::show_view(if remote.get_untracked() {
-                MainView::Conversation
-            } else {
-                MainView::RemoteDesktop
-            });
-        }))
-        .child(view().flex_1())
+        .flex_col()
+        .child(update_banner())
         .child(
-            nsh_base::button()
-                .accessibility_label("切换明暗主题")
-                .on_press(controller::cycle_theme)
-                .w(px(28.0))
-                .h(px(28.0))
+            view()
+                .flex_row()
                 .items_center()
-                .justify_center()
-                .rounded(px(7.0))
-                .hover(|s| s.bg(colors.soft))
-                .active(|s| s.opacity(0.65))
-                .child(dynamic(move || {
-                    let glyph = match theme.get() {
-                        ThemePreference::Dark => Icon::Sun,
-                        ThemePreference::Light | ThemePreference::System => Icon::Moon,
-                    };
-                    icon(glyph, 15.0, colors.muted).into_element()
-                })),
+                .gap_1()
+                .px_2p5()
+                .py_2()
+                .border_t_1()
+                .border_t_color(colors.line_soft)
+                .child(icon_button(Icon::Settings, "设置", || {
+                    controller::open_settings(SettingsPage::General);
+                }))
+                .child(icon_button(Icon::GitBranch, "Git 工作台", || {
+                    controller::toggle_dock(DockTab::Git);
+                }))
+                .child(icon_button(Icon::ChartBar, "用量统计", || {
+                    controller::open_settings(SettingsPage::Usage);
+                }))
+                .child(icon_button(Icon::Monitor, "远程桌面", move || {
+                    controller::show_view(if remote.get_untracked() {
+                        MainView::Conversation
+                    } else {
+                        MainView::RemoteDesktop
+                    });
+                }))
+                .child(view().flex_1())
+                .child(
+                    nsh_base::button()
+                        .accessibility_label("切换明暗主题")
+                        .on_press(controller::cycle_theme)
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(7.0))
+                        .hover(|s| s.bg(colors.soft))
+                        .active(|s| s.opacity(0.65))
+                        .child(dynamic(move || {
+                            let glyph = match theme.get() {
+                                ThemePreference::Dark => Icon::Sun,
+                                ThemePreference::Light | ThemePreference::System => Icon::Moon,
+                            };
+                            icon(glyph, 15.0, colors.muted).into_element()
+                        })),
+                ),
         )
 }

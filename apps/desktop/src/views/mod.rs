@@ -23,6 +23,7 @@ pub(crate) mod remote_desktop;
 pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod timeline;
+pub(crate) mod update_dialog;
 pub(crate) mod visuals;
 
 use nsh_core::prelude::*;

@@ -31,6 +31,7 @@ pub struct Workbench {
     pub start_remote: tokio::sync::Notify,
     pub mobile_server: tokio::sync::watch::Sender<Option<vantry_connectivity::t3compat::T3Server>>,
     updater: AsyncMutex<UpdateManager>,
+    updater_info: tokio::sync::watch::Receiver<AppUpdateInfo>,
     plugins: Mutex<plugins::Host>,
     desktop: AsyncMutex<Option<(DesktopClient, String, String)>>,
     desktop_host: AsyncMutex<Option<Arc<DesktopHost>>>,
@@ -61,10 +62,12 @@ impl Workbench {
             data.to_owned(),
             identity.clone(),
         )?);
-        let updater = AsyncMutex::new(UpdateManager::new(UpdateOptions {
+        let updater_mgr = UpdateManager::new(UpdateOptions {
             data_dir: Some(data.into()),
             ..Default::default()
-        })?);
+        })?;
+        let updater_info = updater_mgr.info_rx();
+        let updater = AsyncMutex::new(updater_mgr);
         let plugins = Mutex::new(plugins::Host::open(
             &data.join("plugins"),
             data,
@@ -90,6 +93,7 @@ impl Workbench {
             identity,
             federator,
             updater,
+            updater_info,
             plugins,
             desktop: AsyncMutex::new(None),
             desktop_host: AsyncMutex::new(None),
@@ -1353,6 +1357,20 @@ impl Workbench {
         let mut out = WorkbenchResponse::default();
         let action = r.action.as_str();
         let input = r.input.as_ref().unwrap_or(&Value::Null);
+
+        // `update.status` must never block behind an in-flight `update.download`
+        // so the desktop UI can poll live download/patching progress smoothly.
+        if action == "update.status" {
+            let mut info = match self.updater.try_lock() {
+                Ok(mgr) => mgr.current_info(),
+                Err(_) => self.updater_info.borrow().clone(),
+            };
+            if info.current_version.is_empty() {
+                info.current_version = env!("CARGO_PKG_VERSION").into();
+            }
+            out.update = Some(info);
+            return Ok(out);
+        }
 
         let mut mgr = self.updater.lock().await;
         match action {

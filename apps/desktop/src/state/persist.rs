@@ -138,6 +138,8 @@ struct WireDesktopState {
     extensions_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mcp_disabled: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    skipped_update_version: String,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -170,6 +172,7 @@ pub struct DesktopStateFile {
     pub default_workspace: Option<Value>,
     pub extensions_enabled: bool,
     pub mcp_disabled: Vec<String>,
+    pub skipped_update_version: String,
 }
 
 impl Default for DesktopStateFile {
@@ -199,6 +202,7 @@ impl Default for DesktopStateFile {
             default_workspace: None,
             extensions_enabled: true,
             mcp_disabled: Vec::new(),
+            skipped_update_version: String::new(),
         }
     }
 }
@@ -319,6 +323,7 @@ impl DesktopStateFile {
                 .extensions_enabled
                 .unwrap_or(defaults.extensions_enabled),
             mcp_disabled: wire.mcp_disabled,
+            skipped_update_version: wire.skipped_update_version,
         }
     }
 
@@ -409,6 +414,7 @@ impl DesktopStateFile {
         wire.collapsed = self.collapsed.clone();
         wire.extensions_enabled = Some(self.extensions_enabled);
         wire.mcp_disabled = self.mcp_disabled.clone();
+        wire.skipped_update_version = self.skipped_update_version.clone();
         wire
     }
 }
@@ -460,6 +466,7 @@ pub fn capture(app: &AppState, ui: &UiState) -> DesktopStateFile {
             .and_then(|w| serde_json::to_value(w).ok()),
         extensions_enabled: ui.extensions_enabled,
         mcp_disabled: ui.mcp_disabled.iter().cloned().collect(),
+        skipped_update_version: ui.skipped_update_version.clone(),
     }
 }
 
@@ -528,6 +535,7 @@ pub fn restore(file: &DesktopStateFile, app: &mut AppState, ui: &mut UiState) {
     ui.filter.collapsed = file.collapsed.iter().cloned().collect();
     ui.extensions_enabled = file.extensions_enabled;
     ui.mcp_disabled = file.mcp_disabled.iter().cloned().collect();
+    ui.skipped_update_version = file.skipped_update_version.clone();
 }
 
 /// Reads the file: `None` when there is none yet; an error when it is not

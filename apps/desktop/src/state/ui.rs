@@ -563,6 +563,14 @@ pub struct UiState {
     pub forms: SettingsForms,
     /// The plugin panel shown (`MainView::Plugin`).
     pub plugin_panel: Option<PluginPanel>,
+    /// Software Update modal dialog visibility.
+    pub update_dialog: bool,
+    /// Version the user explicitly chose "跳过此版本" for (persisted).
+    pub skipped_update_version: String,
+    /// Latest live update info (synced from startup check, settings load, and progress polling).
+    pub update_info: Option<vantry_protocol::AppUpdateInfo>,
+    /// Last error from an update operation, shown inside the update dialog/card.
+    pub update_error: Option<String>,
 }
 
 impl Default for UiState {
@@ -603,6 +611,10 @@ impl Default for UiState {
             remote_target: None,
             forms: SettingsForms::default(),
             plugin_panel: None,
+            update_dialog: false,
+            skipped_update_version: String::new(),
+            update_info: None,
+            update_error: None,
         }
     }
 }
@@ -631,9 +643,34 @@ impl UiState {
 
     pub fn on_catalogs(&mut self, result: Result<SettingsData, String>) {
         self.catalogs = match result {
-            Ok(data) => Catalogs::Loaded(std::sync::Arc::new(data)),
+            Ok(data) => {
+                if data.update.available || !data.update.latest_version.is_empty() {
+                    self.update_info = Some(data.update.clone());
+                }
+                Catalogs::Loaded(std::sync::Arc::new(data))
+            }
             Err(reason) => Catalogs::Failed(reason),
         };
+    }
+
+    /// Updates live update info both in `UiState` and in loaded `SettingsData`.
+    pub fn sync_update_info(&mut self, info: vantry_protocol::AppUpdateInfo) {
+        if !info.error.is_empty() {
+            self.update_error = Some(info.error.clone());
+        } else if info.phase != "failed" {
+            self.update_error = None;
+        }
+        self.update_info = Some(info.clone());
+        if let Catalogs::Loaded(data) = &mut self.catalogs {
+            std::sync::Arc::make_mut(data).update = info;
+        }
+    }
+
+    /// Latest known update info, preferring live `update_info` over cached catalog data.
+    pub fn active_update(&self) -> Option<&vantry_protocol::AppUpdateInfo> {
+        self.update_info
+            .as_ref()
+            .or_else(|| self.data().map(|d| &d.update))
     }
 
     /// Switches MCP server `name` on or off here.

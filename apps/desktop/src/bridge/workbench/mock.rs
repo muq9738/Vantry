@@ -498,11 +498,14 @@ fn demo_settings() -> SettingsData {
     },
     update: AppUpdateInfo {
         current_version: env!("CARGO_PKG_VERSION").into(),
-        latest_version: "0.1.43".into(),
+        latest_version: "0.9.0".into(),
         available: true,
         delta_available: true,
         delta_size: 3_200_000,
-        notes: "NSH 桌面工作台预览".into(),
+        asset_size: 42_600_000,
+        delta_steps: 3,
+        phase: "available".into(),
+        notes: "- 支持跨多个版本的链式二进制增量更新，自动规划最小流量补丁路径。\n- 新增软件更新弹窗与实时下载、增量合成、签名校验进度条。\n- 支持「跳过此版本」「稍后」与「立即重启」交互，不中断后台运行中的任务。\n- 修复长会话滚动与终端面板尺寸同步问题。".into(),
         ..AppUpdateInfo::default()
     },
     peers: vec![EnvironmentInfo {
@@ -847,12 +850,22 @@ impl Repo {
                 if !settings.update.available {
                     return Err(invalid("当前已是最新版本"));
                 }
+                let total = if settings.update.delta_available {
+                    settings.update.delta_size
+                } else {
+                    settings.update.asset_size
+                };
                 settings.update.staged = true;
                 settings.update.staged_version = settings.update.latest_version.clone();
                 settings.update.used_delta = settings.update.delta_available;
                 settings.update.can_auto_restart = true;
+                settings.update.phase = "ready".into();
+                settings.update.downloaded_bytes = total;
+                settings.update.total_bytes = total;
+                settings.update.delta_step = settings.update.delta_steps;
+                settings.update.error.clear();
                 out.update = Some(settings.update.clone());
-                out.output = "更新已下载并完成签名校验，点击「重启并更新」即可安装。".into();
+                out.output = "更新已下载并完成签名校验，点击「立即重启」即可安装。".into();
             }
             names::UPDATE_INSTALL => {
                 if !settings.update.staged {

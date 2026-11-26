@@ -141,6 +141,64 @@ impl InstallPlan {
             used_delta,
         })
     }
+    /// Apply a sequence of incremental `.delta` patches (`v0 -> v1 -> ... -> vN`) onto `target`,
+    /// cleaning up intermediate stages as soon as the next hop completes, and verify the final tree.
+    pub(crate) fn from_delta_chain(
+        steps: &[(PathBuf, String, String)],
+        target: &Path,
+        app: bool,
+        mut on_step: impl FnMut(usize, usize),
+    ) -> Result<Self> {
+        ensure!(!steps.is_empty(), "empty delta chain");
+        let mut builder = Builder::new();
+        builder.prefix(".vantry-update-");
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .canonicalize()?;
+        let root = builder.tempdir_in(&parent).or_else(|_| builder.tempdir())?;
+        let target_name = target.file_name().context("invalid install target")?;
+        let canonical_target = parent.join(target_name);
+        let total = steps.len();
+        let mut current_base = canonical_target.clone();
+        let mut prev_step_dir: Option<PathBuf> = None;
+
+        for (idx, (patch_path, from, to)) in steps.iter().enumerate() {
+            on_step(idx + 1, total);
+            let step_dir = root.path().join(format!("step-{idx}"));
+            fs::create_dir(&step_dir)?;
+            let dest = step_dir.join(target_name);
+            apply_delta(File::open(patch_path)?, from, to, &current_base, &dest)?;
+            if let Some(old_dir) = prev_step_dir.take() {
+                let _ = fs::remove_dir_all(old_dir);
+            }
+            current_base = dest;
+            prev_step_dir = Some(step_dir);
+        }
+
+        verify(&current_base, &canonical_target)?;
+        let staged = if app {
+            let ready = root
+                .path()
+                .join(current_base.file_name().context("missing app bundle name")?);
+            fs::rename(&current_base, &ready)?;
+            if let Some(last_dir) = prev_step_dir.take() {
+                let _ = fs::remove_dir_all(last_dir);
+            }
+            ready
+        } else {
+            current_base
+        };
+        let version = steps.last().unwrap().2.clone();
+        Ok(Self {
+            root,
+            staged,
+            target: canonical_target,
+            version,
+            used_delta: true,
+        })
+    }
     pub fn staged(&self) -> &Path {
         &self.staged
     }

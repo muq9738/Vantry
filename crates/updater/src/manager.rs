@@ -1,7 +1,7 @@
 use crate::{
-    Asset, Channel, InstallPlan, MAX_ASSET, Release, bundled_token_file, compare_versions,
-    normalize_version, parse_release, read_update_credentials, resolve_current_app_bundle,
-    update_token_file,
+    Asset, Channel, DeltaStep, InstallPlan, MAX_ASSET, Release, bundled_token_file,
+    combine_release_notes, compare_versions, normalize_version, parse_releases, plan_delta_chain,
+    read_update_credentials, resolve_current_app_bundle, update_token_file,
 };
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, Response, StatusCode, Url};
@@ -111,8 +111,11 @@ pub struct UpdateManager {
     opts: UpdateOptions,
     client: Client,
     state: watch::Sender<UpdateState>,
+    info_tx: watch::Sender<AppUpdateInfo>,
     info: AppUpdateInfo,
     release: Option<Release>,
+    releases: Vec<Release>,
+    delta_chain: Vec<DeltaStep>,
     token: Option<String>,
     plan: Option<InstallPlan>,
     installer: Option<PathBuf>,
@@ -134,12 +137,21 @@ impl UpdateManager {
             .user_agent(format!("Vantry-Updater/{}", opts.current_version))
             .connect_timeout(Duration::from_secs(30))
             .build()?;
+        let initial_info = AppUpdateInfo {
+            current_version: opts.current_version.clone(),
+            phase: "idle".into(),
+            ..Default::default()
+        };
+        let (info_tx, _) = watch::channel(initial_info.clone());
         Ok(Self {
             opts,
             client,
             state: watch::channel(UpdateState::Idle).0,
-            info: Default::default(),
+            info_tx,
+            info: initial_info,
             release: None,
+            releases: Vec::new(),
+            delta_chain: Vec::new(),
             token: None,
             plan: None,
             installer: None,
@@ -147,6 +159,13 @@ impl UpdateManager {
     }
     pub fn subscribe(&self) -> watch::Receiver<UpdateState> {
         self.state.subscribe()
+    }
+    /// Subscribe to live [`AppUpdateInfo`] snapshots (including download progress) without locking the manager.
+    pub fn info_rx(&self) -> watch::Receiver<AppUpdateInfo> {
+        self.info_tx.subscribe()
+    }
+    fn publish_info(&self) {
+        self.info_tx.send_replace(self.current_info());
     }
     pub fn current_info(&self) -> AppUpdateInfo {
         let mut info = self.info.clone();
@@ -170,6 +189,9 @@ impl UpdateManager {
                 && p.target()
                     .parent()
                     .is_some_and(|d| tempfile::tempdir_in(d).is_ok());
+            if info.phase.is_empty() || info.phase == "available" || info.phase == "idle" {
+                info.phase = "ready".into();
+            }
         }
         info
     }
@@ -188,13 +210,8 @@ impl UpdateManager {
         Ok(match &self.opts.source {
             ReleaseSource::Manifest(url) => url.clone(),
             ReleaseSource::GitHub { api_base, repo } => {
-                let suffix = if self.opts.channel == Channel::Stable {
-                    "releases/latest"
-                } else {
-                    "releases?per_page=100"
-                };
                 format!(
-                    "{}/repos/{}/{suffix}",
+                    "{}/repos/{}/releases?per_page=100",
                     api_base.trim_end_matches('/'),
                     repo.trim_matches('/')
                 )
@@ -221,7 +238,7 @@ impl UpdateManager {
         }
         req
     }
-    async fn metadata(&mut self) -> Result<Release> {
+    async fn metadata_list(&mut self) -> Result<Vec<Release>> {
         let url = self.metadata_url()?;
         let github = matches!(self.opts.source, ReleaseSource::GitHub { .. });
         self.token = if github && self.opts.token.is_some() {
@@ -283,31 +300,53 @@ impl UpdateManager {
             );
             body.extend_from_slice(&chunk);
         }
-        parse_release(&body, self.opts.channel)
+        let releases = parse_releases(&body, self.opts.channel)?;
+        if releases.is_empty() {
+            if github {
+                bail!("仓库尚未发布正式 Release");
+            }
+            bail!("no release for update channel");
+        }
+        Ok(releases)
     }
     pub async fn check(&mut self) -> Result<AppUpdateInfo> {
         let _pending = self.begin(UpdateState::Checking);
+        self.info.phase = "checking".into();
+        self.info.error.clear();
+        self.publish_info();
         self.release = None;
-        let r = match self.metadata().await {
-            Ok(r) => r,
+        self.releases.clear();
+        self.delta_chain.clear();
+        let releases = match self.metadata_list().await {
+            Ok(rs) => rs,
             Err(e) => {
+                self.info.phase = "failed".into();
+                self.info.error = e.to_string();
+                self.publish_info();
                 self.set(UpdateState::Failed(e.to_string()));
                 return Err(e);
             }
         };
+        let r = releases.last().cloned().context("no release for update channel")?;
         let latest = r.version().to_owned();
         let available = compare_versions(&latest, &self.opts.current_version).is_gt();
-        let mut notes = r.body.as_str();
-        if notes.len() > 64 << 10 {
-            notes = &notes[..notes.floor_char_boundary(64 << 10)];
-        }
+        let notes = if available {
+            combine_release_notes(&releases, &self.opts.current_version, &latest)
+        } else {
+            let mut n = r.body.as_str();
+            if n.len() > 64 << 10 {
+                n = &n[..n.floor_char_boundary(64 << 10)];
+            }
+            n.to_owned()
+        };
         let mut info = AppUpdateInfo {
             current_version: self.opts.current_version.clone(),
             latest_version: latest.clone(),
             available,
-            notes: notes.into(),
+            notes,
             published_at: r.published_at.clone().unwrap_or_default(),
             release_url: r.html_url.clone(),
+            phase: if available { "available" } else { "idle" }.into(),
             ..Default::default()
         };
         if info.release_url.is_empty()
@@ -315,26 +354,44 @@ impl UpdateManager {
         {
             info.release_url = format!("https://github.com/{repo}/releases/tag/{}", r.tag_name);
         }
+        let mut chain = Vec::new();
         if available {
-            let (full, delta) = r.assets_for(
+            let (full, _) = r.assets_for(
                 &self.opts.slug,
                 &self.opts.platform,
                 &self.opts.current_version,
             );
+            let full_size = full.as_ref().map(|a| a.size);
             if let Some(a) = full {
                 info.asset_name = a.name;
                 info.asset_size = a.size.try_into().unwrap_or(i64::MAX);
             }
-            if let Some(a) = delta
-                && self.opts.target.as_ref().is_some_and(|p| p.is_dir())
-            {
-                info.delta_available = true;
-                info.delta_size = a.size.try_into().unwrap_or(i64::MAX);
+            if self.opts.target.as_ref().is_some_and(|p| p.is_dir()) {
+                chain = plan_delta_chain(
+                    &releases,
+                    &self.opts.slug,
+                    &self.opts.platform,
+                    &self.opts.current_version,
+                    &latest,
+                    full_size,
+                );
+                if !chain.is_empty() {
+                    let total_delta: u64 = chain.iter().map(|s| s.asset.size).sum();
+                    info.delta_available = true;
+                    info.delta_size = total_delta.try_into().unwrap_or(i64::MAX);
+                    info.delta_steps = chain.len() as i64;
+                }
             }
         }
         self.info = info;
         self.release = Some(r);
+        self.releases = releases;
+        self.delta_chain = chain;
         let info = self.current_info();
+        if info.staged {
+            self.info.phase = "ready".into();
+        }
+        self.publish_info();
         self.set(if info.staged {
             UpdateState::ReadyToInstall
         } else if available {
@@ -342,13 +399,13 @@ impl UpdateManager {
         } else {
             UpdateState::Idle
         });
-        Ok(info)
+        Ok(self.current_info())
     }
-    async fn fetch(
+    async fn download_asset(
         &mut self,
         a: &Asset,
-        progress: &mut impl FnMut(u64, u64),
-    ) -> Result<InstallPlan> {
+        on_chunk: &mut impl FnMut(u64, u64),
+    ) -> Result<(tempfile::NamedTempFile, u64)> {
         ensure!(a.size <= MAX_ASSET, "asset too large");
         let origin = self.metadata_url()?;
         let mut resp: Response = loop {
@@ -387,10 +444,41 @@ impl UpdateManager {
                 "download exceeds declared size"
             );
             file.write_all(&chunk)?;
-            progress(bytes, size);
+            on_chunk(bytes, size);
         }
         ensure!(size == 0 || bytes == size, "incomplete download");
-        progress(bytes, bytes);
+        on_chunk(bytes, bytes);
+        Ok((file, bytes))
+    }
+    async fn fetch_full(
+        &mut self,
+        a: &Asset,
+        progress: &mut impl FnMut(u64, u64),
+    ) -> Result<InstallPlan> {
+        self.info.phase = "downloading".into();
+        self.info.downloaded_bytes = 0;
+        self.info.total_bytes = a.size.try_into().unwrap_or(i64::MAX);
+        self.info.delta_step = 0;
+        self.info.delta_steps = 0;
+        self.info.error.clear();
+        self.publish_info();
+
+        let info_tx = self.info_tx.clone();
+        let mut snapshot = self.info.clone();
+        let (file, _) = self
+            .download_asset(a, &mut |done, total| {
+                snapshot.downloaded_bytes = done.try_into().unwrap_or(i64::MAX);
+                snapshot.total_bytes = total.try_into().unwrap_or(i64::MAX);
+                info_tx.send_replace(snapshot.clone());
+                progress(done, total);
+            })
+            .await?;
+
+        self.info.downloaded_bytes = snapshot.downloaded_bytes;
+        self.info.total_bytes = snapshot.total_bytes;
+        self.info.phase = "verifying".into();
+        self.publish_info();
+
         let target = self.opts.target.clone();
         let app = self.opts.platform.starts_with("darwin-")
             && target
@@ -404,6 +492,86 @@ impl UpdateManager {
         })
         .await?
     }
+    async fn fetch_delta_chain(
+        &mut self,
+        chain: &[DeltaStep],
+        progress: &mut impl FnMut(u64, u64),
+    ) -> Result<InstallPlan> {
+        let target = self
+            .opts
+            .target
+            .clone()
+            .context("delta requires a base installation")?;
+        let total_steps = chain.len();
+        let total_bytes: u64 = chain.iter().map(|s| s.asset.size).sum();
+
+        self.info.phase = "downloading".into();
+        self.info.downloaded_bytes = 0;
+        self.info.total_bytes = total_bytes.try_into().unwrap_or(i64::MAX);
+        self.info.delta_steps = total_steps as i64;
+        self.info.delta_step = 1;
+        self.info.error.clear();
+        self.publish_info();
+
+        let info_tx = self.info_tx.clone();
+        let mut snapshot = self.info.clone();
+        let mut temp_files = Vec::with_capacity(total_steps);
+        let mut downloaded_before: u64 = 0;
+
+        for (idx, step) in chain.iter().enumerate() {
+            snapshot.delta_step = (idx + 1) as i64;
+            info_tx.send_replace(snapshot.clone());
+            let (file, step_bytes) = self
+                .download_asset(&step.asset, &mut |done, step_total| {
+                    let combined_done = downloaded_before.saturating_add(done);
+                    let combined_total = if total_bytes > 0 {
+                        total_bytes.max(combined_done)
+                    } else {
+                        downloaded_before.saturating_add(step_total)
+                    };
+                    snapshot.downloaded_bytes = combined_done.try_into().unwrap_or(i64::MAX);
+                    snapshot.total_bytes = combined_total.try_into().unwrap_or(i64::MAX);
+                    info_tx.send_replace(snapshot.clone());
+                    progress(combined_done, combined_total);
+                })
+                .await?;
+            downloaded_before = downloaded_before.saturating_add(step_bytes);
+            temp_files.push((file, step.from.clone(), step.to.clone()));
+        }
+
+        self.info.downloaded_bytes = downloaded_before.try_into().unwrap_or(i64::MAX);
+        self.info.total_bytes = total_bytes
+            .max(downloaded_before)
+            .try_into()
+            .unwrap_or(i64::MAX);
+        self.info.phase = "applying_delta".into();
+        self.info.delta_step = 1;
+        self.publish_info();
+
+        let app = self.opts.platform.starts_with("darwin-")
+            && target.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"));
+        let mut apply_snapshot = self.info.clone();
+        let apply_tx = self.info_tx.clone();
+        let plan = tokio::task::spawn_blocking(move || {
+            let paths: Vec<(PathBuf, String, String)> = temp_files
+                .iter()
+                .map(|(f, from, to)| (f.path().to_path_buf(), from.clone(), to.clone()))
+                .collect();
+            let result = InstallPlan::from_delta_chain(&paths, &target, app, |step, total| {
+                apply_snapshot.phase = "applying_delta".into();
+                apply_snapshot.delta_step = step as i64;
+                apply_snapshot.delta_steps = total as i64;
+                apply_tx.send_replace(apply_snapshot.clone());
+            });
+            drop(temp_files);
+            result
+        })
+        .await??;
+
+        self.info.phase = "verifying".into();
+        self.publish_info();
+        Ok(plan)
+    }
     pub async fn download_and_stage(
         &mut self,
         mut progress: impl FnMut(u64, u64),
@@ -416,6 +584,8 @@ impl UpdateManager {
             p.version == self.info.latest_version
                 && crate::install::verify(p.staged(), p.target()).is_ok()
         }) {
+            self.info.phase = "ready".into();
+            self.publish_info();
             self.set(UpdateState::ReadyToInstall);
             let p = self.plan.as_ref().unwrap();
             let size = if p.used_delta {
@@ -427,20 +597,23 @@ impl UpdateManager {
             return Ok(p);
         }
         let _pending = self.begin(UpdateState::Downloading);
-        let (full, delta) = self.release.as_ref().unwrap().assets_for(
+        let (full, _) = self.release.as_ref().unwrap().assets_for(
             &self.opts.slug,
             &self.opts.platform,
             &self.opts.current_version,
         );
+        let chain = self.delta_chain.clone();
         let result = async {
-            if let Some(a) = delta.filter(|_| self.info.delta_available) {
-                match self.fetch(&a, &mut progress).await {
+            if !chain.is_empty() && self.info.delta_available {
+                match self.fetch_delta_chain(&chain, &mut progress).await {
                     Ok(p) => return Ok(p),
                     Err(e) if full.is_none() => return Err(e),
-                    Err(_) => (),
+                    Err(_) => {
+                        self.info.delta_available = false;
+                    }
                 }
             }
-            self.fetch(&full.context("no matching release asset")?, &mut progress)
+            self.fetch_full(&full.context("no matching release asset")?, &mut progress)
                 .await
         }
         .await
@@ -459,10 +632,16 @@ impl UpdateManager {
         match result {
             Ok(p) => {
                 self.plan = Some(p);
+                self.info.phase = "ready".into();
+                self.info.error.clear();
+                self.publish_info();
                 self.set(UpdateState::ReadyToInstall);
                 Ok(self.plan.as_ref().unwrap())
             }
             Err(e) => {
+                self.info.phase = "failed".into();
+                self.info.error = e.to_string();
+                self.publish_info();
                 self.set(UpdateState::Failed(e.to_string()));
                 Err(e)
             }
@@ -470,20 +649,29 @@ impl UpdateManager {
     }
     pub fn apply(&mut self, opts: &crate::ApplyOptions) -> Result<()> {
         let plan = self.plan.as_ref().context("download an update first")?;
+        self.info.phase = "applying".into();
+        self.publish_info();
         self.set(UpdateState::Applying);
         match crate::apply_staged(plan.staged(), plan.target(), opts) {
             Ok(()) => {
                 self.opts.current_version = plan.version.clone();
                 self.info = AppUpdateInfo {
                     current_version: plan.version.clone(),
+                    phase: "idle".into(),
                     ..Default::default()
                 };
                 self.plan = None;
                 self.release = None;
+                self.releases.clear();
+                self.delta_chain.clear();
+                self.publish_info();
                 self.set(UpdateState::Idle);
                 Ok(())
             }
             Err(e) => {
+                self.info.phase = "failed".into();
+                self.info.error = e.to_string();
+                self.publish_info();
                 self.set(UpdateState::Failed(e.to_string()));
                 Err(e)
             }
@@ -501,6 +689,8 @@ impl UpdateManager {
             "staged version mismatch"
         );
         let data = self.opts.data_dir.as_deref().unwrap_or(Path::new(""));
+        self.info.phase = "applying".into();
+        self.publish_info();
         self.set(UpdateState::Applying);
         crate::launch_apply(
             self.plan.as_mut().unwrap(),
@@ -508,7 +698,12 @@ impl UpdateManager {
             desktop_pid,
             allow_busy_core,
         )
-        .inspect_err(|e| self.set(UpdateState::Failed(e.to_string())))?;
+        .inspect_err(|e| {
+            self.info.phase = "failed".into();
+            self.info.error = e.to_string();
+            self.publish_info();
+            self.set(UpdateState::Failed(e.to_string()));
+        })?;
         Ok(())
     }
 }

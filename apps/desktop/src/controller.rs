@@ -275,6 +275,9 @@ pub(crate) fn start(config: &LaunchConfig) {
     } else {
         spawn(run_connection(core));
     }
+    if current_machine().is_none() {
+        spawn_for_window(check_updates_on_startup(mock));
+    }
 }
 
 /// Starts the local Core when it does not answer, then connects.
@@ -2269,18 +2272,87 @@ pub(crate) fn project_add() {
     });
 }
 
+pub(crate) fn open_update_dialog() {
+    ui().update(|u| {
+        u.update_error = None;
+        u.update_dialog = true;
+    });
+}
+
+pub(crate) fn dismiss_update_dialog() {
+    ui().update(|u| u.update_dialog = false);
+}
+
+pub(crate) fn skip_update_version() {
+    ui().update(|u| {
+        if let Some(latest) = u.active_update().map(|i| i.latest_version.clone())
+            && !latest.is_empty()
+        {
+            u.skipped_update_version = latest;
+        }
+        u.update_dialog = false;
+    });
+}
+
+async fn check_updates_on_startup(is_mock: bool) {
+    timer(Duration::from_millis(if is_mock { 300 } else { 2_200 })).await;
+    let Some((workbench, _)) = local_workbench() else {
+        return;
+    };
+    let action = if is_mock {
+        names::UPDATE_STATUS
+    } else {
+        names::UPDATE_CHECK
+    };
+    let Ok(resp) = call(workbench.workbench(actions::request(action))).await else {
+        return;
+    };
+    let Some(info) = resp.update else {
+        return;
+    };
+    let newer = crate::views::update_dialog::has_newer_update(&info);
+    ui().update(move |u| {
+        let skipped = !u.skipped_update_version.is_empty()
+            && u.skipped_update_version == info.latest_version;
+        u.sync_update_info(info);
+        // Auto-open the Software Update dialog for real builds when a non-skipped update exists.
+        if !is_mock && newer && !skipped {
+            u.update_dialog = true;
+        }
+    });
+}
+
 pub(crate) fn update_op(action: &'static str) {
     let Some((workbench, is_mock)) = local_workbench() else {
         return;
     };
     let mut go = false;
-    ui().update(|u| go = u.begin_op("update"));
+    ui().update(|u| {
+        go = u.begin_op("update");
+        if go {
+            u.update_error = None;
+            if action == names::UPDATE_DOWNLOAD
+                && let Some(mut info) = u.active_update().cloned()
+            {
+                info.phase = "downloading".into();
+                info.downloaded_bytes = 0;
+                info.total_bytes = if info.delta_available && info.delta_size > 0 {
+                    info.delta_size
+                } else {
+                    info.asset_size
+                };
+                info.delta_step = if info.delta_steps > 0 { 1 } else { 0 };
+                info.error.clear();
+                u.sync_update_info(info);
+            }
+        }
+    });
     if !go {
         return;
     }
     let staged_version = ui().with_untracked(|u| {
-        u.data()
-            .map(|d| d.update.staged_version.clone())
+        u.active_update()
+            .map(|d| d.staged_version.clone())
             .unwrap_or_default()
     });
     let mut request = actions::request(action);
@@ -2298,14 +2370,75 @@ pub(crate) fn update_op(action: &'static str) {
     };
     let active_ui = ui();
     let local_ui = machines::by_id("").map(|m| m.session.ui);
+    let sync_both = move |info: vantry_protocol::AppUpdateInfo| {
+        if let Some(local_ui) = local_ui
+            && local_ui != active_ui
+        {
+            local_ui.update(|u| u.sync_update_info(info.clone()));
+        }
+        active_ui.update(move |u| u.sync_update_info(info));
+    };
+
     spawn_for_window(async move {
+        let stop_poll = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if action == names::UPDATE_DOWNLOAD && !is_mock {
+            let poll_wb = workbench.clone();
+            let poll_stop = stop_poll.clone();
+            spawn_for_window(async move {
+                while !poll_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    timer(Duration::from_millis(160)).await;
+                    if poll_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok(resp) = call(poll_wb.workbench(actions::request(names::UPDATE_STATUS))).await
+                        && let Some(info) = resp.update
+                    {
+                        sync_both(info);
+                    }
+                }
+            });
+        } else if action == names::UPDATE_DOWNLOAD && is_mock {
+            // Smooth visual preview of multi-step incremental download & patching in `--mock` mode.
+            if let Some(mut sim) = active_ui.with_untracked(|u| u.active_update().cloned()) {
+                let total = if sim.delta_available && sim.delta_size > 0 {
+                    sim.delta_size
+                } else {
+                    sim.asset_size.max(3_200_000)
+                };
+                let steps = sim.delta_steps.max(1);
+                sim.total_bytes = total;
+                for pct in [12, 28, 46, 65, 84, 100] {
+                    sim.phase = "downloading".into();
+                    sim.downloaded_bytes = (total * pct) / 100;
+                    sim.delta_step = (((pct - 1) * steps) / 100 + 1).clamp(1, steps);
+                    sync_both(sim.clone());
+                    timer(Duration::from_millis(110)).await;
+                }
+                for step in 1..=steps {
+                    sim.phase = "applying_delta".into();
+                    sim.delta_step = step;
+                    sync_both(sim.clone());
+                    timer(Duration::from_millis(110)).await;
+                }
+                sim.phase = "verifying".into();
+                sync_both(sim);
+                timer(Duration::from_millis(140)).await;
+            }
+        }
+
         let result = call(workbench.workbench(request)).await.map_err(|e| e.message);
+        stop_poll.store(true, std::sync::atomic::Ordering::Relaxed);
+
         if action == names::UPDATE_INSTALL && !is_mock {
             match result {
                 Ok(_) => {
                     // Keep the button disabled and show clear progress while quitting so
                     // apply-update can swap the bundle and reopen the new version.
                     active_ui.update(|u| {
+                        if let Some(mut info) = u.active_update().cloned() {
+                            info.phase = "applying".into();
+                            u.sync_update_info(info);
+                        }
                         u.forms.feedback = Some(crate::state::ui::Feedback {
                             ok: true,
                             text: "正在重启并安装更新…".into(),
@@ -2316,21 +2449,36 @@ pub(crate) fn update_op(action: &'static str) {
                     nsh_core::element::desktop::quit();
                 }
                 Err(error) => {
-                    active_ui.update(move |u| u.end_op("update", action, Err(error), done));
+                    active_ui.update(move |u| {
+                        u.update_error = Some(error.clone());
+                        u.end_op("update", action, Err(error), done);
+                    });
                 }
             }
             return;
         }
-        if let Ok(resp) = &result
-            && let Some(local_ui) = local_ui
-            && local_ui != active_ui
-        {
-            let resp = resp.clone();
-            local_ui.update(move |u| {
-                if let crate::state::ui::Catalogs::Loaded(data) = &mut u.catalogs {
-                    std::sync::Arc::make_mut(data).absorb(action, &resp);
+        if let Ok(resp) = &result {
+            if let Some(info) = &resp.update {
+                sync_both(info.clone());
+                if action == names::UPDATE_CHECK
+                    && crate::views::update_dialog::has_newer_update(info)
+                {
+                    active_ui.update(|u| u.update_dialog = true);
                 }
-            });
+            }
+            if let Some(local_ui) = local_ui
+                && local_ui != active_ui
+            {
+                let resp = resp.clone();
+                local_ui.update(move |u| {
+                    if let crate::state::ui::Catalogs::Loaded(data) = &mut u.catalogs {
+                        std::sync::Arc::make_mut(data).absorb(action, &resp);
+                    }
+                });
+            }
+        } else if let Err(error) = &result {
+            let err_copy = error.clone();
+            active_ui.update(move |u| u.update_error = Some(err_copy));
         }
         active_ui.update(move |u| u.end_op("update", action, result, done));
     });

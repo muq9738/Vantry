@@ -1762,6 +1762,21 @@ pub struct AppUpdateInfo {
     pub used_delta: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_auto_restart: bool,
+    /// Live update phase: idle, checking, available, downloading, applying_delta, verifying, ready, applying, failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub downloaded_bytes: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_bytes: i64,
+    /// Total number of incremental delta hops planned or used (e.g. 3 when jumping across 3 releases).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delta_steps: i64,
+    /// 1-based index of the delta hop currently being downloaded or applied.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delta_step: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -271,6 +271,7 @@ fn workbench() -> impl IntoElement {
         .child(views::git::branch_dialog())
         .child(views::settings::settings())
         .child(views::settings::pairing_dialog())
+        .child(views::update_dialog::update_dialog())
         .child(views::dialogs::rename_dialog())
         .child(views::dialogs::confirm_dialog())
         .child(views::dialogs::attachment_preview_dialog())
