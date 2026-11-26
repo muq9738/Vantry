@@ -94,6 +94,7 @@ impl CoreWorkbench {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn on_peer(mut self) -> Self {
         self.peer = true;
         self
