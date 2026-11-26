@@ -530,13 +530,32 @@ async fn execute(
         )?;
         session.prompt(&message, images).await?;
         session.wait_for_idle().await;
-        if let Some(Message::Assistant(last)) = session.messages().last() {
-            if matches!(last.stop_reason, StopReason::Error | StopReason::Aborted) {
-                bail!(
-                    "{}",
-                    last.error_message.as_deref().unwrap_or("Pi turn failed")
-                );
+        let mut retries = 0;
+        loop {
+            let Some(Message::Assistant(last)) = session.messages().last().cloned() else {
+                break;
+            };
+            if !matches!(last.stop_reason, StopReason::Error | StopReason::Aborted) {
+                break;
             }
+            if retries < BLANK_FAILURE_RETRIES
+                && blank_upstream_failure(&last)
+                && !stop.is_cancelled()
+                && !dir.join("stop.json").try_exists()?
+            {
+                // Pi's own retry only knows named transient errors. A relay that
+                // drops the stream reports nothing; the failed reply is left out
+                // of the next request's context, so the model continues cleanly.
+                retries += 1;
+                tokio::time::sleep(Duration::from_secs(1 << retries)).await;
+                session.prompt(BLANK_FAILURE_CONTINUE, Vec::new()).await?;
+                session.wait_for_idle().await;
+                continue;
+            }
+            bail!(
+                "{}",
+                last.error_message.as_deref().unwrap_or("Pi turn failed")
+            );
         }
         Ok(())
     };
@@ -573,6 +592,25 @@ async fn execute(
     session.unsubscribe(subscription);
     runtime.dispose().await;
     result
+}
+
+const BLANK_FAILURE_RETRIES: u32 = 2;
+const BLANK_FAILURE_CONTINUE: &str =
+    "（上一次模型请求被上游中断，未返回任何内容。请从中断处继续完成当前任务。）";
+
+/// An upstream error that carried nothing: no output, no tokens, no named
+/// cause (for example `Error Code null: Unknown error`). Named errors are
+/// Pi's to retry or report; aborts are never retried.
+fn blank_upstream_failure(message: &pi_ai::types::AssistantMessage) -> bool {
+    let error = message.error_message.as_deref().unwrap_or("").trim();
+    message.stop_reason == StopReason::Error
+        && message.usage.output == 0
+        && message.content.iter().all(|block| match block {
+            pi_ai::types::ContentBlock::Text { text, .. } => text.trim().is_empty(),
+            pi_ai::types::ContentBlock::Thinking { thinking, .. } => thinking.trim().is_empty(),
+            _ => false,
+        })
+        && (error.is_empty() || error.to_ascii_lowercase().ends_with("unknown error"))
 }
 
 #[derive(Clone, Copy)]
@@ -666,4 +704,38 @@ pub(crate) async fn consume_controls(
         handled.insert(path);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod blank_failure_tests {
+    use super::*;
+
+    fn reply(content: Value, output: u64, stop: &str, error: Option<&str>) -> pi_ai::types::AssistantMessage {
+        // The shape the magpie relay produced in a failed sub-agent job.
+        let mut message = json!({
+            "role": "assistant", "content": content, "api": "openai-responses",
+            "provider": "magpie", "model": "dmit-ai/group/gtp-6-astra",
+            "usage": {"input": 0, "output": output, "cacheRead": 0, "cacheWrite": 0, "totalTokens": output,
+                "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+            "stopReason": stop, "timestamp": 1795680547124u64
+        });
+        if let Some(error) = error {
+            message["errorMessage"] = json!(error);
+        }
+        serde_json::from_value(message).unwrap()
+    }
+
+    #[test]
+    fn only_an_empty_unexplained_upstream_error_is_retried() {
+        assert!(blank_upstream_failure(&reply(json!([]), 0, "error", Some("Error Code null: Unknown error"))));
+        assert!(blank_upstream_failure(&reply(json!([]), 0, "error", None)));
+        let named = ["429 Too Many Requests", "insufficient_quota", "invalid api key", "context_length_exceeded"];
+        for error in named {
+            assert!(!blank_upstream_failure(&reply(json!([]), 0, "error", Some(error))), "{error}");
+        }
+        assert!(!blank_upstream_failure(&reply(json!([]), 0, "aborted", None)), "a stop is final");
+        let partial = json!([{"type": "text", "text": "已完成一半"}]);
+        assert!(!blank_upstream_failure(&reply(partial, 12, "error", Some("Unknown error"))));
+        assert!(!blank_upstream_failure(&reply(json!([]), 0, "stop", None)));
+    }
 }
