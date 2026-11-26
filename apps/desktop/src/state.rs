@@ -736,6 +736,11 @@ impl AppState {
         if self.awaiting_refresh.contains(thread_id) {
             return false;
         }
+        // A child shown in the drawer beside its parent: its detail was merged
+        // and the live stream keeps it current, as for a truncated selection.
+        if self.child_details.contains(thread_id) {
+            return matches!(self.connection, Connection::Live);
+        }
         let Some(summary_sequence) = self.summary_sequence else {
             return false;
         };

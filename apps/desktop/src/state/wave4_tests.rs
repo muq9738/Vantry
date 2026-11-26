@@ -630,3 +630,32 @@ fn waiting_children_shows_status_row_and_delegated_wake_titles_parse() {
     .unwrap();
     assert_eq!(titles, vec!["任务 A", "任务 B"]);
 }
+
+#[test]
+fn a_failed_child_accepts_a_follow_up_from_the_drawer_in_summaries_mode() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 7,
+        threads: Some(vec![summary("parent", 0)]),
+    });
+    let token = state.begin_detail_load("parent");
+    let mut parent = bounded_detail("parent", "pr1");
+    parent.tasks = Some(vec![vantry_protocol::Task {
+        id: "task1".into(),
+        parent_thread_id: "parent".into(),
+        child_thread_id: "child".into(),
+        ..Default::default()
+    }]);
+    assert!(state.apply_thread_detail(token, parent));
+    state.on_live();
+    let mut child = bounded_detail("child", "cr1");
+    child.thread.parent_thread_id = "parent".into();
+    child.runs.as_mut().unwrap()[0].status = RunStatus::Failed;
+    assert!(state.merge_child_detail(child));
+    state.drafts.entry("child".into()).or_default().text = "?".into();
+
+    let command = state.submit_child("child").expect("the drawer sends to the child");
+    assert_eq!(command.thread_id, "child");
+    assert_eq!(command.message, "?");
+    assert_eq!(state.selected.as_deref(), Some("parent"), "the parent stays shown");
+}

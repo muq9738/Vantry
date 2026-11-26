@@ -811,7 +811,19 @@ pub(crate) fn stop_child(child: String) {
 }
 
 pub(crate) fn submit_child(child: &str) {
-    intent(|s| s.submit_child(child));
+    let mut command = None;
+    let mut blocked = false;
+    state().update(|s| {
+        // A sent draft leaves `drafts`, so text still here was not sent.
+        let waiting = s.drafts.get(child).is_some_and(|d| !d.text.trim().is_empty());
+        command = s.submit_child(child);
+        blocked = waiting && command.is_none();
+    });
+    match command {
+        Some(command) => dispatch(command),
+        None if blocked => warn("子任务会话仍在同步，稍后再发送"),
+        None => {}
+    }
 }
 
 pub(crate) fn delegate_child(message: String) {
