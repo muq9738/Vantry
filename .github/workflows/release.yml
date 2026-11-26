@@ -4,10 +4,8 @@ run-name: Windows release packages for ${{ inputs.tag || github.ref_name }}
 env:
   CARGO_TERM_COLOR: always
 
+# Windows releases are opt-in; normal version tags publish macOS ARM64 only.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
