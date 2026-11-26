@@ -17,6 +17,8 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 env_logger.workspace = true
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 nsh-base = { workspace = true, features = ["editor", "rich-editor", "term"] }
 nsh-core.workspace = true
 qrcodegen = "1.8"

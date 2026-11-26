@@ -278,7 +278,7 @@ pub(super) fn restore_selection(html: &str, text: &str, with_files: bool) -> Opt
 
 impl PluginSpec for References {
     fn transform_pasted_html(&self, _: &EditorState, html: String) -> String {
-        match restore_selection(&html, "", false) {
+        match restore_selection(&html, "", false).or_else(|| crate::state::thread_links::pasted_thread_html(&html)) {
             Some(text) => text
                 .split('\n')
                 .map(|line| {

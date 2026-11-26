@@ -2,6 +2,33 @@
 
 pub const THREAD_SCHEME: &str = "vantry-thread://";
 
+/// A thread URL, optionally qualified with the owning Core's environment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ThreadTarget<'a> {
+    pub id: &'a str,
+    pub environment: Option<&'a str>,
+}
+
+impl<'a> ThreadTarget<'a> {
+    pub fn parse_url(url: &'a str) -> Option<Self> {
+        let target = url.strip_prefix(THREAD_SCHEME)?.split('#').next()?;
+        let (id, query) = target.split_once('?').unwrap_or((target, ""));
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            || url.contains(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
+        {
+            return None;
+        }
+        let environment = query
+            .split('&')
+            .find_map(|p| p.strip_prefix("environmentId="))
+            .filter(|s| !s.is_empty());
+        Some(Self { id, environment })
+    }
+}
+
 pub fn thread_markdown(title: &str, url: &str) -> String {
     let label = title
         .replace('\\', "\\\\")
@@ -38,16 +65,7 @@ impl<'a> ThreadLink<'a> {
                 ']' if depth == 0 => {
                     let rest = text[i + 2..].strip_prefix('(')?;
                     let (url, _) = rest.split_once(')')?;
-                    let target = url.strip_prefix(THREAD_SCHEME)?;
-                    let id = target.split(['?', '#']).next()?;
-                    if id.is_empty()
-                        || !id
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-                        || url.contains(char::is_whitespace)
-                    {
-                        return None;
-                    }
+                    ThreadTarget::parse_url(url)?;
                     let source = &text[..i + 4 + url.len()];
                     return Some(Self { source, title, url });
                 }
@@ -76,6 +94,20 @@ mod tests {
             (title, url, md.as_str())
         );
         assert!(ThreadLink::parse("[接手(接手 Rust…").is_none());
+        assert_eq!(
+            ThreadTarget::parse_url(link.url),
+            Some(ThreadTarget {
+                id: "th_old",
+                environment: Some("remote")
+            })
+        );
+        assert_eq!(
+            ThreadTarget::parse_url("vantry-thread://one#fragment")
+                .unwrap()
+                .environment,
+            None
+        );
+        assert!(ThreadTarget::parse_url("vantry-thread://?environmentId=remote").is_none());
         assert!(ThreadLink::parse("[目录](/some/path)").is_none());
     }
 }

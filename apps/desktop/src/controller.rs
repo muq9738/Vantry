@@ -671,35 +671,25 @@ pub(crate) fn open_link(url: String) {
         }
         return;
     }
-    if let Some(rest) = trimmed.strip_prefix("vantry-thread://") {
-        let thread_id = rest.split(['?', '#']).next().unwrap_or("").trim();
-        let environment = rest.split_once('?').and_then(|(_, query)| {
-            query
-                .split('&')
-                .find_map(|p| p.strip_prefix("environmentId="))
-        });
-        let scope = match environment.filter(|v| !v.is_empty()) {
-            Some(env) if machines::by_id(env).is_some() => env.to_owned(),
-            Some("local") => String::new(),
-            Some(env)
-                if std::fs::read_to_string(
-                    crate::launch_config().data_dir.join("environment-id"),
-                )
-                .is_ok_and(|local| local.trim() == env) =>
-            {
-                String::new()
-            }
-            Some(_) => {
-                warn("会话所属主机尚未配对。");
-                return;
-            }
-            None => current_machine().unwrap_or_default(),
-        };
-        machines::activate(&scope, || {
-            if state().with_untracked(|s| s.thread(thread_id).is_some()) {
-                select_thread(thread_id.to_owned());
+    if let Some(target) = vantry_protocol::ThreadTarget::parse_url(trimmed) {
+        let thread_id = target.id.to_owned();
+        let environment = target.environment.map(str::to_owned);
+        let scope = current_machine().unwrap_or_default();
+        spawn_for_window(async move {
+            let machine = match environment {
+                Some(id) => machines::link_machine(&id).await,
+                None => machines::by_id(&scope),
+            };
+            if let Some(machine) = machine {
+                machines::activate(&machine.id, || {
+                    if state().with_untracked(|s| s.snapshot_loaded && s.thread(&thread_id).is_none()) {
+                        warn("找不到链接中的会话。");
+                    } else {
+                        select_thread(thread_id);
+                    }
+                });
             } else {
-                warn("找不到链接中的会话。");
+                warn("无法定位会话所属的配对主机。");
             }
         });
         return;
@@ -1109,21 +1099,37 @@ pub(crate) fn reopen_request(id: String) {
 pub(crate) fn copy_thread_link(id: String) {
     let title = state().with_untracked(|s| s.thread(&id).map(crate::state::sidebar::display_title));
     let Some(title) = title else { return };
-    let scope = current_machine().or_else(|| std::fs::read_to_string(crate::launch_config().data_dir.join("environment-id")).ok());
-    let mut url = format!("{}{id}", vantry_protocol::THREAD_SCHEME);
-    if let Some(scope) = scope.filter(|s| !s.trim().is_empty()) { url.push_str(&format!("?environmentId={}", scope.trim())); }
-    let escape = |s: &str| {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-    };
-    let mut item = ClipboardItem::default();
-    item.text = vantry_protocol::thread_markdown(&title, &url);
-    item.html = Some(format!("<a href=\"{}\">{}</a>", escape(&url), escape(&title)));
-    drop(set_clipboard_item(item));
+    copy_thread_title(id, title);
+}
+
+pub(crate) fn copy_thread_title(id: String, title: String) {
+    let Some(machine) = machines::by_id(&current_machine().unwrap_or_default()) else { return };
+    let mock = bridges(|b| b.mock);
+    spawn_for_window(async move {
+        let url = match machine.environment().await {
+            Ok(env) => format!("{}{id}?environmentId={env}", vantry_protocol::THREAD_SCHEME),
+            Err(_) if mock => format!("{}{id}", vantry_protocol::THREAD_SCHEME),
+            Err(error) => { warn(error.message); return; }
+        };
+        copy_message_text(vantry_protocol::thread_markdown(&title, &url));
+    });
 }
 
 /// Copies `text` to the clipboard and says so.
 pub(crate) fn copy(text: String) {
     drop(set_clipboard(text));
+    state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制。")));
+}
+
+fn copy_message_text(text: String) {
+    if !text.contains(vantry_protocol::THREAD_SCHEME) {
+        copy(text);
+        return;
+    }
+    let mut item = ClipboardItem::default();
+    item.html = Some(crate::state::thread_links::clipboard_html(&text));
+    item.text = text;
+    drop(set_clipboard_item(item));
     state().update(|s| s.notice = Some(Notice::new(NoticeLevel::Info, "已复制。")));
 }
 
@@ -1252,7 +1258,7 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
         .filter(|a| a.mime.starts_with("image/"))
         .collect();
     if images.is_empty() {
-        copy(text);
+        copy_message_text(text);
         return;
     }
     let sources: Vec<(vantry_protocol::Attachment, Option<PathBuf>)> = state().with_untracked(|s| {
@@ -1268,7 +1274,7 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
     if let Some(id) = &selection_id {
         let mut clip = ClipboardItem::default();
         clip.text = text.clone();
-        let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let escaped = crate::state::thread_links::clipboard_html(&text);
         clip.html = Some(format!("<div data-vantry-selection=\"{id}\">{escaped}</div>"));
         drop(set_clipboard_item(clip));
     } else if !text.trim().is_empty() {
@@ -1288,7 +1294,7 @@ pub(crate) fn copy_with_images(text: String, attachments: Vec<vantry_protocol::A
         };
         if !text.is_empty() {
             html.push_str("<p>");
-            html.push_str(&escape(&text).replace('\n', "<br>"));
+            html.push_str(&crate::state::thread_links::clipboard_html(&text));
             html.push_str("</p>");
         }
         let mut uris: Vec<String> = Vec::new();
@@ -1380,7 +1386,7 @@ pub(crate) fn close_attachment_preview() {
 /// Copies a reply's text row.
 pub(crate) fn copy_reply(run_id: String, start: usize, end: usize) {
     let text = state().with_untracked(|s| s.text_of(&run_id, start, end));
-    copy(text);
+    copy_message_text(text);
 }
 
 // ----------------------------------------------------------------- threads
