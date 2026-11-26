@@ -1,8 +1,7 @@
 //! The workbench backed by the local Core: settings, plugins, remote
 //! access, the remote desktop, updates, usage and attachments go through
 //! `POST /v1/workbench` (`vantry_client::CoreClient::workbench`); files,
-//! Git and the terminal work on the local workspace directory, which this
-//! machine reaches directly.
+//! Git and terminal sessions use the local checkout or the paired Core that owns it.
 //!
 //! A Core that does not serve an action falls back, in order: the 0.1.42
 //! name of the action ([`actions::baseline_alias`]), then what
@@ -10,7 +9,9 @@
 //! (`not_ready`, `unknown endpoint`) or not running keeps the window working
 //! on local data.
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex}, time::Duration};
+
+mod terminal;
 
 use base64::Engine;
 use vantry_protocol::{
@@ -52,9 +53,12 @@ pub struct CoreWorkbench {
     socket: PathBuf,
     local: LocalWorkbench,
     model: Option<String>,
-    /// Route file & Git operations through Core's `/v1/workbench` (used for remote Cores).
+    /// Route checkout and terminal operations through the selected Core.
     core_fs: bool,
     workspace_override: Option<String>,
+    terminal_thread: String,
+    terminal_cwd: String,
+    terminal_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl CoreWorkbench {
@@ -67,11 +71,13 @@ impl CoreWorkbench {
             model,
             core_fs: false,
             workspace_override: None,
+            terminal_thread: String::new(),
+            terminal_cwd: String::new(),
+            terminal_ids: Default::default(),
         }
     }
 
-    /// A Core workbench that routes file & Git calls through the Core's `/v1/workbench`
-    /// for a checkout reached through a paired Core.
+    /// Route checkout and terminal operations through a paired Core.
     pub fn for_core_workspace(
         socket: PathBuf,
         workspace: String,
@@ -79,11 +85,9 @@ impl CoreWorkbench {
         model: Option<String>,
     ) -> Self {
         CoreWorkbench {
-            socket,
-            local,
-            model,
             core_fs: true,
             workspace_override: Some(workspace),
+            ..Self::new(socket, local, model)
         }
     }
 
@@ -258,18 +262,37 @@ impl WorkbenchBridge for CoreWorkbench {
     }
 
     fn terminal_run(&self, session: String, command: String, sink: TerminalSink) -> BridgeFuture<i32> {
+        if self.core_fs {
+            return self.remote_terminal(session, command, sink);
+        }
         self.local.terminal_run(session, command, sink)
     }
 
     fn terminal_interrupt(&self, session: String) -> BridgeFuture<()> {
+        if self.core_fs {
+            return self.terminal_control(names::TERMINAL_INTERRUPT, session, serde_json::json!({}));
+        }
         self.local.terminal_interrupt(session)
     }
 
+    fn terminal_close(&self, session: String) -> BridgeFuture<()> {
+        if self.core_fs {
+            return self.terminal_control(names::TERMINAL_CLOSE, session, serde_json::json!({}));
+        }
+        self.local.terminal_close(session)
+    }
+
     fn terminal_write(&self, session: String, data: String) -> BridgeFuture<()> {
+        if self.core_fs {
+            return self.terminal_control(names::TERMINAL_WRITE, session, serde_json::json!({"data": data}));
+        }
         self.local.terminal_write(session, data)
     }
 
     fn terminal_resize(&self, session: String, rows: u16, cols: u16) -> BridgeFuture<()> {
+        if self.core_fs {
+            return self.terminal_control(names::TERMINAL_RESIZE, session, serde_json::json!({"rows": rows, "cols": cols}));
+        }
         self.local.terminal_resize(session, rows, cols)
     }
 
@@ -531,6 +554,63 @@ mod tests {
             drop(self.bench);
             self.dir.close().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_routes_by_workspace_and_keeps_remote_controls_on_the_same_session() {
+        let remote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = remote.clone();
+        let fx = Fixture::new(Arc::new(move |r| {
+            assert_eq!(r["workspace"], "/peer/repo");
+            assert_eq!(r["threadId"], "origin");
+            let action = r["action"].as_str().unwrap();
+            let input = &r["input"];
+            if action != names::TERMINAL_OPEN { assert_eq!(input["sessionId"], "server-id"); }
+            let output = match action {
+                names::TERMINAL_OPEN => { assert_eq!(input["cwd"], "sub"); json!({"sessionId":"server-id"}) }
+                names::TERMINAL_READ => {
+                    let done = finished.load(std::sync::atomic::Ordering::Acquire);
+                    if input["offset"] == 0 {
+                        json!({"startOffset":0,"offset":1,"data":"5A==","exited":false,"exitCode":null})
+                    } else {
+                        json!({"startOffset":1,"offset":if done {3} else {1},"data":if done {"uK0="} else {""},"exited":done,"exitCode":4})
+                    }
+                }
+                names::TERMINAL_WRITE => { assert_eq!(input["data"], "x"); json!({}) }
+                names::TERMINAL_RESIZE => { assert_eq!(input["cols"], 90); json!({}) }
+                names::TERMINAL_INTERRUPT => json!({}),
+                names::TERMINAL_CLOSE => { finished.store(true,std::sync::atomic::Ordering::Release); json!({}) }
+                _ => panic!("unexpected {action}"),
+            };
+            (200, json!({"output":output.to_string()}))
+        }));
+        let (sink, _) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(fx.bench.terminal_run("local".into(), "exit 9".into(), sink).await.unwrap(), 9);
+        assert!(fx.seen().is_empty());
+        let wb = CoreWorkbench::for_core_workspace(fx.bench.socket.clone(), "/peer/repo".into(), fx.bench.local.clone(), None)
+            .terminal_scope("origin".into(), "sub".into());
+        let (sink, mut output) = tokio::sync::mpsc::unbounded_channel();
+        let id = String::from("tab");
+        let job = tokio::spawn(wb.terminal_run(id.clone(), "some-command".into(), sink));
+        assert_eq!(output.recv().await.as_deref(), Some(""));
+        wb.terminal_write(id.clone(), "x".into()).await.unwrap();
+        wb.terminal_resize(id.clone(), 24, 90).await.unwrap();
+        wb.terminal_interrupt(id.clone()).await.unwrap();
+        wb.terminal_close(id).await.unwrap();
+        assert_eq!(job.await.unwrap().unwrap(), 4);
+        assert_eq!(output.recv().await.as_deref(), Some("中"));
+        fx.finish().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_on_old_peer_returns_upgrade_error() {
+        let fx = Fixture::new(Arc::new(|_| api_error("not_found", "unknown workbench action terminal.session.open")));
+        let wb = CoreWorkbench::for_core_workspace(fx.bench.socket.clone(), "/peer/repo".into(), fx.bench.local.clone(), None);
+        let (sink, _) = tokio::sync::mpsc::unbounded_channel();
+        let err = wb.terminal_run("tab".into(), "exit 0".into(), sink).await.unwrap_err();
+        assert!(err.message.contains("升级"));
+        assert_eq!(fx.seen(), [names::TERMINAL_OPEN]);
+        fx.finish().await;
     }
 
     #[tokio::test]

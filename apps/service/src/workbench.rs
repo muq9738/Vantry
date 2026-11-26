@@ -37,6 +37,8 @@ pub struct Workbench {
     desktop_viewer: AsyncMutex<Option<Arc<DesktopViewer>>>,
     /// This device waiting for another host's approval, by handle.
     pending_pairings: Mutex<std::collections::HashMap<String, vantry_connectivity::peer::PendingPairing>>,
+    #[cfg(unix)]
+    terminals: crate::workbench_terminal::Terminals,
     pub environment: String,
 }
 fn user_home_dir() -> Option<PathBuf> {
@@ -93,6 +95,8 @@ impl Workbench {
             desktop_host: AsyncMutex::new(None),
             desktop_viewer: AsyncMutex::new(None),
             pending_pairings: Mutex::new(Default::default()),
+            #[cfg(unix)]
+            terminals: Default::default(),
             environment,
         })
     }
@@ -202,6 +206,19 @@ impl Workbench {
             "workspace" | "files.list" | "files.read" | "files.search" | "reply.image"
             | "terminal.open" => {
                 return tokio::task::block_in_place(|| self.workspace(r));
+            }
+            s if s.starts_with("terminal.session.") => {
+                #[cfg(unix)]
+                {
+                    let root = if s == "terminal.session.open" {
+                        self.root(&r)?
+                    } else {
+                        None
+                    };
+                    out.output = self.terminals.handle(&r, root).await?.to_string();
+                }
+                #[cfg(not(unix))]
+                bail!("当前 Core 主机不支持交互式 PTY 终端");
             }
             "skills.list" => return self.skills(r).await,
             s if s.starts_with("git.") => return tokio::task::block_in_place(|| self.git(r)),

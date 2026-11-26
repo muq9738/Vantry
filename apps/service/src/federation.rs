@@ -235,10 +235,6 @@ impl Federator {
             .clone()
     }
 
-    fn remote_thread_id(local_thread_id: &str) -> String {
-        format!("remote_{local_thread_id}")
-    }
-
     async fn ensure_remote(
         &self,
         request: &ProviderRequest,
@@ -253,7 +249,7 @@ impl Federator {
         if let Some(existing) = self.get_task(&request.attempt_id) {
             return Ok((target, existing));
         }
-        let remote_thread = Self::remote_thread_id(&request.thread_id);
+        let remote_thread = vantry_protocol::federated_thread_id(&request.thread_id);
         let existing_thread = self
             .ledger
             .lock()
@@ -488,7 +484,7 @@ impl Federator {
             return Ok(());
         }
         // Fallback: stop any active run on the deterministic remote thread.
-        let remote_thread = Self::remote_thread_id(&request.thread_id);
+        let remote_thread = vantry_protocol::federated_thread_id(&request.thread_id);
         if let Ok(snap) = target.snapshot().await {
             for run in snap
                 .runs

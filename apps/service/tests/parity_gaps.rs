@@ -329,6 +329,32 @@ async fn paired_cross_machine_subtask_delegation_and_restart() -> Result<()> {
         paths: vec!["remote.md".into()], ..Default::default()
     }).await?;
     assert_eq!(file.output, "# Only on B");
+    #[cfg(unix)]
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let opened = remote.workbench(&WorkbenchRequest {
+            action: "terminal.session.open".into(), workspace: repo_b.display().to_string(),
+            input: Some(json!({"command":"cat remote.md; exit 7"})), ..Default::default()
+        }).await?;
+        let opened: Value = serde_json::from_str(&opened.output)?;
+        let mut bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            ensure!(Instant::now() < deadline, "paired terminal did not exit");
+            let read = remote.workbench(&WorkbenchRequest {
+                action: "terminal.session.read".into(),
+                input: Some(json!({"sessionId": opened["sessionId"], "offset": bytes.len()})),
+                ..Default::default()
+            }).await?;
+            let chunk: Value = serde_json::from_str(&read.output)?;
+            bytes.extend(STANDARD.decode(chunk["data"].as_str().context("missing terminal data")?)?);
+            if chunk["exited"] == true {
+                assert_eq!(chunk["exitCode"], 7);
+                break;
+            }
+        }
+        assert_eq!(bytes, b"# Only on B");
+    }
     let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jOscAAAAASUVORK5CYII=";
     let image = client_b.workbench(&WorkbenchRequest {
         action: "attachment.import".into(), name: "dot.png".into(), data: png.into(),

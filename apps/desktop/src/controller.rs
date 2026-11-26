@@ -170,7 +170,12 @@ pub(crate) fn start(config: &LaunchConfig) {
             let sock = remote.socket();
             (
                 Arc::new(remote),
-                Arc::new(CoreWorkbench::new(sock.clone(), local, config.model.clone())),
+                Arc::new(CoreWorkbench::for_core_workspace(
+                    sock.clone(),
+                    config.workspace.as_ref().map(|w| w.path.clone()).unwrap_or_default(),
+                    local,
+                    config.model.clone(),
+                )),
                 Some(sock),
             )
         }
@@ -2896,6 +2901,7 @@ pub(crate) fn run_terminal() {
         }
     });
     if let Some((session, line)) = interactive {
+        if shell::send(&session, shell::Input::Data(line.clone())) { return; }
         spawn(async move {
             let _ = call(workbench.terminal_write(session, line)).await;
         });
@@ -2933,6 +2939,7 @@ pub(crate) fn interrupt_terminal() {
 }
 
 fn interrupt_session(id: String) {
+    if shell::send(&id, shell::Input::Interrupt) { return; }
     if let Some(workbench) = workbench() {
         spawn(async move {
             let _ = call(workbench.terminal_interrupt(id)).await;
