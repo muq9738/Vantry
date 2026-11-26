@@ -23,6 +23,12 @@ pub fn request(action: &str) -> WorkbenchRequest {
 
 /// Action names.
 pub mod names {
+    pub const TERMINAL_OPEN: &str = "terminal.session.open";
+    pub const TERMINAL_READ: &str = "terminal.session.read";
+    pub const TERMINAL_WRITE: &str = "terminal.session.write";
+    pub const TERMINAL_RESIZE: &str = "terminal.session.resize";
+    pub const TERMINAL_INTERRUPT: &str = "terminal.session.interrupt";
+    pub const TERMINAL_CLOSE: &str = "terminal.session.close";
     pub const MODELS: &str = "models";
     pub const PI_STATUS: &str = "pi.status";
     pub const PI_SETUP_SAVE: &str = "pi.setup.save";

@@ -3,15 +3,85 @@ use super::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-enum Input {
+pub(super) enum Input {
     Data(String),
     Size(u16, u16),
+    Interrupt,
     Close,
 }
 thread_local! { static SHELLS: RefCell<HashMap<String,UnboundedSender<Input>>> = RefCell::new(HashMap::new()); }
 
 pub(crate) fn native_shell() -> bool {
-    cfg!(unix) && !bridges(|b| b.mock) && !remote_project()
+    !bridges(|b| b.mock) && (cfg!(unix) || current_machine().is_some() || remote_project())
+}
+
+fn terminal_peer<'a>(
+    owner: Option<&'a str>,
+    environment: Option<&'a str>,
+    thread: Option<&str>,
+) -> Option<(&'a str, String)> {
+    let host = environment.filter(|id| !id.is_empty()).or(owner)?;
+    let id = match thread {
+        Some(id) if Some(host) != owner => vantry_protocol::federated_thread_id(id),
+        _ => thread.unwrap_or_default().into(),
+    };
+    Some((host, id))
+}
+
+/// Resolve the checkout and machine from the originating thread.
+fn terminal_workbench(
+    thread: Option<&vantry_protocol::Thread>,
+    cwd: &str,
+) -> Result<(Arc<dyn WorkbenchBridge>, String), String> {
+    let workspace = match thread {
+        Some(t) => t.workspace.clone(),
+        None => state().with_untracked(|s| s.new_thread.workspace.clone()),
+    };
+    let root = workspace
+        .as_ref()
+        .and_then(|w| [&w.path, &w.repository].into_iter().find(|p| !p.is_empty()))
+        .or_else(|| thread.map(|t| &t.project_path).filter(|p| !p.is_empty()))
+        .cloned()
+        .unwrap_or_default();
+    let current = current_machine();
+    let peer = terminal_peer(
+        current.as_deref(),
+        workspace.as_ref().map(|w| w.environment_id.as_str()),
+        thread.map(|t| t.id.as_str()),
+    );
+    let default = workbench().ok_or("工作台尚未就绪")?;
+    if bridges(|b| b.mock) {
+        return Ok((default, root));
+    }
+    if let Some((peer, remote_thread)) = peer {
+        let same = current.as_deref() == Some(peer);
+        let mut socket = None;
+        if same {
+            socket = bridges(|b| b.core_socket.clone());
+        } else {
+            machines::run_on(peer, || socket = bridges(|b| b.core_socket.clone()));
+        }
+        let socket = socket.ok_or_else(|| format!("配对主机 {peer} 的工作台不可用"))?;
+        let scoped = CoreWorkbench::for_core_workspace(
+            socket,
+            root.clone(),
+            LocalWorkbench::new(PathBuf::from(&root), None),
+            None,
+        )
+        .terminal_scope(remote_thread, cwd.into());
+        let dir = if cwd.is_empty() { root } else { cwd.into() };
+        return Ok((Arc::new(scoped), dir));
+    }
+    let root = if root.is_empty() {
+        default.root()
+    } else {
+        root
+    };
+    let dir = PathBuf::from(root).join(cwd);
+    Ok((
+        Arc::new(LocalWorkbench::new(dir.clone(), None)),
+        dir.display().to_string(),
+    ))
 }
 
 /// The registry key of session `id` on the shown machine: what writes,
@@ -25,11 +95,13 @@ pub(crate) fn shell_start(id: String) {
     if id.starts_with("task-") || SHELLS.with(|all| all.borrow().contains_key(&key)) {
         return;
     }
-    let Some(bridge) = project_workbench()
-        .map(|(_, bridge)| bridge)
-        .or_else(workbench)
-    else {
-        return;
+    let thread = state().with_untracked(|s| s.selected_thread().cloned());
+    let bridge = match terminal_workbench(thread.as_ref(), "") {
+        Ok((bridge, _)) => bridge,
+        Err(error) => {
+            bench().update(|b| b.terminal.on_exit(&id, Err(error)));
+            return;
+        }
     };
     let (input, mut events) = unbounded_channel();
     SHELLS.with(|all| all.borrow_mut().insert(key.clone(), input));
@@ -64,7 +136,8 @@ pub(crate) fn shell_start(id: String) {
                         Input::Size(rows, cols) => {
                             call(bridge.terminal_resize(id.clone(), rows, cols)).await
                         }
-                        Input::Close => call(bridge.terminal_interrupt(id.clone())).await,
+                        Input::Interrupt => call(bridge.terminal_interrupt(id.clone())).await,
+                        Input::Close => call(bridge.terminal_close(id.clone())).await,
                     };
                     if let Err(e) = result {
                         bench().update(|b| {
@@ -82,7 +155,7 @@ pub(crate) fn shell_start(id: String) {
         bench().update(|b| b.terminal.on_exit(&id, result));
     });
 }
-fn send(id: &str, event: Input) -> bool {
+pub(super) fn send(id: &str, event: Input) -> bool {
     SHELLS.with(|all| {
         all.borrow()
             .get(&shell_key(id))
@@ -102,20 +175,20 @@ pub(crate) fn shell_close(id: &str) -> bool {
 /// Launch a real PTY terminal tab for a `vantry_terminal_run` request, stream
 /// output and accept keyboard input, and automatically submit the process exit
 /// code back to Core when the command exits.
-pub(crate) fn start_terminal_task(
-    request_id: String,
-    title: String,
-    command: String,
-    cwd: String,
-) {
-    let dir = if !cwd.trim().is_empty() {
-        cwd.trim().to_owned()
-    } else {
-        let root = bench().with_untracked(|b| b.root.clone());
-        if !root.is_empty() {
-            root
-        } else {
-            std::env::var("HOME").unwrap_or_else(|_| "/".into())
+pub(crate) fn start_terminal_task(request_id: String, title: String, command: String, cwd: String) {
+    let thread = state().with_untracked(|s| {
+        let request = s.requests.iter().find(|r| r.id == request_id)?;
+        s.thread(&request.thread_id).cloned()
+    });
+    let Some(thread) = thread else {
+        warn("找不到发起终端请求的会话");
+        return;
+    };
+    let (bridge, dir) = match terminal_workbench(Some(&thread), cwd.trim()) {
+        Ok(target) => target,
+        Err(error) => {
+            warn(error);
+            return;
         }
     };
     let tab_title = if title.trim().is_empty() {
@@ -141,13 +214,6 @@ pub(crate) fn start_terminal_task(
         return;
     }
 
-    let bridge: Arc<dyn WorkbenchBridge> = if bridges(|b| b.mock) {
-        let Some(wb) = workbench() else { return };
-        wb
-    } else {
-        Arc::new(LocalWorkbench::new(PathBuf::from(&dir), None))
-    };
-
     let (input, mut events) = unbounded_channel();
     SHELLS.with(|all| all.borrow_mut().insert(key.clone(), input));
     let (sink, mut output) = unbounded_channel();
@@ -155,7 +221,8 @@ pub(crate) fn start_terminal_task(
         if let Some(s) = b.terminal.sessions.iter_mut().find(|s| s.id == session_id) {
             s.running = true;
         }
-        b.terminal.on_output(&session_id, &format!("$ {command}\r\n"));
+        b.terminal
+            .on_output(&session_id, &format!("$ {command}\r\n"));
     });
 
     spawn_for_window(async move {
@@ -182,7 +249,10 @@ pub(crate) fn start_terminal_task(
                         Input::Size(rows, cols) => {
                             call(bridge.terminal_resize(session_id.clone(), rows, cols)).await
                         }
-                        Input::Close => call(bridge.terminal_interrupt(session_id.clone())).await,
+                        Input::Interrupt => {
+                            call(bridge.terminal_interrupt(session_id.clone())).await
+                        }
+                        Input::Close => call(bridge.terminal_close(session_id.clone())).await,
                     };
                     if let Err(e) = result {
                         bench().update(|b| {
@@ -281,7 +351,7 @@ fn terminal_input(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_input;
+    use super::{terminal_input, terminal_peer};
 
     #[test]
     fn terminal_command_submits_multiline_as_one_shell_input() {
@@ -298,5 +368,26 @@ mod tests {
             assert!(output.status.success());
             assert_eq!(output.stdout, b"\t$literal \\n\n3");
         }
+    }
+
+    #[test]
+    fn terminal_machine_and_thread_follow_the_request_owner() {
+        assert_eq!(terminal_peer(None, Some(""), Some("chat")), None);
+        assert_eq!(
+            terminal_peer(Some("mac"), None, Some("chat")),
+            Some(("mac", "chat".into()))
+        );
+        assert_eq!(
+            terminal_peer(None, Some("linux"), Some("child")),
+            Some(("linux", "remote_child".into()))
+        );
+        assert_eq!(
+            terminal_peer(Some("mac"), Some("linux"), Some("child")),
+            Some(("linux", "remote_child".into()))
+        );
+        assert_eq!(
+            terminal_peer(None, Some("linux"), None),
+            Some(("linux", String::new()))
+        );
     }
 }

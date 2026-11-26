@@ -101,6 +101,11 @@ pub struct ResyncRequired {
     pub message: String,
 }
 
+/// Thread created on the execution host for a federated thread on its owner Core.
+pub fn federated_thread_id(owner_thread_id: &str) -> String {
+    format!("remote_{owner_thread_id}")
+}
+
 impl ServerStatus {
     pub fn has_capability(&self, name: &str) -> bool {
         self.capabilities.iter().flatten().any(|s| s == name)

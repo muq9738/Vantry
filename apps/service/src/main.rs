@@ -13,6 +13,8 @@ mod settings;
 mod usage;
 mod workbench;
 mod workbench_git;
+#[cfg(unix)]
+mod workbench_terminal;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
