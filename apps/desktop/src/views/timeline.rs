@@ -557,7 +557,7 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                         view().flex_row().flex_wrap().justify_end().items_center().gap_1p5().pr(px(30.0)).child(each(
                             move || numbered.get(),
                             |(item, _): &(vantry_protocol::Attachment, String)| item.id.clone(),
-                            |entry, _| {
+                            move |entry, _| {
                                 dynamic(move || {
                                     let (item, label) = entry.get();
                                     if item.mime.starts_with("image/") {
@@ -567,7 +567,29 @@ fn user_row(item: ItemMemo) -> impl IntoElement {
                                         )
                                         .into_element()
                                     } else {
-                                        super::caption(format!("@{label}")).into_element()
+                                        let click_item = item.clone();
+                                        let click_label = label.clone();
+                                        let colors = palette();
+                                        nsh_base::button()
+                                            .accessibility_label(format!("预览 {label}"))
+                                            .on_press(move || {
+                                                controller::open_attachment_preview(
+                                                    click_item.clone(),
+                                                    click_label.clone(),
+                                                )
+                                            })
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded(px(6.0))
+                                            .bg(colors.info_bg)
+                                            .hover(|s| s.opacity(0.85))
+                                            .child(
+                                                text(format!("@{label}"))
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(colors.info_ink),
+                                            )
+                                            .into_element()
                                     }
                                 })
                             },
@@ -735,7 +757,7 @@ fn steer_row(item: ItemMemo) -> impl IntoElement {
                             .child(each(
                                 move || numbered.get(),
                                 |(item, _): &(vantry_protocol::Attachment, String)| item.id.clone(),
-                                |entry, _| {
+                                move |entry, _| {
                                     dynamic(move || {
                                         let (item, label) = entry.get();
                                         if item.mime.starts_with("image/") {
@@ -745,7 +767,29 @@ fn steer_row(item: ItemMemo) -> impl IntoElement {
                                             )
                                             .into_element()
                                         } else {
-                                            super::caption(format!("@{label}")).into_element()
+                                            let click_item = item.clone();
+                                            let click_label = label.clone();
+                                            let colors = palette();
+                                            nsh_base::button()
+                                                .accessibility_label(format!("预览 {label}"))
+                                                .on_press(move || {
+                                                    controller::open_attachment_preview(
+                                                        click_item.clone(),
+                                                        click_label.clone(),
+                                                    )
+                                                })
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded(px(6.0))
+                                                .bg(colors.info_bg)
+                                                .hover(|s| s.opacity(0.85))
+                                                .child(
+                                                    text(format!("@{label}"))
+                                                        .text_size(px(11.5))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(colors.info_ink),
+                                                )
+                                                .into_element()
                                         }
                                     })
                                 },

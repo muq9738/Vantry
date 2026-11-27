@@ -29,7 +29,7 @@ use crate::bridge::{BridgeError, BridgeFuture, ErrorCode};
 
 #[derive(Default)]
 struct Repo {
-    files: BTreeMap<String, String>,
+    files: BTreeMap<String, Vec<u8>>,
     /// path → (index code, worktree code)
     changes: BTreeMap<String, (String, String)>,
     commits: Vec<String>,
@@ -61,13 +61,23 @@ impl MockWorkbench {
         let mut repo = Repo::default();
         for (path, text) in [
             ("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
-            ("README.md", "# demo\n\n一个演示工程。\n"),
-            ("src/main.rs", "fn main() {\n    println!(\"hello, vantry\");\n}\n"),
+            ("README.md", "# demo\n\n一个演示工程。\n\n- [查看源码](src/main.rs:2)\n- [查看截图](docs/preview.png)\n- [矢量图](docs/badge.svg)\n"),
+            ("src/main.rs", "fn main() {\n    // Vantry demo entry\n    let greeting = \"hello, vantry\";\n    println!(\"{greeting}\");\n}\n"),
             ("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"),
             ("docs/notes.md", "## 笔记\n\n- 第一条\n- 第二条\n"),
+            ("docs/badge.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"240\" height=\"80\" viewBox=\"0 0 240 80\"><rect width=\"240\" height=\"80\" rx=\"12\" fill=\"#D97757\"/><text x=\"120\" y=\"48\" text-anchor=\"middle\" fill=\"#ffffff\" font-family=\"sans-serif\" font-size=\"24\" font-weight=\"bold\">Vantry SVG</text></svg>\n"),
         ] {
-            repo.files.insert(path.into(), text.into());
+            repo.files.insert(path.into(), text.as_bytes().to_vec());
         }
+        // Small valid 1x1 coral PNG for mock image preview testing.
+        const DEMO_PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        repo.files.insert("docs/preview.png".into(), DEMO_PNG.to_vec());
         repo.changes.insert("src/main.rs".into(), (" ".into(), "M".into()));
         repo.changes.insert("docs/notes.md".into(), ("?".into(), "?".into()));
         repo.commits = vec!["a1b2c3d 初始化工程".into(), "d4e5f6a 添加 lib".into()];
@@ -141,7 +151,7 @@ impl WorkbenchBridge for MockWorkbench {
     fn read_file(&self, path: String) -> BridgeFuture<FileContent> {
         let repo = self.repo.lock().unwrap();
         match repo.files.get(&path) {
-            Some(text) => ok(preview_of(&path, text.as_bytes())),
+            Some(bytes) => ok(preview_of(&path, bytes)),
             None => Box::pin(async { Err(BridgeError::new(ErrorCode::NotFound, "no such file")) }),
         }
     }
@@ -180,7 +190,11 @@ impl WorkbenchBridge for MockWorkbench {
             if side == " " || side.is_empty() || (staged && side == "?") {
                 continue;
             }
-            let text = repo.files.get(file).cloned().unwrap_or_default();
+            let text = repo
+                .files
+                .get(file)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
             if side == "?" {
                 out.push_str(&format!("diff --git a/{file} b/{file}\nnew file\n--- /dev/null\n+++ b/{file}\n"));
                 for line in text.lines() {
@@ -393,7 +407,11 @@ impl WorkbenchBridge for MockWorkbench {
             .filter(|p| p.to_lowercase().contains(&needle))
             .map(|p| SearchHit { path: p.clone(), ..SearchHit::default() })
             .collect();
-        for (path, text) in &repo.files {
+        for (path, bytes) in &repo.files {
+            if super::looks_binary(bytes) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
                     hits.push(SearchHit {

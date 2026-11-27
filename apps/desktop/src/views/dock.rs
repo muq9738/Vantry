@@ -14,9 +14,7 @@ use crate::{
     bridge::workbench::SearchHit,
     controller,
     icons::Icon,
-    state::{
-        workbench::{Change, DockTab, FileSearch, PreviewContent, TreeRow},
-    },
+    state::workbench::{Change, DockTab, FileSearch, TreeRow},
     theme::palette,
 };
 
@@ -448,17 +446,77 @@ fn files_panel() -> impl IntoElement {
         controller::bench().with_untracked(|b| b.files.rows())
     });
     let selected = computed(|| controller::bench().with(|b| b.files.selected.clone()));
+    let loading_file = computed(|| controller::bench().with(|b| b.files.loading_file));
     let preview = computed(|| controller::bench().with(|b| b.files.preview.clone()));
+    let highlight = computed(|| controller::bench().with(|b| b.files.highlight_lines));
+    let wrap = computed(|| controller::bench().with(|b| b.files.wrap));
     let error = computed(|| controller::bench().with(|b| b.files.error.clone()));
     let root = computed(|| controller::bench().with(|b| b.root.clone()));
     let search = computed(|| controller::bench().with(|b| b.files.search.clone()));
     let searching = move || search.with(|s| s.active());
-    let tree = computed(move ||preview.with(Option::is_none) || controller::bench().with(|b|b.files.show_tree));
-    let file = move ||selected.get_untracked().unwrap_or_default();
-    let markdown = computed(move ||selected.with(|p|p.as_ref().is_some_and(|p|p.to_lowercase().ends_with(".md") || p.to_lowercase().ends_with(".markdown"))));
-    let source = computed(move ||controller::bench().with(|b|b.files.selected.as_ref().is_some_and(|p|b.files.source_paths.contains(p))));
+    let tree = computed(move || {
+        (selected.with(Option::is_none) && preview.with(Option::is_none))
+            || controller::bench().with(|b| b.files.show_tree)
+    });
+    let file = move || selected.get_untracked().unwrap_or_default();
+    let local_abs = computed(move || {
+        let r = root.get();
+        let p = selected.get()?;
+        if r.is_empty() || controller::remote_project() {
+            return None;
+        }
+        Some(
+            std::path::Path::new(&r)
+                .join(p)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    });
+    let is_markdown = computed(move || {
+        selected.with(|p| {
+            p.as_deref()
+                .is_some_and(crate::bridge::workbench::is_markdown_ext)
+        })
+    });
+    let is_svg = computed(move || {
+        selected.with(|p| p.as_deref().is_some_and(crate::bridge::workbench::is_svg_ext))
+    });
+    let is_html = computed(move || {
+        selected.with(|p| p.as_deref().is_some_and(crate::bridge::workbench::is_html_ext))
+    });
+    let has_source_toggle = computed(move || is_markdown.get() || is_svg.get() || is_html.get());
+    let source = computed(move || {
+        controller::bench().with(|b| {
+            b.files
+                .selected
+                .as_ref()
+                .is_some_and(|p| b.files.source_paths.contains(p))
+        })
+    });
+    let is_raster_image = computed(move || {
+        preview.with(|p| {
+            p.as_ref()
+                .is_some_and(|f| f.binary && f.image_data_uri.is_some())
+        })
+    });
+    let is_other_binary = computed(move || {
+        preview.with(|p| {
+            p.as_ref()
+                .is_some_and(|f| f.binary && f.image_data_uri.is_none())
+        })
+    });
+    let is_code_shown = computed(move || {
+        preview.with(Option::is_some)
+            && !is_raster_image.get()
+            && !is_other_binary.get()
+            && (!has_source_toggle.get() || source.get())
+            && !selected.with(|p| p.as_deref().is_some_and(crate::bridge::workbench::is_diff_ext))
+    });
+    let image_src = computed(move || preview.with(|p| p.as_ref().and_then(|f| f.image_data_uri.clone())));
     view()
         .flex_1()
+        .min_w_0()
+        .min_h_0()
         .flex_col()
         .child(
             view()
@@ -467,15 +525,41 @@ fn files_panel() -> impl IntoElement {
                 .gap_1()
                 .px_3()
                 .py_1p5()
+                .child(crate::icons::icon(Icon::Folder, 14.0, colors.muted))
                 .child(
-                    crate::icons::icon(Icon::Folder, 14.0, colors.muted),
+                    view()
+                        .flex_1()
+                        .min_w_0()
+                        .tooltip(super::tip(move || root.get()))
+                        .child(
+                            text(move || {
+                                root.with(|p| {
+                                    std::path::Path::new(p)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| p.clone())
+                                })
+                            })
+                            .number_of_lines(1u32)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(13.0))
+                            .text_color(colors.ink),
+                        ),
                 )
-                .child(view().flex_1().min_w_0().tooltip(super::tip(move ||root.get())).child(
-                    text(move || root.with(|p| std::path::Path::new(p).file_name().map(|s|s.to_string_lossy().into_owned()).unwrap_or_else(||p.clone())))
-                        .number_of_lines(1u32).font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(13.0)).text_color(colors.ink)))
-                .child(view().tooltip(super::tip(crate::tr("刷新"))).child(icon_button(Icon::RefreshCw, "刷新", controller::refresh_files)))
-                .child(view().tooltip(super::tip(crate::tr("在访达中显示"))).child(icon_button(Icon::ExternalLink, "在访达中显示", controller::reveal_workspace))),
+                .child(
+                    view()
+                        .tooltip(super::tip(crate::tr("刷新")))
+                        .child(icon_button(Icon::RefreshCw, "刷新", controller::refresh_files)),
+                )
+                .child(
+                    view()
+                        .tooltip(super::tip(crate::tr("在访达中显示")))
+                        .child(icon_button(
+                            Icon::ExternalLink,
+                            "在访达中显示",
+                            controller::reveal_workspace,
+                        )),
+                ),
         )
         .child(
             view()
@@ -505,7 +589,10 @@ fn files_panel() -> impl IntoElement {
                 )
                 .child(when(
                     move || search.with(|s| s.active()),
-                    || link_button("✕", || controller::set_file_search("")).accessibility_label("清除搜索"),
+                    || {
+                        link_button("✕", || controller::set_file_search(""))
+                            .accessibility_label("清除搜索")
+                    },
                 )),
         )
         .child(when(
@@ -517,55 +604,290 @@ fn files_panel() -> impl IntoElement {
                     .text_color(colors.danger)
             },
         ))
-        .child(view().flex_row().flex_1().min_h_0().gap_2().p_2()
-        .child(when(move ||tree.get(),move ||view().w(px(188.0)).flex_shrink_0().flex_col().bg(colors.sidebar).border_1().border_color(colors.line_soft).rounded(px(9.0)).overflow_hidden()
-        .child(when(searching, move || search_results(search, selected, preview)))
-        .child(when(move || !searching(), move || {
-            scroll().flex_1().child(view().flex_col().p_1().child(each(
-                move || rows.get(),
-                |r: &TreeRow| r.entry.path.clone(),
-                move |row, _| tree_row(row, selected),
-            )))
-        }))))
-        .child(when(move ||preview.with(Option::is_none),||view().flex_1().items_center().justify_center().child(caption("选择左侧文件以阅读内容"))))
-        .child(when(
-            move || preview.with(Option::is_some),
-            move || {
-                view()
-                    .flex_1()
-                    .flex_col()
-                    .border_t_1()
-                    .border_t_color(colors.line)
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .px_3()
-                            .py_1()
-                            .child(
-                                text(move || selected.get().unwrap_or_default())
-                                    .flex_1()
-                                    .number_of_lines(1u32)
-                                    .font_family(MONO)
-                                    .text_size(px(11.5))
-                                    .text_color(colors.ink),
+        .child(
+            view()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .gap_2()
+                .p_2()
+                .child(when(move || tree.get(), move || {
+                    view()
+                        .w(px(188.0))
+                        .flex_shrink_0()
+                        .flex_col()
+                        .min_h_0()
+                        .bg(colors.sidebar)
+                        .border_1()
+                        .border_color(colors.line_soft)
+                        .rounded(px(9.0))
+                        .overflow_hidden()
+                        .child(when(searching, move || {
+                            search_results(search, selected, preview)
+                        }))
+                        .child(when(move || !searching(), move || {
+                            scroll().flex_1().min_h_0().child(
+                                view().flex_col().p_1().child(each(
+                                    move || rows.get(),
+                                    |r: &TreeRow| r.entry.path.clone(),
+                                    move |row, _| tree_row(row, selected),
+                                )),
                             )
-                            .child(link_button(move ||if tree.get(){"隐藏目录"}else{"显示目录"},||controller::bench().update(|b|b.files.show_tree=!b.files.show_tree)))
-                            .child(when(move ||markdown.get(),move ||link_button(move ||if source.get(){"阅读预览"}else{"查看源码"},move ||controller::bench().update(|b|{let p=file();if !b.files.source_paths.remove(&p){b.files.source_paths.insert(p);}}))))
-                            .child(view().tooltip(super::tip(crate::tr("复制路径"))).child(super::small_icon_button(Icon::Copy,"复制路径",move ||controller::copy(file()))))
-                            .child(view().tooltip(super::tip(crate::tr("引用到输入框"))).child(super::small_icon_button(Icon::Quote,"引用到输入框",move ||controller::quote_to_draft(file())))),
-                    )
-                    .child(when(move ||markdown.get() && !source.get(),move ||scroll().flex_1().child(dynamic(move ||markdown::static_document(&crate::state::markdown::MarkdownDoc::parse(&preview.with(|p|p.as_ref().map(|p|p.text.clone()).unwrap_or_default()))).into_element()))))
-                    .child(when(move ||!markdown.get() || source.get(),move ||scroll().flex_1().child(code_lines(move || {
-                        preview.with(|p| match p {
-                            Some(file) if file.binary => "（二进制文件，不预览）".to_owned(),
-                            Some(file) if file.truncated => format!("{}\n…（已截断）", file.text),
-                            Some(file) => file.text.clone(),
-                            None => String::new(),
-                        })
-                    }))))
-            },
-        )))
+                        }))
+                }))
+                .child(when(
+                    move || selected.with(Option::is_none) && preview.with(Option::is_none),
+                    || {
+                        view()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .justify_center()
+                            .child(caption("选择左侧文件以阅读内容"))
+                    },
+                ))
+                .child(when(
+                    move || selected.with(Option::is_some) || preview.with(Option::is_some),
+                    move || {
+                        view()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex_col()
+                            .rounded(px(9.0))
+                            .border_1()
+                            .border_color(colors.line_soft)
+                            .overflow_hidden()
+                            .child(
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2p5()
+                                    .py_1p5()
+                                    .bg(colors.soft)
+                                    .border_b_1()
+                                    .border_b_color(colors.line_soft)
+                                    .child(
+                                        view()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .tooltip(super::tip(move || {
+                                                selected.get().unwrap_or_default()
+                                            }))
+                                            .child(
+                                                text(move || selected.get().unwrap_or_default())
+                                                    .number_of_lines(1u32)
+                                                    .font_family(MONO)
+                                                    .text_size(px(11.5))
+                                                    .text_color(colors.ink),
+                                            ),
+                                    )
+                                    .child(when(
+                                        move || highlight.with(Option::is_some),
+                                        move || {
+                                            text(move || {
+                                                highlight
+                                                    .get()
+                                                    .map(super::preview::format_line_badge)
+                                                    .unwrap_or_default()
+                                            })
+                                            .font_family(MONO)
+                                            .text_size(px(10.5))
+                                            .text_color(colors.accent)
+                                            .px_1()
+                                            .rounded(px(4.0))
+                                            .bg(colors.info_bg)
+                                        },
+                                    ))
+                                    .child(link_button(
+                                        move || if tree.get() { "隐藏目录" } else { "显示目录" },
+                                        || {
+                                            controller::bench()
+                                                .update(|b| b.files.show_tree = !b.files.show_tree)
+                                        },
+                                    ))
+                                    .child(when(
+                                        move || is_code_shown.get(),
+                                        move || {
+                                            link_button(
+                                                move || if wrap.get() { "已折行" } else { "折行" },
+                                                controller::toggle_files_wrap,
+                                            )
+                                        },
+                                    ))
+                                    .child(when(
+                                        move || has_source_toggle.get(),
+                                        move || {
+                                            link_button(
+                                                move || {
+                                                    if source.get() {
+                                                        "阅读预览"
+                                                    } else {
+                                                        "查看源码"
+                                                    }
+                                                },
+                                                move || {
+                                                    controller::bench().update(|b| {
+                                                        let p = file();
+                                                        if !b.files.source_paths.remove(&p) {
+                                                            b.files.source_paths.insert(p);
+                                                        }
+                                                    })
+                                                },
+                                            )
+                                        },
+                                    ))
+                                    .child(when(
+                                        move || image_src.with(Option::is_some),
+                                        move || {
+                                            link_button("复制图片", move || {
+                                                if let Some(src) = image_src.get_untracked() {
+                                                    controller::copy_image_preview(src, file());
+                                                }
+                                            })
+                                        },
+                                    ))
+                                    .child(when(
+                                        move || preview.with(Option::is_some),
+                                        || {
+                                            view()
+                                                .tooltip(super::tip("弹窗放大预览"))
+                                                .child(super::small_icon_button(
+                                                    Icon::Maximize2,
+                                                    "弹窗放大预览",
+                                                    controller::expand_selected_file_to_preview,
+                                                ))
+                                        },
+                                    ))
+                                    .child(when(
+                                        move || local_abs.with(Option::is_some),
+                                        move || {
+                                            view()
+                                                .tooltip(super::tip("使用默认应用打开"))
+                                                .child(super::small_icon_button(
+                                                    Icon::ExternalLink,
+                                                    "使用默认应用打开",
+                                                    move || {
+                                                        if let Some(p) = local_abs.get_untracked() {
+                                                            controller::open_local_path(p);
+                                                        }
+                                                    },
+                                                ))
+                                        },
+                                    ))
+                                    .child(
+                                        view()
+                                            .tooltip(super::tip(crate::tr("复制路径")))
+                                            .child(super::small_icon_button(
+                                                Icon::Copy,
+                                                "复制路径",
+                                                move || controller::copy(file()),
+                                            )),
+                                    )
+                                    .child(
+                                        view()
+                                            .tooltip(super::tip(crate::tr("引用到输入框")))
+                                            .child(super::small_icon_button(
+                                                Icon::Quote,
+                                                "引用到输入框",
+                                                move || controller::quote_to_draft(file()),
+                                            )),
+                                    ),
+                            )
+                            .child(view().flex_1().min_w_0().min_h_0().flex_col().child(dynamic(
+                                move || {
+                                    if loading_file.get() {
+                                        return view()
+                                            .flex_1()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(caption("正在加载文件…"))
+                                            .into_element();
+                                    }
+                                    let Some(f) = preview.get() else {
+                                        return view()
+                                            .flex_1()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(caption("无法预览该文件"))
+                                            .into_element();
+                                    };
+                                    let abs = local_abs.get();
+                                    let hl = highlight.get();
+                                    let show_src = source.get();
+                                    let wrapped = wrap.get();
+                                    if crate::bridge::workbench::is_svg_ext(&f.path)
+                                        && let Some(src) = f.image_data_uri.clone()
+                                    {
+                                        if show_src {
+                                            return super::preview::code_viewer(
+                                                f.text,
+                                                "xml".into(),
+                                                wrapped,
+                                                f.truncated,
+                                                hl,
+                                            )
+                                            .into_element();
+                                        }
+                                        return super::preview::image_viewer(src, false)
+                                            .into_element();
+                                    }
+                                    if let Some(src) = f.image_data_uri.clone() {
+                                        return super::preview::image_viewer(src, false)
+                                            .into_element();
+                                    }
+                                    if f.binary {
+                                        return super::preview::binary_file_card(
+                                            f.path, abs, f.mime, f.size,
+                                        )
+                                        .into_element();
+                                    }
+                                    if crate::bridge::workbench::is_markdown_ext(&f.path)
+                                        && !show_src
+                                    {
+                                        let doc = crate::state::markdown::MarkdownDoc::parse(&f.text);
+                                        return scroll()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .min_h_0()
+                                            .child(
+                                                view()
+                                                    .w_full()
+                                                    .min_w_0()
+                                                    .px_4()
+                                                    .py_3()
+                                                    .child(markdown::static_document(&doc)),
+                                            )
+                                            .into_element();
+                                    }
+                                    if crate::bridge::workbench::is_html_ext(&f.path) && !show_src {
+                                        return super::preview::html_viewer(f.path, f.text)
+                                            .into_element();
+                                    }
+                                    if crate::bridge::workbench::is_diff_ext(&f.path) {
+                                        return scroll()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .min_h_0()
+                                            .child(view().p_3().child(markdown::diff_text(&f.text)))
+                                            .into_element();
+                                    }
+                                    let lang = crate::bridge::workbench::ext_lower(&f.path);
+                                    super::preview::code_viewer(
+                                        f.text,
+                                        lang,
+                                        wrapped,
+                                        f.truncated,
+                                        hl,
+                                    )
+                                    .into_element()
+                                },
+                            )))
+                    },
+                )),
+        )
 }
 
 /// What the search found: file names, then matching lines.
@@ -606,9 +928,10 @@ fn search_results(
                     |(n, _): &(usize, SearchHit)| *n,
                     move |hit, _| {
                         let path = move || hit.with_untracked(|(_, h)| h.path.clone());
+                        let line_no = move || hit.with_untracked(|(_, h)| h.line_number);
                         let on = move || selected.with(|s| s.as_deref() == Some(hit.with(|(_, h)| h.path.clone()).as_str()));
                         nsh_base::button()
-                            .on_press(move || controller::open_search_hit(path()))
+                            .on_press(move || controller::open_search_hit_at(path(), line_no()))
                             .flex_col()
                             .px_2()
                             .py_0p5()
@@ -693,30 +1016,6 @@ fn tree_row(row: ReadSignal<TreeRow>, selected: Memo<Option<String>>) -> impl In
                 .text_size(px(12.0))
                 .text_color(move || if is_dir() || on() { colors.ink } else { colors.muted }),
         )
-}
-
-/// Source text with line numbers.
-fn code_lines(source: impl Fn() -> String + 'static) -> impl IntoElement {
-    let colors = palette();
-    let numbered = computed(move || {
-        let text = source();
-        let width = text.lines().count().max(1).to_string().len();
-        text.lines()
-            .enumerate()
-            .map(|(n, line)| format!("{:>width$}  {line}", n + 1))
-            .collect::<Vec<_>>()
-            .join("\n")
-    });
-    scroll().horizontal().child(
-        text(move || numbered.get())
-            .select_text()
-            .font_family(MONO)
-            .text_size(px(11.5))
-            .line_height(LineHeight::Multiple(1.45))
-            .text_color(colors.ink)
-            .px_3()
-            .py_2(),
-    )
 }
 
 pub(super) fn git_panel() -> impl IntoElement {
@@ -1462,58 +1761,4 @@ fn shell_screen(id: String) -> impl IntoElement {
                 controller::shell_resize(&resize, *rows as u16, *cols as u16);
             }
         })
-}
-
-pub(crate) fn preview_dialog() -> impl IntoElement {
-    when(||controller::bench().with(|b|b.preview.content.is_some()),||{
-        let close=||controller::bench().update(|b|b.preview=Default::default());
-        nsh_base::dialog().on_cancel(close).child(view().flex_1().bg(palette().scrim).items_center().justify_center().p_5().child(view().max_w(px(940.0)).w_full().max_h(px(680.0)).h_full().bg(palette().canvas).rounded(px(12.0)).p_3().child(link_button("关闭预览",close)).child(preview_panel())))
-    })
-}
-
-fn preview_panel() -> impl IntoElement {
-    let colors = palette();
-    let title = computed(|| controller::bench().with(|b| b.preview.title.clone()));
-    let content = computed(|| controller::bench().with(|b| b.preview.content.clone()));
-    let source = computed(|| controller::bench().with(|b| b.preview.source));
-    let raw = computed(|| controller::bench().with(|b| b.preview.raw().to_owned()));
-    let is_markdown = move || matches!(content.get(), Some(PreviewContent::Markdown(_)));
-    view()
-        .flex_1()
-        .flex_col()
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .px_3()
-                .py_1p5()
-                .child(
-                    text(move || {
-                        let t = title.get();
-                        if t.is_empty() { "预览".to_owned() } else { t }
-                    })
-                    .flex_1()
-                    .number_of_lines(1u32)
-                    .text_size(px(12.5))
-                    .text_color(colors.ink),
-                )
-                .child(when(is_markdown, move || {
-                    link_button(move || if source.get() { "渲染" } else { "源码" }, controller::toggle_preview_source)
-                }))
-                .child(link_button("复制", move || controller::copy(raw.get_untracked()))),
-        )
-        .child(scroll().flex_1().child(view().p_3().child(dynamic(move || {
-            match (content.get(), source.get()) {
-                (None, _) => text("在文件面板选择文件，或在回复上选择“在预览中打开”。")
-                    .text_size(px(12.0))
-                    .text_color(colors.faint)
-                    .into_element(),
-                (Some(PreviewContent::Markdown(_)), true) | (Some(PreviewContent::Code { .. }), _) => {
-                    code_lines(move || raw.get()).into_element()
-                }
-                (Some(PreviewContent::Markdown(doc)), false) => markdown::static_document(&doc).into_element(),
-                (Some(PreviewContent::Diff(diff)), _) => markdown::diff_text(&diff).into_element(),
-            }
-        }))))
 }

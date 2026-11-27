@@ -17,6 +17,7 @@ pub(crate) mod header;
 pub(crate) mod markdown;
 pub(crate) mod pickers;
 pub(crate) mod plugin_panel;
+pub(crate) mod preview;
 mod reference_input;
 pub(crate) use reference_input::remember_copy;
 pub(crate) mod remote_desktop;

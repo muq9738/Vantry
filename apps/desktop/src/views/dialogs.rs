@@ -178,6 +178,7 @@ pub(crate) fn attachment_preview_dialog() -> impl IntoElement {
                                 .border_1()
                                 .border_color(colors.line)
                                 .shadow_xl()
+                                .on_press(|| {})
                                 .child(
                                     view()
                                         .flex_row()

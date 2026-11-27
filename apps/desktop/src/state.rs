@@ -17,6 +17,7 @@ mod actions;
 pub mod draft;
 pub use draft::{Draft, DraftMention};
 pub mod approval;
+pub mod file_link;
 pub mod markdown;
 pub(crate) mod thread_links;
 pub mod language;
@@ -456,6 +457,7 @@ pub fn title_from_message(text: &str) -> String {
         .into_iter()
         .map(|inline| match inline {
             markdown::Inline::Link { text, .. } => text,
+            markdown::Inline::Image { alt, .. } => alt,
             markdown::Inline::Text(text)
             | markdown::Inline::Strong(text)
             | markdown::Inline::Emphasis(text)

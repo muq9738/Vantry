@@ -145,6 +145,52 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
                 .child(text(title.clone()).underline().text_color(colors.info_ink)));
             continue;
         }
+        if let Inline::Image { alt, url } = inline {
+            let label = if alt.trim().is_empty() {
+                std::path::Path::new(url)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "图片".to_owned())
+            } else {
+                alt.clone()
+            };
+            let href = url.clone();
+            let load_url = url.clone();
+            let loaded = signal(None::<String>);
+            spawn(async move {
+                loaded.set(controller::load_inline_image(load_url).await);
+            });
+            block = block.child(
+                view()
+                    .cursor(Cursor::Pointer)
+                    .tooltip(super::tip(format!("点击预览 {label}")))
+                    .on_press(move || controller::open_link(href.clone()))
+                    .child(dynamic(move || match loaded.get() {
+                        Some(src) => view()
+                            .my_1()
+                            .p_1()
+                            .rounded(px(8.0))
+                            .bg(colors.soft)
+                            .border_1()
+                            .border_color(colors.line_soft)
+                            .child(
+                                image(src)
+                                    .w(px(260.0))
+                                    .h(px(160.0))
+                                    .object_fit(nsh_core::ResizeMode::Contain),
+                            )
+                            .into_element(),
+                        None => text(format!(" {label} "))
+                            .underline()
+                            .text_color(colors.accent)
+                            .bg(colors.soft)
+                            .rounded(px(4.0))
+                            .into_element(),
+                    })),
+            );
+            continue;
+        }
         block = block.child(match inline {
             Inline::Text(t) => text(t.clone()),
             Inline::Strong(t) => text(t.clone()).font_weight(FontWeight::SEMIBOLD),
@@ -156,6 +202,7 @@ pub(crate) fn inline_text(inlines: &[Inline]) -> Text {
                 .bg(colors.code)
                 .rounded(px(4.0))
                 .text_color(colors.ink),
+            Inline::Image { alt, .. } => text(alt.clone()),
             Inline::Link { text: label, url } => {
                 let href = url.clone();
                 if url.starts_with("vantry-attachment://") {

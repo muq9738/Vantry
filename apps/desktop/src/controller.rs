@@ -716,44 +716,179 @@ pub(crate) fn open_link(url: String) {
         drop(nsh_core::element::open_url(trimmed));
         return;
     }
-    let file = if trimmed.starts_with("file://") {
-        url::Url::parse(trimmed)
+    let Some(link) = crate::state::file_link::parse_file_link(trimmed) else {
+        return;
+    };
+    let root = bench().with_untracked(|b| b.root.clone());
+    let remote = remote_project();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let (mut ws_rel, mut local_abs) =
+        crate::state::file_link::resolve_target(&link, &root, home.as_deref(), remote);
+
+    // If a literal path doesn't exist locally, try percent-decoding (`my%20shot.png`).
+    if !remote
+        && let Some(abs) = local_abs.as_ref()
+        && !abs.exists()
+        && let Some(decoded) = crate::state::file_link::percent_decode_path(&link.path)
+    {
+        let mut alt = link.clone();
+        alt.path = decoded;
+        let (alt_rel, alt_abs) =
+            crate::state::file_link::resolve_target(&alt, &root, home.as_deref(), remote);
+        if alt_abs.as_ref().is_some_and(|p| p.exists()) {
+            ws_rel = alt_rel;
+            local_abs = alt_abs;
+        }
+    }
+
+    let is_image = crate::bridge::workbench::is_image_ext(&link.path);
+    if is_image {
+        // Images (screenshots, diagrams, SVGs) always open cleanly inside Vantry's preview modal.
+        if let Some(abs) = local_abs
+            .as_ref()
+            .filter(|p| !bridges(|b| b.mock) && p.exists())
+            .cloned()
+        {
+            open_local_file_preview(abs, link.lines);
+        } else if let Some(rel) = ws_rel {
+            open_workspace_file_preview(rel, local_abs, link.lines);
+        } else if let Some(abs) = local_abs {
+            open_local_file_preview(abs, link.lines);
+        } else if remote {
+            warn("图片位于远端工作区之外，无法预览。");
+        } else {
+            warn("当前会话未关联项目目录，无法定位该图片路径。");
+        }
+        return;
+    }
+
+    // Non-image files inside the active workspace open in the right-side Files reader (tree collapsed).
+    if let Some(rel) = ws_rel {
+        open_file_in_dock(rel, link.lines);
+        return;
+    }
+
+    // Files outside the workspace (or when no project is attached) open in Vantry's preview modal.
+    if let Some(abs) = local_abs {
+        open_local_file_preview(abs, link.lines);
+    } else if remote {
+        warn("文件位于远端工作区之外。");
+    } else {
+        warn("当前会话未关联项目目录，无法定位该相对路径。");
+    }
+}
+
+/// Opens a local file (inside or outside the workspace) in Vantry's Preview Dialog.
+pub(crate) fn open_local_file_preview(path: PathBuf, lines: Option<(usize, usize)>) {
+    let title = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let full = path.to_string_lossy().into_owned();
+    let mut generation = 0;
+    bench().update(|b| {
+        generation = b.preview.begin_loading(&title, Some(full.clone()), lines);
+    });
+    spawn_for_window(async move {
+        let result = crate::bridge::workbench::read_local_file_preview(&path).await;
+        bench().update(move |b| b.preview.finish_file(generation, &title, Some(full), result));
+    });
+}
+
+/// Opens a workspace file via the active [`WorkbenchBridge`] (works for both mock and remote Core)
+/// in Vantry's Preview Dialog.
+pub(crate) fn open_workspace_file_preview(
+    rel_path: String,
+    local_abs: Option<PathBuf>,
+    lines: Option<(usize, usize)>,
+) {
+    let Some((_, workbench)) = project_workbench() else {
+        if let Some(abs) = local_abs {
+            open_local_file_preview(abs, lines);
+        } else {
+            warn("当前工作区尚未就绪，无法预览文件。");
+        }
+        return;
+    };
+    let file_path = local_abs
+        .filter(|_| !bridges(|b| b.mock) && !remote_project())
+        .map(|p| p.to_string_lossy().into_owned());
+    let title = rel_path.clone();
+    let mut generation = 0;
+    bench().update(|b| {
+        generation = b.preview.begin_loading(&title, file_path.clone(), lines);
+    });
+    spawn_for_window(async move {
+        let result = call(workbench.read_file(rel_path))
+            .await
+            .map_err(|e| e.message);
+        bench().update(move |b| b.preview.finish_file(generation, &title, file_path, result));
+    });
+}
+
+/// Loads a local or workspace image referenced by Markdown `![alt](url)` as a `data:` URI.
+pub(crate) async fn load_inline_image(url: String) -> Option<String> {
+    let link = crate::state::file_link::parse_file_link(&url)?;
+    if !crate::bridge::workbench::is_image_ext(&link.path) {
+        return None;
+    }
+    let root = bench().with_untracked(|b| b.root.clone());
+    let remote = remote_project();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let (mut ws_rel, mut local_abs) =
+        crate::state::file_link::resolve_target(&link, &root, home.as_deref(), remote);
+    if !remote
+        && let Some(abs) = local_abs.as_ref()
+        && !abs.exists()
+        && let Some(decoded) = crate::state::file_link::percent_decode_path(&link.path)
+    {
+        let mut alt = link.clone();
+        alt.path = decoded;
+        let (alt_rel, alt_abs) =
+            crate::state::file_link::resolve_target(&alt, &root, home.as_deref(), remote);
+        if alt_abs.as_ref().is_some_and(|p| p.exists()) {
+            ws_rel = alt_rel;
+            local_abs = alt_abs;
+        }
+    }
+    let cache_key = format!(
+        "inline\x1f{}\x1f{}\x1f{}",
+        current_machine().unwrap_or_default(),
+        root,
+        link.path
+    );
+    if let Some(src) = PREVIEWS.with(|p| p.borrow().0.get(&cache_key).cloned()) {
+        return Some(src);
+    }
+    let loaded = if let Some(abs) = local_abs.filter(|p| !bridges(|b| b.mock) && p.exists()) {
+        crate::bridge::workbench::read_local_file_preview(&abs)
+            .await
             .ok()
-            .and_then(|url| url.to_file_path().ok())
-    } else if std::path::Path::new(trimmed).is_absolute() {
-        Some(PathBuf::from(trimmed))
+    } else if let Some(rel) = ws_rel
+        && let Some((_, wb)) = project_workbench()
+    {
+        call(wb.read_file(rel)).await.ok()
     } else {
         None
     };
-    if let Some(file) = file {
-        let path = file.to_string_lossy();
-        let path = path
-            .rsplit_once(':')
-            .filter(|(_, line)| line.parse::<u32>().is_ok())
-            .map_or(path.as_ref(), |(p, _)| p);
-        let root = bench().with_untracked(|b| b.root.clone());
-        let label = std::path::Path::new(path);
-        if !remote_project()
-            && label.extension().and_then(|s| s.to_str()).is_some_and(|s| {
-                matches!(
-                    s.to_ascii_lowercase().as_str(),
-                    "png" | "jpeg" | "jpg" | "webp" | "gif"
-                )
-            })
-        {
-            drop(nsh_core::element::open_path(label));
-        } else if !root.is_empty()
-            && let Ok(relative) = label.strip_prefix(root)
-            && !relative.as_os_str().is_empty()
-        {
-            select_dock_tab(DockTab::Files);
-            open_search_hit(relative.to_string_lossy().replace('\\', "/"));
-        } else if !remote_project() {
-            drop(nsh_core::element::open_path(path));
-        } else {
-            warn("文件位于远端工作区之外。");
+    let src = loaded.and_then(|f| f.image_data_uri)?;
+    PREVIEWS.with(|p| {
+        let (map, bytes) = &mut *p.borrow_mut();
+        if *bytes + src.len() > PREVIEW_CACHE_BYTES {
+            map.clear();
+            *bytes = 0;
         }
-    }
+        *bytes += src.len();
+        if let Some(old) = map.insert(cache_key, src.clone()) {
+            *bytes -= old.len();
+        }
+    });
+    Some(src)
 }
 
 /// Render an offline `svg`/`html`/`artifact` block into a local temp HTML file
@@ -1410,12 +1545,66 @@ pub(crate) fn copy_attachment_image(item: vantry_protocol::Attachment) {
     });
 }
 
+/// Opens any attachment (image, SVG, Markdown, code/text, or binary file) in the unified Preview Dialog.
 pub(crate) fn open_attachment_preview(item: vantry_protocol::Attachment, label: String) {
-    ui().update(move |u| u.attachment_preview = Some((item, label)));
+    let source = state().with_untracked(|s| {
+        s.drafts
+            .get(&s.draft_key())
+            .and_then(|d| d.image_paths.get(&item.id))
+            .cloned()
+    });
+    let modal_title = if label.is_empty() || label == item.name {
+        item.name.clone()
+    } else {
+        format!("{label} · {}", item.name)
+    };
+    let file_path = source.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let mut generation = 0;
+    bench().update(|b| {
+        generation = b.preview.begin_loading(&modal_title, file_path.clone(), None);
+    });
+    spawn_for_window(async move {
+        let result = read_attachment_file_content(&item, source).await;
+        bench().update(move |b| b.preview.finish_file(generation, &modal_title, file_path, result));
+    });
 }
 
 pub(crate) fn close_attachment_preview() {
     ui().update(|u| u.attachment_preview = None);
+}
+
+/// Loads any attachment's raw bytes (from Core `attachment.read` or local draft path)
+/// and converts it into a [`FileContent`] suitable for the unified preview dialog.
+async fn read_attachment_file_content(
+    item: &vantry_protocol::Attachment,
+    source: Option<PathBuf>,
+) -> Result<crate::bridge::workbench::FileContent, String> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    if let Some(workbench) = workbench() {
+        let mut request = actions::request(names::ATTACHMENT_READ);
+        request.thread_id = state().with_untracked(|s| s.selected.clone().unwrap_or_default());
+        if let Ok(val) = serde_json::to_value(item) {
+            request.input = Some(val);
+            if let Ok(response) = call(workbench.workbench(request)).await
+                && !response.data.is_empty()
+                && let Ok(bytes) = STANDARD.decode(&response.data)
+            {
+                let mut fc = crate::bridge::workbench::preview_of_file(
+                    &item.name,
+                    &bytes,
+                    bytes.len() as u64,
+                );
+                if fc.mime.is_empty() && !item.mime.is_empty() {
+                    fc.mime = item.mime.clone();
+                }
+                return Ok(fc);
+            }
+        }
+    }
+    if let Some(path) = source {
+        return crate::bridge::workbench::read_local_file_preview(&path).await;
+    }
+    Err("无法读取该附件内容。".to_owned())
 }
 
 /// Copies a run's reply text.
@@ -1830,7 +2019,19 @@ async fn read_attachment_preview(
             return Some(format!("data:{};base64,{}", item.mime, response.data));
         }
     }
-    source.and_then(|path| path.to_str().map(nsh_core::platform::clipboard::file_url))
+    if let Some(path) = source
+        && let Ok(bytes) = tokio::fs::read(&path).await
+        && (1..=(8 << 20)).contains(&bytes.len())
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let mime = crate::bridge::workbench::detect_image_mime(
+            &path.to_string_lossy(),
+            &bytes,
+        )
+        .unwrap_or(item.mime.as_str());
+        return Some(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)));
+    }
+    None
 }
 
 pub(crate) fn remove_attachment(id: String) {
@@ -2957,9 +3158,31 @@ pub(crate) fn toggle_dir(path: String) {
 }
 
 pub(crate) fn select_file(path: String) {
+    select_file_at(path, None);
+}
+
+pub(crate) fn select_file_at(path: String, lines: Option<(usize, usize)>) {
     let mut load = None;
-    bench().update(|b| load = b.files.select_file(&path));
+    bench().update(|b| load = b.files.select_file_at(&path, lines));
     run_loads(load.into_iter().collect());
+}
+
+/// Opens a workspace file in the right-side Files dock (directory collapsed by default),
+/// optionally highlighting and scrolling to `lines`.
+pub(crate) fn open_file_in_dock(path: String, lines: Option<(usize, usize)>) {
+    bench().update(|b| b.files.show_tree = false);
+    select_dock_tab(DockTab::Files);
+    select_file_at(path, lines);
+}
+
+pub(crate) fn toggle_files_wrap() {
+    bench().update(|b| b.files.wrap = !b.files.wrap);
+}
+
+pub(crate) fn expand_selected_file_to_preview() {
+    bench().update(|b| {
+        b.preview_selected_file();
+    });
 }
 
 pub(crate) fn refresh_files() {
@@ -2982,8 +3205,40 @@ pub(crate) fn preview_text(title: String, text: String) {
     bench().update(move |b| b.preview.show(&title, &text));
 }
 
+pub(crate) fn close_preview() {
+    bench().update(|b| b.preview.close());
+}
+
 pub(crate) fn toggle_preview_source() {
     bench().update(|b| b.preview.toggle_source());
+}
+
+pub(crate) fn toggle_preview_wrap() {
+    bench().update(|b| b.preview.toggle_wrap());
+}
+
+/// Opens a local file with the system's default application.
+pub(crate) fn open_local_path(path: String) {
+    if bridges(|b| b.mock) || path.is_empty() {
+        return;
+    }
+    spawn(async move {
+        if let Err(error) = nsh_core::element::open_path(PathBuf::from(path)).await {
+            warn(format!("无法使用默认应用打开：{error}"));
+        }
+    });
+}
+
+/// Reveals a local file or folder in Finder / Explorer.
+pub(crate) fn reveal_local_path(path: String) {
+    if bridges(|b| b.mock) || path.is_empty() {
+        return;
+    }
+    spawn(async move {
+        if let Err(error) = reveal_path(PathBuf::from(path)).await {
+            warn(format!("无法在访达中显示：{error}"));
+        }
+    });
 }
 
 pub(crate) fn refresh_git() {
@@ -3236,9 +3491,10 @@ pub(crate) fn set_file_search(text: &str) {
     });
 }
 
-/// Opens a search hit in the preview.
-pub(crate) fn open_search_hit(path: String) {
-    select_file(path);
+/// Opens a search hit in the preview, jumping to its matching line when known.
+pub(crate) fn open_search_hit_at(path: String, line_number: usize) {
+    let lines = (line_number > 0).then_some((line_number, line_number));
+    select_file_at(path, lines);
 }
 
 // ----------------------------------------------------------------- composer
@@ -3286,6 +3542,14 @@ pub(crate) fn escape() {
     });
     if picker {
         toggle_model_picker();
+        return;
+    }
+    if bench().with_untracked(|b| b.preview.content.is_some()) {
+        close_preview();
+        return;
+    }
+    if ui().with_untracked(|u| u.attachment_preview.is_some()) {
+        close_attachment_preview();
         return;
     }
     if modal_ui || state().with_untracked(|s| s.modal_request().is_some()) {

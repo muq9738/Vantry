@@ -17,8 +17,7 @@ use vantry_protocol::{
 
 use super::{
     DirEntry, FileContent, MAX_SEARCH_HITS, PrSummary, SearchHit, SettingsData, TerminalSink,
-    WorkbenchBridge, actions::names, mime_of, parse_git_status, preview_of, resolve_in,
-    sort_entries,
+    WorkbenchBridge, actions::names, mime_of, parse_git_status, resolve_in, sort_entries,
 };
 use crate::bridge::{BridgeError, BridgeFuture, ErrorCode};
 
@@ -139,14 +138,21 @@ impl WorkbenchBridge for LocalWorkbench {
         let root = self.root.clone();
         Box::pin(async move {
             let file = resolve_in(&root, &path)?;
+            let meta = tokio::fs::metadata(&file).await.map_err(io_error)?;
+            let total_size = meta.len();
+            let cap = if super::is_image_ext(&path) {
+                super::MAX_IMAGE_PREVIEW_BYTES as u64 + 1
+            } else {
+                super::MAX_PREVIEW_BYTES as u64 + 1
+            };
             let handle = tokio::fs::File::open(&file).await.map_err(io_error)?;
             let mut bytes = Vec::new();
             handle
-                .take(super::MAX_PREVIEW_BYTES as u64 + 1)
+                .take(cap)
                 .read_to_end(&mut bytes)
                 .await
                 .map_err(io_error)?;
-            Ok(preview_of(&path, &bytes))
+            Ok(super::preview_of_file(&path, &bytes, total_size))
         })
     }
 
@@ -873,6 +879,30 @@ mod tests {
             bench.read_file("missing.rs".into()).await.unwrap_err().code,
             ErrorCode::NotFound
         );
+
+        // Verify local preview reads images, SVG, and binary files cleanly.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x05,
+        ];
+        std::fs::write(dir.path().join("shot.png"), png).unwrap();
+        let img = bench.read_file("shot.png".into()).await.unwrap();
+        assert!(img.binary);
+        assert_eq!(img.dimensions, Some((4, 5)));
+        assert!(img.image_data_uri.as_deref().is_some_and(|s| s.starts_with("data:image/png;base64,")));
+
+        std::fs::write(dir.path().join("icon.svg"), "<svg></svg>").unwrap();
+        let svg = bench.read_file("icon.svg".into()).await.unwrap();
+        assert!(!svg.binary);
+        assert_eq!(svg.text, "<svg></svg>");
+        assert!(svg.image_data_uri.as_deref().is_some_and(|s| s.starts_with("data:image/svg+xml;base64,")));
+
+        std::fs::write(dir.path().join("spec.pdf"), b"%PDF-1.7\0raw").unwrap();
+        let pdf = bench.read_file("spec.pdf".into()).await.unwrap();
+        assert!(pdf.binary);
+        assert!(pdf.image_data_uri.is_none());
+        assert_eq!(pdf.mime, "application/pdf");
+        assert_eq!(pdf.size, 12);
         let attachment = bench.attach(dir.path().join("README.md")).await.unwrap();
         assert_eq!((attachment.name.as_str(), attachment.size), ("README.md", 5));
         assert_eq!(attachment.mime, "text/markdown");

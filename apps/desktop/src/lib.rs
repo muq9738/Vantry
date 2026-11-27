@@ -266,7 +266,7 @@ fn workbench() -> impl IntoElement {
             },
         ))
         .child(views::approval_modal::approval_modal())
-        .child(views::dock::preview_dialog())
+        .child(views::preview::preview_dialog())
         .child(views::git::dialog())
         .child(views::git::branch_dialog())
         .child(views::settings::settings())

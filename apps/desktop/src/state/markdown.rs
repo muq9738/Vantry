@@ -21,6 +21,7 @@ pub enum Inline {
     Strike(String),
     Code(String),
     Link { text: String, url: String },
+    Image { alt: String, url: String },
 }
 
 /// One item of a list (nested lists are flattened, with their depth).
@@ -149,6 +150,7 @@ pub fn plain(inlines: &[Inline]) -> String {
             | Inline::Strike(t)
             | Inline::Code(t) => t.as_str(),
             Inline::Link { text, .. } => text.as_str(),
+            Inline::Image { alt, .. } => alt.as_str(),
         })
         .collect()
 }
@@ -527,6 +529,27 @@ pub fn parse_inlines(text: &str) -> Vec<Inline> {
             i += ticks;
             continue;
         }
+        if c == '!' && chars.get(i + 1) == Some(&'[') {
+            if let Some((text_end, url_end)) = link_at(&chars, i + 1) {
+                let mut label = chars[i + 2..text_end].iter().copied().peekable();
+                let mut alt = String::new();
+                while let Some(c) = label.next() {
+                    if c == '\\' && label.peek().is_some_and(char::is_ascii_punctuation) {
+                        alt.push(label.next().unwrap());
+                    } else {
+                        alt.push(c);
+                    }
+                }
+                let url: String = chars[text_end + 2..url_end].iter().collect();
+                flush(&mut plain, &mut out);
+                out.push(Inline::Image {
+                    alt,
+                    url: url.trim().trim_start_matches('<').trim_end_matches('>').to_owned(),
+                });
+                i = url_end + 1;
+                continue;
+            }
+        }
         if c == '[' {
             if let Some((text_end, url_end)) = link_at(&chars, i) {
                 let mut label = chars[i + 1..text_end].iter().copied().peekable();
@@ -850,5 +873,24 @@ mod tests {
         let mut doc = MarkdownDoc::parse("# a\n\nb");
         doc.update("x");
         assert_eq!(doc, MarkdownDoc::parse("x"));
+    }
+
+    #[test]
+    fn parses_inline_markdown_images() {
+        assert_eq!(
+            parse_inlines("结果：![首页截图](screenshots/list.png) 和 [SSE 实现](src/sse.ts:42)"),
+            vec![
+                t("结果："),
+                Inline::Image {
+                    alt: "首页截图".into(),
+                    url: "screenshots/list.png".into(),
+                },
+                t(" 和 "),
+                Inline::Link {
+                    text: "SSE 实现".into(),
+                    url: "src/sse.ts:42".into(),
+                },
+            ]
+        );
     }
 }

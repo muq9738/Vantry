@@ -433,16 +433,39 @@ impl Workbench {
                 out.output = json!({"results": matches}).to_string();
             }
             "files.read" => {
-                let bytes = workspace::read(
-                    &root,
-                    Path::new(r.paths.first().context("file path required")?),
-                    2 << 20,
-                )?;
-                out.output = String::from_utf8(bytes)?
-                    .lines()
-                    .take(2000)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let rel_path = Path::new(r.paths.first().context("file path required")?);
+                let allow_binary = r
+                    .input
+                    .as_ref()
+                    .and_then(|v| v.get("allowBinary"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let limit = if allow_binary { 8 << 20 } else { 2 << 20 };
+                let bytes = workspace::read(&root, rel_path, limit)?;
+                let looks_binary = bytes.iter().take(8192).any(|&b| b == 0);
+                if allow_binary && (looks_binary || std::str::from_utf8(&bytes).is_err()) {
+                    let mime = crate::settings::mime(
+                        rel_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                        &bytes,
+                    );
+                    let is_image = mime.starts_with("image/");
+                    if is_image {
+                        out.data = STANDARD.encode(&bytes);
+                    }
+                    out.output = json!({
+                        "binary": true,
+                        "image": is_image,
+                        "mime": mime,
+                        "size": bytes.len(),
+                    })
+                    .to_string();
+                } else {
+                    out.output = String::from_utf8(bytes)?
+                        .lines()
+                        .take(2000)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
             }
             "reply.image" => {
                 ensure!(!r.thread_id.is_empty(), "thread ID required");

@@ -1411,6 +1411,8 @@ fn attachment_chips(
                         )
                         .into_element()
                 } else {
+                    let click_item = attachment.get_untracked();
+                    let click_label = short.get();
                     view()
                         .flex_row()
                         .items_center()
@@ -1420,14 +1422,27 @@ fn attachment_chips(
                         .h(px(26.0))
                         .rounded(px(7.0))
                         .bg(colors.info_bg)
-                        .child(icon(Icon::Paperclip, 11.5, colors.info_ink))
                         .child(
-                            text(move || format!("@{}", short.get()))
-                                .number_of_lines(1u32)
-                                .max_w(px(180.0))
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(colors.info_ink),
+                            nsh_base::button()
+                                .accessibility_label("预览附件")
+                                .on_press(move || {
+                                    controller::open_attachment_preview(
+                                        click_item.clone(),
+                                        click_label.clone(),
+                                    )
+                                })
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(icon(Icon::Paperclip, 11.5, colors.info_ink))
+                                .child(
+                                    text(move || format!("@{}", short.get()))
+                                        .number_of_lines(1u32)
+                                        .max_w(px(180.0))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.info_ink),
+                                ),
                         )
                         .child(
                             nsh_base::button()

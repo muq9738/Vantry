@@ -62,12 +62,23 @@ pub struct FileContent {
     pub text: String,
     /// Only the first [`MAX_PREVIEW_BYTES`] are shown.
     pub truncated: bool,
-    /// Not text: nothing to show.
+    /// Not text: binary file (may still carry `image_data_uri`).
     pub binary: bool,
+    /// Data URI (`data:image/...;base64,...`) when this file is an image (raster or SVG).
+    pub image_data_uri: Option<String>,
+    /// File size in bytes, when known.
+    pub size: u64,
+    /// Detected MIME type.
+    pub mime: String,
+    /// Image dimensions `(width, height)` when available.
+    pub dimensions: Option<(u32, u32)>,
 }
 
-/// The largest part of a file the preview reads.
+/// The largest part of a text file the preview reads.
 pub const MAX_PREVIEW_BYTES: usize = 512 << 10;
+
+/// The largest image file the preview reads (16 MiB).
+pub const MAX_IMAGE_PREVIEW_BYTES: usize = 16 << 20;
 
 /// What a pull request would say about the branch.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -285,26 +296,178 @@ pub fn resolve_in(root: &Path, path: &str) -> Result<PathBuf, BridgeError> {
     Ok(out)
 }
 
-/// A MIME type from a file name's extension (attachments).
+/// A MIME type from a file name's extension (attachments & previews).
 pub fn mime_of(name: &str) -> &'static str {
-    let ext = name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = ext_lower(name);
     match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "tif" | "tiff" => "image/tiff",
+        "avif" => "image/avif",
+        "heic" | "heif" => "image/heic",
         "svg" => "image/svg+xml",
         "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "dmg" => "application/x-apple-diskimage",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
         "json" => "application/json",
-        "md" | "markdown" => "text/markdown",
-        "txt" | "log" | "rs" | "go" | "ts" | "js" | "py" | "toml" | "yaml" | "yml" | "sh" => {
-            "text/plain"
-        }
+        "html" | "htm" => "text/html",
+        "css" | "scss" | "less" => "text/css",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "md" | "markdown" | "mdx" => "text/markdown",
+        "txt" | "log" | "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py"
+        | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "c" | "cc" | "cpp" | "h" | "hpp"
+        | "java" | "kt" | "swift" | "rb" | "php" | "sql" | "vue" | "svelte" | "ini" | "conf"
+        | "env" | "diff" | "patch" => "text/plain",
         _ => "application/octet-stream",
     }
+}
+
+pub fn ext_lower(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+pub fn is_svg_ext(path: &str) -> bool {
+    ext_lower(path) == "svg"
+}
+
+pub fn is_raster_image_ext(path: &str) -> bool {
+    matches!(
+        ext_lower(path).as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" | "avif" | "heic" | "heif"
+    )
+}
+
+pub fn is_image_ext(path: &str) -> bool {
+    is_raster_image_ext(path) || is_svg_ext(path)
+}
+
+pub fn is_markdown_ext(path: &str) -> bool {
+    matches!(ext_lower(path).as_str(), "md" | "markdown" | "mdx")
+}
+
+pub fn is_html_ext(path: &str) -> bool {
+    matches!(ext_lower(path).as_str(), "html" | "htm")
+}
+
+pub fn is_diff_ext(path: &str) -> bool {
+    matches!(ext_lower(path).as_str(), "diff" | "patch")
+}
+
+/// Detects an image MIME from magic bytes, falling back to `path`'s extension.
+pub fn detect_image_mime(path: &str, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") && bytes.len() >= 26 {
+        return Some("image/bmp");
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("image/x-icon");
+    }
+    if is_svg_ext(path) {
+        return Some("image/svg+xml");
+    }
+    if is_raster_image_ext(path) {
+        return Some(mime_of(path));
+    }
+    None
+}
+
+/// Parses `(width, height)` from common raster image headers without decoding the full bitmap.
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.get(12..16) == Some(b"IHDR") {
+        let d = bytes.get(16..24)?;
+        return Some((
+            u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+            u32::from_be_bytes([d[4], d[5], d[6], d[7]]),
+        ));
+    }
+    if (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) && bytes.len() >= 10 {
+        return Some((
+            u32::from(u16::from_le_bytes([bytes[6], bytes[7]])),
+            u32::from(u16::from_le_bytes([bytes[8], bytes[9]])),
+        ));
+    }
+    if bytes.starts_with(b"BM") && bytes.len() >= 26 {
+        let w = i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]).unsigned_abs();
+        let h = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    if bytes.len() >= 30 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        match &bytes[12..16] {
+            b"VP8X" => {
+                let w = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+                let h = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+                return Some((w, h));
+            }
+            b"VP8L" => {
+                let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+                return Some((1 + (bits & 0x3FFF), 1 + ((bits >> 14) & 0x3FFF)));
+            }
+            b"VP8 " => {
+                let w = u32::from(u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF);
+                let h = u32::from(u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF);
+                return Some((w, h));
+            }
+            _ => {}
+        }
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        let mut data = &bytes[2..];
+        while data.starts_with(&[0xFF]) {
+            while data.first() == Some(&0xFF) {
+                data = &data[1..];
+            }
+            let (&marker, rest) = data.split_first()?;
+            if matches!(marker, 0 | 0xD9 | 0xDA) {
+                return None;
+            }
+            if matches!(marker, 0x01 | 0xD0..=0xD8) {
+                data = rest;
+                continue;
+            }
+            let len = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+            if len < 2 || len > rest.len() {
+                return None;
+            }
+            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+                let f = rest.get(3..7)?;
+                return Some((
+                    u32::from(u16::from_be_bytes([f[2], f[3]])),
+                    u32::from(u16::from_be_bytes([f[0], f[1]])),
+                ));
+            }
+            data = &rest[len..];
+        }
+    }
+    None
 }
 
 /// Whether `bytes` look like text (no NUL in what was read).
@@ -312,23 +475,98 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
-/// `bytes` as preview text: lossy UTF-8, cut at [`MAX_PREVIEW_BYTES`].
-pub fn preview_of(path: &str, bytes: &[u8]) -> FileContent {
+/// `bytes` as preview content, supporting text/code, SVG (text + rendered data URI),
+/// raster images (data URI + dimensions), and other binary files (metadata).
+pub fn preview_of_file(path: &str, bytes: &[u8], total_size: u64) -> FileContent {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let size = if total_size > 0 { total_size } else { bytes.len() as u64 };
+    if is_svg_ext(path) && !looks_binary(bytes) {
+        let truncated = bytes.len() > MAX_PREVIEW_BYTES;
+        let shown = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES)];
+        let data_uri = (bytes.len() <= MAX_IMAGE_PREVIEW_BYTES)
+            .then(|| format!("data:image/svg+xml;base64,{}", STANDARD.encode(bytes)));
+        return FileContent {
+            path: path.to_owned(),
+            text: String::from_utf8_lossy(shown).into_owned(),
+            truncated,
+            binary: false,
+            image_data_uri: data_uri,
+            size,
+            mime: "image/svg+xml".into(),
+            dimensions: None,
+        };
+    }
+    if let Some(mime) = detect_image_mime(path, bytes)
+        && mime != "image/svg+xml"
+    {
+        let dimensions = image_dimensions(bytes);
+        let data_uri = (size <= MAX_IMAGE_PREVIEW_BYTES as u64 && bytes.len() <= MAX_IMAGE_PREVIEW_BYTES)
+            .then(|| format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
+        return FileContent {
+            path: path.to_owned(),
+            text: String::new(),
+            truncated: size > MAX_IMAGE_PREVIEW_BYTES as u64,
+            binary: true,
+            image_data_uri: data_uri,
+            size,
+            mime: mime.into(),
+            dimensions,
+        };
+    }
     if looks_binary(bytes) {
         return FileContent {
             path: path.to_owned(),
             binary: true,
+            size,
+            mime: mime_of(path).into(),
             ..FileContent::default()
         };
     }
-    let truncated = bytes.len() > MAX_PREVIEW_BYTES;
+    let truncated = bytes.len() > MAX_PREVIEW_BYTES || total_size > MAX_PREVIEW_BYTES as u64;
     let shown = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES)];
     FileContent {
         path: path.to_owned(),
         text: String::from_utf8_lossy(shown).into_owned(),
         truncated,
         binary: false,
+        image_data_uri: None,
+        size,
+        mime: mime_of(path).into(),
+        dimensions: None,
     }
+}
+
+/// `bytes` as preview text: lossy UTF-8, cut at [`MAX_PREVIEW_BYTES`].
+pub fn preview_of(path: &str, bytes: &[u8]) -> FileContent {
+    preview_of_file(path, bytes, bytes.len() as u64)
+}
+
+/// Reads any local file for in-app preview (text, code, Markdown, SVG, raster image, or binary metadata).
+pub async fn read_local_file_preview(path: &Path) -> Result<FileContent, String> {
+    use tokio::io::AsyncReadExt;
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("无法访问文件：{e}"))?;
+    if meta.is_dir() {
+        return Err("目标是文件夹，无法直接预览内容。".to_owned());
+    }
+    let total_size = meta.len();
+    let display = path.to_string_lossy().into_owned();
+    let cap = if is_image_ext(&display) {
+        MAX_IMAGE_PREVIEW_BYTES as u64 + 1
+    } else {
+        MAX_PREVIEW_BYTES as u64 + 1
+    };
+    let handle = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("无法打开文件：{e}"))?;
+    let mut bytes = Vec::new();
+    handle
+        .take(cap)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("读取文件失败：{e}"))?;
+    Ok(preview_of_file(&display, &bytes, total_size))
 }
 
 /// Sorts directory entries: folders first, then by name.
@@ -463,6 +701,39 @@ mod tests {
         assert_eq!(preview.text.len(), MAX_PREVIEW_BYTES);
         assert_eq!(mime_of("Shot.PNG"), "image/png");
         assert_eq!(mime_of("notes"), "application/octet-stream");
+    }
+
+    #[test]
+    fn previews_encode_raster_images_svg_and_binary_metadata() {
+        // Minimal 1x1 PNG header + data
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x07, 0x74, 0x00, 0x00, 0x03, 0x77,
+        ];
+        let img = preview_of_file("screenshots/list.png", png, png.len() as u64);
+        assert!(img.binary);
+        assert_eq!(img.mime, "image/png");
+        assert_eq!(img.dimensions, Some((1908, 887)));
+        assert!(
+            img.image_data_uri
+                .as_deref()
+                .is_some_and(|u| u.starts_with("data:image/png;base64,"))
+        );
+
+        let svg = preview_of_file("logo.svg", b"<svg></svg>", 11);
+        assert!(!svg.binary);
+        assert_eq!(svg.text, "<svg></svg>");
+        assert!(
+            svg.image_data_uri
+                .as_deref()
+                .is_some_and(|u| u.starts_with("data:image/svg+xml;base64,"))
+        );
+
+        let pdf = preview_of_file("spec.pdf", b"%PDF-1.7\0body", 2048);
+        assert!(pdf.binary);
+        assert!(pdf.image_data_uri.is_none());
+        assert_eq!(pdf.mime, "application/pdf");
+        assert_eq!(pdf.size, 2048);
     }
 
     #[test]

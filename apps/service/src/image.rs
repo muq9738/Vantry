@@ -24,6 +24,8 @@ pub fn validate(path: &Path, data: &[u8]) -> Result<()> {
             )
         } else if data.starts_with(&[255, 216]) {
             jpeg_size(&data[2..])?
+        } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+            webp_size(data)?
         } else {
             bail!("unsupported image format")
         };
@@ -60,4 +62,56 @@ fn jpeg_size(mut data: &[u8]) -> Result<(u32, u32)> {
         data = &rest[size..];
     }
     bail!("missing JPEG frame header")
+}
+fn webp_size(data: &[u8]) -> Result<(u32, u32)> {
+    let chunk = data.get(12..16).context("invalid WebP chunk")?;
+    match chunk {
+        b"VP8X" => {
+            let b = data.get(24..30).context("invalid WebP VP8X header")?;
+            let w = 1 + u32::from_le_bytes([b[0], b[1], b[2], 0]);
+            let h = 1 + u32::from_le_bytes([b[3], b[4], b[5], 0]);
+            Ok((w, h))
+        }
+        b"VP8L" => {
+            let b = data.get(21..25).context("invalid WebP VP8L header")?;
+            let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            Ok((1 + (bits & 0x3FFF), 1 + ((bits >> 14) & 0x3FFF)))
+        }
+        b"VP8 " => {
+            let b = data.get(26..30).context("invalid WebP VP8 header")?;
+            let w = u32::from(u16::from_le_bytes([b[0], b[1]]) & 0x3FFF);
+            let h = u32::from(u16::from_le_bytes([b[2], b[3]]) & 0x3FFF);
+            Ok((w, h))
+        }
+        _ => bail!("unsupported WebP chunk"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_png_gif_webp_and_svg() {
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10,
+        ];
+        assert!(validate(Path::new("a.png"), &png).is_ok());
+
+        let gif = b"GIF89a\x02\x00\x03\x00";
+        assert!(validate(Path::new("a.gif"), gif).is_ok());
+
+        // VP8X WebP with width = 200 (199 = 0xC7), height = 100 (99 = 0x63)
+        let mut webp = vec![0u8; 30];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8X");
+        webp[24..27].copy_from_slice(&[199, 0, 0]);
+        webp[27..30].copy_from_slice(&[99, 0, 0]);
+        assert!(validate(Path::new("a.webp"), &webp).is_ok());
+
+        assert!(validate(Path::new("a.svg"), b"<svg/>").is_ok());
+        assert!(validate(Path::new("a.txt"), b"hello").is_err());
+    }
 }

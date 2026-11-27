@@ -73,7 +73,7 @@ pub enum Load {
 }
 
 /// The file tree.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesState {
     /// Folders shown open.
     pub expanded: BTreeSet<String>,
@@ -83,11 +83,35 @@ pub struct FilesState {
     /// Monotonic counter bumped whenever the visible tree rows may change.
     pub tree_revision: u64,
     pub selected: Option<String>,
+    pub loading_file: bool,
     pub show_tree: bool,
     pub source_paths: BTreeSet<String>,
+    pub wrap: bool,
+    /// Optional 1-based inclusive line range to highlight & scroll to.
+    pub highlight_lines: Option<(usize, usize)>,
     pub preview: Option<FileContent>,
     pub error: Option<String>,
     pub search: FileSearch,
+}
+
+impl Default for FilesState {
+    fn default() -> Self {
+        Self {
+            expanded: BTreeSet::new(),
+            children: BTreeMap::new(),
+            loading: BTreeSet::new(),
+            tree_revision: 0,
+            selected: None,
+            loading_file: false,
+            show_tree: false,
+            source_paths: BTreeSet::new(),
+            wrap: true,
+            highlight_lines: None,
+            preview: None,
+            error: None,
+            search: FileSearch::default(),
+        }
+    }
 }
 
 /// The file panel's search (names first, then lines).
@@ -223,11 +247,26 @@ impl FilesState {
 
     /// Shows file `path` in the preview.
     pub fn select_file(&mut self, path: &str) -> Option<Load> {
+        self.select_file_at(path, None)
+    }
+
+    /// Shows file `path` in the preview, optionally highlighting/jumping to `lines`.
+    pub fn select_file_at(&mut self, path: &str, lines: Option<(usize, usize)>) -> Option<Load> {
+        self.highlight_lines = lines;
+        if lines.is_some()
+            && (crate::bridge::workbench::is_markdown_ext(path)
+                || crate::bridge::workbench::is_svg_ext(path)
+                || crate::bridge::workbench::is_html_ext(path))
+        {
+            self.source_paths.insert(path.to_owned());
+        }
         if self.selected.as_deref() == Some(path) && self.preview.is_some() {
             return None;
         }
         self.selected = Some(path.to_owned());
+        self.loading_file = true;
         self.preview = None;
+        self.error = None;
         Some(Load::File(path.to_owned()))
     }
 
@@ -235,6 +274,7 @@ impl FilesState {
         if self.selected.as_deref() != Some(path) {
             return; // Another file was picked meanwhile.
         }
+        self.loading_file = false;
         match result {
             Ok(content) => {
                 self.preview = Some(content);
@@ -720,48 +760,241 @@ fn push_capped(output: &mut String, chunk: &str) {
 /// What the preview panel shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewContent {
+    /// Loading asynchronously.
+    Loading,
+    /// Load failed with a human-readable error.
+    Error(String),
     /// Rendered Markdown (a document, a reply).
     Markdown(MarkdownDoc),
-    /// Source with its language (line numbers in the view).
+    /// Source with its language (syntax-colored and line-numbered in the view).
     Code { lang: String, text: String },
     /// A unified diff.
     Diff(String),
+    /// A raster image (`data:image/...;base64,...`).
+    Image {
+        src: String,
+        mime: String,
+        size: u64,
+        dimensions: Option<(u32, u32)>,
+    },
+    /// An SVG image (rendered graphic ↔ XML source).
+    Svg {
+        src: String,
+        xml: String,
+        size: u64,
+    },
+    /// An HTML document (sandboxed render ↔ source).
+    Html {
+        source: String,
+        size: u64,
+    },
+    /// A binary file that cannot be rendered inline (PDF, ZIP, Office, etc.).
+    Binary {
+        mime: String,
+        size: u64,
+    },
 }
 
-/// The preview panel.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The preview modal/panel state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewState {
     pub title: String,
+    /// Full local path when backed by a local file (enables reveal/open externally).
+    pub file_path: Option<String>,
+    /// Optional 1-based inclusive line range to highlight & scroll to.
+    pub highlight_lines: Option<(usize, usize)>,
     pub content: Option<PreviewContent>,
-    /// Markdown shows as its source.
+    /// Rendered view (Markdown / SVG / HTML) shows as source.
     pub source: bool,
+    /// Wrap long lines in code view.
+    pub wrap: bool,
+    /// Whether text content was truncated at the preview byte limit.
+    pub truncated: bool,
+    /// Monotonic counter so stale async loads are ignored.
+    pub generation: u64,
     raw: String,
 }
 
+impl Default for PreviewState {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            file_path: None,
+            highlight_lines: None,
+            content: None,
+            source: false,
+            wrap: true,
+            truncated: false,
+            generation: 0,
+            raw: String::new(),
+        }
+    }
+}
+
 impl PreviewState {
-    /// Shows `text` from `title` (a file name picks Markdown, a diff or code).
+    /// Begins an async file/attachment preview load and returns its generation token.
+    pub fn begin_loading(
+        &mut self,
+        title: &str,
+        file_path: Option<String>,
+        highlight_lines: Option<(usize, usize)>,
+    ) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.title = title.to_owned();
+        self.file_path = file_path;
+        self.highlight_lines = highlight_lines;
+        self.content = Some(PreviewContent::Loading);
+        self.source = false;
+        self.truncated = false;
+        self.raw.clear();
+        self.generation
+    }
+
+    /// Shows `text` from `title` (a file name picks Markdown, HTML, diff, or code).
     pub fn show(&mut self, title: &str, text: &str) {
+        self.generation = self.generation.wrapping_add(1);
+        self.file_path = None;
+        self.highlight_lines = None;
+        self.truncated = false;
+        self.apply_text(title, text, false);
+    }
+
+    /// Populates the preview from a loaded [`FileContent`].
+    pub fn show_file(
+        &mut self,
+        title: &str,
+        file: &FileContent,
+        file_path: Option<String>,
+        highlight_lines: Option<(usize, usize)>,
+    ) {
+        self.generation = self.generation.wrapping_add(1);
+        self.title = title.to_owned();
+        self.file_path = file_path;
+        self.highlight_lines = highlight_lines;
+        self.truncated = file.truncated;
+        self.apply_file_content(title, file);
+    }
+
+    /// Finishes an async load if `generation` is still current.
+    pub fn finish_file(
+        &mut self,
+        generation: u64,
+        title: &str,
+        file_path: Option<String>,
+        result: Result<FileContent, String>,
+    ) {
+        if self.generation != generation {
+            return;
+        }
+        self.title = title.to_owned();
+        if file_path.is_some() {
+            self.file_path = file_path;
+        }
+        match result {
+            Ok(file) => {
+                self.truncated = file.truncated;
+                self.apply_file_content(title, &file);
+            }
+            Err(error) => {
+                self.raw.clear();
+                self.content = Some(PreviewContent::Error(error));
+            }
+        }
+    }
+
+    fn apply_file_content(&mut self, title: &str, file: &FileContent) {
+        let name = if title.is_empty() { &file.path } else { title };
+        if crate::bridge::workbench::is_svg_ext(name)
+            && let Some(src) = &file.image_data_uri
+        {
+            self.raw = file.text.clone();
+            self.source = self.highlight_lines.is_some();
+            self.content = Some(PreviewContent::Svg {
+                src: src.clone(),
+                xml: file.text.clone(),
+                size: file.size,
+            });
+            return;
+        }
+        if let Some(src) = &file.image_data_uri {
+            self.raw.clear();
+            self.source = false;
+            self.content = Some(PreviewContent::Image {
+                src: src.clone(),
+                mime: file.mime.clone(),
+                size: file.size,
+                dimensions: file.dimensions,
+            });
+            return;
+        }
+        if file.binary {
+            self.raw.clear();
+            self.source = false;
+            self.content = Some(PreviewContent::Binary {
+                mime: if file.mime.is_empty() {
+                    crate::bridge::workbench::mime_of(name).into()
+                } else {
+                    file.mime.clone()
+                },
+                size: file.size,
+            });
+            return;
+        }
+        self.apply_text(name, &file.text, self.highlight_lines.is_some());
+    }
+
+    fn apply_text(&mut self, title: &str, text: &str, prefer_source: bool) {
         let lower = title.to_lowercase();
         self.title = title.to_owned();
         self.raw = text.to_owned();
         self.source = false;
-        self.content = Some(if lower.ends_with(".md") || lower.ends_with(".markdown") || lower.is_empty() {
+        self.content = Some(if crate::bridge::workbench::is_markdown_ext(&lower) || lower.is_empty() {
+            self.source = prefer_source;
             PreviewContent::Markdown(MarkdownDoc::parse(text))
-        } else if lower.ends_with(".diff") || lower.ends_with(".patch") || text.starts_with("diff --git") {
+        } else if crate::bridge::workbench::is_html_ext(&lower) {
+            self.source = prefer_source;
+            PreviewContent::Html {
+                source: text.to_owned(),
+                size: text.len() as u64,
+            }
+        } else if crate::bridge::workbench::is_diff_ext(&lower) || text.starts_with("diff --git") {
             PreviewContent::Diff(text.to_owned())
         } else {
             PreviewContent::Code {
-                lang: lower.rsplit_once('.').map(|(_, e)| e.to_owned()).unwrap_or_default(),
+                lang: crate::bridge::workbench::ext_lower(&lower),
                 text: text.to_owned(),
             }
         });
     }
 
-    /// Markdown ↔ its source.
+    /// Rendered view ↔ source (Markdown, SVG, HTML).
     pub fn toggle_source(&mut self) {
-        if matches!(self.content, Some(PreviewContent::Markdown(_))) || self.source {
+        if self.has_source_toggle() || self.source {
             self.source = !self.source;
         }
+    }
+
+    pub fn has_source_toggle(&self) -> bool {
+        matches!(
+            self.content,
+            Some(
+                PreviewContent::Markdown(_)
+                    | PreviewContent::Svg { .. }
+                    | PreviewContent::Html { .. }
+            )
+        )
+    }
+
+    pub fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+    }
+
+    pub fn close(&mut self) {
+        let next_gen = self.generation.wrapping_add(1);
+        *self = PreviewState {
+            generation: next_gen,
+            ..PreviewState::default()
+        };
     }
 
     pub fn raw(&self) -> &str {
@@ -834,16 +1067,20 @@ impl WorkbenchState {
         }
     }
 
-    /// Opens the selected file in the preview panel.
+    /// Opens the selected file in the preview dialog.
     pub fn preview_selected_file(&mut self) -> bool {
-        match &self.files.preview {
-            Some(file) if !file.binary => {
-                let (title, text) = (file.path.clone(), file.text.clone());
-                self.preview.show(&title, &text);
-                true
-            }
-            _ => false,
-        }
+        let Some(file) = self.files.preview.clone() else {
+            return false;
+        };
+        let local_path = (!self.root.is_empty()).then(|| {
+            std::path::Path::new(&self.root)
+                .join(&file.path)
+                .to_string_lossy()
+                .into_owned()
+        });
+        let lines = self.files.highlight_lines;
+        self.preview.show_file(&file.path, &file, local_path, lines);
+        true
     }
 }
 
@@ -1054,5 +1291,66 @@ mod tests {
         assert_eq!(preview.raw(), "fn main() {}");
         assert_eq!(DockTab::parse("terminal"), DockTab::Terminal);
         assert_eq!(DockTab::parse("?"), DockTab::Files);
+    }
+
+    #[test]
+    fn preview_handles_images_svg_html_binary_and_line_highlights() {
+        let mut preview = PreviewState::default();
+        let img = FileContent {
+            path: "shot.png".into(),
+            binary: true,
+            image_data_uri: Some("data:image/png;base64,AAAA".into()),
+            size: 1024,
+            mime: "image/png".into(),
+            dimensions: Some((800, 600)),
+            ..Default::default()
+        };
+        preview.show_file("shot.png", &img, Some("/tmp/shot.png".into()), None);
+        assert!(matches!(
+            preview.content,
+            Some(PreviewContent::Image {
+                dimensions: Some((800, 600)),
+                size: 1024,
+                ..
+            })
+        ));
+        assert_eq!(preview.file_path.as_deref(), Some("/tmp/shot.png"));
+
+        let svg = FileContent {
+            path: "icon.svg".into(),
+            text: "<svg/>".into(),
+            image_data_uri: Some("data:image/svg+xml;base64,PHN2Zy8+".into()),
+            size: 6,
+            mime: "image/svg+xml".into(),
+            ..Default::default()
+        };
+        preview.show_file("icon.svg", &svg, None, None);
+        assert!(matches!(preview.content, Some(PreviewContent::Svg { .. })));
+        assert!(!preview.source);
+        preview.toggle_source();
+        assert!(preview.source);
+
+        let md = FileContent {
+            path: "guide.md".into(),
+            text: "# Heading\nline 2\nline 3".into(),
+            ..Default::default()
+        };
+        preview.show_file("guide.md", &md, None, Some((2, 3)));
+        assert!(matches!(preview.content, Some(PreviewContent::Markdown(_))));
+        assert!(preview.source, "targeting lines in Markdown opens source view");
+        assert_eq!(preview.highlight_lines, Some((2, 3)));
+
+        let pdf = FileContent {
+            path: "report.pdf".into(),
+            binary: true,
+            size: 4096,
+            mime: "application/pdf".into(),
+            ..Default::default()
+        };
+        preview.show_file("report.pdf", &pdf, Some("/tmp/report.pdf".into()), None);
+        assert!(matches!(
+            preview.content,
+            Some(PreviewContent::Binary { size: 4096, .. })
+        ));
     }
 }

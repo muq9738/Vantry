@@ -187,14 +187,53 @@ impl WorkbenchBridge for CoreWorkbench {
         let socket = self.socket.clone();
         let mut req = self.ws_request("files.read");
         req.paths = vec![path.clone()];
+        req.input = Some(serde_json::json!({"allowBinary": true}));
+        let mut fallback = self.ws_request("reply.image");
+        fallback.thread_id = self.terminal_thread.clone();
+        fallback.name = path.clone();
         Box::pin(async move {
-            let res = Self::ask(socket, req).await?;
-            Ok(FileContent {
-                path,
-                text: res.output,
-                truncated: false,
-                binary: false,
-            })
+            match Self::ask(socket.clone(), req).await {
+                Ok(res) => {
+                    if !res.data.is_empty()
+                        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&res.data)
+                    {
+                        let size = serde_json::from_str::<serde_json::Value>(&res.output)
+                            .ok()
+                            .and_then(|v| v["size"].as_u64())
+                            .unwrap_or(bytes.len() as u64);
+                        return Ok(super::preview_of_file(&path, &bytes, size));
+                    }
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&res.output)
+                        && meta["binary"].as_bool() == Some(true)
+                    {
+                        return Ok(FileContent {
+                            path: path.clone(),
+                            binary: true,
+                            size: meta["size"].as_u64().unwrap_or(0),
+                            mime: meta["mime"]
+                                .as_str()
+                                .unwrap_or_else(|| super::mime_of(&path))
+                                .to_owned(),
+                            ..FileContent::default()
+                        });
+                    }
+                    Ok(super::preview_of_file(
+                        &path,
+                        res.output.as_bytes(),
+                        res.output.len() as u64,
+                    ))
+                }
+                Err(err) if super::is_image_ext(&path) && !fallback.thread_id.is_empty() => {
+                    if let Ok(res) = Self::ask(socket, fallback).await
+                        && !res.data.is_empty()
+                        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&res.data)
+                    {
+                        return Ok(super::preview_of_file(&path, &bytes, bytes.len() as u64));
+                    }
+                    Err(err)
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 
@@ -760,6 +799,54 @@ mod tests {
         let attachment = fx.bench.attach(file).await.unwrap();
         assert_eq!(attachment.id, "att-core-1");
         assert!(fx.bench.attach(fx.dir.path().to_path_buf()).await.is_err(), "a folder");
+        fx.finish().await;
+    }
+
+    #[tokio::test]
+    async fn remote_read_file_decodes_binary_and_images() {
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+        ];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        let fx = Fixture::new(Arc::new(move |request: &Value| {
+            assert_eq!(request["action"], "files.read");
+            assert_eq!(request["input"]["allowBinary"], true);
+            match request["paths"][0].as_str().unwrap() {
+                "shot.png" => (
+                    200,
+                    json!({
+                        "data": b64,
+                        "output": json!({"binary": true, "image": true, "mime": "image/png", "size": 24}).to_string()
+                    }),
+                ),
+                "doc.pdf" => (
+                    200,
+                    json!({
+                        "output": json!({"binary": true, "image": false, "mime": "application/pdf", "size": 9000}).to_string()
+                    }),
+                ),
+                _ => (200, json!({"output": "fn main() {}"})),
+            }
+        }));
+        let remote = CoreWorkbench::for_core_workspace(
+            fx.bench.socket.clone(),
+            "/peer/repo".into(),
+            fx.bench.local.clone(),
+            None,
+        );
+        let img = remote.read_file("shot.png".into()).await.unwrap();
+        assert!(img.binary);
+        assert_eq!(img.dimensions, Some((2, 3)));
+        assert!(img.image_data_uri.as_deref().is_some_and(|u| u.starts_with("data:image/png;base64,")));
+        let pdf = remote.read_file("doc.pdf".into()).await.unwrap();
+        assert!(pdf.binary);
+        assert!(pdf.image_data_uri.is_none());
+        assert_eq!(pdf.mime, "application/pdf");
+        assert_eq!(pdf.size, 9000);
+        let code = remote.read_file("main.rs".into()).await.unwrap();
+        assert!(!code.binary);
+        assert_eq!(code.text, "fn main() {}");
         fx.finish().await;
     }
 
