@@ -586,13 +586,18 @@ fn dispatch(command: Command) {
         let thread = command.thread_id.clone();
         let result = call(core.dispatch(command)).await;
         let mut follow_up = None;
-        let mut refresh = None;
+        let mut refresh: Option<(String, u64)> = None;
         state().update(|s| {
-            refresh = s.begin_conflict_refresh(kind, &thread, &result);
+            if let Some(req) = s.begin_conflict_refresh(kind, &thread, &result) {
+                refresh = Some((thread.clone(), req));
+            }
             follow_up = s.on_command_result(&id, result);
+            if refresh.is_none() && follow_up.is_none() {
+                refresh = s.take_missing_detail_load();
+            }
         });
-        if let Some(request) = refresh {
-            load_detail(&core, thread, request).await;
+        if let Some((refresh_thread, request)) = refresh {
+            load_detail(&core, refresh_thread, request).await;
         }
         if let Some(next) = follow_up {
             dispatch(next);

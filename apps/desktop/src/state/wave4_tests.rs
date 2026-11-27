@@ -291,6 +291,119 @@ fn complete_detail_can_send_early_but_waits_after_an_accepted_receipt() {
 }
 
 #[test]
+fn new_thread_remains_submittable_after_first_turn_completes_in_summaries_mode() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 10,
+        threads: Some(vec![summary("existing", 0)]),
+    });
+    state.on_live();
+    state.new_thread();
+    state.set_draft_text("第一轮消息");
+    let create = state.submit().expect("new thread submits in summaries mode");
+    assert_eq!(create.kind, CommandKind::CreateThread);
+
+    let send = state
+        .on_command_result(
+            &create.command_id,
+            Ok(Receipt {
+                accepted: true,
+                thread_id: "t_new".into(),
+                ..Receipt::default()
+            }),
+        )
+        .expect("CreateThread follow-up sends the first message");
+    assert_eq!(send.kind, CommandKind::SendMessage);
+    assert_eq!(state.selected.as_deref(), Some("t_new"));
+
+    assert!(state
+        .on_command_result(
+            &send.command_id,
+            Ok(Receipt {
+                accepted: true,
+                thread_id: "t_new".into(),
+                ..Receipt::default()
+            }),
+        )
+        .is_none());
+
+    state.apply_event(&CoreEvent {
+        sequence: 11,
+        r#type: "run.started".into(),
+        thread_id: "t_new".into(),
+        run_id: "r1".into(),
+        data: serde_json::json!({"id":"r1","threadId":"t_new","status":"running"}),
+        ..CoreEvent::default()
+    });
+    state.apply_event(&CoreEvent {
+        sequence: 12,
+        r#type: "run.completed".into(),
+        thread_id: "t_new".into(),
+        run_id: "r1".into(),
+        data: serde_json::json!({"id":"r1","threadId":"t_new","status":"completed"}),
+        ..CoreEvent::default()
+    });
+
+    state.set_draft_text("第二轮消息");
+    assert!(
+        state.composer_status().can_submit,
+        "newly created thread must stay submittable after its first turn finishes"
+    );
+    let second = state.submit().expect("second message should dispatch");
+    assert_eq!(second.kind, CommandKind::SendMessage);
+    assert_eq!(second.thread_id, "t_new");
+}
+
+#[test]
+fn event_arriving_before_message_receipt_does_not_strand_awaiting_refresh() {
+    let mut state = AppState::default();
+    state.apply_summaries(ThreadSummaries {
+        sequence: 7,
+        threads: Some(vec![summary("t1", 0)]),
+    });
+    state.on_live();
+    let token = state.begin_detail_load("t1");
+    assert!(state.apply_thread_detail(token, detail_variant("t1", "r1", 7, false)));
+
+    state.set_draft_text("快速任务");
+    let send = state.submit().expect("send message");
+    // Live events arrive and finish the run BEFORE the HTTP command receipt returns.
+    state.apply_event(&CoreEvent {
+        sequence: 8,
+        r#type: "run.started".into(),
+        thread_id: "t1".into(),
+        run_id: "r2".into(),
+        data: serde_json::json!({"id":"r2","threadId":"t1","status":"running"}),
+        ..CoreEvent::default()
+    });
+    state.apply_event(&CoreEvent {
+        sequence: 9,
+        r#type: "run.completed".into(),
+        thread_id: "t1".into(),
+        run_id: "r2".into(),
+        data: serde_json::json!({"id":"r2","threadId":"t1","status":"completed"}),
+        ..CoreEvent::default()
+    });
+
+    assert!(state
+        .on_command_result(
+            &send.command_id,
+            Ok(Receipt {
+                accepted: true,
+                thread_id: "t1".into(),
+                ..Receipt::default()
+            }),
+        )
+        .is_none());
+
+    state.set_draft_text("下一条消息");
+    assert!(
+        state.composer_status().can_submit,
+        "receipt arriving after live events must not lock composer in awaiting_refresh"
+    );
+}
+
+#[test]
 fn truncated_detail_stays_blocked_unless_same_sequence_proves_idle() {
     let mut state = AppState::default();
     state.apply_summaries(ThreadSummaries {

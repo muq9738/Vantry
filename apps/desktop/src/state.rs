@@ -231,6 +231,9 @@ pub struct PendingCommand {
     pub in_flight: bool,
     /// Why its outcome is unknown (shown with a retry), when it is.
     pub unconfirmed: Option<String>,
+    /// Event cursor when this command was dispatched, used to tell whether a
+    /// live event for the thread already landed before the HTTP receipt returned.
+    pub dispatched_sequence: i64,
 }
 
 /// Where the subscription goes after its stream ended.
@@ -376,6 +379,9 @@ pub struct AppState {
     /// A receipt was accepted, but no authoritative snapshot/event has
     /// arrived yet. Keep the composer blocked so a second send cannot race it.
     awaiting_refresh: BTreeSet<String>,
+    /// Highest event sequence observed per thread, so a live event that raced
+    /// ahead of an HTTP command receipt does not leave `awaiting_refresh` stuck.
+    last_thread_event_seq: BTreeMap<String, i64>,
     /// Child threads whose bounded detail was merged in summaries mode.
     child_details: BTreeSet<String>,
     pub stats: FoldStats,
@@ -421,6 +427,7 @@ impl Default for AppState {
             summary_active_runs: BTreeMap::new(),
             detail_readiness: None,
             awaiting_refresh: BTreeSet::new(),
+            last_thread_event_seq: BTreeMap::new(),
             child_details: BTreeSet::new(),
             stats: FoldStats::default(),
         }
@@ -1094,6 +1101,7 @@ impl AppState {
         }
         let id = thread.id;
         self.detail_readiness = Some((id.clone(), sequence, truncated_runs));
+        self.awaiting_refresh.remove(&id);
         self.summary_statuses.remove(&id);
         self.summary_activity.remove(&id);
         self.runs.retain(|run| run.thread_id != id);
@@ -1211,6 +1219,7 @@ impl AppState {
         self.summary_active_runs.clear();
         self.detail_readiness = None;
         self.awaiting_refresh.clear();
+        self.last_thread_event_seq.clear();
         for thread in &mut self.threads {
             clear_zero_time(&mut thread.created_at);
             if let Some(seq) = thread.unread_sequence {
@@ -1275,6 +1284,11 @@ impl AppState {
         // resubscription never replays what was already seen.
         self.sequence = event.sequence;
         if !event.thread_id.is_empty() {
+            let entry = self
+                .last_thread_event_seq
+                .entry(event.thread_id.clone())
+                .or_insert(0);
+            *entry = (*entry).max(event.sequence);
             self.awaiting_refresh.remove(&event.thread_id);
             if let Some((detail_id, detail_seq, _)) = &mut self.detail_readiness
                 && detail_id == &event.thread_id
@@ -1974,8 +1988,20 @@ impl AppState {
             purpose,
             in_flight: true,
             unconfirmed: None,
+            dispatched_sequence: self.sequence,
         });
         command
+    }
+
+    /// Starts a bounded-detail load if the current selection has no detail
+    /// readiness in summaries mode (e.g. after forking or merging into a thread).
+    pub fn take_missing_detail_load(&mut self) -> Option<(String, u64)> {
+        if self.snapshot_loaded || self.detail_readiness.is_some() {
+            return None;
+        }
+        let id = self.selected.clone()?;
+        let request = self.begin_detail_load(&id);
+        Some((id, request))
     }
 
     /// Sends the shown draft: creates the thread first when it is new; while
@@ -2246,11 +2272,11 @@ impl AppState {
                     return None;
                 }
                 self.show_new_thread(&thread_id, &pending.command);
-                if !self.snapshot_loaded {
-                    self.detail_readiness = Some((thread_id.clone(), self.sequence, false));
-                }
                 if self.selected.is_none() && self.draft_key() == draft_key {
                     self.select_thread(Some(thread_id.clone()));
+                }
+                if !self.snapshot_loaded && self.selected.as_deref() == Some(thread_id.as_str()) {
+                    self.detail_readiness = Some((thread_id.clone(), self.sequence, false));
                 }
                 self.local_order.retain(|id| id != &draft_key);
                 if let Some(later_edits) = self.drafts.remove(&draft_key) {
@@ -2274,7 +2300,13 @@ impl AppState {
                     } else {
                         receipt.thread_id.clone()
                     };
-                    if !thread_id.is_empty() {
+                    let already_refreshed = self
+                        .last_thread_event_seq
+                        .get(&thread_id)
+                        .copied()
+                        .unwrap_or(0)
+                        > pending.dispatched_sequence;
+                    if !thread_id.is_empty() && !already_refreshed {
                         self.awaiting_refresh.insert(thread_id);
                     }
                 }
