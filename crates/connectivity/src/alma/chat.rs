@@ -11,7 +11,7 @@ pub(super) struct Scope {
     pub core: CoreClient,
     pub thread: String,
     pub pairing: String,
-    pub lan: Option<Value>,
+    pub lan: Option<std::net::SocketAddr>,
 }
 
 fn error(status: u16, message: &str) -> (u16, Value) {
@@ -204,9 +204,12 @@ impl Scope {
         }
         if request["method"] == "GET" {
             if uri.path() == "/__alma_lan__"
-                && let Some(lan) = &self.lan
+                && let Some(bound) = self.lan
             {
-                return Ok((200, lan.clone()));
+                let addresses = crate::lan::listener_addresses(bound)
+                    .map_err(|_| error(503, "Local network unavailable"))?;
+                let hosts: Vec<_> = addresses.iter().map(|addr| addr.ip()).collect();
+                return Ok((200, json!({"hosts": hosts, "port": bound.port()})));
             }
             if let Some(body) = self.bootstrap(uri.path()).await.map_err(core_error)? {
                 return Ok((200, body));

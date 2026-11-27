@@ -621,18 +621,22 @@ fn warn(text: impl Into<String>) {
 
 // ------------------------------------------------------------ conversation
 
+fn core_default_model() -> String {
+    ui().with_untracked(|u| u.data().map(|data| data.models.default.clone()).unwrap_or_default())
+}
+
 pub(crate) fn submit() {
-    intent(AppState::submit);
+    let model = core_default_model();
+    intent(|s| s.submit(&model));
 }
 
 /// Send an immediate reply from an interactive in-message block (`ask`, `dispatch`, `vantry-ui`).
 pub(crate) fn send_quick_reply(message: String) {
-    let text = message.trim().to_owned();
-    if text.is_empty() {
+    if message.trim().is_empty() {
         return;
     }
     state().update(|s| {
-        s.set_draft_text(&text);
+        s.set_draft_text(&message);
     });
     submit();
 }
@@ -820,12 +824,13 @@ pub(crate) fn stop_child(child: String) {
 }
 
 pub(crate) fn submit_child(child: &str) {
+    let model = core_default_model();
     let mut command = None;
     let mut blocked = false;
     state().update(|s| {
         // A sent draft leaves `drafts`, so text still here was not sent.
         let waiting = s.drafts.get(child).is_some_and(|d| !d.text.trim().is_empty());
-        command = s.submit_child(child);
+        command = s.submit_child(child, &model);
         blocked = waiting && command.is_none();
     });
     match command {
@@ -2191,7 +2196,7 @@ pub(crate) fn pair_redeem() {
     let (code, name) = ui().with_untracked(|u| (u.forms.pair_code.clone(), u.forms.pair_name.clone()));
     if code.trim().is_empty() {
         ui().update(|u| {
-            u.forms.feedback = Some(crate::state::ui::Feedback { ok: false, text: "请输入配对码或连接链接".into() })
+            u.forms.feedback = Some(crate::state::ui::Feedback { ok: false, text: "请粘贴主机生成的完整电脑配对链接".into() })
         });
         return;
     }
@@ -2201,9 +2206,6 @@ pub(crate) fn pair_redeem() {
     if !ui().with_untracked(|u| !u.op_busy("pair.redeem")) { return; }
     ui().update(|u| { u.begin_op("pair.redeem"); });
     let mut request = actions::pair_redeem(&code, &name);
-    if !code.trim().starts_with("vantry://") {
-        request.input = Some(serde_json::json!({"code":code.trim()}));
-    }
     spawn_for_window(async move {
         let result = async {
             loop {

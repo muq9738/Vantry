@@ -12,7 +12,6 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use vantry_connectivity::{
-    desktop_client::DesktopClient,
     desktop_media::{DesktopFrame, DesktopHost, DesktopViewer, InputEvent, LanTicket},
     identity::{IdentityStore, Pair},
     peer::{self, Route},
@@ -27,14 +26,13 @@ pub struct Workbench {
     magpie: Option<PathBuf>,
     pub identity: Arc<IdentityStore>,
     pub federator: Arc<crate::federation::Federator>,
-    invitations: vantry_connectivity::bootstrap::Publisher,
     pub start_remote: tokio::sync::Notify,
     pub alma: crate::alma::Sharing,
-    pub mobile_server: tokio::sync::watch::Sender<Option<vantry_connectivity::t3compat::T3Server>>,
+    pub desktop_relay: Option<crate::alma::DesktopRelays>,
+    pub gateway_ready: tokio::sync::watch::Sender<bool>,
     updater: AsyncMutex<UpdateManager>,
     updater_info: tokio::sync::watch::Receiver<AppUpdateInfo>,
     plugins: Mutex<plugins::Host>,
-    desktop: AsyncMutex<Option<(DesktopClient, String, String)>>,
     desktop_host: AsyncMutex<Option<Arc<DesktopHost>>>,
     desktop_viewer: AsyncMutex<Option<Arc<DesktopViewer>>>,
     /// This device waiting for another host's approval, by handle.
@@ -58,7 +56,9 @@ pub fn api_error(e: anyhow::Error) -> vantry_core::Error {
 impl Workbench {
     pub fn new(core: Core, options: CoreOptions, magpie: Option<PathBuf>) -> Result<Self> {
         let data = core.directory();
-        let identity = Arc::new(IdentityStore::open(data, "Vantry")?);
+        let desktop_relay = crate::alma::DesktopRelays::load(data)?;
+        let endpoints = desktop_relay.as_ref().map(|r| r.client_urls()).unwrap_or_default();
+        let identity = Arc::new(IdentityStore::open_desktop(data, "Vantry", endpoints)?);
         let federator = Arc::new(crate::federation::Federator::open(
             data.to_owned(),
             identity.clone(),
@@ -87,18 +87,17 @@ impl Workbench {
         let alma = crate::alma::Sharing::new(core.clone());
         Ok(Self {
             alma,
+            desktop_relay,
             core,
             options,
             magpie,
-            invitations: vantry_connectivity::bootstrap::Publisher::new(identity.clone())?,
             start_remote: tokio::sync::Notify::new(),
-            mobile_server: tokio::sync::watch::channel(None).0,
+            gateway_ready: tokio::sync::watch::channel(false).0,
             identity,
             federator,
             updater,
             updater_info,
             plugins,
-            desktop: AsyncMutex::new(None),
             desktop_host: AsyncMutex::new(None),
             desktop_viewer: AsyncMutex::new(None),
             pending_pairings: Mutex::new(Default::default()),
@@ -188,7 +187,7 @@ impl Workbench {
                                 if let Ok(conn) = vantry_connectivity::peer::PeerConnection::connect(
                                     &peer.pair,
                                     Some(&cfg),
-                                    vantry_connectivity::peer::Route::Auto,
+                                    Route::Auto,
                                     stop,
                                 )
                                 .await
@@ -295,12 +294,13 @@ impl Workbench {
                     "canHost":matches!(caps.screen_capture, Permission::Granted) && matches!(caps.accessibility, Permission::Granted)
                 }).to_string();
             }
-            "remote.pair.create" => return self.pair().await,
-            "remote.pair.alma.status" | "remote.pair.alma.show" | "remote.pair.alma.create" | "remote.pair.alma.revoke" => {
+            "remote.pair.create" => return self.pair(r.input.as_ref().is_some_and(|v| v["requireRelay"] == true)).await,
+            "remote.pair.alma.status" | "remote.pair.alma.show" | "remote.pair.alma.create" | "remote.pair.alma.replace" | "remote.pair.alma.revoke" => {
                 let input = r.input.as_ref().unwrap_or(&Value::Null);
                 let status = match action {
-                    "remote.pair.alma.create" => self.alma.create(&r.thread_id,
-                        input["relay"].as_str().unwrap_or(""), input["registrationKey"].as_str().unwrap_or("")).await?,
+                    "remote.pair.alma.create" | "remote.pair.alma.replace" => self.alma.create(&r.thread_id,
+                        input["relay"].as_str().unwrap_or(""), input["registrationKey"].as_str().unwrap_or(""),
+                        (action == "remote.pair.alma.replace").then_some(r.name.as_str())).await?,
                     "remote.pair.alma.revoke" => self.alma.revoke(&r.name).await?,
                     "remote.pair.alma.show" => self.alma.status(Some(&r.thread_id)).await,
                     _ => self.alma.status(None).await,
@@ -993,43 +993,45 @@ impl Workbench {
                 )
             })
             .collect();
-        let mut clients: Vec<_> = cfg
+        let clients: Vec<_> = cfg
             .clients
             .iter()
             .map(|c| json!({"id":c.id,"name":c.name,"createdAt":c.created_at}))
             .collect();
-        if let Some(mobile) = self.mobile_server.borrow().as_ref() {
-            clients.extend(mobile.paired_devices());
-        }
         let requests: Vec<Value> = self
             .identity
             .device_requests()
             .iter()
             .map(|r| r.summary())
             .collect();
+        let identity = self.identity.public_identity();
         out.output =
-            json!({"enabled":cfg.enabled,"name":cfg.host.name,"direct":cfg.host.direct,
-                    "identity":self.identity.public_identity(),"peers":peers,"clients":clients,
+            json!({"enabled":cfg.enabled,"name":cfg.host.name,"direct":identity["direct"],
+                    "identity":identity,"peers":peers,"clients":clients,
+                    "relay":self.desktop_relay.as_ref().map_or("", |r| r.public_relay()),
+                    "relayConnected":self.desktop_relay.as_ref().is_some_and(|r| r.online()),
+                    "relayEndpoints":self.desktop_relay.as_ref().map(|r| r.status()).unwrap_or_default(),
                     "requireApproval":cfg.require_approval(),"requests":requests})
                 .to_string();
 
         Ok(out)
     }
-    async fn pair(&self) -> Result<WorkbenchResponse> {
-        let mut ready = self.mobile_server.subscribe();
+    async fn pair(&self, require_relay: bool) -> Result<WorkbenchResponse> {
+        let mut ready = self.gateway_ready.subscribe();
         self.start_remote.notify_one();
-        let mobile = tokio::time::timeout(Duration::from_secs(5), ready.wait_for(Option::is_some))
-            .await.context("Remote access could not start")??.clone().context("Remote access stopped")?;
-        let cfg = self.identity.snapshot();
-        let invite = self.invitations.issue(&cfg.registration_key).await?;
+        tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|online| *online))
+            .await.context("Remote access could not start")??;
+        let direct = self.identity.public_identity()["direct"].as_array().is_some_and(|v| !v.is_empty());
+        if require_relay || !direct {
+            let relay = self.desktop_relay.as_ref().context("未找到可用的电脑中继或局域网地址")?;
+            relay.wait_for_registration().await?;
+        }
+        let invite = self.identity.issue()?;
         let mut out = self.remote_status()?;
         let mut status: Value = serde_json::from_str(&out.output)?;
         status["code"] = json!(invite.code);
         status["link"] = json!(invite.link());
         status["expiresAt"] = json!(invite.expires_at);
-        if let Some(link) = mobile.mobile_pairing_link()? {
-            status["t3PairingLink"] = json!(link);
-        }
         out.output = status.to_string();
         Ok(out)
     }
@@ -1037,28 +1039,14 @@ impl Workbench {
         use vantry_connectivity::peer::Redemption;
         let input = r.input.as_ref().unwrap_or(&Value::Null);
         let stop = CancellationToken::new();
-        let relay = input["relay"].as_str().map(str::to_owned).or_else(|| {
-            input["code"].as_str().and_then(|_| self.identity.snapshot().relay_endpoints().first().map(|e| e.url.clone()))
-        });
-        if input["code"].is_string() && relay.is_none() { anyhow::bail!("此设备未配置中继，请粘贴完整的电脑配对链接"); }
-        let state = if let Some(relay) = relay.as_deref() {
-            vantry_connectivity::bootstrap::redeem_code_start(
-                relay,
-                input["code"].as_str().unwrap_or(&r.message),
-                &self.identity,
-                &r.name,
-                stop,
-            )
-            .await?
-        } else {
-            let pair = Pair::parse(
-                input["link"].as_str().unwrap_or(&r.message),
-                std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1"),
-            )?;
-            match pair.v {
-                2 => peer::redeem_start(&pair, &self.identity, &r.name, Route::Auto, stop).await?,
-                _ => Redemption::Paired(self.identity.save_peer(pair)?),
-            }
+        let link = input["link"].as_str().unwrap_or(&r.message).trim();
+        ensure!(link.starts_with("vantry://connect#"), "请粘贴主机生成的完整电脑配对链接");
+        let mut pair = Pair::parse(link, false)?;
+        pair.retain_alma_relays();
+        ensure!(!pair.direct.is_empty() || !pair.relay.is_empty(), "请在主机生成带 Alma 中继地址的新配对链接");
+        let state = match pair.v {
+            2 => peer::redeem_start(&pair, &self.identity, &r.name, Route::Auto, stop).await?,
+            _ => Redemption::Paired(self.identity.save_peer(pair)?),
         };
         self.redemption_output(state, None)
     }
@@ -1115,10 +1103,8 @@ impl Workbench {
         let id = input["id"].as_str().unwrap_or(&r.name);
         let removed = self.identity.remove_peer(id)?;
         let revoked = self.identity.revoke_client(id)?;
-        let mobile_revoked = self.mobile_server.borrow().as_ref()
-            .map(|server| server.revoke_client(id)).transpose()?.unwrap_or(false);
         out.output = json!({
-        "revoked":removed||revoked||mobile_revoked}
+        "revoked":removed||revoked}
         )
         .to_string();
 
@@ -1189,7 +1175,6 @@ impl Workbench {
             return Ok(out);
         }
 
-        let mut session = self.desktop.lock().await;
         let mut host_guard = self.desktop_host.lock().await;
         if action == "rd.session.start" {
             // If caller passed a vantry-lan:// link as peer/target, connect as viewer!
@@ -1216,36 +1201,11 @@ impl Workbench {
                 return Ok(out);
             }
 
-            let relay_url = input["relay"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    let s = r.name.trim();
-                    (s.starts_with("http://") || s.starts_with("https://")).then_some(s)
-                });
-            let mut relay_info = Value::Null;
-            if let Some(relay) = relay_url {
-                ensure!(session.is_none(), "desktop session active");
-                let client = DesktopClient::new(relay)?;
-                let v = client
-                    .create(
-                        input["registrationKey"].as_str().unwrap_or(""),
-                        input["video"].clone(),
-                    )
-                    .await?;
-                *session = Some((
-                    client,
-                    v["sessionId"]
-                        .as_str()
-                        .context("missing session ID")?
-                        .into(),
-                    v["hostToken"]
-                        .as_str()
-                        .context("missing host token")?
-                        .into(),
-                ));
-                relay_info = v;
-            }
+            ensure!(
+                input["relay"].as_str().unwrap_or("").is_empty()
+                    && !candidate.contains("://") && !candidate.starts_with("DESK-"),
+                "远程桌面仅支持局域网链接"
+            );
             if host_guard.is_none() {
                 let bind = if std::env::var("VANTRY_RD_LOOPBACK").as_deref() == Ok("1") {
                     "127.0.0.1:0"
@@ -1315,23 +1275,13 @@ impl Workbench {
                 .as_ref()
                 .map(|h| h.ticket().link())
                 .unwrap_or_default();
-            if relay_info.is_object() {
-                relay_info["lanLink"] = json!(lan_link);
-                relay_info["active"] = json!(true);
-                out.output = relay_info.to_string();
-            } else {
-                out.output = json!({
-                    "active": true,
-                    "sharing": true,
-                    "lanLink": lan_link,
-                    "viewerCount": host_guard.as_ref().map_or(0, |h| h.viewer_count()),
-                })
-                .to_string();
-            }
+            out.output = json!({
+                "active": true,
+                "sharing": true,
+                "lanLink": lan_link,
+                "viewerCount": host_guard.as_ref().map_or(0, |h| h.viewer_count()),
+            }).to_string();
         } else if action == "rd.session.stop" {
-            if let Some((client, id, token)) = session.take() {
-                let _ = client.delete(&id, &token).await;
-            }
             if let Some(h) = host_guard.take() {
                 h.stop();
             }
@@ -1339,14 +1289,6 @@ impl Workbench {
                 v.disconnect();
             }
             out.output = json!({"active": false, "sharing": false, "connected": false}).to_string();
-        } else if let Some((client, id, token)) = session.as_ref() {
-            let mut status = client.status(id, token).await?;
-            if let Some(h) = host_guard.as_ref() {
-                status["lanLink"] = json!(h.ticket().link());
-                status["viewerCount"] = json!(h.viewer_count());
-                status["sharing"] = json!(true);
-            }
-            out.output = status.to_string();
         } else if let Some(h) = host_guard.as_ref() {
             out.output = json!({
                 "active": true,

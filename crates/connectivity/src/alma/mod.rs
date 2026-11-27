@@ -1,9 +1,11 @@
-//! Opt-in Alma mobile host. The relay transports opaque phone sessions.
+//! Alma relay registration for mobile E2E sessions and native desktop TLS streams.
 mod bootstrap;
 mod chat;
 mod crypto;
 mod lan;
 pub use crypto::new_code;
+
+pub const DEVICE_NAME: &str = "vantry";
 
 use crate::transport::{self, Ws};
 use anyhow::{Result, anyhow, bail, ensure};
@@ -13,14 +15,17 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tokio::{
-    sync::mpsc,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::{mpsc, watch},
     task::{AbortHandle, JoinSet},
     time::{Instant, interval, timeout},
 };
@@ -32,19 +37,33 @@ use vantry_client::{ClientError, CoreClient};
 const MAX_FRAME: usize = 4 << 20;
 const HANDSHAKE: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Registration {
+    #[default]
+    Offline,
+    Online,
+    Rejected,
+}
+
 #[derive(Default)]
 pub struct Activity {
-    relay_online: AtomicBool,
-    rejected: AtomicBool,
+    relay: watch::Sender<Registration>,
     phones: AtomicUsize,
 }
 
 impl Activity {
     pub fn relay_online(&self) -> bool {
-        self.relay_online.load(Ordering::Relaxed)
+        *self.relay.borrow() == Registration::Online
     }
     pub fn rejected(&self) -> bool {
-        self.rejected.load(Ordering::Relaxed)
+        *self.relay.borrow() == Registration::Rejected
+    }
+    pub async fn wait_for_registration(&self) -> Result<()> {
+        let mut state = self.relay.subscribe();
+        let outcome = timeout(HANDSHAKE, state.wait_for(|r| *r != Registration::Offline))
+            .await.map_err(|_| anyhow!("Alma 中继注册超时"))??;
+        ensure!(*outcome == Registration::Online, "Alma 中继拒绝注册，请核对注册凭据");
+        Ok(())
     }
     pub fn phones(&self) -> usize {
         self.phones.load(Ordering::Relaxed)
@@ -59,12 +78,43 @@ impl Drop for ConnectedPhone {
 }
 
 #[derive(Clone)]
+enum Endpoint {
+    Phone(Scope),
+    Desktop { path: String, gateway: SocketAddr },
+}
+
+impl Endpoint {
+    fn accepts(&self, path: &str) -> bool {
+        match self {
+            Self::Phone(_) => path == "/__alma_e2e__",
+            Self::Desktop { path: expected, .. } => path == expected,
+        }
+    }
+}
+
+/// Base URL used by native clients, which append their usual TLS tunnel path.
+pub fn desktop_client_url(relay: &Url, code: &str) -> Result<Url> {
+    let mut client = relay.clone();
+    client.path_segments_mut().map_err(|_| anyhow!("Invalid Alma relay URL"))?
+        .pop_if_empty().push("c").push(&crypto::routing(code)?);
+    Ok(client)
+}
+
+pub fn is_desktop_client_url(raw: &str) -> bool {
+    let Ok(url) = transport::relay_url(raw, false) else { return false; };
+    let Some(mut path) = url.path_segments() else { return false; };
+    let Some(token) = path.next_back() else { return false; };
+    path.next_back() == Some("c") && token.len() == 22
+        && token.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+#[derive(Clone)]
 pub struct Host {
     relay: Url,
     registration: String,
     code: Arc<str>,
     key: Option<String>,
-    scope: Scope,
+    endpoint: Endpoint,
     pub activity: Arc<Activity>,
 }
 
@@ -83,12 +133,23 @@ impl Host {
             code: code.into(),
             key,
             activity: Default::default(),
-            scope: Scope {
+            endpoint: Endpoint::Phone(Scope {
                 pairing,
                 thread,
                 core,
                 lan: None,
-            },
+            }),
+        })
+    }
+
+    pub fn desktop(relay: Url, code: String, key: Option<String>, route: &str,
+                   gateway: SocketAddr, activity: Arc<Activity>) -> Result<Self> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("route", route).finish();
+        Ok(Self {
+            registration: crypto::registration(&code)?,
+            relay, code: code.into(), key, activity,
+            endpoint: Endpoint::Desktop { path: format!("/relay/connect?{query}"), gateway },
         })
     }
 
@@ -101,7 +162,9 @@ impl Host {
                 _ = stop.cancelled() => Ok(()),
                 result = self.connection(&client) => result,
             };
-            self.activity.relay_online.store(false, Ordering::Relaxed);
+            if !self.activity.rejected() {
+                self.activity.relay.send_replace(Registration::Offline);
+            }
             if result.is_ok() {
                 return Ok(());
             }
@@ -124,7 +187,7 @@ impl Host {
             MAX_FRAME,
         )
         .await?;
-        let mut register = json!({"t":"register","tokenHash":self.registration,"name":"Vantry","ver":env!("CARGO_PKG_VERSION"),"proto":1});
+        let mut register = json!({"t":"register","tokenHash":self.registration,"name":DEVICE_NAME,"ver":env!("CARGO_PKG_VERSION"),"proto":1});
         if let Some(key) = &self.key {
             register["key"] = key.as_str().into();
         }
@@ -160,7 +223,7 @@ impl Host {
                         Message::Pong(_) => continue,
                         Message::Close(info) => {
                             if info.is_some_and(|f| matches!(u16::from(f.code), 4000 | 4002 | 4003 | 4401)) {
-                                self.activity.rejected.store(true, Ordering::Relaxed);
+                                self.activity.relay.send_replace(Registration::Rejected);
                                 tracing::warn!("Alma registration rejected or replaced");
                                 return Ok(());
                             }
@@ -177,7 +240,7 @@ impl Host {
                         }
                         ensure!(kind == "registered" && frame["proto"].as_u64().unwrap_or(1) == 1, "Unsupported relay version");
                         registered = true;
-                        self.activity.relay_online.store(true, Ordering::Relaxed);
+                        self.activity.relay.send_replace(Registration::Online);
                         tracing::info!("Alma relay registered with protocol 1");
                         continue;
                     }
@@ -189,7 +252,7 @@ impl Host {
                             write(&mut ws, json!({"t":"hend","id":id})).await?;
                         }
                         "wopen" => {
-                            if frame["path"] != "/__alma_e2e__" || sessions.len() >= 16 || sessions.contains_key(id) {
+                            if !self.endpoint.accepts(frame["path"].as_str().unwrap_or("")) || sessions.len() >= 16 || sessions.contains_key(id) {
                                 write(&mut ws, json!({"t":"werr","id":id,"message":"Encrypted session unavailable"})).await?;
                                 continue;
                             }
@@ -197,12 +260,16 @@ impl Host {
                             next_session += 1;
                             let responder = Responder { id: id.into(), number: next_session, out: out.clone() };
                             let code = self.code.clone();
-                            let scope = self.scope.clone();
+                            let endpoint = self.endpoint.clone();
                             let activity = self.activity.clone();
                             let task = tasks.spawn(async move {
                                 let wire = PhoneWire::Relay(&responder, inbox);
-                                let _ = serve_phone(wire, &code, scope, activity).await;
-                                let _ = responder.reply(json!({"t":"wclose","id":responder.id,"code":1008})).await;
+                                let result = match endpoint {
+                                    Endpoint::Phone(scope) => serve_phone(wire, &code, scope, activity).await,
+                                    Endpoint::Desktop { gateway, .. } => serve_desktop(wire, gateway).await,
+                                };
+                                let code = if result.is_ok() { 1000 } else { 1008 };
+                                let _ = responder.reply(json!({"t":"wclose","id":responder.id,"code":code})).await;
                             });
                             sessions.insert(id.into(),Phone { number: next_session, input, task });
                             write(&mut ws, json!({"t":"wopened","id":id})).await?;
@@ -220,6 +287,26 @@ impl Host {
                         _ => {}
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The native gateway performs the pinned TLS handshake and authenticates every
+/// Core request. The relay and its routing token carry only those TLS bytes.
+async fn serve_desktop(mut wire: PhoneWire<'_>, gateway: SocketAddr) -> Result<()> {
+    let mut socket = TcpStream::connect(gateway).await?;
+    let mut buf = vec![0; 32 * 1024];
+    loop {
+        tokio::select! {
+            message = wire.read() => {
+                let Message::Binary(bytes) = message? else { bail!("Expected desktop TLS data"); };
+                socket.write_all(&bytes).await?;
+            }
+            count = socket.read(&mut buf) => {
+                let count = count?;
+                if count == 0 { return Ok(()); }
+                wire.send(Message::Binary(buf[..count].to_vec().into())).await?;
             }
         }
     }

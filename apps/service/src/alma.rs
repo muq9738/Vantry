@@ -1,4 +1,6 @@
+mod desktop;
 mod sharing;
+pub use desktop::DesktopRelays;
 pub use sharing::Sharing;
 
 use anyhow::{Result, ensure};
@@ -19,9 +21,11 @@ struct Pairing {
     thread_id: String,
     id: String,
     code: String,
+    #[serde(default)]
+    port: u16,
 }
 
-pub fn prepare(data: &Path, relay: &str, thread: &str, reset: bool) -> Result<Host> {
+pub fn prepare(data: &Path, relay: &str, thread: &str, reset: bool) -> Result<(Host, std::net::TcpListener)> {
     let relay = relay_url(relay, false)?;
     ensure!(
         !thread.is_empty()
@@ -43,7 +47,7 @@ pub fn prepare(data: &Path, relay: &str, thread: &str, reset: bool) -> Result<Ho
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let (pairing, changed) = match saved {
+    let (mut pairing, changed) = match saved {
         Some(p) if p.relay == relay.as_str() && p.thread_id == thread => {
             use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
             ensure!(
@@ -59,10 +63,16 @@ pub fn prepare(data: &Path, relay: &str, thread: &str, reset: bool) -> Result<Ho
                 thread_id: thread.into(),
                 id: uuid::Uuid::new_v4().to_string(),
                 code: new_code()?,
+                port: 0,
             };
             (p, true)
         }
     };
+    let listener = std::net::TcpListener::bind(("0.0.0.0", pairing.port))?;
+    listener.set_nonblocking(true)?;
+    let bound = listener.local_addr()?;
+    let changed = changed || pairing.port != bound.port();
+    pairing.port = bound.port();
     let link = pairing_link(&relay, &pairing.code);
     let qr = QrCode::encode_text(link.as_str(), QrCodeEcc::Medium)?;
     let size = qr.size() + 8;
@@ -81,20 +91,24 @@ pub fn prepare(data: &Path, relay: &str, thread: &str, reset: bool) -> Result<Ho
         hostfs::atomic_write(&data.join(state), &serde_json::to_vec(&pairing)?)?;
     }
     hostfs::atomic_write(&data.join("alma-pairing.svg"), svg.as_bytes())?;
-    Host::new(
+    let mut host = Host::new(
         relay,
         pairing.code,
         key,
         pairing.id,
         thread.into(),
         CoreClient::from_data_dir(data),
-    )
+    )?;
+    host.set_lan_listener(bound);
+    Ok((host, listener))
 }
 
 fn pairing_link(endpoint: &url::Url, code: &str) -> url::Url {
     let mut link = url::Url::parse("alma://connect").expect("static Alma URL");
+    // Alma iOS opens its encrypted client socket at an absolute /c/ path.
     link.query_pairs_mut()
-        .append_pair("u", endpoint.as_str().trim_end_matches('/'))
+        .append_pair("u", &endpoint.origin().ascii_serialization())
+        .append_pair("name", vantry_connectivity::alma::DEVICE_NAME)
         .append_pair("k", code)
         .append_pair("e2e", "1");
     link
@@ -103,6 +117,17 @@ fn pairing_link(endpoint: &url::Url, code: &str) -> url::Url {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_invitation_uses_the_relay_origin_and_local_device_name() {
+        let endpoint = url::Url::parse("https://relay.example:9443/vantry-relay/").unwrap();
+        let link = pairing_link(&endpoint, "fixture");
+        let params: std::collections::HashMap<_, _> = link.query_pairs().collect();
+        assert_eq!(params["u"], "https://relay.example:9443");
+        assert_eq!(params["name"], "vantry");
+        assert_eq!(params["k"], "fixture");
+        assert_eq!(params["e2e"], "1");
+    }
 
     #[test]
     fn pairing_survives_restart_and_rotates_when_scope_changes() -> Result<()> {

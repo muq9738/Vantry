@@ -46,12 +46,46 @@ pub struct Pair {
     pub code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub t3_url: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub t3_token: String,
 }
 impl Pair {
+    /// Drop obsolete desktop relay hints while keeping direct candidates.
+    pub fn retain_alma_relays(&mut self) {
+        self.relays.retain(|s| crate::alma::is_desktop_client_url(s));
+        if !crate::alma::is_desktop_client_url(&self.relay) {
+            self.relay = self.relays.first().cloned().unwrap_or_default();
+        }
+    }
+    pub(crate) fn updated_identity(&self, snapshot: &Value) -> Result<Self> {
+        let active = snapshot["certificate"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing certificate"))?;
+        ensure!(
+            (self.device_id.is_empty() || snapshot["deviceId"] == self.device_id)
+                && (active == self.certificate || active == self.next_certificate),
+            "peer identity changed"
+        );
+        let next = snapshot["nextCertificate"].as_str().unwrap_or("");
+        if !next.is_empty() {
+            validate_cert(
+                &cert(next)?,
+                &ServerName::try_from("vantry.remote")?,
+                UnixTime::now(),
+            )?;
+        }
+        let mut p = self.clone();
+        p.certificate = active.into();
+        p.next_certificate = next.into();
+        if let Some(d) = snapshot.get("direct").filter(|v| v.is_array()) {
+            p.direct = serde_json::from_value(d.clone())?;
+        }
+        if let Some(r) = snapshot.get("relays").filter(|v| v.is_array()) {
+            p.relays = serde_json::from_value(r.clone())?;
+            p.relay = p.relays.first().cloned().unwrap_or_default();
+        }
+        p.validate(std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1"))?;
+        Ok(p)
+    }
+
     pub fn link(&self) -> String {
         format!(
             "vantry://connect#{}",
@@ -74,15 +108,6 @@ impl Pair {
         Ok(p)
     }
     pub fn validate(&self, private: bool) -> Result<()> {
-        if self.v == 3 {
-            ensure!(
-                self.t3_token.len() >= 16
-                    && !self.device_id.is_empty()
-                    && relay_url(&self.t3_url, private)?.path() == "/",
-                "invalid T3 pairing"
-            );
-            return Ok(());
-        }
         ensure!(
             self.route.len() >= 32
                 && match self.v {
@@ -180,15 +205,6 @@ impl Configuration {
             .and_then(|p| u16::try_from(p).ok())
             .unwrap_or(0)
     }
-    pub fn t3_listen(&self) -> &str {
-        self.extra
-            .get("t3Listen")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("")
-    }
-    /// New devices wait for approval after redeeming a code (T3 Code's
-    /// "Require approval for new devices").
     pub fn require_approval(&self) -> bool {
         self.extra
             .get("requireApproval")
@@ -591,7 +607,13 @@ fn verification_code() -> String {
 }
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<State>>>>> =
     LazyLock::new(Mutex::default);
+enum RelayAdvertisement {
+    Saved,
+    Desktop(Vec<String>),
+}
 pub struct IdentityStore {
+    advertisement: RelayAdvertisement,
+    listener: Mutex<Option<std::net::SocketAddr>>,
     path: PathBuf,
     state: Arc<Mutex<State>>,
 }
@@ -632,7 +654,7 @@ impl IdentityStore {
         let mut stores = STORES.lock().unwrap();
         stores.retain(|_, s| s.strong_count() > 0);
         if let Some(state) = stores.get(&path).and_then(Weak::upgrade) {
-            return Ok(Self { path, state });
+            return Ok(Self { path, state, advertisement: RelayAdvertisement::Saved, listener: Default::default() });
         }
         let mut cfg: Configuration = match File::open(&path) {
             Ok(file) => {
@@ -692,10 +714,39 @@ impl IdentityStore {
             requests: Vec::new(),
         }));
         stores.insert(path.clone(), Arc::downgrade(&state));
-        Ok(Self { path, state })
+        Ok(Self { path, state, advertisement: RelayAdvertisement::Saved, listener: Default::default() })
+    }
+    pub fn open_desktop(dir: &Path, name: &str, relays: Vec<String>) -> Result<Self> {
+        let mut store = Self::open(dir, name)?;
+        store.advertisement = RelayAdvertisement::Desktop(relays);
+        Ok(store)
+    }
+    fn advertised_host(&self, cfg: &Configuration) -> Pair {
+        let mut host = cfg.host.clone();
+        if let Some(bound) = *self.listener.lock().unwrap()
+            && let Ok(addresses) = crate::lan::listener_addresses(bound)
+        {
+            host.direct = addresses.iter().map(ToString::to_string).collect();
+        }
+        match &self.advertisement {
+            RelayAdvertisement::Desktop(relays) => {
+                host.relay = relays.first().cloned().unwrap_or_default();
+                host.relays = relays.clone();
+            }
+            RelayAdvertisement::Saved => {
+                host.relays = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
+            }
+        }
+        host
     }
     pub fn snapshot(&self) -> Configuration {
-        self.state.lock().unwrap().cfg.clone()
+        let mut cfg = self.state.lock().unwrap().cfg.clone();
+        if matches!(self.advertisement, RelayAdvertisement::Desktop(_)) {
+            for peer in &mut cfg.peers {
+                peer.pair.retain_alma_relays();
+            }
+        }
+        cfg
     }
     pub fn public_identity(&self) -> Value {
         let cfg = self.snapshot();
@@ -703,17 +754,19 @@ impl IdentityStore {
             .ok()
             .and_then(|c| validity(&c))
             .and_then(|(_, end)| Utc.timestamp_opt(end, 0).single());
-        let relays: Vec<_> = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
-        json!({"deviceId":cfg.host.device_id,"certificate":cfg.host.certificate,"nextCertificate":cfg.next_certificate,"expiresAt":end,"direct":cfg.host.direct,"relays":relays})
+        let host = self.advertised_host(&cfg);
+        json!({"deviceId":host.device_id,"certificate":host.certificate,"nextCertificate":cfg.next_certificate,"expiresAt":end,"direct":host.direct,"relays":host.relays})
     }
-    pub fn remember_listener(&self, direct: Vec<String>, port: u16, enable: bool) -> Result<()> {
+    pub fn remember_listener(&self, bound: std::net::SocketAddr, enable: bool) -> Result<()> {
+        let addresses = crate::lan::listener_addresses(bound)?;
         let mut state = self.state.lock().unwrap();
         let mut cfg = state.cfg.clone();
-        cfg.host.direct = direct;
-        cfg.extra.insert("directPort".into(), json!(port));
+        cfg.host.direct = addresses.iter().map(ToString::to_string).collect();
+        cfg.extra.insert("directPort".into(), json!(bound.port()));
         cfg.enabled |= enable;
         persist(&self.path, &cfg)?;
         state.cfg = cfg;
+        *self.listener.lock().unwrap() = Some(bound);
         Ok(())
     }
 
@@ -747,23 +800,19 @@ impl IdentityStore {
     pub fn issue(&self) -> Result<Pair> {
         let mut s = self.state.lock().unwrap();
         ensure!(s.cfg.clients.len() < 128, "paired device limit reached");
+        let host = self.advertised_host(&s.cfg);
         let mut public = Pair {
             v: 2,
             name: s.cfg.host.name.clone(),
-            relay: s.cfg.host.relay.clone(),
+            relay: host.relay,
+            relays: host.relays,
             route: s.cfg.host.route.clone(),
             device_id: s.cfg.host.device_id.clone(),
-            direct: s.cfg.host.direct.clone(),
+            direct: host.direct,
             certificate: s.cfg.host.certificate.clone(),
             next_certificate: s.cfg.next_certificate.clone(),
             ..Default::default()
         };
-        public.relays = s
-            .cfg
-            .relay_endpoints()
-            .into_iter()
-            .map(|ep| ep.url)
-            .collect();
         let entry = s.codes.issue(
             "session",
             &public.name,
@@ -829,32 +878,8 @@ impl IdentityStore {
             .find(|p| p.id == id)
             .ok_or_else(|| anyhow!("unknown peer"))?
             .pair;
-        let active = snapshot["certificate"]
-            .as_str()
-            .ok_or_else(|| anyhow!("missing certificate"))?;
-        ensure!(
-            (p.device_id.is_empty() || snapshot["deviceId"] == p.device_id)
-                && (active == p.certificate || active == p.next_certificate),
-            "peer identity changed"
-        );
-        let next = snapshot["nextCertificate"].as_str().unwrap_or("");
-        if !next.is_empty() {
-            validate_cert(
-                &cert(next)?,
-                &ServerName::try_from("vantry.remote")?,
-                UnixTime::now(),
-            )?;
-        }
         let before = serde_json::to_value(&*p)?;
-        p.certificate = active.into();
-        p.next_certificate = next.into();
-        if let Some(d) = snapshot.get("direct").filter(|v| v.is_array()) {
-            p.direct = serde_json::from_value(d.clone())?;
-        }
-        if let Some(r) = snapshot.get("relays").filter(|v| v.is_array()) {
-            p.relays = serde_json::from_value(r.clone())?;
-        }
-        p.validate(std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1"))?;
+        *p = p.updated_identity(&snapshot)?;
         if before != serde_json::to_value(&*p)? {
             persist(&self.path, &cfg)?;
             s.cfg = cfg;
@@ -969,8 +994,7 @@ impl IdentityStore {
             return Ok(out);
         }
         let mut cfg = s.cfg.clone();
-        let mut issued = cfg.host.clone();
-        issued.relays = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
+        let mut issued = self.advertised_host(&cfg);
         issued.secret = token();
         issued.next_certificate = cfg.next_certificate.clone();
         cfg.clients.push(AccessClient {
@@ -1034,8 +1058,7 @@ impl IdentityStore {
         ensure!(s.cfg.clients.len() < 128, "paired device limit reached");
         let request = s.requests[index].clone();
         let mut cfg = s.cfg.clone();
-        let mut issued = cfg.host.clone();
-        issued.relays = cfg.relay_endpoints().into_iter().map(|ep| ep.url).collect();
+        let mut issued = self.advertised_host(&cfg);
         issued.secret = token();
         issued.next_certificate = cfg.next_certificate.clone();
         cfg.clients.push(AccessClient {
@@ -1099,7 +1122,10 @@ impl IdentityStore {
         }
     }
 
-    pub fn save_peer(&self, pair: Pair) -> Result<String> {
+    pub fn save_peer(&self, mut pair: Pair) -> Result<String> {
+        if matches!(self.advertisement, RelayAdvertisement::Desktop(_)) {
+            pair.retain_alma_relays();
+        }
         pair.validate(std::env::var("VANTRY_ALLOW_INSECURE_LAN_RELAY").as_deref() == Ok("1"))?;
         ensure!(pair.v != 2, "pairing redemption required");
         let mut s = self.state.lock().unwrap();

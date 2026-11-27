@@ -115,7 +115,7 @@ async fn run_two_devices() -> Result<()> {
             key: key.clone(),
             instance: bootstrap.device_id.clone(),
             gateway,
-            t3: None,
+            http_backend: None,
         }
         .run(tx, stop.clone()),
     );

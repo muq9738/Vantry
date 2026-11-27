@@ -134,15 +134,14 @@ export async function withAlmaFixture(servicePath, relayDirectory, thread, exerc
     const stop = () => cancel.abort(new Error('Test interrupted'));
     process.once('SIGTERM', stop);
     process.once('SIGINT', stop);
-    const start = (binary, args, env = {}) => {
-        const child = spawn(binary, args, {env: {...process.env, ...env}, stdio: 'ignore'});
+    const start = (binary, args, env = {}, stdio = 'ignore') => {
+        const child = spawn(binary, args, {env: {...process.env, ...env}, stdio});
         children.push(child);
         return child;
     };
     const ctl = async (...args) => JSON.parse((await exec(service, ['ctl', ...args, '--data-dir', data], {timeout:5000})).stdout);
     try {
         await mkdir(data, {mode:0o700});
-        const fixtureEnv = await setup?.({root, data}) || {};
         const gate = randomBytes(24).toString('base64url');
         await writeFile(join(data, 'alma-registration-key'), gate, {mode:0o600});
         const listener = createServer();
@@ -151,8 +150,10 @@ export async function withAlmaFixture(servicePath, relayDirectory, thread, exerc
         const port = listener.address().port;
         await new Promise(resolve => listener.close(resolve));
         const relay = 'http://127.0.0.1:' + port;
+        const fixtureEnv = await setup?.({root, data, relay, registrationKey:gate}) || {};
         const agentCount = async () => (await (await fetch(relay + '/healthz', {signal:AbortSignal.timeout(3000)})).json()).agents;
-        const relayProcess = start(process.execPath, [relayEntry], {HOST:'127.0.0.1', PORT:String(port), RELAY_REGISTRATION_KEY:gate, RELAY_TOKEN_SECRET:''});
+        const startRelay = () => start(process.execPath, [relayEntry], {HOST:'127.0.0.1', PORT:String(port), RELAY_REGISTRATION_KEY:gate, RELAY_TOKEN_SECRET:''});
+        let relayProcess = startRelay();
         const startCore = () => start(service, ['core', '--data-dir', data, '--workspace', root, '--provider', 'controlled',
             '--controlled-delay', '80ms', ...(cliHost ? ['--alma-thread', thread, '--alma-relay', relay] : [])], fixtureEnv);
         let core = startCore();
@@ -183,7 +184,8 @@ export async function withAlmaFixture(servicePath, relayDirectory, thread, exerc
             await registered();
         };
         return await exercise({ctl, connect:() => connectTo(url,code), connectTo, restart, thread, url,
-            relay, registrationKey:gate, version, signal:cancel.signal});
+            relay, registrationKey:gate, version, signal:cancel.signal, root, data, start,
+            stopRelay:() => stopChild(relayProcess), resumeRelay:() => { relayProcess = startRelay(); }});
     } finally {
         try {
             for (const p of phones) p.socket.close();

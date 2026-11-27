@@ -55,7 +55,7 @@ pub struct HostConfig {
     pub instance: String,
     /// Local authenticated TLS gateway. Never point this at an unprotected Core endpoint.
     pub gateway: SocketAddr,
-    pub t3: Option<SocketAddr>,
+    pub http_backend: Option<SocketAddr>,
 }
 impl HostConfig {
     pub async fn run(self, state: watch::Sender<HostState>, stop: CancellationToken) -> Result<()> {
@@ -103,7 +103,7 @@ impl HostConfig {
                         };
                         let target = match open.channel.as_str() {
                             "core" | "stream" => Some(self.gateway),
-                            "http" | "t3" => self.t3,
+                            "http" => self.http_backend,
                             _ => None,
                         };
                         let Some(target) = target else { continue };
@@ -185,17 +185,6 @@ impl PeerConnection {
         route: Route,
         stop: CancellationToken,
     ) -> Result<Self> {
-        Self::connect_with_relay_delay(pair, identity, route, Duration::from_millis(450), stop)
-            .await
-    }
-
-    pub(crate) async fn connect_with_relay_delay(
-        pair: &Pair,
-        identity: Option<&Configuration>,
-        route: Route,
-        auto_relay_delay: Duration,
-        stop: CancellationToken,
-    ) -> Result<Self> {
         let tls = TlsConnector::from(client_tls(pair, identity)?);
         let tasks = Tasks::new(stop.child_token());
         let client = transport::http_client()?;
@@ -204,17 +193,18 @@ impl PeerConnection {
             let mut attempts = FuturesUnordered::new();
             let mut targets = Vec::new();
             if !matches!(route, Route::Relay) {
-                for (i, address) in pair.direct.iter().take(8).enumerate() {
+                for (i, address) in crate::lan::direct_candidates(&pair.direct).into_iter().take(8).enumerate() {
                     targets.push(("direct", address.clone(), i as u64 * 150));
                 }
             }
             if !matches!(route, Route::Direct) {
                 let delay = if matches!(route, Route::Auto) && !pair.direct.is_empty() {
-                    auto_relay_delay.as_millis() as u64
+                    450
                 } else {
                     0
                 };
-                for (i, url) in std::iter::once(&pair.relay).chain(&pair.relays).filter(|url| !url.is_empty()).take(8).enumerate() {
+                let other_relays = pair.relays.iter().filter(|url| **url != pair.relay);
+                for (i, url) in std::iter::once(&pair.relay).chain(other_relays).filter(|url| !url.is_empty()).take(8).enumerate() {
                     if !targets.iter().any(|(mode, target, _)| *mode == "relay" && target == url) {
                         targets.push(("relay", url.clone(), delay + i as u64 * 150));
                     }
@@ -624,82 +614,119 @@ pub async fn redeem(
     }
 }
 
+const RECHECK_LAN: Duration = Duration::from_secs(10);
+
+struct CachedPeer {
+    tx: Sender,
+    tasks: Tasks,
+    idle_since: Instant,
+    retry_direct_at: Option<Instant>,
+}
+
+impl CachedPeer {
+    fn reusable(&self, now: Instant) -> bool {
+        !self.tx.is_closed() && now.duration_since(self.idle_since) < Duration::from_secs(45)
+            && self.retry_direct_at.is_none_or(|deadline| now < deadline)
+    }
+}
+
+struct PeerRoutes {
+    pair: Pair,
+    next_refresh: Instant,
+    selected: Option<&'static str>,
+}
+
 struct PeerProxyPool {
     cfg: Configuration,
-    pair: Pair,
+    routes: Mutex<PeerRoutes>,
+    authorization: Option<http::HeaderValue>,
     route: Route,
     stop: CancellationToken,
-    idle: Mutex<std::collections::VecDeque<(Instant, Sender, Tasks)>>,
-    relay_fast_until: Mutex<Option<Instant>>,
+    idle: Mutex<std::collections::VecDeque<CachedPeer>>,
 }
 
 impl PeerProxyPool {
     fn new(cfg: Configuration, pair: Pair, route: Route, stop: CancellationToken) -> Arc<Self> {
+        let authorization = if pair.secret.is_empty() {
+            None
+        } else {
+            http::HeaderValue::from_str(&format!("Bearer {}", pair.secret)).ok()
+        };
         Arc::new(Self {
             cfg,
-            pair,
+            routes: Mutex::new(PeerRoutes { pair, next_refresh: Instant::now(), selected: None }),
+            authorization,
             route,
             stop,
             idle: Mutex::default(),
-            relay_fast_until: Mutex::default(),
         })
     }
 
-    fn relay_delay(&self) -> Duration {
-        let fast = self
-            .relay_fast_until
-            .lock()
-            .unwrap()
-            .is_some_and(|until| Instant::now() < until);
-        if fast {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(450)
-        }
-    }
-
-    async fn dial(&self) -> Result<PeerConnection> {
-        let conn = PeerConnection::connect_with_relay_delay(
-            &self.pair,
-            Some(&self.cfg),
-            self.route.clone(),
-            self.relay_delay(),
-            self.stop.clone(),
-        )
-        .await?;
-        if conn.mode == "relay" {
-            *self.relay_fast_until.lock().unwrap() =
-                Some(Instant::now() + Duration::from_secs(60));
-        } else {
-            *self.relay_fast_until.lock().unwrap() = None;
+    async fn dial(self: &Arc<Self>) -> Result<PeerConnection> {
+        let pair = self.routes.lock().unwrap().pair.clone();
+        let conn = PeerConnection::connect(&pair, Some(&self.cfg), self.route.clone(), self.stop.clone()).await?;
+        if matches!(self.route, Route::Auto) {
+            self.refresh_routes(pair, conn.mode);
         }
         Ok(conn)
     }
 
-    fn pop_idle(&self) -> Option<(Sender, Tasks)> {
+    // Learn addresses from the authenticated host even when an earlier invitation
+    // contains only a relay or a previous DHCP lease. Keep the current stream live.
+    fn refresh_routes(self: &Arc<Self>, known: Pair, mode: &'static str) {
+        let now = Instant::now();
+        {
+            let mut routes = self.routes.lock().unwrap();
+            if routes.selected != Some(mode) {
+                tracing::info!("Paired Core connected via {mode}");
+                routes.selected = Some(mode);
+            }
+            if now < routes.next_refresh { return; }
+            routes.next_refresh = now + Duration::from_secs(30);
+        }
+        let pool = self.clone();
+        let route = if mode == "direct" { Route::Direct } else { Route::Relay };
+        tokio::spawn(async move {
+            let refresh = async {
+                let conn = PeerConnection::connect(&known, Some(&pool.cfg), route, pool.stop.clone()).await?;
+                let identity = conn.get_json("/v1/access/identity").await?;
+                let mut updated = known.updated_identity(&identity)?;
+                if known.relay.is_empty() || crate::alma::is_desktop_client_url(&known.relay) {
+                    updated.retain_alma_relays();
+                }
+                updated.validate(private_http())?;
+                pool.routes.lock().unwrap().pair = updated;
+                Ok::<(), anyhow::Error>(())
+            };
+            tokio::select! { _ = pool.stop.cancelled() => {}, _ = timeout(Duration::from_secs(15), refresh) => {} }
+        });
+    }
+
+    fn pop_idle(&self) -> Option<CachedPeer> {
         let mut idle = self.idle.lock().unwrap();
-        while let Some((at, tx, tasks)) = idle.pop_front() {
-            if at.elapsed() < Duration::from_secs(45) && !tx.is_closed() {
-                return Some((tx, tasks));
+        while let Some(peer) = idle.pop_front() {
+            if peer.reusable(Instant::now()) {
+                return Some(peer);
             }
         }
         None
     }
 
-    fn recycle(self: &Arc<Self>, mut tx: Sender, tasks: Tasks) {
+    fn recycle(self: &Arc<Self>, mut peer: CachedPeer) {
         let pool = Arc::clone(self);
         let stop = self.stop.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = stop.cancelled() => {}
-                ready = tx.ready() => {
+                ready = peer.tx.ready() => {
                     if ready.is_ok() {
                         let mut idle = pool.idle.lock().unwrap();
-                        idle.retain(|(at, s, _)| at.elapsed() < Duration::from_secs(45) && !s.is_closed());
-                        if idle.len() >= 4 {
-                            idle.pop_front();
-                        }
-                        idle.push_back((Instant::now(), tx, tasks));
+                        let now = Instant::now();
+                        peer.idle_since = now;
+                        if !peer.reusable(now) { return; }
+                        idle.retain(|cached| cached.reusable(now));
+                        if idle.len() >= 4 { idle.pop_front(); }
+                        idle.push_back(peer);
                     }
                 }
             }
@@ -718,10 +745,8 @@ impl PeerProxyPool {
             };
         }
 
-        if !self.pair.secret.is_empty()
-            && let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {}", self.pair.secret))
-        {
-            req.headers_mut().insert("authorization", val);
+        if let Some(value) = &self.authorization {
+            req.headers_mut().insert("authorization", value.clone());
         }
         req.headers_mut()
             .insert("host", http::HeaderValue::from_static("vantry.remote"));
@@ -748,10 +773,10 @@ impl PeerProxyPool {
             builder.body(full(bytes.clone())).unwrap()
         };
 
-        if let Some((mut tx, tasks)) = self.pop_idle() {
-            if let Ok(reply) = forward(build(&parts, &body_bytes), &mut tx, &tasks).await {
+        if let Some(mut peer) = self.pop_idle() {
+            if let Ok(reply) = forward(build(&parts, &body_bytes), &mut peer.tx, &peer.tasks).await {
                 if reply.status() != 101 {
-                    self.recycle(tx, tasks);
+                    self.recycle(peer);
                 }
                 return credential_rejected(reply);
             }
@@ -761,6 +786,8 @@ impl PeerProxyPool {
             Ok(conn) => conn,
             Err(e) => return json(503, json!({"code":"not_ready","message":e.to_string()})),
         };
+        let retry_direct_at = (matches!(self.route, Route::Auto) && conn.mode == "relay")
+            .then(|| Instant::now() + RECHECK_LAN);
         let tasks = conn.tasks;
         let mut tx = match sender(conn.stream, &tasks).await {
             Ok(tx) => tx,
@@ -769,7 +796,7 @@ impl PeerProxyPool {
         match forward(build(&parts, &body_bytes), &mut tx, &tasks).await {
             Ok(reply) => {
                 if reply.status() != 101 {
-                    self.recycle(tx, tasks);
+                    self.recycle(CachedPeer { tx, tasks, idle_since: Instant::now(), retry_direct_at });
                 }
                 credential_rejected(reply)
             }
@@ -878,21 +905,6 @@ pub async fn serve_gateway(
     mtls: bool,
     stop: CancellationToken,
 ) -> Result<()> {
-    serve_gateway_with_t3(listener, identity, core, mtls, None, stop).await
-}
-/// The optional loopback T3 adapter enforces its own device and WebSocket ticket authentication.
-pub async fn serve_gateway_with_t3(
-    listener: TcpListener,
-    identity: Arc<IdentityStore>,
-    core: PathBuf,
-    mtls: bool,
-    t3: Option<SocketAddr>,
-    stop: CancellationToken,
-) -> Result<()> {
-    ensure!(
-        t3.is_none_or(|a| a.ip().is_loopback()),
-        "T3 backend must be local"
-    );
     let tasks = Tasks::new(stop.clone());
     let rates = Arc::new(Mutex::new(Rate::default()));
     let result = loop {
@@ -920,7 +932,7 @@ pub async fn serve_gateway_with_t3(
                     (identity.clone(), core.clone(), rates.clone(), group.clone());
                 async move {
                     Ok::<_, Infallible>(
-                        gateway_request(req, identity, core, t3, peer, rates, group)
+                        gateway_request(req, identity, core, peer, rates, group)
                             .await
                             .unwrap_or_else(error),
                     )
@@ -942,7 +954,6 @@ async fn gateway_request(
     mut req: Request<Incoming>,
     identity: Arc<IdentityStore>,
     core: PathBuf,
-    t3: Option<SocketAddr>,
     peer: SocketAddr,
     rates: Arc<Mutex<Rate>>,
     group: Tasks,
@@ -954,22 +965,6 @@ async fn gateway_request(
         || path.split('/').any(|s| s == ".." || s == ".")
     {
         return Err(400);
-    }
-    if let Some(address) = t3
-        && (path.starts_with("/api/")
-            || matches!(
-                path.as_str(),
-                "/.well-known/t3/environment" | "/oauth/token" | "/ws"
-            ))
-    {
-        let io = TcpStream::connect(address).await.map_err(|_| 502u16)?;
-        return proxy(
-            req.map(|b| b.map_err(Into::into).boxed_unsync()),
-            Box::new(io),
-            &group,
-        )
-        .await
-        .map_err(|_| 502);
     }
     if path == "/pairings/redeem" {
         if req.method() != Method::POST {

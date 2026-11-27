@@ -40,7 +40,7 @@ Vantry pairs a pure-Rust **[NSH](https://github.com/longbridge/nsh) native deskt
 | **Durable execution** | Queue follow-ups or live-steer running agents (edit, reorder, promote to steer, cancel), configure tool approval policies (`auto`, `auto-accept-edits`, `ask`, `plan`), handle model-only secret prompts, and recover cleanly after window closes or Core restarts. |
 | **Multi-agent tasks** | Delegate persistent child tasks with isolated Git worktrees, inherited permission bounds, live subtask progress in the session overview, automatic or manual result delivery back to the parent thread, follow-up turns, and cascading cancellation. |
 | **Files, Git & terminal** | Right-side workbench dock with a file tree, search and read-only preview, Git status/diffs/staging/branching/commits/PR summaries, and an integrated terminal. |
-| **Multi-machine work** | Unified sidebar across local and paired remote machines, direct LAN mTLS with automatic self-hosted relay fallback, gzip-compressed on-demand summary/detail sync, and compatibility with existing `v0.1.42` pairings and T3 Protocol 2 clients. |
+| **Multi-machine work** | Work across paired Vantry computers over LAN or an Alma relay. Share a conversation with Alma iOS over LAN or an Alma-compatible HTTPS relay. |
 | **MCP & plugins** | Native Pi MCP support (`~/.pi/agent/mcp.json` and project `.pi/mcp.json`) with Codemode/tool-search discovery, explicit project trust, and on-demand connection probing; declarative native plugin panels and separate-session remote desktop. |
 
 The desktop interface supports **English**, **简体中文**, and **日本語**.
@@ -65,8 +65,8 @@ Updates download and verify in the background (with optional binary `.delta` pat
 
 ## Multi-machine and remote desktop
 
-- **Paired Core sessions** — Pair another machine from **Settings → Environments** to connect over direct LAN mTLS or a self-hosted relay (such as the standalone `vantry-relay` binary or a companion relay service). Filter the sidebar by machine and open any conversation in the same window; actions always route to the Core that owns the project. Existing `v0.1.42` session pairings reuse the same identity and relay settings.
-- **Remote desktop** — Screen sharing uses a separate session and authorization flow (LAN-first with optional self-hosted relay; no public relay is preset). Each viewing/control request requires explicit approval on the host. On macOS, hosting requires **Screen Recording** and **Accessibility** permissions.
+- **Paired Core sessions** — Open **Settings → Environments** to pair two computers using the host’s invitation link over LAN or an Alma relay. The sidebar groups conversations by machine. To use a phone outside the LAN, share the conversation with Alma iOS and enter the public URL of your Alma relay.
+- **Remote desktop** — Start screen sharing on the host and open its LAN invitation on the other computer. On macOS, screen capture and keyboard or mouse input require **Screen Recording** and **Accessibility** permissions.
 
 ## Architecture
 
@@ -92,7 +92,7 @@ Worker (vantry-service provider-worker) ── embedded pi-rust ── Model Pro
 | `crates/core` | Transactional SQLite store, command idempotency, task scheduler, outbox, and event stream. |
 | `crates/pi-runtime` | Embedded `pi-rust` session host, model catalog, MCP bridge, approvals, and job journal. |
 | `crates/protocol`, `crates/client` | Shared v1 protocol types and compressed HTTP/NDJSON client with cursor resync. |
-| `crates/connectivity` | mTLS identity, pairing codes, direct/relay transports, T3 compatibility, and remote-desktop signaling. |
+| `crates/connectivity` | Device identity, native TLS pairing over LAN or an Alma relay, LAN desktop transport and encrypted Alma mobile connections. |
 | `crates/platform` | Workspace/worktree boundaries, Git adapter, PTY, plugin host, and OS integration. |
 | `crates/updater`, `tools/xtask` | Binary delta/full updater and release packaging (`package`, `make-delta`, `prepare-icon`). |
 
@@ -149,8 +149,8 @@ Engineering guides are primarily written in Chinese. Several design docs predate
 | [Desktop UI](docs/desktop-ui.md) | Stardust visual language, composer behavior, and workbench panels. |
 | [Task orchestration](docs/task-orchestration.md) | Parent/child delegation, isolation, and continuation rules. |
 | [MCP integration](docs/mcp-integration.md) | Codemode-first MCP discovery, project trust, and probing. |
-| [Remote connections](docs/native-connectivity.md) | Device pairing, direct mTLS, self-hosted relay, and T3 compatibility. |
-| [Remote desktop](docs/remote-desktop.md) | LAN-first WebRTC sharing, relay fallback, and macOS permissions. |
+| [Remote connections](docs/native-connectivity.md) | Pair Vantry computers and connect Alma iOS over LAN or an Alma relay. |
+| [Remote desktop](docs/remote-desktop.md) | LAN screen sharing and macOS permissions. |
 | [Updates](docs/updates.md) | Staged verification, `.delta` patches, and idle Core handoff. |
 | [Release notes](docs/releases/) | Version-by-version changes and release downloads. |
 
@@ -160,7 +160,7 @@ Vantry builds on and draws inspiration from great open-source projects:
 
 - **[NSH](https://github.com/longbridge/nsh)** — Pure-Rust native GPU desktop UI framework.
 - **[pi-rust](https://github.com/yannelli/pi-rust)** — Embedded `pi-coding-agent` session runtime and extension host.
-- **[T3 Code](https://github.com/pingdotgg/t3code)** — Inspiration for orchestration workflows and Protocol 2 compatibility.
+- **[T3 Code](https://github.com/pingdotgg/t3code)** — Inspiration for orchestration workflows.
 - **[Lucide](https://lucide.dev)**, **[Mermaid](https://mermaid.js.org)**, and **[KaTeX](https://katex.org)** — Iconography, diagrams, and math rendering.
 
 ## License

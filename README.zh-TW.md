@@ -40,7 +40,7 @@ Vantry 結合純 Rust 的 **[NSH](https://github.com/longbridge/nsh) 原生桌�
 | **持久化執行與即時控制** | 執行中支援訊息佇列與即時 `steer` 引導（可編輯、重新排序、轉為追加、取消）；提供 `auto` / `auto-accept-edits` / `ask` / `plan` 權限模式、模型專用金鑰輸入，以及關閉視窗或重啟 Core 後的狀態復原。 |
 | **多代理任務編排** | 持久父子任務委派、獨立 Git worktree 隔離、權限上限繼承、於對話概覽即時檢視子任務進度與輸出、自動或手動交付結果回父對話、子任務追問與級聯停止。 |
 | **檔案、Git 與終端機** | 右側工具塢整合檔案樹、搜尋與唯讀預覽、Git 狀態／差異／暫存／分支切換／提交／PR 摘要，以及內嵌終端機。 |
-| **多機連線與遠端協作** | 側欄統一彙整本機與已配對機器的對話，支援區域網路 mTLS 直連與自建中繼自動回退、gzip 壓縮與按需摘要／詳情同步，並相容既有 `v0.1.42` 配對身分與 T3 協定 2 用戶端。 |
+| **多機連線與遠端協作** | 已配對的 Vantry 電腦透過區域網路或 Alma 中繼連線。Alma iOS 可以透過區域網路或相容 Alma 的 HTTPS 中繼存取共用對話。 |
 | **MCP、技能與外掛** | 原生支援 Pi MCP（`~/.pi/agent/mcp.json` 與專案 `.pi/mcp.json`），採用 Codemode／按需工具探索、明確專案信任與連線探測；支援宣告式原生外掛面板與獨立授權的遠端桌面。 |
 
 桌面介面內建 **简体中文**、**English** 與 **日本語**。
@@ -65,8 +65,8 @@ Vantry 結合純 Rust 的 **[NSH](https://github.com/longbridge/nsh) 原生桌�
 
 ## 跨機連線與遠端桌面
 
-- **配對對話連線** —— 於 **設定 → 環境** 中與其他機器配對，優先透過區域網路 mTLS 直連，無法直連時自動回退至自建中繼（可使用獨立 `vantry-relay` 或配套中繼服務）。於側欄依機器篩選並在同一視窗開啟對話，所有操作均會路由至專案所屬機器的 Core。舊版 `v0.1.42` 的配對身分與中繼設定可直接沿用。
-- **遠端桌面** —— 螢幕共用採用獨立的工作階段與授權流程（區域網路直連優先，可選自建中繼，不預設任何公網伺服器），每次觀看與鍵鼠控制皆須在共用端明確同意。於 macOS 開啟共用需授予 **螢幕錄製** 與 **輔助使用** 權限。
+- **對話配對** —— 兩台電腦在「設定 → 環境」使用主機產生的完整連結配對，支援區域網路與 Alma 公網中繼，側欄可依機器查看對話。手機使用行動網路時，在所選對話的 Alma iOS 配對視窗填入 Alma 中繼的公開網址。
+- **遠端桌面** —— 在主機開啟共用，另一台電腦使用區域網路邀請連結連線。macOS 擷取畫面需要「螢幕錄製」權限，鍵鼠控制需要「輔助使用」權限。
 
 ## 架構概覽
 
@@ -92,7 +92,7 @@ Worker (vantry-service provider-worker) ── 內建 pi-rust ── 模型服�
 | `crates/core` | SQLite 交易儲存、命令冪等回執、父子任務排程器、outbox 與事件串流。 |
 | `crates/pi-runtime` | 內建 `pi-rust` 對話宿主、模型目錄、MCP 橋接、核准互動與執行日誌。 |
 | `crates/protocol`、`crates/client` | v1 協定型別與支援 gzip 壓縮、游標續傳的 HTTP/NDJSON 用戶端。 |
-| `crates/connectivity` | mTLS 裝置身分、配對碼、直連／中繼傳輸、T3 相容層與遠端桌面信令。 |
+| `crates/connectivity` | 裝置身分、電腦 TLS 配對與 Alma 公網中繼、區域網路桌面傳輸及 Alma 手機端對端加密連線。 |
 | `crates/platform` | 工作區與 worktree 邊界檢查、Git 轉接層、PTY、外掛宿主與系統整合。 |
 | `crates/updater`、`tools/xtask` | 增量／完整更新引擎與發行封裝工具（`package`、`make-delta`、`prepare-icon`）。 |
 
@@ -149,8 +149,8 @@ cargo run --locked -p xtask -- package desktop
 | [桌面介面說明](docs/desktop-ui.md) | Stardust 視覺語言、輸入互動與工具塢面板。 |
 | [任務編排](docs/task-orchestration.md) | 父子任務委派、工作區隔離與結果續行規則。 |
 | [MCP 整合](docs/mcp-integration.md) | Codemode 優先的 MCP 探索、專案信任與連線探測。 |
-| [原生遠端連線](docs/native-connectivity.md) | 裝置配對、mTLS 直連、自建中繼與 T3 相容。 |
-| [遠端桌面](docs/remote-desktop.md) | 區域網路優先 WebRTC 共用、中繼回退與 macOS 權限。 |
+| [原生遠端連線](docs/native-connectivity.md) | 電腦與 Alma iOS 的區域網路與公網配對。 |
+| [遠端桌面](docs/remote-desktop.md) | 區域網路螢幕共用與 macOS 權限。 |
 | [更新機制](docs/updates.md) | 背景驗證、`.delta` 增量修補與 Core 閒置交接。 |
 | [版本發行紀錄](docs/releases/) | 各版本變更說明與下載連結。 |
 
@@ -160,7 +160,7 @@ Vantry 建構於並受啟發於以下優秀的開源專案：
 
 - **[NSH](https://github.com/longbridge/nsh)** —— 純 Rust 原生 GPU 桌面 UI 框架。
 - **[pi-rust](https://github.com/yannelli/pi-rust)** —— 內建 `pi-coding-agent` 對話執行時期與擴充宿主。
-- **[T3 Code](https://github.com/pingdotgg/t3code)** —— 任務編排設計靈感與協定 2 相容。
+- **[T3 Code](https://github.com/pingdotgg/t3code)** —— 任務編排流程的設計參考。
 - **[Lucide](https://lucide.dev)**、**[Mermaid](https://mermaid.js.org)** 與 **[KaTeX](https://katex.org)** —— 圖示設計、圖表與數學公式繪製支援。
 
 ## 開源授權

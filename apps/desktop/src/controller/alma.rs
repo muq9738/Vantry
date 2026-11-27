@@ -65,11 +65,12 @@ fn dispatch(action: &'static str, background: bool) {
     };
     let mut req = actions::request(action);
     req.thread_id = form.thread_id;
-    if action == "remote.pair.alma.create" && form.advanced {
+    if (action == "remote.pair.alma.create" && form.advanced) || action == "remote.pair.alma.replace" {
         req.input = Some(
             serde_json::json!({"relay":form.relay.trim(),"registrationKey":form.key.expose()}),
         );
-    } else if action == "remote.pair.alma.revoke" {
+    }
+    if matches!(action, "remote.pair.alma.revoke" | "remote.pair.alma.replace") {
         let Some(status) = &form.status else { return };
         req.name = status.share_id.clone();
     }
@@ -112,8 +113,9 @@ fn dispatch(action: &'static str, background: bool) {
                     f.link = link;
                     f.status = Some(status);
                     f.error.clear();
-                    if action == "remote.pair.alma.create" {
+                    if matches!(action, "remote.pair.alma.create" | "remote.pair.alma.replace") {
                         f.key.clear();
+                        f.advanced = false;
                     }
                 }
                 Err(error) => f.error = error,

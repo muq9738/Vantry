@@ -343,7 +343,7 @@ fn models_and_policies_go_to_the_thread_or_to_new_threads() {
     assert_eq!(state.current_model(), "openai/gpt");
     // The new thread is created with them.
     state.set_draft_text("开始");
-    let create = state.submit().unwrap();
+    let create = state.submit("fixture/model").unwrap();
     assert_eq!(create.kind, CommandKind::CreateThread);
     assert_eq!((create.model.as_str(), create.approval_policy.as_str()), ("openai/gpt", "ask"));
 }
@@ -361,7 +361,7 @@ fn attachments_ride_with_the_message() {
     state.add_attachment(attachment.clone());
     assert_eq!(state.draft().attachments.len(), 1, "once");
     assert!(state.composer_status().can_submit, "an attachment alone can be sent");
-    let send = state.submit().unwrap();
+    let send = state.submit("fixture/model").unwrap();
     assert_eq!(send.attachments, vec![attachment]);
     assert!(state.draft().attachments.is_empty());
     state.add_attachment(Attachment { id: "x".into(), ..Attachment::default() });
@@ -433,7 +433,7 @@ fn editing_a_queued_message_uses_the_composer_and_restores_the_draft() {
     assert_eq!(status.primary, PrimaryAction::Save);
     assert!(state.queue_items()[1].editing);
     state.set_draft_text("乙（改）");
-    let edit = state.submit().unwrap();
+    let edit = state.submit("fixture/model").unwrap();
     assert_eq!(edit.kind, CommandKind::EditInput);
     assert_eq!((edit.input_id.as_str(), edit.message.as_str()), ("b", "乙（改）"));
     assert_eq!(state.draft().text, "我的草稿", "the draft is back");
@@ -572,7 +572,7 @@ fn switching_unsent_drafts_does_not_redirect_a_late_create_or_its_edits() {
     state.start_local_draft();
     assert_eq!(state.draft_key(), first, "reuse the empty draft");
     state.set_draft_text("first send");
-    let create = state.submit().unwrap();
+    let create = state.submit("fixture/model").unwrap();
     state.set_draft_text("written while creating");
     state.start_local_draft();
     let second = state.draft_key();
@@ -592,7 +592,7 @@ fn switching_unsent_drafts_does_not_redirect_a_late_create_or_its_edits() {
     assert_eq!(state.draft().text, "second draft");
     assert_eq!(state.drafts["created"].text, "written while creating");
     assert_eq!(state.local_order, [second.clone()]);
-    let rejected = state.submit().unwrap();
+    let rejected = state.submit("fixture/model").unwrap();
     state.select_thread(Some("existing".into()));
     state.on_command_result(
         &rejected.command_id,
@@ -817,7 +817,7 @@ async fn a_conversation_against_the_mock_core_streams_asks_and_completes() {
     let stream = tokio::spawn(bridge.subscribe(state.sequence, sink));
 
     state.set_draft_text("看看目录");
-    let create = state.submit().unwrap();
+    let create = state.submit("fixture/model").unwrap();
     send(&bridge, &mut state, create).await;
     let thread = state.selected.clone().unwrap();
     pump(&bridge, &mut state, &mut events, |s| !s.approval_queue().is_empty()).await;
@@ -848,12 +848,12 @@ async fn a_conversation_against_the_mock_core_streams_asks_and_completes() {
 
     // Queue while a run goes: it waits, then starts after the run.
     state.set_draft_text("第二条");
-    let second = state.submit().unwrap();
+    let second = state.submit("fixture/model").unwrap();
     send(&bridge, &mut state, second).await;
     pump(&bridge, &mut state, &mut events, |s| !s.approval_queue().is_empty()).await;
     state.set_running_action(RunningAction::Queue);
     state.set_draft_text("排队的");
-    let queue = state.submit().unwrap();
+    let queue = state.submit("fixture/model").unwrap();
     assert_eq!(queue.kind, CommandKind::QueueMessage);
     send(&bridge, &mut state, queue).await;
     pump(&bridge, &mut state, &mut events, |s| s.queue_items().len() == 1).await;

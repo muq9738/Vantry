@@ -24,6 +24,7 @@ mod control;
 pub use control::{deliver_control, request_stop};
 mod disk;
 mod events;
+mod gemini_web;
 pub use events::{IncrementalJournalReader, JobEvents, JournalCursor};
 mod ui;
 mod worker;

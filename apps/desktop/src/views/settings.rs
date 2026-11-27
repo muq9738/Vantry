@@ -1220,7 +1220,7 @@ pub(crate) fn pairing_dialog() -> impl IntoElement {
             card().w_full().max_w(px(440.0)).p_5().gap_3()
                 .child(row().child(title("连接另一台电脑").flex_1()).child(super::icon_button(crate::icons::Icon::X, "关闭", close)))
                 .child(hint("在主机的「设置 → 环境」生成一次性配对链接，然后粘贴到这里。"))
-                .child(secret_field(|| controller::ui().with(|u| u.forms.pair_code.clone()), |t| controller::set_pair_field(true, t), "一次性配对码或连接链接"))
+                .child(secret_field(|| controller::ui().with(|u| u.forms.pair_code.clone()), |t| controller::set_pair_field(true, t), "完整的电脑配对链接"))
                 .child(field(|| controller::ui().with(|u| u.forms.pair_name.clone()), |t| controller::set_pair_field(false, t), "这台设备的名称（可选）"))
                 .child(hint(|| controller::ui().with(|u| u.forms.pair_wait.clone())))
                 .child(feedback_line())
@@ -1289,44 +1289,15 @@ fn remote_page(data: Data) -> impl IntoElement {
                         controller::reload_catalogs,
                     )),
             );
-            if !remote.t3_pairing_link.is_empty() {
-                let link = remote.t3_pairing_link.clone();
-                c = c.child(caption("Scan with Vantry on iPhone"));
-                if let Some(qr) = alma::qr(&link, 320) { c = c.child(qr); }
-                c = c.child(link_button("Copy iPhone pairing link", move || controller::copy(link.clone())));
-            }
-            if !remote.pairing_code.is_empty() {
-                let code = remote.pairing_code.clone();
-                c = c.child(caption("Computer-to-computer pairing code"));
-                let copy = code.clone();
-                c = c.child(
-                    row()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(8.0))
-                        .bg(colors.soft)
-                        .child(
-                            text(code)
-                                .select_text()
-                                .flex_1()
-                                .font_family(MONO)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_size(px(14.0))
-                                .text_color(colors.ink),
-                        )
-                        .child(when(!remote.pairing_expires_at.is_empty(), {
-                            let at = remote.pairing_expires_at.clone();
-                            move || caption(format!("至 {}", short_time(&at)))
-                        }))
-                        .child(link_button("复制", move || controller::copy(copy.clone()))),
-                );
-            }
             if !remote.pairing_link.is_empty() {
                 let link = remote.pairing_link.clone();
                 c = c.child(ghost_button("复制电脑配对链接", move || controller::copy(link.clone())));
+                if !remote.pairing_expires_at.is_empty() {
+                    c = c.child(caption(format!("有效至 {}", short_time(&remote.pairing_expires_at))));
+                }
             }
             if let Some(on) = remote.require_approval && target.get().is_none() {
-                c = c.child(switch_row("新电脑需要批准", "使用一次性配对码后，在本机核对设备显示的验证码。", move || on, move || {
+                c = c.child(switch_row("新电脑需要批准", "使用一次性配对链接后，在本机核对设备显示的验证码。", move || on, move || {
                     let mut req = actions::request("remote.access.approval");
                     req.input = Some(serde_json::json!({"enabled":!on}));
                     controller::settings_op("approval.policy", req, "已更新设备批准设置");

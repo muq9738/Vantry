@@ -808,11 +808,14 @@ impl AppState {
         let submit_key = format!("submit:{}", self.draft_key());
         let pending = self.pending_by_key(&submit_key);
         let active = self.selected.as_deref().and_then(|id| self.active_run(id));
+        let can_steer = active.is_some_and(|run| {
+            run.status == RunStatus::Running && !vantry_protocol::uses_gemini_web(&run.provider_id, &run.model)
+        });
         let primary = if editing {
             PrimaryAction::Save
         } else {
             match active {
-                Some(run) if run.status == RunStatus::Running => match self.running_action {
+                Some(_) if can_steer => match self.running_action {
                     RunningAction::Steer => PrimaryAction::Steer,
                     RunningAction::Queue => PrimaryAction::Queue,
                 },
@@ -828,7 +831,7 @@ impl AppState {
                 && self.early_submit_ready()
                 && !self.attachment_imports.contains_key(&self.draft_key()),
             primary,
-            can_choose_running_action: !editing && active.is_some_and(|run| run.status == RunStatus::Running),
+            can_choose_running_action: !editing && can_steer,
             can_stop: active.is_some_and(|run| !self.in_flight(&format!("stop:{}", run.id))),
             sending: !editing && pending.is_some_and(|p| p.in_flight),
             retry: pending
@@ -844,6 +847,14 @@ impl AppState {
             Some(thread) => thread.model.clone(),
             None => self.new_thread.model.clone(),
         }
+    }
+
+    fn draft_message(&self, draft: &Draft, thread: Option<&Thread>, default_model: &str) -> String {
+        let (provider, model) = match thread {
+            Some(t) => (&t.provider_id, &t.model),
+            None => (&self.new_thread.provider_id, &self.new_thread.model),
+        };
+        draft.message_for(provider, if model.is_empty() { default_model } else { model })
     }
 
     /// The approval policy the composer shows.
@@ -2009,18 +2020,18 @@ impl AppState {
     /// says); saves the queued message being edited. Returns the command to
     /// dispatch; the draft moves into the pending command until the Core
     /// accepts it.
-    pub fn submit(&mut self) -> Option<Command> {
+    pub fn submit(&mut self, default_model: &str) -> Option<Command> {
         let status = self.composer_status();
         if !status.can_submit {
             return None;
         }
         if status.editing {
-            return self.save_queue_edit();
+            return self.save_queue_edit(default_model);
         }
         let draft_key = self.draft_key();
         let key = format!("submit:{draft_key}");
         let draft = self.take_draft();
-        let text = draft.outgoing().trim().to_owned();
+        let text = self.draft_message(&draft, self.selected_thread(), default_model);
         let Some(thread_id) = self.selected.clone() else {
             let mut send = Command::new(new_command_id("send"), CommandKind::SendMessage);
             send.message = text.clone();
@@ -2050,14 +2061,14 @@ impl AppState {
     }
 
     /// Submit a child's own draft while its parent stays selected in the sidebar.
-    pub fn submit_child(&mut self, child: &str) -> Option<Command> {
+    pub fn submit_child(&mut self, child: &str, default_model: &str) -> Option<Command> {
         let parent=self.selected.as_deref()?;
         if !self.tasks.iter().any(|t| t.parent_thread_id==parent && t.child_thread_id==child) {return None;}
         if !self.early_ready_for(child) {return None;}
         let key=format!("submit:{child}");
         if self.pending_by_key(&key).is_some() || self.drafts.get(child)?.is_blank() {return None;}
         let draft=self.drafts.remove(child)?;
-        let text=draft.outgoing().trim().to_owned();
+        let text = self.draft_message(&draft, self.thread(child), default_model);
         Some(self.send_existing(child.into(),key,child.into(),draft,text))
     }
 
@@ -2066,6 +2077,7 @@ impl AppState {
         let mut command = match active {
             Some(run)
                 if run.status == RunStatus::Running
+                    && !vantry_protocol::uses_gemini_web(&run.provider_id, &run.model)
                     && self.running_action == RunningAction::Steer =>
             {
                 let mut steer = Command::new(new_command_id("steer"), CommandKind::SteerMessage);

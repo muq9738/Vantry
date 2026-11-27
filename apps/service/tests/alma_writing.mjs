@@ -29,7 +29,7 @@ await withAlmaFixture(process.argv[2],process.argv[3],thread,async ({ctl,connect
     assert.deepEqual(models.map(m=>m.id),[model]);
     assert.equal((await phone.http(base,{model:'vantry:other'},'PUT')).status,400);
     assert.equal((await phone.http(base+'/send',{text:'没有可重用操作 ID 的写作请求。'})).status,400);
-    const input = {text:'只转发这句写作要求。',optimisticId:'physical-equivalent'};
+    const input = {text:'  只转发这句写作要求。\n\n“原文”  ',optimisticId:'physical-equivalent'};
     assert.equal((await phone.http(base+'/send',input)).status,202);
     assert.equal((await phone.http(base+'/send',input)).status,202);
     const calls = async()=> (await readFile(audit,'utf8')).trim().split('\n').map(s=>JSON.parse(s));
@@ -58,6 +58,7 @@ await withAlmaFixture(process.argv[2],process.argv[3],thread,async ({ctl,connect
     const seen=await calls();
     assert.deepEqual(seen.map(r=>r.observeOnly),[false,true,true,true]);
     assert(seen.every(r=>r.message===input.text && r.run===run.id && r.operation.endsWith('/op/'+input.optimisticId)));
+    assert(seen.every(r=>!('system' in r) && !('history' in r) && !('tools' in r)));
     assert.equal((await ctl('snapshot')).runs.length,1);
     console.log('PASS: one writing operation across duplicate mobile sends, Core restart, interrupted observation, and explicit retrieval.');
 },testConfig);

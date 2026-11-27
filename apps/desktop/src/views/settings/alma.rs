@@ -80,6 +80,12 @@ fn pairing_busy() -> bool {
     read(|f| f.busy)
 }
 
+fn relay_fields() -> impl IntoElement {
+    view().flex_col().gap_2()
+        .child(field(|| read(|f| f.relay.clone()), |v| alma::edit(|f| f.relay = v.into()), "alma-relay 的 HTTPS 地址"))
+        .child(secret_field(|| read(|f| f.key.expose().to_owned()), |v| alma::edit(|f| f.key = Secret::new(v)), "注册凭据（中继要求时填写）"))
+}
+
 pub(crate) fn dialog() -> impl IntoElement {
     when(
         || controller::ui().with(|u| u.forms.alma.is_some()),
@@ -142,7 +148,7 @@ pub(crate) fn dialog() -> impl IntoElement {
                         view()
                             .flex_col()
                             .gap_2()
-                            .child(hint("在同一 Wi-Fi 下，用 Alma iOS 扫码即可打开这条会话。"))
+                            .child(hint("同一 Wi-Fi 可直接扫码。在外网连接请填写 alma-relay 的地址。"))
                             .child(link_button(
                                 move || {
                                     if advanced.get() {
@@ -155,21 +161,7 @@ pub(crate) fn dialog() -> impl IntoElement {
                             ))
                             .child(when(
                                 move || advanced.get(),
-                                || {
-                                    view()
-                                        .flex_col()
-                                        .gap_2()
-                                        .child(field(
-                                            || read(|f| f.relay.clone()),
-                                            |v| alma::edit(|f| f.relay = v.into()),
-                                            "Alma 兼容中继 HTTPS 地址",
-                                        ))
-                                        .child(secret_field(
-                                            || read(|f| f.key.expose().to_owned()),
-                                            |v| alma::edit(|f| f.key = Secret::new(v)),
-                                            "注册凭据（中继要求时填写）",
-                                        ))
-                                },
+                                relay_fields,
                             ))
                             .child(
                                 primary_button("生成配对码", || {
@@ -251,6 +243,19 @@ pub(crate) fn dialog() -> impl IntoElement {
                                     .disabled(pairing_busy)
                                 },
                             ))
+                            .child(when(move || own.get() && !confirm.get(), move || {
+                                view().flex_col().gap_2()
+                                    .child(link_button(move || if advanced.get() { "取消更改" } else { "重新配对…" }, || alma::edit(|f| {
+                                        f.advanced = !f.advanced;
+                                        f.relay = f.status.as_ref().map(|s| s.relay.clone()).unwrap_or_default();
+                                        f.key.clear();
+                                    })).disabled(pairing_busy))
+                                    .child(when(move || advanced.get(), || view().flex_col().gap_2()
+                                        .child(relay_fields())
+                                        .child(hint("公网中继连接成功后，旧码失效。在 Alma 打开新链接即可。"))
+                                        .child(primary_button("重新配对并生成新码", || alma::request("remote.pair.alma.replace"))
+                                            .disabled(|| pairing_busy() || read(|f| f.relay.trim().is_empty())))))
+                            }))
                             .child(when(
                                 move || !confirm.get(),
                                 || {

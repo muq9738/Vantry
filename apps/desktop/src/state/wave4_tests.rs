@@ -256,9 +256,9 @@ fn summary_stage_allows_a_local_draft_but_blocks_before_summary() {
     });
     assert!(state.selected.is_none(), "the non-blank local draft stays shown");
     assert!(state.composer_status().can_submit);
-    let create = state.submit().expect("summary is enough for a new thread");
+    let create = state.submit("fixture/model").expect("summary is enough for a new thread");
     assert_eq!(create.kind, CommandKind::CreateThread);
-    assert!(state.submit().is_none(), "the pending receipt prevents a duplicate");
+    assert!(state.submit("fixture/model").is_none(), "the pending receipt prevents a duplicate");
 }
 
 #[test]
@@ -271,9 +271,9 @@ fn complete_detail_can_send_early_but_waits_after_an_accepted_receipt() {
     let token = state.begin_detail_load("t1");
     assert!(state.apply_thread_detail(token, detail_variant("t1", "r1", 7, false)));
     state.set_draft_text("早发消息");
-    let send = state.submit().expect("complete detail is authoritative enough");
+    let send = state.submit("fixture/model").expect("complete detail is authoritative enough");
     assert_eq!(send.kind, CommandKind::SendMessage);
-    assert!(state.submit().is_none(), "the in-flight receipt is single-shot");
+    assert!(state.submit("fixture/model").is_none(), "the in-flight receipt is single-shot");
 
     assert!(state
         .on_command_result(
@@ -287,7 +287,7 @@ fn complete_detail_can_send_early_but_waits_after_an_accepted_receipt() {
         .is_none());
     state.set_draft_text("不要重复发");
     assert!(!state.composer_status().can_submit);
-    assert!(state.submit().is_none(), "wait for detail/snapshot after receipt");
+    assert!(state.submit("fixture/model").is_none(), "wait for detail/snapshot after receipt");
 }
 
 #[test]
@@ -300,7 +300,7 @@ fn new_thread_remains_submittable_after_first_turn_completes_in_summaries_mode()
     state.on_live();
     state.new_thread();
     state.set_draft_text("第一轮消息");
-    let create = state.submit().expect("new thread submits in summaries mode");
+    let create = state.submit("fixture/model").expect("new thread submits in summaries mode");
     assert_eq!(create.kind, CommandKind::CreateThread);
 
     let send = state
@@ -349,7 +349,7 @@ fn new_thread_remains_submittable_after_first_turn_completes_in_summaries_mode()
         state.composer_status().can_submit,
         "newly created thread must stay submittable after its first turn finishes"
     );
-    let second = state.submit().expect("second message should dispatch");
+    let second = state.submit("fixture/model").expect("second message should dispatch");
     assert_eq!(second.kind, CommandKind::SendMessage);
     assert_eq!(second.thread_id, "t_new");
 }
@@ -366,7 +366,7 @@ fn event_arriving_before_message_receipt_does_not_strand_awaiting_refresh() {
     assert!(state.apply_thread_detail(token, detail_variant("t1", "r1", 7, false)));
 
     state.set_draft_text("快速任务");
-    let send = state.submit().expect("send message");
+    let send = state.submit("fixture/model").expect("send message");
     // Live events arrive and finish the run BEFORE the HTTP command receipt returns.
     state.apply_event(&CoreEvent {
         sequence: 8,
@@ -767,7 +767,7 @@ fn a_failed_child_accepts_a_follow_up_from_the_drawer_in_summaries_mode() {
     assert!(state.merge_child_detail(child));
     state.drafts.entry("child".into()).or_default().text = "?".into();
 
-    let command = state.submit_child("child").expect("the drawer sends to the child");
+    let command = state.submit_child("child", "fixture/model").expect("the drawer sends to the child");
     assert_eq!(command.thread_id, "child");
     assert_eq!(command.message, "?");
     assert_eq!(state.selected.as_deref(), Some("parent"), "the parent stays shown");

@@ -59,7 +59,7 @@ enum Role {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Expose a local Core socket proxying a paired remote peer over mTLS/relay.
+    /// Expose a local Core socket for a paired computer over LAN or Alma relay.
     PeerProxy(PeerProxyArgs),
 }
 #[derive(Args)]
@@ -273,20 +273,8 @@ async fn serve(args: CoreArgs) -> Result<()> {
     let stop = CancellationToken::new();
     let shutdown = signal()?;
     let saved = ext.identity.snapshot();
-    let mut relay_targets = Vec::new();
-    if saved.enabled {
-        if !saved.host.relay.is_empty() {
-            relay_targets.push((saved.host.relay.clone(), saved.registration_key.clone()));
-        }
-        for endpoint in &saved.relays {
-            if !endpoint.url.is_empty() && !relay_targets.iter().any(|(url, _)| url == &endpoint.url) {
-                let key = if endpoint.registration_key.is_empty() { &saved.registration_key } else { &endpoint.registration_key };
-                relay_targets.push((endpoint.url.clone(), key.clone()));
-            }
-        }
-    }
     let remote = async {
-        let wait_for_pair = args.listen_remote.is_none() && !saved.enabled && saved.t3_listen().is_empty();
+        let wait_for_pair = args.listen_remote.is_none() && !saved.enabled;
         if wait_for_pair {
             tokio::select! {
                 _ = stop.cancelled() => return Ok::<(), anyhow::Error>(()),
@@ -302,73 +290,28 @@ async fn serve(args: CoreArgs) -> Result<()> {
             }
         };
         let bound = listener.local_addr()?;
-        let direct = if bound.ip().is_unspecified() {
-            if_addrs::get_if_addrs()?.into_iter().map(|i| i.ip())
-                .filter(|ip| !ip.is_loopback() && ip.is_ipv4() == bound.is_ipv4())
-                .map(|ip| std::net::SocketAddr::new(ip, bound.port()).to_string()).collect()
-        } else { vec![bound.to_string()] };
-        ext.identity.remember_listener(direct, bound.port(), wait_for_pair)?;
-        let t3 = vantry_connectivity::t3compat::T3Server::open(
-            vantry_connectivity::t3compat::T3Options {
-                data_dir: data.clone(),
-                core_socket: data.join("core.sock"),
-                environment_id: ext.environment.clone(),
-                name: ext.identity.snapshot().host.name,
-                version: env!("CARGO_PKG_VERSION").into(),
-                provider: ext.options.provider_id.clone(),
-                model: ext.options.model.clone(),
-                identity: Some(ext.identity.clone()),
-            },
-        )?;
-        let configured_t3 = saved.t3_listen();
-        let (t3_listener, t3_addr) = t3
-            .bind_configured((!configured_t3.is_empty()).then_some(configured_t3))
-            .await?;
-        let t3_stop = stop.clone();
-        ext.mobile_server.send_replace(Some(t3.clone()));
-        let t3_task = tokio::spawn(async move {
-            let _ = t3.serve(t3_listener, t3_stop).await;
-        });
-        let mut gateway = listener.local_addr()?;
-        if gateway.ip().is_unspecified() {
-            gateway.set_ip(if gateway.is_ipv4() {
-                std::net::Ipv4Addr::LOCALHOST.into()
-            } else {
-                std::net::Ipv6Addr::LOCALHOST.into()
-            });
-        }
+        ext.identity.remember_listener(bound, wait_for_pair)?;
         let relay_stop = stop.child_token();
-        let mut hosts = tokio::task::JoinSet::new();
-        for (relay, key) in relay_targets {
-            let host = vantry_connectivity::peer::HostConfig {
-                relay,
-                key,
-                gateway,
-                route: saved.host.route.clone(),
-                instance: saved.host.device_id.clone(),
-                t3: Some(t3_addr),
-            };
-            let (status, _) = tokio::sync::watch::channel(vantry_connectivity::peer::HostState::Connecting);
-            let owner = relay_stop.clone();
-            hosts.spawn(async move {
-                if host.run(status, owner).await.is_err() {
-                    tracing::warn!("saved IDE relay could not start");
-                }
-            });
+        let mut relay_tasks = tokio::task::JoinSet::new();
+        if let Some(relays) = &ext.desktop_relay {
+            for host in relays.hosts(&saved.host.route, bound)? {
+                relay_tasks.spawn(host.run(relay_stop.clone()));
+            }
         }
-        let res = vantry_connectivity::peer::serve_gateway_with_t3(
+        ext.gateway_ready.send_replace(true);
+        let res = vantry_connectivity::peer::serve_gateway(
             listener,
             ext.identity.clone(),
             data.join("core.sock"),
             false,
-            Some(t3_addr),
             stop.clone(),
         )
         .await;
+        ext.gateway_ready.send_replace(false);
         relay_stop.cancel();
-        while hosts.join_next().await.is_some() {}
-        t3_task.abort();
-        let _ = t3_task.await;
+        while let Some(task) = relay_tasks.join_next().await {
+            task??;
+        }
         res
     };
     let warm_pi = provider.default_provider == "pi";
@@ -378,10 +321,12 @@ async fn serve(args: CoreArgs) -> Result<()> {
         .serve(stop.clone());
     ext.alma.restore().await;
     let alma_task = if let (Some(relay), Some(thread)) = (&args.alma_relay, &args.alma_thread) {
-        let host = alma::prepare(&data, relay, thread, args.alma_reset_pairing)?;
+        let (host, listener) = alma::prepare(&data, relay, thread, args.alma_reset_pairing)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         let owner = stop.clone();
         Some(tokio::spawn(async move {
-            if host.run(owner).await.is_err() {
+            let (relay, lan) = tokio::join!(host.clone().run(owner.clone()), host.serve_lan(listener, owner));
+            if relay.is_err() || lan.is_err() {
                 tracing::warn!("Alma mobile host stopped");
             }
         }))
@@ -583,7 +528,7 @@ async fn main() -> Result<()> {
 
 async fn peer_proxy(args: PeerProxyArgs) -> Result<()> {
     let data = data_dir(args.data_dir.as_deref())?;
-    let store = vantry_connectivity::identity::IdentityStore::open(&data, "Vantry")?;
+    let store = vantry_connectivity::identity::IdentityStore::open_desktop(&data, "Vantry", Vec::new())?;
     let cfg = store.snapshot();
     let peer = cfg
         .peers
@@ -591,10 +536,12 @@ async fn peer_proxy(args: PeerProxyArgs) -> Result<()> {
         .find(|p| p.id == args.peer || p.pair.name == args.peer)
         .cloned()
         .context("unknown paired peer")?;
+    use vantry_connectivity::peer::Route;
     let route = match args.mode.as_str() {
-        "direct" => vantry_connectivity::peer::Route::Direct,
-        "relay" => vantry_connectivity::peer::Route::Relay,
-        _ => vantry_connectivity::peer::Route::Auto,
+        "auto" => Route::Auto,
+        "direct" => Route::Direct,
+        "relay" => Route::Relay,
+        _ => anyhow::bail!("unknown peer connection mode"),
     };
     if let Some(parent) = args.socket.parent() {
         hostfs::ensure_private_dir(parent)?;

@@ -7,12 +7,17 @@ import {createServer} from 'node:http';
 import {deadline, routing, waitFor, withAlmaFixture} from './alma_interop_client.mjs';
 
 const thread = 'studio-selected-chat';
-const requestedModels = [];
+const requests = [];
+const regularModels = ['gemini-4-argon','gemini-4-hydrogen','gemini-3.8-flash','gemini-4-carbon','gemini-4-neon']
+    .map(id => 'dmit-ai/group/' + id);
+const webModel = 'gemini-web-bridge/gemini-web-neon-high';
+const messageText = m => typeof m.content === 'string' ? m.content : m.content.map(p=>p.text ?? '').join('');
 const modelApi = createServer(async (req,res) => {
     const chunks = [];
     for await (const part of req) chunks.push(part);
-    const {model} = JSON.parse(Buffer.concat(chunks));
-    requestedModels.push(model);
+    const request = JSON.parse(Buffer.concat(chunks));
+    requests.push(request);
+    const {model} = request;
     res.writeHead(200,{'content-type':'text/event-stream'});
     const frame = (delta, finish) => 'data: ' + JSON.stringify({id:'fixture',object:'chat.completion.chunk',
         created:1,model,choices:[{index:0,delta,finish_reason:finish}]}) + '\n\n';
@@ -29,7 +34,9 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
         const parts = new URL(link).searchParams;
         const key = parts.get('k');
         assert(key && parts.get('e2e') === '1');
-        return connectTo(parts.get('u') + '/c/' + routing(key), key);
+        // iOS replaces the relay path with its absolute client route.
+        const route = new URL('/c/' + routing(key), parts.get('u'));
+        return connectTo(route.toString(), key);
     };
     assert.equal((await action('status')).enabled, false);
     await ctl('model','--thread',thread,'--model','selected-thread-model','--provider','controlled');
@@ -51,6 +58,9 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
         assert.equal(response.status,200,path);
         boot[path] = response.body;
     }
+    assert.equal(new URL(created.link).searchParams.get('name'),'vantry');
+    assert.equal(boot.settings.deviceName,'vantry');
+    assert.equal(boot.health.name,'vantry');
     const threads = boot['threads?fields=list'];
     assert.deepEqual(threads.map(t=>t.id), [thread]);
     assert.deepEqual(boot.workspaces.map(w=>w.id),[threads[0].workspaceId]);
@@ -129,11 +139,68 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
         assert(!run?.error,run?.error);
         return run?.status === 'completed' && run.output === 'Chosen local model.';
     },20000);
-    assert.deepEqual(requestedModels,['second']);
+    assert.deepEqual(requests.map(r=>r.model),['second']);
+    const choose = async id => {
+        const model = 'vantry:magpie/' + id;
+        assert.equal((await change(thread,model)).body.model,model);
+    };
+    const generate = async (text, optimisticId) => {
+        assert.equal((await resumed.http('/api/threads/'+thread+'/send',
+            {text,optimisticId})).status,202);
+        await waitFor(async () => {
+            const run = (await ctl('snapshot')).runs.find(r=>r.input===text);
+            assert(!run?.error,run?.error);
+            return run?.status === 'completed' && run.output === 'Chosen local model.';
+        },20000);
+        return requests.at(-1);
+    };
+    let previous = 'Model selection test';
+    for (const id of regularModels) {
+        await choose(id);
+        const text = '普通 Gemini 会话 ' + id;
+        const request = await generate(text,'regular-'+id.split('/').at(-1));
+        assert.equal(request.model,id);
+        assert(request.messages.some(m=>['system','developer'].includes(m.role) && messageText(m).length > 0));
+        assert(request.tools?.length > 0);
+        assert(request.messages.some(m=>m.role==='user' && messageText(m)===previous));
+        assert.equal(messageText(request.messages.at(-1)),text);
+        previous = text;
+    }
+    await choose(webModel);
+    const turns = ['  保留标点、换行和末尾空格。\n\n“原文”  ', '\t第二次只发这一句。\n'];
+    for (const [n,text] of turns.entries()) {
+        const request = await generate(text,'web-'+n);
+        assert.equal(request.model,webModel);
+        assert.deepEqual(request.messages,[{role:'user',content:text}]);
+        assert(!request.tools?.length && !request.system && !request.instructions);
+    }
+    const submitted = 1 + regularModels.length + turns.length;
+    assert.equal(requests.length,submitted);
+    const replace = (id, key) => action('replace',{name:id,input:{relay,registrationKey:key}});
+    await assert.rejects(replace(created.shareId,'invalid-fixture-key'));
+    assert.equal((await action('show')).link,created.link);
+    assert.equal((await resumed.http('/api/threads')).status,200);
     const closed = once(resumed.socket,'close');
-    assert.equal((await action('revoke',{name:created.shareId})).enabled,false);
+    const fresh = await replace(created.shareId,registrationKey);
+    assert(fresh.ready && fresh.shareId !== created.shareId);
+    assert.notEqual(new URL(fresh.link).searchParams.get('k'),new URL(created.link).searchParams.get('k'));
     await deadline(closed);
     await assert.rejects(connectLink(created.link));
+    await assert.rejects(replace(created.shareId,registrationKey));
+    await restart();
+    assert.equal((await action('show')).link,fresh.link);
+    const freshPhone = await connectLink(fresh.link);
+    const saved = (await freshPhone.http('/api/threads/'+thread+'/messages')).body;
+    assert.equal(saved[0].metadata.optimisticId,'from-device');
+    assert.equal((await freshPhone.http('/api/threads/'+thread+'/send',
+        {text:turns[1],optimisticId:'web-1'})).status,202);
+    assert.equal((await ctl('snapshot')).runs.length,1+submitted);
+    assert.equal(requests.length,submitted);
+    assert((await freshPhone.http('/api/models')).body.data.some(m=>m.id==='magpie/'+webModel));
+    const disconnected = once(freshPhone.socket,'close');
+    assert.equal((await action('revoke',{name:fresh.shareId})).enabled,false);
+    await deadline(disconnected);
+    await assert.rejects(connectLink(fresh.link));
     await restart();
     assert.equal((await action('status')).enabled,false);
     const remote = await action('create',{threadId:'unshared-thread', input:{relay,registrationKey}});
@@ -141,16 +208,51 @@ await withAlmaFixture(process.argv[2], process.argv[3], thread, async fixture =>
     await waitFor(async () => (await action('status')).ready);
     const viaRelay = await connectLink(remote.link);
     assert.deepEqual((await viaRelay.http('/api/threads')).body.map(t=>t.id),['unshared-thread']);
+    const cachedLan = (await viaRelay.http('/__alma_lan__')).body;
+    const mobileCode = new URL(remote.link).searchParams.get('k');
+    await fixture.stopRelay();
+    await waitFor(async () => !(await action('status')).ready);
+    const onWifi = await connectTo('http://' + cachedLan.hosts[0] + ':' + cachedLan.port, mobileCode);
+    assert.deepEqual((await onWifi.http('/api/threads')).body.map(t=>t.id),['unshared-thread']);
+    fixture.resumeRelay();
+    await waitFor(async () => (await action('status')).ready);
+    const outside = await connectLink(remote.link);
+    assert.deepEqual((await outside.http('/api/threads')).body.map(t=>t.id),['unshared-thread']);
     assert(!(await action('status')).link);
     await action('revoke',{name:remote.shareId});
+    const titleThread = 'untitled-gemini-web', titleText = '  第一段文字。\n第二段仍由用户书写。  ';
+    await ctl('create','--thread',titleThread,'--provider','pi','--model','magpie/'+webModel);
+    await ctl('send','--thread',titleThread,'--message',titleText);
+    await waitFor(async () => {
+        const snapshot = await ctl('snapshot');
+        return snapshot.threads.find(t=>t.id===titleThread)?.title === '第一段文字' &&
+            snapshot.runs.find(r=>r.threadId===titleThread)?.status === 'completed';
+    },20000);
+    assert.equal(requests.length,submitted+1,'Gemini Web titles must stay local');
+    assert.deepEqual(requests.at(-1).messages,[{role:'user',content:titleText}]);
+    const regularTitle = 'untitled-regular-gemini';
+    await ctl('create','--thread',regularTitle,'--provider','pi','--model','magpie/'+regularModels.at(-1));
+    await ctl('send','--thread',regularTitle,'--message',titleText);
+    await waitFor(async () => {
+        const snapshot = await ctl('snapshot');
+        return snapshot.threads.find(t=>t.id===regularTitle)?.title &&
+            snapshot.runs.find(r=>r.threadId===regularTitle)?.status === 'completed';
+    },20000);
+    const regularRequests = requests.slice(submitted+1);
+    assert.equal(regularRequests.length,2,'ordinary Gemini uses the standard title and agent requests');
+    assert(regularRequests.some(r=>r.messages.some(m=>['system','developer'].includes(m.role) &&
+        messageText(m).includes('Name this conversation'))));
     console.log('PASS ' + fixture.version + ': desktop-created QR, LAN and relay, scoped chat, ' + deltas
-        + ' streaming deltas, existing pairing after restart, and immediate revocation.');
+        + ' streaming deltas, five standard Gemini routes, verbatim Gemini Web, atomic re-pairing, restart, and immediate revocation.');
 }, {cliHost:false, async setup({root}) {
     modelApi.listen(0,'127.0.0.1');
     await once(modelApi,'listening');
     const dir = join(root,'pi');
     await mkdir(dir);
-    await writeFile(join(dir,'models.json'),JSON.stringify({providers:{fixture:{baseUrl:'http://127.0.0.1:'+modelApi.address().port+'/v1',
-        api:'openai-completions',apiKey:'local-fixture',models:[{id:'first',name:'First'},{id:'second',name:'Second'}]}}}));
+    const localApi = {baseUrl:'http://127.0.0.1:'+modelApi.address().port+'/v1',api:'openai-completions',apiKey:'local-fixture'};
+    await writeFile(join(dir,'models.json'),JSON.stringify({providers:{
+        fixture:{...localApi,models:[{id:'first',name:'First'},{id:'second',name:'Second'}]},
+        magpie:{...localApi,models:[...regularModels,webModel].map(id=>({id,name:id}))},
+    }}));
     return {PI_CODING_AGENT_DIR:dir};
 }}).finally(()=>new Promise(resolve=>modelApi.close(resolve)));

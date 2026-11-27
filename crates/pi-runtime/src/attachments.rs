@@ -121,6 +121,46 @@ fn resolve(data: &Path, item: &Attachment) -> Result<(PathBuf, Vec<u8>)> {
     );
     Ok((path.join(&item.name), content))
 }
+enum AttachmentContent {
+    Image(ContentBlock),
+    Text(String),
+    Pdf {
+        text: String,
+        pages: usize,
+        path: PathBuf,
+    },
+}
+
+fn content(data: &Path, item: &Attachment) -> Result<AttachmentContent> {
+    let (path, bytes) = resolve(data, item)?;
+    let mime = item
+        .mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) {
+        return Ok(AttachmentContent::Image(ContentBlock::Image {
+            mime_type: mime,
+            data: STANDARD.encode(bytes),
+        }));
+    }
+    if matches!(mime.as_str(), "application/pdf" | "application/x-pdf")
+        || (item.name.to_ascii_lowercase().ends_with(".pdf") && crate::pdf::has_header(&bytes))
+    {
+        let (text, pages) = crate::pdf::extract(&bytes)?;
+        return Ok(AttachmentContent::Pdf { text, pages, path });
+    }
+    ensure!(!bytes.contains(&0), "unsupported binary attachment");
+    Ok(AttachmentContent::Text(
+        String::from_utf8(bytes).context("unsupported binary attachment")?,
+    ))
+}
+
 pub fn attachment_payload(
     data: &Path,
     text: &str,
@@ -129,26 +169,9 @@ pub fn attachment_payload(
     let mut message = text.to_owned();
     let mut images = vec![];
     for item in items {
-        let (path, bytes) = resolve(data, item)?;
-        let mime = item
-            .mime
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        match mime.as_str() {
-            "image/png" | "image/jpeg" | "image/webp" | "image/gif" => {
-                images.push(ContentBlock::Image {
-                    mime_type: mime,
-                    data: STANDARD.encode(bytes),
-                })
-            }
-            _ if matches!(mime.as_str(), "application/pdf" | "application/x-pdf")
-                || (item.name.to_ascii_lowercase().ends_with(".pdf")
-                    && crate::pdf::has_header(&bytes)) =>
-            {
-                let (text, pages) = crate::pdf::extract(&bytes)?;
+        match content(data, item)? {
+            AttachmentContent::Image(image) => images.push(image),
+            AttachmentContent::Pdf { text, pages, path } => {
                 message.push_str(&format!(
                     "\n\nAttached PDF {:?} ({} B, {pages} pages, path: {}):\n",
                     item.name,
@@ -161,12 +184,36 @@ pub fn attachment_payload(
                     &text
                 });
             }
-            _ => {
-                ensure!(!bytes.contains(&0), "unsupported binary attachment");
-                let text = std::str::from_utf8(&bytes).context("unsupported binary attachment")?;
-                message.push_str(&format!("\n\nAttached file {:?}:\n{text}", item.name));
+            AttachmentContent::Text(text) => {
+                message.push_str(&format!("\n\nAttached file {:?}:\n{text}", item.name))
             }
         }
     }
     Ok((message, images))
+}
+
+pub(crate) fn user_message(
+    data: &Path,
+    text: &str,
+    items: &[Attachment],
+) -> Result<pi_ai::Message> {
+    if items.is_empty() {
+        return Ok(pi_ai::Message::user(text));
+    }
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(ContentBlock::text(text));
+    }
+    for item in items {
+        blocks.push(match content(data, item)? {
+            AttachmentContent::Image(image) => image,
+            AttachmentContent::Text(text) | AttachmentContent::Pdf { text, .. } => {
+                ContentBlock::text(text)
+            }
+        });
+    }
+    Ok(pi_ai::Message::User(pi_ai::UserMessage {
+        content: pi_ai::UserContent::Blocks(blocks),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    }))
 }

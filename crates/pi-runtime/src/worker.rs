@@ -336,6 +336,9 @@ async fn execute(
         req.provider_id.is_empty() || req.provider_id == "pi",
         "unsupported execution provider"
     );
+    if vantry_protocol::uses_gemini_web(&req.provider_id, &job.expected_model) {
+        return crate::gemini_web::run(job, dir, journal).await;
+    }
     let cwd = crate::workspace::cwd(job)?;
     let stop_file = dir.join("stop.json");
     let (_workspace_lock, waited_for_lock) = crate::workspace::lock_workspace_dir(

@@ -104,6 +104,7 @@ impl Scope {
                 let thread = self.core.thread_detail(&self.thread, 1).await?.thread;
                 match path {
                     "/api/settings" => json!({
+                        "deviceName":super::DEVICE_NAME,
                         "general":{"theme":"system","language":"system"},
                         "chat":{"defaultModel":selection(&thread.model),"streamResponse":true,"enableMarkdown":true},
                         "ui":{}
@@ -139,7 +140,7 @@ impl Scope {
                 "autoUpdateSupported":false,"autoUpdateStatus":{"status":"idle"}}),
             "/api/alma/vitals" => json!({"fatigue":0,"level":"awake","isNight":false,
                 "mood":null,"energy":7,"valence":7,"updated":null}),
-            "/api/health" => json!({"status":"ok","name":"Vantry","timestamp":chrono::Utc::now()}),
+            "/api/health" => json!({"status":"ok","name":super::DEVICE_NAME,"timestamp":chrono::Utc::now()}),
             _ => return Ok(None),
         };
         Ok(Some(body))

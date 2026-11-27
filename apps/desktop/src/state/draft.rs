@@ -92,6 +92,13 @@ impl Draft {
         self.replace_mentions(|mention| &mention.expand)
     }
 
+    pub(super) fn message_for(&self, provider: &str, model: &str) -> String {
+        if vantry_protocol::uses_gemini_web(provider, model) {
+            return self.text.clone();
+        }
+        self.outgoing().trim().to_owned()
+    }
+
     /// Short display label (without leading `@`) for an attachment: its
     /// mention's text when the draft has one, so the thumbnail and the text
     /// name it alike; else the image's number in the UI's language.
@@ -480,6 +487,14 @@ mod tests {
         assert_eq!(draft.text, "先看 @修复 [登录] 流程 再改");
         assert_eq!(caret, Some("先看 @修复 [登录] 流程".encode_utf16().count() as u32));
         assert_eq!(draft.outgoing(), format!("先看 {link} 再改"));
+        for model in ["", "google/gemini-4-neon", "magpie/dmit-ai/group/gemini-4-neon:high",
+            "magpie/dmit-ai/group/gemini-web-neon-high", "other/gemini-web/gemini-4-neon"] {
+            assert_eq!(draft.message_for("pi", model), draft.outgoing(), "{model}");
+        }
+        for model in ["gemini-web/gemini-4-neon", "magpie/gemini-web-bridge/gemini-web-neon-high"] {
+            assert_eq!(draft.message_for("pi", model), draft.text, "{model}");
+        }
+        assert_eq!(draft.message_for(vantry_protocol::GEMINI_WRITING_PROVIDER, vantry_protocol::GEMINI_WRITING_MODEL), draft.text);
     }
 
     #[test]

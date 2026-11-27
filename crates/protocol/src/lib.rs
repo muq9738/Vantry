@@ -11,6 +11,21 @@ pub use provider::*;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const GEMINI_WRITING_PROVIDER: &str = "gemini-writing";
 pub const GEMINI_WRITING_MODEL: &str = "gemini-writing/neon-high";
+
+/// The bound browser thread and explicitly selected Gemini Web backends forward user text verbatim.
+pub fn uses_gemini_web(provider: &str, model: &str) -> bool {
+    if provider == GEMINI_WRITING_PROVIDER {
+        return true;
+    }
+    if !matches!(provider, "pi" | "") {
+        return false;
+    }
+    let route = model.strip_prefix("magpie/").unwrap_or(model);
+    route.split_once('/').is_some_and(|(backend, id)| {
+        matches!(backend, "gemini-web" | "gemini-web-bridge") && !id.is_empty()
+    })
+}
+
 pub const EMBEDDED_PI_CAPABILITY: &str = "provider.pi.embedded.v1";
 pub const LEGACY_PI_RUNTIME_CAPABILITY: &str = "provider.pi.runtime.v1";
 /// Opt in to NDJSON keepalive records on `/v1/events`. Supporting servers echo `1`.

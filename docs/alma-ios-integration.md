@@ -1,5 +1,7 @@
 # Vantry 接入 Alma iOS 与 T3 移动协议退役方案
 
+Vantry 同时监听局域网并主动连接 `alma-relay`。Alma 可以用同一份配对经两条路径打开原会话。通过公网二维码首次连接后，手机可从加密连接取得 Mac 当前的局域网地址。下文保留了迁移前的协议调查与分阶段联调记录。[当前手机配对方法](native-connectivity.md#用-alma-ios-打开-vantry-会话)
+
 目标是让用户在电脑上只开 Vantry，用原版 Alma iOS 扫码，打开电脑上的同一条会话。手机优先走局域网，跨网走自建 linkd。电脑和手机可以接力发消息、查看工具进度、处理审批、跟踪子任务和 Todo。Vantry Core 持有会话历史与执行状态。移动应用的安装和更新沿用 Alma 官方渠道，自研 Vantry-iOS 退出发版计划。
 
 本文是实施设计。协议基线取 Alma 桌面端 `0.4.567`、官方 `alma-relay 1.5.0` 和独立 `linkd v0.1.2`。验收记录另行填写实际 Alma iOS build、Vantry 与 linkd 提交号。

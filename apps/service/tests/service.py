@@ -105,21 +105,12 @@ def exercise(root):
         assert json.loads(peer_ctl('workbench','remote.peers.list')['output'])['peers'][0]['id']==peer_id
         assert json.loads(peer_ctl('workbench','remote.peers.revoke','--name',peer_id)['output'])['revoked']
         peer_ctl('shutdown-if-idle');assert peer.wait(timeout=5)==0
-        with socket.socket() as bound:
-            bound.bind(('127.0.0.1',0)); relay_port=bound.getsockname()[1]
-        config=root/'relay.json'; key=os.urandom(24).hex()
-        config.write_text(json.dumps({'desktop':{'registrationKey':key}}))
-        relay=subprocess.Popen([BIN,'relay','serve','-config',config,'--listen',f'127.0.0.1:{relay_port}'],env=env)
-        children.append(relay)
-        def relay_ok():
-            with contextlib.closing(http.client.HTTPConnection('127.0.0.1',relay_port,timeout=1)) as conn:
-                try:conn.request('GET','/healthz');return conn.getresponse().status==200
-                except ConnectionRefusedError:return False
-        until(relay_ok)
-        room=json.loads(wb('rd.session.start',input={'registrationKey':key,'relay':f'http://127.0.0.1:{relay_port}'})['output'])
-        assert json.loads(wb('rd.session.status')['output'])['sessionId']==room['sessionId']
-        assert json.loads(wb('rd.session.stop')['output'])['active']==False
-        relay.terminate();assert relay.wait(timeout=5)==0
+        blocked=api('workbench', {'action':'rd.session.start','input':{'relay':'http://127.0.0.1:9'}},success=False)
+        assert blocked['code']=='invalid_command'
+        room=json.loads(wb('rd.session.start')['output'])
+        assert room['sharing'] and room['lanLink'].startswith('vantry-lan://')
+        assert json.loads(wb('rd.session.status')['output'])['lanLink']==room['lanLink']
+        assert not json.loads(wb('rd.session.stop')['output'])['active']
         assert ctl('health')['state'] == 'ready'
         assert ctl('status')['sequence'] >= 0
         assert 'orchestration.v1' in api('capabilities')['capabilities']

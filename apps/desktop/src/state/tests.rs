@@ -581,13 +581,13 @@ fn the_first_message_creates_the_thread_then_sends() {
     assert!(state.selected.is_none());
     state.set_draft_text("  帮我看看这个仓库\n第二行  ");
     state.toggle_mode();
-    let create = state.submit().unwrap();
+    let create = state.submit("fixture/model").unwrap();
     assert_eq!(create.kind, CommandKind::CreateThread);
     assert!(create.title.is_empty(), "Pi generates the title from the first task");
     assert_eq!(create.interaction_mode, "plan");
     assert!(state.draft().text.is_empty());
     assert!(state.composer_status().sending);
-    assert!(state.submit().is_none(), "one submission at a time");
+    assert!(state.submit("fixture/model").is_none(), "one submission at a time");
 
     let receipt = Receipt {
         thread_id: "t9".into(),
@@ -621,7 +621,7 @@ fn a_rejected_send_restores_the_draft() {
         json!({ "run": run("r1", "t1", RunStatus::Completed) }),
     ));
     state.set_draft_text("再来一次");
-    let send = state.submit().unwrap();
+    let send = state.submit("fixture/model").unwrap();
     assert_eq!(send.kind, CommandKind::SendMessage);
     state.on_command_result(
         &send.command_id,
@@ -642,7 +642,7 @@ fn an_unconfirmed_send_offers_a_retry_and_abandoning_restores_the_draft() {
         json!({ "run": run("r1", "t1", RunStatus::Completed) }),
     ));
     state.set_draft_text("可能已送达");
-    let send = state.submit().unwrap();
+    let send = state.submit("fixture/model").unwrap();
     state.on_command_result(&send.command_id, Err(BridgeError::unavailable("eof")));
     let status = state.composer_status();
     assert_eq!(status.retry.as_deref(), Some("submit:t1"));
@@ -671,7 +671,7 @@ fn while_running_the_draft_steers_or_queues() {
     let mut state = live_state();
     assert_eq!(state.composer_status().primary, PrimaryAction::Steer);
     state.set_draft_text("改成中文");
-    let steer = state.submit().unwrap();
+    let steer = state.submit("fixture/model").unwrap();
     assert_eq!(steer.kind, CommandKind::SteerMessage);
     assert_eq!(steer.run_id, "r1");
     state.on_command_result(&steer.command_id, Ok(accepted(&steer)));
@@ -679,7 +679,7 @@ fn while_running_the_draft_steers_or_queues() {
     state.set_running_action(RunningAction::Queue);
     assert_eq!(state.composer_status().primary, PrimaryAction::Queue);
     state.set_draft_text("之后再做");
-    let queue = state.submit().unwrap();
+    let queue = state.submit("fixture/model").unwrap();
     assert_eq!(queue.kind, CommandKind::QueueMessage);
     assert!(queue.run_id.is_empty());
     state.on_command_result(&queue.command_id, Ok(accepted(&queue)));

@@ -325,10 +325,10 @@ impl AppState {
     }
 
     /// Saves the edited queued message (`input.edit`).
-    pub(super) fn save_queue_edit(&mut self) -> Option<Command> {
+    pub(super) fn save_queue_edit(&mut self, default_model: &str) -> Option<Command> {
         let edit = self.queue_edit.clone()?;
         let draft = self.drafts.get(&edit.thread_id).cloned().unwrap_or_default();
-        let text = draft.outgoing().trim().to_owned();
+        let text = self.draft_message(&draft, self.thread(&edit.thread_id), default_model);
         let Some(input) = self.queued_input(&edit.input_id) else {
             self.end_queue_edit();
             self.notice = Some(Notice::new(
@@ -338,7 +338,7 @@ impl AppState {
             return None;
         };
         self.end_queue_edit();
-        if text.is_empty() || (text == input.message && draft.attachments == input.attachments) {
+        if text.trim().is_empty() || (text == input.message && draft.attachments == input.attachments) {
             return None;
         }
         let mut command = thread_command(CommandKind::EditInput, "edit", &input.thread_id);

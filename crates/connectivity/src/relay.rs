@@ -486,7 +486,7 @@ impl Relay {
                     let mut tx = if let Some(tx) = cached {
                         tx
                     } else {
-                        sender(self.open(route, "t3", &tasks).await?, &tasks)
+                        sender(self.open(route, "http", &tasks).await?, &tasks)
                             .await
                             .map_err(|_| 502u16)?
                     };

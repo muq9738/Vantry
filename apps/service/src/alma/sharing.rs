@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{io::ErrorKind, net::IpAddr, path::Path, sync::Arc};
+use std::{io::ErrorKind, net::SocketAddr, path::Path, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use vantry_client::CoreClient;
@@ -20,6 +20,8 @@ const FILE: &str = "alma-mobile-share.json";
 #[serde(rename_all = "camelCase")]
 struct Share {
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_scope: Option<String>,
     thread_id: String,
     code: String,
     port: u16,
@@ -27,8 +29,15 @@ struct Share {
     key: String,
 }
 
+impl Share {
+    fn operation_scope(&self) -> &str {
+        self.operation_scope.as_deref().unwrap_or(&self.id)
+    }
+}
+
 struct Live {
-    url: url::Url,
+    relay: Option<url::Url>,
+    bound: SocketAddr,
     title: String,
     activity: Arc<Activity>,
     stop: CancellationToken,
@@ -54,39 +63,9 @@ pub struct Sharing {
     state: Mutex<State>,
 }
 
-fn lan_addresses() -> Result<Vec<String>> {
-    let mut addresses = Vec::new();
-    for nic in if_addrs::get_if_addrs()? {
-        let IpAddr::V4(ip) = nic.ip() else { continue };
-        if ip.is_loopback()
-            || ip.is_link_local()
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || [198, 18] == ip.octets()[..2]
-            || [198, 19] == ip.octets()[..2]
-        {
-            continue;
-        }
-        let name = nic.name.to_lowercase();
-        let physical = ["en", "eth", "wl", "wi-fi", "wlan"]
-            .iter()
-            .any(|p| name.starts_with(p));
-        let virtual_link = [
-            "utun", "tun", "tap", "bridge", "docker", "veth", "vmnet", "awdl", "llw",
-        ]
-        .iter()
-        .any(|prefix| name.starts_with(prefix));
-        addresses.push((virtual_link, !physical, nic.index.unwrap_or(u32::MAX), ip));
-    }
-    addresses.sort_unstable();
-    let mut hosts = Vec::new();
-    for (_, _, _, ip) in addresses {
-        let ip = ip.to_string();
-        if !hosts.contains(&ip) {
-            hosts.push(ip);
-        }
-    }
-    Ok(hosts)
+fn lan_url(bound: SocketAddr) -> Option<url::Url> {
+    let address = vantry_connectivity::lan::listener_addresses(bound).ok()?.into_iter().next()?;
+    url::Url::parse(&format!("http://{address}")).ok()
 }
 
 impl Sharing {
@@ -112,31 +91,31 @@ impl Sharing {
                 && uuid::Uuid::parse_str(&share.id).is_ok(),
             "配对记录无效"
         );
-        let hosts = lan_addresses()?;
-        ensure!(
-            !hosts.is_empty() || !share.relay.is_empty(),
-            "找不到局域网地址，请连接 Wi-Fi 或填写 Alma 兼容中继"
-        );
         let listener = TcpListener::bind(("0.0.0.0", share.port))
             .await
             .context("无法打开 Alma 局域网端口")?;
-        share.port = listener.local_addr()?.port();
-        let endpoint = if share.relay.is_empty() {
-            url::Url::parse(&format!("http://{}:{}", hosts[0], share.port))?
+        let bound = listener.local_addr()?;
+        share.port = bound.port();
+        let relay = if share.relay.is_empty() {
+            None
         } else {
-            relay_url(&share.relay, false)?
+            Some(relay_url(&share.relay, false)?)
         };
         let mut host = Host::new(
-            endpoint.clone(),
+            match &relay {
+                Some(url) => url.clone(),
+                None => url::Url::parse(&format!("http://{bound}"))?,
+            },
             share.code.clone(),
             Some(share.key.clone()).filter(|k| !k.is_empty()),
-            share.id.clone(),
+            share.operation_scope().into(),
             share.thread_id.clone(),
             CoreClient::from_data_dir(self.core.directory()),
         )?;
-        host.set_lan(&hosts, share.port);
+        host.set_lan_listener(bound);
         let mut live = Live {
-            url: endpoint,
+            relay,
+            bound,
             title: thread.title,
             activity: host.activity.clone(),
             stop: CancellationToken::new(),
@@ -185,11 +164,12 @@ impl Sharing {
             "relay":share.relay,"error":state.error,"ready":false,"phones":0});
         if let Some(live) = &state.live {
             out["title"] = live.title.clone().into();
-            out["ready"] = (share.relay.is_empty() || live.activity.relay_online()).into();
+            let endpoint = live.relay.clone().or_else(|| lan_url(live.bound));
+            out["ready"] = (endpoint.is_some() && (live.relay.is_none() || live.activity.relay_online())).into();
             out["relayRejected"] = live.activity.rejected().into();
             out["phones"] = live.activity.phones().into();
-            if reveal == Some(share.thread_id.as_str()) {
-                out["link"] = pairing_link(&live.url, &share.code).to_string().into();
+            if reveal == Some(share.thread_id.as_str()) && let Some(endpoint) = endpoint {
+                out["link"] = pairing_link(&endpoint, &share.code).to_string().into();
             }
         }
         out
@@ -199,7 +179,13 @@ impl Sharing {
         self.view(&*self.state.lock().await, reveal)
     }
 
-    pub async fn create(&self, thread: &str, relay: &str, key: &str) -> Result<Value> {
+    pub async fn create(
+        &self,
+        thread: &str,
+        relay: &str,
+        key: &str,
+        replacing: Option<&str>,
+    ) -> Result<Value> {
         ensure!(
             !thread.is_empty()
                 && thread.len() <= 255
@@ -209,7 +195,15 @@ impl Sharing {
             "请选择一条已保存的 Vantry 会话"
         );
         let mut state = self.state.lock().await;
-        if let Some(saved) = &state.share {
+        if let Some(id) = replacing {
+            ensure!(
+                state
+                    .share
+                    .as_ref()
+                    .is_some_and(|s| s.id == id && s.thread_id == thread),
+                "配对已变更，请刷新后重试"
+            );
+        } else if let Some(saved) = &state.share {
             ensure!(
                 saved.thread_id == thread,
                 "已有其他会话正在共享，请先停止原共享"
@@ -232,6 +226,7 @@ impl Sharing {
         }
         let mut share = Share {
             id: uuid::Uuid::new_v4().to_string(),
+            operation_scope: state.share.as_ref().map(|old| old.operation_scope().to_owned()),
             thread_id: thread.into(),
             code: new_code()?,
             port: 0,
@@ -239,13 +234,24 @@ impl Sharing {
             key: key.trim().into(),
         };
         let live = self.start(&mut share).await?;
-        if let Err(e) = self.save(Some(&share)) {
+        // Leave the previous pairing usable until its replacement has registered and is durable.
+        if replacing.is_some()
+            && !share.relay.is_empty()
+            && let Err(error) = live.activity.wait_for_registration().await
+        {
             live.close().await;
-            return Err(e);
+            return Err(error);
         }
-        state.live = Some(live);
+        if let Err(error) = self.save(Some(&share)) {
+            live.close().await;
+            return Err(error);
+        }
+        let old = state.live.replace(live);
         state.share = Some(share);
         state.error.clear();
+        if let Some(old) = old {
+            old.close().await;
+        }
         Ok(self.view(&state, Some(thread)))
     }
 

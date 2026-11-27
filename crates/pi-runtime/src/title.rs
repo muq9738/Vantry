@@ -89,7 +89,8 @@ pub async fn summarize_title(job: &JobRequest) -> String {
             && title.chars().count() <= 96)
             .then(|| title.to_owned())
     };
-    if let Ok(Some(title)) = tokio::time::timeout(Duration::from_secs(20), generate).await {
+    if !vantry_protocol::uses_gemini_web(&job.request.provider_id, &job.expected_model)
+        && let Ok(Some(title)) = tokio::time::timeout(Duration::from_secs(20), generate).await {
         return title;
     }
     let clause = task

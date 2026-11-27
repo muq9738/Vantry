@@ -561,7 +561,11 @@ fn send(db: &Connection, c: &Command, options: &CoreOptions) -> Result<Receipt> 
                     {
                         r = run(db, &current)?;
                     }
-                    if r.status == RunStatus::Running {
+                    let verbatim = vantry_protocol::uses_gemini_web(&r.provider_id, &r.model);
+                    if verbatim && inter && mode == "steer" && !c.fallback_to_queue {
+                        return Err(conflict("Gemini Web 本轮原文已发送，请将后续消息排队"));
+                    }
+                    if r.status == RunStatus::Running && !verbatim {
                         if !c.parent_attempt_id.is_empty() && c.parent_attempt_id != r.attempt_id {
                             return Err(conflict("stale attempt"));
                         }
@@ -688,6 +692,8 @@ fn edit_queue(db: &Connection, c: &Command) -> Result<Receipt> {
                     settle_waiting_run(db, &r.id)?;
                     db.execute("UPDATE inputs SET queue_order=-1 WHERE id=?", [key])?;
                     dequeue(db, &i.thread_id)?;
+                } else if vantry_protocol::uses_gemini_web(&r.provider_id, &r.model) {
+                    return Err(conflict("Gemini Web 本轮原文已发送，请保留排队消息"));
                 } else if r.status != RunStatus::Running {
                     return Err(conflict("no running attempt"));
                 } else {

@@ -143,7 +143,7 @@ async fn interop(binary: &Path) -> Result<()> {
             route: host.snapshot().host.route,
             instance: token(),
             gateway,
-            t3: None,
+            http_backend: None,
         }
         .run(cfg, stop.clone()),
     );

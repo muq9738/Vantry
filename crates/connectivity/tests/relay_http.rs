@@ -73,7 +73,7 @@ async fn run_upgrades() -> Result<()> {
             key: key.clone(),
             instance: token(),
             gateway: addr,
-            t3: Some(addr),
+            http_backend: Some(addr),
         }
         .run(tx, stop.clone()),
     );
@@ -159,7 +159,7 @@ async fn public_route_reuses_its_http_tunnel() -> Result<()> {
                 key,
                 instance: token(),
                 gateway: address,
-                t3: Some(address),
+                http_backend: Some(address),
             }
             .run(tx, stop.clone()),
         );
