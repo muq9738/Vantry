@@ -148,10 +148,23 @@ impl Release {
         }
         let delta = delta.filter(|d| {
             full.as_ref()
-                .is_none_or(|f| d.size == 0 || f.size == 0 || d.size < f.size)
+                .is_none_or(|f| delta_worth_using(d.size, f.size, 1))
         });
         (full, delta)
     }
+}
+
+/// Minimum bandwidth-savings threshold for preferring incremental delta(s) over the full package.
+///
+/// A single-step delta must be at most 75% of the full archive size (saving >= 25%), and a
+/// multi-step chain must be at most 65% (saving >= 35%) because each extra hop adds another
+/// download round-trip plus a full on-disk bundle reconstruction and SHA-256 verification pass.
+pub fn delta_worth_using(delta_bytes: u64, full_bytes: u64, steps: usize) -> bool {
+    if delta_bytes == 0 || full_bytes == 0 {
+        return true;
+    }
+    let max_pct: u128 = if steps > 1 { 65 } else { 75 };
+    (delta_bytes as u128) * 100 <= (full_bytes as u128) * max_pct
 }
 /// One hop in a single- or multi-version incremental delta update chain.
 #[derive(Debug, Clone)]
@@ -265,13 +278,11 @@ pub fn plan_delta_chain(
         }
     }
 
-    let Some(&(total_bytes, _)) = dist.get(&target) else {
+    let Some(&(total_bytes, hops)) = dist.get(&target) else {
         return Vec::new();
     };
     if let Some(full) = full_size
-        && full > 0
-        && total_bytes > 0
-        && total_bytes >= full
+        && !delta_worth_using(total_bytes, full, hops)
     {
         return Vec::new();
     }

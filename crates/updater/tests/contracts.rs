@@ -218,3 +218,62 @@ fn credentials_rotate_and_invalid_override_does_not_fall_back() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn delta_threshold_rejects_low_savings_and_github_proxy_candidates() -> Result<()> {
+    assert!(delta_worth_using(750, 1000, 1));
+    assert!(!delta_worth_using(760, 1000, 1));
+    assert!(delta_worth_using(650, 1000, 2));
+    assert!(!delta_worth_using(660, 1000, 2));
+
+    let releases = parse_releases(
+        br#"[
+            {"tag_name":"v0.2.18","assets":[{"name":"vantry-0.2.17-to-0.2.18-darwin-arm64.delta","size":10700000}]},
+            {"tag_name":"v0.2.19","assets":[
+                {"name":"vantry-0.2.18-to-0.2.19-darwin-arm64.delta","size":10700000},
+                {"name":"vantry-0.2.19-darwin-arm64.zip","size":24100000}
+            ]}
+        ]"#,
+        Channel::Stable,
+    )?;
+    // 21.4 MB / 24.1 MB (88.8%) across 2 steps is not worth the extra hop + disk rebuild.
+    assert!(
+        plan_delta_chain(
+            &releases,
+            "vantry",
+            "darwin-arm64",
+            "0.2.17",
+            "0.2.19",
+            Some(24_100_000)
+        )
+        .is_empty()
+    );
+
+    let proxies = resolve_github_proxies(Some("https://gh-proxy.com"));
+    assert_eq!(proxies, vec!["https://gh-proxy.com/".to_owned()]);
+    assert!(resolve_github_proxies(Some("none")).is_empty());
+
+    let gh_url = reqwest::Url::parse(
+        "https://github.com/muq9738/Vantry/releases/download/v0.2.19/vantry-0.2.19-darwin-arm64.zip",
+    )?;
+    let candidates = github_download_candidates(&gh_url, false, &proxies);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates[0].1);
+    assert_eq!(
+        candidates[0].0.as_str(),
+        "https://gh-proxy.com/https://github.com/muq9738/Vantry/releases/download/v0.2.19/vantry-0.2.19-darwin-arm64.zip"
+    );
+    assert!(!candidates[1].1);
+    assert_eq!(candidates[1].0, gh_url);
+
+    // Authenticated or non-GitHub URLs are never rewritten.
+    let auth_candidates = github_download_candidates(&gh_url, true, &proxies);
+    assert_eq!(auth_candidates.len(), 1);
+    assert!(!auth_candidates[0].1);
+
+    let local_url = reqwest::Url::parse("http://127.0.0.1:8080/delta")?;
+    let local_candidates = github_download_candidates(&local_url, false, &proxies);
+    assert_eq!(local_candidates.len(), 1);
+    assert!(!local_candidates[0].1);
+    Ok(())
+}

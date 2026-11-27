@@ -6,12 +6,106 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, Response, StatusCode, Url};
 use std::{
-    io::Write,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::task::JoinSet;
 pub use vantry_protocol::AppUpdateInfo;
+
+/// Default GitHub release download proxies tried in order for mainland China users
+/// (public repositories only), always falling back to direct `github.com`.
+const DEFAULT_CN_GITHUB_PROXIES: &[&str] = &["https://gh-proxy.com/", "https://ghfast.top/"];
+const PROXY_CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_millis(120);
+const MAX_CONCURRENT_DELTA_DOWNLOADS: usize = 4;
+const DOWNLOAD_WRITE_BUFFER: usize = 256 * 1024;
+
+/// Heuristic local check (zero network calls) for whether the host is in mainland China.
+fn is_cn_region() -> bool {
+    #[cfg(unix)]
+    if let Ok(target) = std::fs::read_link("/etc/localtime") {
+        let s = target.to_string_lossy();
+        if s.contains("Asia/Shanghai")
+            || s.contains("Asia/Chongqing")
+            || s.contains("Asia/Harbin")
+            || s.contains("Asia/Urumqi")
+            || s.ends_with("/PRC")
+        {
+            return true;
+        }
+    }
+    for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(val) = std::env::var(var) {
+            let lower = val.to_ascii_lowercase();
+            if lower.starts_with("zh_cn") || lower.starts_with("zh-cn") || lower.starts_with("zh-hans") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn normalize_proxy_prefix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "none" | "off" | "direct" | "0" | "false"
+        )
+    {
+        return None;
+    }
+    let mut prefix = trimmed.to_owned();
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Some(prefix)
+}
+
+/// Resolve GitHub download proxy prefixes from explicit option -> `VANTRY_GITHUB_PROXY` env -> CN region detection.
+pub fn resolve_github_proxies(explicit: Option<&str>) -> Vec<String> {
+    if let Some(raw) = explicit {
+        return normalize_proxy_prefix(raw).into_iter().collect();
+    }
+    if let Ok(env_val) = std::env::var("VANTRY_GITHUB_PROXY") {
+        return normalize_proxy_prefix(&env_val).into_iter().collect();
+    }
+    if is_cn_region() {
+        DEFAULT_CN_GITHUB_PROXIES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build ordered download candidate URLs `(url, is_proxy)` for an asset.
+/// Proxies are only applied to public GitHub HTTPS URLs; direct URL is always the final fallback.
+pub fn github_download_candidates(url: &Url, auth: bool, proxies: &[String]) -> Vec<(Url, bool)> {
+    let is_public_github = !auth
+        && url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some("github.com" | "objects.githubusercontent.com" | "release-assets.githubusercontent.com")
+        );
+    let mut out = Vec::with_capacity(proxies.len() + 1);
+    if is_public_github {
+        for prefix in proxies {
+            if let Ok(proxied) = Url::parse(&format!("{prefix}{url}")) {
+                out.push((proxied, true));
+            }
+        }
+    }
+    out.push((url.clone(), false));
+    out
+}
 
 #[derive(Debug, Clone)]
 pub enum ReleaseSource {
@@ -39,6 +133,9 @@ pub struct UpdateOptions {
     pub local_token: Option<PathBuf>,
     pub bundled_token: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
+    /// Optional GitHub download proxy prefix override (`None` = auto-detect CN region / `VANTRY_GITHUB_PROXY`;
+    /// `"none"` / `"direct"` disables proxying).
+    pub github_proxy: Option<String>,
 }
 impl Default for UpdateOptions {
     fn default() -> Self {
@@ -76,6 +173,7 @@ impl Default for UpdateOptions {
             local_token: update_token_file(),
             bundled_token: exe.as_deref().and_then(bundled_token_file),
             data_dir: None,
+            github_proxy: None,
         }
     }
 }
@@ -406,49 +504,23 @@ impl UpdateManager {
         a: &Asset,
         on_chunk: &mut impl FnMut(u64, u64),
     ) -> Result<(tempfile::NamedTempFile, u64)> {
-        ensure!(a.size <= MAX_ASSET, "asset too large");
         let origin = self.metadata_url()?;
-        let mut resp: Response = loop {
-            let auth = self.token.is_some();
-            let raw = if (auth && !a.url.is_empty()) || a.browser_download_url.is_empty() {
-                &a.url
-            } else {
-                &a.browser_download_url
-            };
-            ensure!(!raw.is_empty(), "missing asset URL");
-            let url = origin.join(raw)?;
-            let auth = auth && url.origin() == origin.origin();
-            let resp = self.request(url, false, auth).send().await?;
-            if auth && denied(resp.status()) {
-                self.token = None;
-                continue;
-            }
-            ensure!(
-                matches!(resp.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT),
-                "asset download returned {}",
-                resp.status()
-            );
-            break resp;
-        };
-        let size = resp.content_length().unwrap_or(a.size);
-        ensure!(
-            size <= MAX_ASSET && (a.size == 0 || size == a.size),
-            "release size mismatch"
-        );
-        let mut file = tempfile::NamedTempFile::new()?;
-        let mut bytes = 0;
-        while let Some(chunk) = resp.chunk().await? {
-            bytes += chunk.len() as u64;
-            ensure!(
-                bytes <= MAX_ASSET && (size == 0 || bytes <= size),
-                "download exceeds declared size"
-            );
-            file.write_all(&chunk)?;
-            on_chunk(bytes, size);
+        let proxies = resolve_github_proxies(self.opts.github_proxy.as_deref());
+        let auth_denied = AtomicBool::new(false);
+        let result = download_asset_with_client(
+            &self.client,
+            &origin,
+            self.token.as_deref(),
+            &proxies,
+            a,
+            &auth_denied,
+            on_chunk,
+        )
+        .await;
+        if auth_denied.load(Ordering::Relaxed) {
+            self.token = None;
         }
-        ensure!(size == 0 || bytes == size, "incomplete download");
-        on_chunk(bytes, bytes);
-        Ok((file, bytes))
+        result
     }
     async fn fetch_full(
         &mut self,
@@ -465,11 +537,15 @@ impl UpdateManager {
 
         let info_tx = self.info_tx.clone();
         let mut snapshot = self.info.clone();
+        let mut last_publish = Instant::now();
         let (file, _) = self
             .download_asset(a, &mut |done, total| {
                 snapshot.downloaded_bytes = done.try_into().unwrap_or(i64::MAX);
                 snapshot.total_bytes = total.try_into().unwrap_or(i64::MAX);
-                info_tx.send_replace(snapshot.clone());
+                if done >= total || last_publish.elapsed() >= PROGRESS_PUBLISH_INTERVAL {
+                    last_publish = Instant::now();
+                    info_tx.send_replace(snapshot.clone());
+                }
                 progress(done, total);
             })
             .await?;
@@ -513,35 +589,155 @@ impl UpdateManager {
         self.info.error.clear();
         self.publish_info();
 
+        let origin = self.metadata_url()?;
+        let proxies = Arc::new(resolve_github_proxies(self.opts.github_proxy.as_deref()));
+        let token = self.token.clone();
+        let auth_denied = Arc::new(AtomicBool::new(false));
+        let combined_done = Arc::new(AtomicU64::new(0));
+        let completed_steps = Arc::new(AtomicUsize::new(0));
+        let last_publish = Arc::new(Mutex::new(Instant::now()));
         let info_tx = self.info_tx.clone();
-        let mut snapshot = self.info.clone();
-        let mut temp_files = Vec::with_capacity(total_steps);
-        let mut downloaded_before: u64 = 0;
+        let base_snapshot = Arc::new(self.info.clone());
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DELTA_DOWNLOADS.min(total_steps.max(1))));
+        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<(u64, u64)>();
 
+        let mut join_set = JoinSet::new();
         for (idx, step) in chain.iter().enumerate() {
-            snapshot.delta_step = (idx + 1) as i64;
-            info_tx.send_replace(snapshot.clone());
-            let (file, step_bytes) = self
-                .download_asset(&step.asset, &mut |done, step_total| {
-                    let combined_done = downloaded_before.saturating_add(done);
-                    let combined_total = if total_bytes > 0 {
-                        total_bytes.max(combined_done)
-                    } else {
-                        downloaded_before.saturating_add(step_total)
-                    };
-                    snapshot.downloaded_bytes = combined_done.try_into().unwrap_or(i64::MAX);
-                    snapshot.total_bytes = combined_total.try_into().unwrap_or(i64::MAX);
-                    info_tx.send_replace(snapshot.clone());
-                    progress(combined_done, combined_total);
-                })
-                .await?;
-            downloaded_before = downloaded_before.saturating_add(step_bytes);
-            temp_files.push((file, step.from.clone(), step.to.clone()));
-        }
+            let client = self.client.clone();
+            let origin = origin.clone();
+            let token = token.clone();
+            let proxies = proxies.clone();
+            let auth_denied = auth_denied.clone();
+            let combined_done = combined_done.clone();
+            let completed_steps = completed_steps.clone();
+            let last_publish = last_publish.clone();
+            let info_tx = info_tx.clone();
+            let base_snapshot = base_snapshot.clone();
+            let sem = sem.clone();
+            let prog_tx = prog_tx.clone();
+            let asset = step.asset.clone();
+            let from = step.from.clone();
+            let to = step.to.clone();
 
-        self.info.downloaded_bytes = downloaded_before.try_into().unwrap_or(i64::MAX);
+            join_set.spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("download semaphore closed"))?;
+                let mut prev_step_done = 0u64;
+                let (file, step_bytes) = download_asset_with_client(
+                    &client,
+                    &origin,
+                    token.as_deref(),
+                    &proxies,
+                    &asset,
+                    &auth_denied,
+                    &mut |done, step_total| {
+                        let delta = done.saturating_sub(prev_step_done);
+                        prev_step_done = done;
+                        let now_done = if delta > 0 {
+                            combined_done.fetch_add(delta, Ordering::Relaxed) + delta
+                        } else {
+                            combined_done.load(Ordering::Relaxed)
+                        };
+                        let now_total = if total_bytes > 0 {
+                            total_bytes.max(now_done)
+                        } else {
+                            now_done.max(step_total)
+                        };
+                        let _ = prog_tx.send((now_done, now_total));
+                        let should_publish = now_done >= now_total
+                            || last_publish
+                                .lock()
+                                .ok()
+                                .is_some_and(|mut t| {
+                                    if t.elapsed() >= PROGRESS_PUBLISH_INTERVAL {
+                                        *t = Instant::now();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                        if should_publish {
+                            let mut snap = (*base_snapshot).clone();
+                            snap.downloaded_bytes = now_done.try_into().unwrap_or(i64::MAX);
+                            snap.total_bytes = now_total.try_into().unwrap_or(i64::MAX);
+                            snap.delta_step = (completed_steps.load(Ordering::Relaxed) + 1)
+                                .min(total_steps) as i64;
+                            info_tx.send_replace(snap);
+                        }
+                    },
+                )
+                .await?;
+                let done_steps = completed_steps.fetch_add(1, Ordering::Relaxed) + 1;
+                let now_done = combined_done.load(Ordering::Relaxed);
+                let mut snap = (*base_snapshot).clone();
+                snap.downloaded_bytes = now_done.try_into().unwrap_or(i64::MAX);
+                snap.total_bytes = total_bytes.max(now_done).try_into().unwrap_or(i64::MAX);
+                snap.delta_step = done_steps.min(total_steps) as i64;
+                info_tx.send_replace(snap);
+                Ok::<_, anyhow::Error>((idx, file, from, to, step_bytes))
+            });
+        }
+        drop(prog_tx);
+
+        let mut ordered: Vec<Option<(tempfile::NamedTempFile, String, String)>> =
+            (0..total_steps).map(|_| None).collect();
+        let mut downloaded_total = 0u64;
+        let mut last_reported_done = 0u64;
+        let mut first_err: Option<anyhow::Error> = None;
+
+        while !join_set.is_empty() {
+            tokio::select! {
+                Some((done, total)) = prog_rx.recv() => {
+                    if done >= last_reported_done {
+                        last_reported_done = done;
+                        progress(done, total.max(done));
+                    }
+                }
+                joined = join_set.join_next() => {
+                    match joined {
+                        Some(Ok(Ok((idx, file, from, to, bytes)))) => {
+                            downloaded_total = downloaded_total.saturating_add(bytes);
+                            ordered[idx] = Some((file, from, to));
+                        }
+                        Some(Ok(Err(e))) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                                join_set.abort_all();
+                            }
+                        }
+                        Some(Err(e)) => {
+                            if first_err.is_none() && !e.is_cancelled() {
+                                first_err = Some(e.into());
+                                join_set.abort_all();
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        while let Ok((done, total)) = prog_rx.try_recv() {
+            if done >= last_reported_done {
+                last_reported_done = done;
+                progress(done, total.max(done));
+            }
+        }
+        if auth_denied.load(Ordering::Relaxed) {
+            self.token = None;
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        let temp_files: Vec<(tempfile::NamedTempFile, String, String)> = ordered
+            .into_iter()
+            .map(|slot| slot.context("missing downloaded delta step"))
+            .collect::<Result<_>>()?;
+
+        self.info.downloaded_bytes = downloaded_total.try_into().unwrap_or(i64::MAX);
         self.info.total_bytes = total_bytes
-            .max(downloaded_before)
+            .max(downloaded_total)
             .try_into()
             .unwrap_or(i64::MAX);
         self.info.phase = "applying_delta".into();
@@ -712,4 +908,123 @@ fn denied(status: StatusCode) -> bool {
         status,
         StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
     )
+}
+
+async fn download_asset_with_client(
+    client: &Client,
+    origin: &Url,
+    token: Option<&str>,
+    proxies: &[String],
+    a: &Asset,
+    auth_denied: &AtomicBool,
+    on_chunk: &mut impl FnMut(u64, u64),
+) -> Result<(tempfile::NamedTempFile, u64)> {
+    ensure!(a.size <= MAX_ASSET, "asset too large");
+    let mut use_token = token.filter(|t| !t.is_empty()).filter(|_| !auth_denied.load(Ordering::Relaxed));
+
+    let (base_url, send_auth) = loop {
+        let auth = use_token.is_some();
+        let raw = if (auth && !a.url.is_empty()) || a.browser_download_url.is_empty() {
+            &a.url
+        } else {
+            &a.browser_download_url
+        };
+        ensure!(!raw.is_empty(), "missing asset URL");
+        let url = origin.join(raw)?;
+        let send_auth = auth && url.origin() == origin.origin();
+        if send_auth {
+            let mut req = client.get(url.clone()).header("Accept", "application/octet-stream");
+            if let Some(tok) = use_token {
+                req = req.bearer_auth(tok);
+            }
+            let resp = req.send().await?;
+            if denied(resp.status()) {
+                auth_denied.store(true, Ordering::Relaxed);
+                use_token = None;
+                continue;
+            }
+            ensure!(
+                matches!(resp.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT),
+                "asset download returned {}",
+                resp.status()
+            );
+            return stream_response_to_file(resp, a.size, on_chunk).await;
+        }
+        break (url, false);
+    };
+
+    let candidates = github_download_candidates(&base_url, send_auth, proxies);
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (candidate_url, is_proxy) in candidates {
+        let req = client
+            .get(candidate_url.clone())
+            .header("Accept", "application/octet-stream");
+        let send_fut = req.send();
+        let resp_res = if is_proxy {
+            match tokio::time::timeout(PROXY_CONNECT_RESPONSE_TIMEOUT, send_fut).await {
+                Ok(r) => r.map_err(anyhow::Error::from),
+                Err(_) => Err(anyhow::anyhow!("proxy request timed out: {candidate_url}")),
+            }
+        } else {
+            send_fut.await.map_err(anyhow::Error::from)
+        };
+        let resp = match resp_res {
+            Ok(r) if matches!(r.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT) => r,
+            Ok(r) => {
+                let err = anyhow::anyhow!("asset download returned {}", r.status());
+                if is_proxy {
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => {
+                if is_proxy {
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+        match stream_response_to_file(resp, a.size, on_chunk).await {
+            Ok(ok) => return Ok(ok),
+            Err(err) if is_proxy => {
+                last_err = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("asset download failed")))
+}
+
+async fn stream_response_to_file(
+    mut resp: Response,
+    declared_size: u64,
+    on_chunk: &mut impl FnMut(u64, u64),
+) -> Result<(tempfile::NamedTempFile, u64)> {
+    let size = resp.content_length().unwrap_or(declared_size);
+    ensure!(
+        size <= MAX_ASSET && (declared_size == 0 || size == declared_size),
+        "release size mismatch"
+    );
+    let file = tempfile::NamedTempFile::new()?;
+    let mut writer = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
+    let mut bytes = 0u64;
+    while let Some(chunk) = resp.chunk().await? {
+        bytes += chunk.len() as u64;
+        ensure!(
+            bytes <= MAX_ASSET && (size == 0 || bytes <= size),
+            "download exceeds declared size"
+        );
+        writer.write_all(&chunk)?;
+        on_chunk(bytes, size);
+    }
+    ensure!(size == 0 || bytes == size, "incomplete download");
+    writer.flush()?;
+    let file = writer.into_inner().map_err(|e| e.into_error())?;
+    on_chunk(bytes, bytes);
+    Ok((file, bytes))
 }

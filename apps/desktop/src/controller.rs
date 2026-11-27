@@ -2386,14 +2386,27 @@ pub(crate) fn update_op(action: &'static str) {
             let poll_wb = workbench.clone();
             let poll_stop = stop_poll.clone();
             spawn_for_window(async move {
+                let mut last_info: Option<vantry_protocol::AppUpdateInfo> = None;
                 while !poll_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    timer(Duration::from_millis(160)).await;
+                    timer(Duration::from_millis(300)).await;
                     if poll_stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
                     if let Ok(resp) = call(poll_wb.workbench(actions::request(names::UPDATE_STATUS))).await
                         && let Some(info) = resp.update
                     {
+                        // Ignore stale pre-download snapshots before Core enters the download
+                        // loop so the optimistic `total_bytes` is never overwritten with 0.
+                        if matches!(info.phase.as_str(), "idle" | "available" | "checking")
+                            && info.downloaded_bytes == 0
+                            && !info.staged
+                        {
+                            continue;
+                        }
+                        if last_info.as_ref() == Some(&info) {
+                            continue;
+                        }
+                        last_info = Some(info.clone());
                         sync_both(info);
                     }
                 }

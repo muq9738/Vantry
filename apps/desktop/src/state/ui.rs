@@ -686,13 +686,25 @@ impl UiState {
 
     /// Updates live update info both in `UiState` and in loaded `SettingsData`.
     pub fn sync_update_info(&mut self, info: vantry_protocol::AppUpdateInfo) {
+        if self.update_info.as_ref() == Some(&info) {
+            return;
+        }
         if !info.error.is_empty() {
             self.update_error = Some(info.error.clone());
         } else if info.phase != "failed" {
             self.update_error = None;
         }
+        let transient = matches!(
+            info.phase.as_str(),
+            "downloading" | "applying_delta" | "verifying"
+        );
         self.update_info = Some(info.clone());
-        if let Catalogs::Loaded(data) = &mut self.catalogs {
+        // Skip cloning the entire SettingsData via Arc::make_mut during transient
+        // download/patch ticks; views already prefer `update_info` via `active_update()`.
+        if !transient
+            && let Catalogs::Loaded(data) = &mut self.catalogs
+            && data.update != info
+        {
             std::sync::Arc::make_mut(data).update = info;
         }
     }
