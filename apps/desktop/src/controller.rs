@@ -2545,6 +2545,7 @@ pub(crate) fn update_op(action: &'static str) {
             {
                 info.phase = "downloading".into();
                 info.downloaded_bytes = 0;
+                info.speed_bps = 0;
                 info.total_bytes = if info.delta_available && info.delta_size > 0 {
                     info.delta_size
                 } else {

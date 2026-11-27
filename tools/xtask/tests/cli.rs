@@ -100,6 +100,42 @@ fn make_delta_is_atomic_and_applies() -> Result<()> {
     assert_eq!(fs::read(patch)?, good);
     Ok(())
 }
+#[test]
+fn make_deltas_builds_cross_version_patches_in_parallel() -> Result<()> {
+    let tmp = tempdir()?;
+    let v1 = tmp.path().join("v1");
+    let v2 = tmp.path().join("v2");
+    let v3 = tmp.path().join("v3");
+    let out_dir = tmp.path().join("deltas");
+    for (dir, body) in [(&v1, b"alpha-001"), (&v2, b"alpha-002"), (&v3, b"alpha-003")] {
+        fs::create_dir(dir)?;
+        fs::write(dir.join("bin"), body)?;
+    }
+    let output = cli(&[
+        "make-deltas",
+        "--to",
+        "0.2.23",
+        "--platform",
+        "darwin-arm64",
+        "--new",
+        s(&v3),
+        "--out-dir",
+        s(&out_dir),
+        "--base",
+        &format!("0.2.21={}", s(&v1)),
+        "--base",
+        &format!("0.2.22={}", s(&v2)),
+    ])?;
+    assert!(output.contains("vantry-0.2.21-to-0.2.23-darwin-arm64.delta"));
+    assert!(output.contains("vantry-0.2.22-to-0.2.23-darwin-arm64.delta"));
+    for (from, base) in [("0.2.21", &v1), ("0.2.22", &v2)] {
+        let p = out_dir.join(format!("vantry-{from}-to-0.2.23-darwin-arm64.delta"));
+        let rebuilt = tmp.path().join(format!("rebuilt-{from}"));
+        vantry_updater::apply_delta(File::open(&p)?, from, "0.2.23", base, &rebuilt)?;
+        assert_eq!(fs::read(rebuilt.join("bin"))?, b"alpha-003");
+    }
+    Ok(())
+}
 fn package_case(root: &Path, kind: &str, target: &str, helper: &Path, bin: &Path) -> Result<()> {
     let out = root.join(format!("{kind}-{target}"));
     let mut args = vec![

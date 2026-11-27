@@ -74,6 +74,18 @@ pub(crate) fn format_mb(bytes: i64) -> String {
     }
 }
 
+/// Human-readable throughput string (e.g. `1.4 MB/s` or `420 KB/s`).
+pub(crate) fn format_speed(bps: i64) -> String {
+    let bps = bps.max(0) as f64;
+    if bps >= 1_000_000.0 {
+        format!("{:.1} MB/s", bps / 1_000_000.0)
+    } else if bps >= 1_000.0 {
+        format!("{:.0} KB/s", bps / 1_000.0)
+    } else {
+        format!("{bps:.0} B/s")
+    }
+}
+
 /// Summary badge text describing incremental (single or multi-step) vs full package size.
 pub(crate) fn update_size_badge(update: &AppUpdateInfo) -> String {
     if update.delta_available && (!update.staged || update.used_delta) {
@@ -138,17 +150,24 @@ pub(crate) fn progress_metrics(update: &AppUpdateInfo) -> (f32, String, String) 
             } else {
                 "正在下载更新…".to_owned()
             };
-            let detail = if total > 0 {
+            let speed_suffix = if update.speed_bps > 0 {
+                format!(" · {}", format_speed(update.speed_bps))
+            } else {
+                String::new()
+            };
+            let detail = if total > 0 && done == 0 {
+                format!("连接中… · 0.0 MB / {}", format_mb(total))
+            } else if total > 0 {
                 format!(
-                    "{:.0}% · {} / {}",
+                    "{:.0}% · {} / {}{speed_suffix}",
                     raw_frac * 100.0,
                     format_mb(done),
                     format_mb(total)
                 )
             } else if done > 0 {
-                format_mb(done)
+                format!("{}{speed_suffix}", format_mb(done))
             } else {
-                "准备中…".to_owned()
+                "连接中…".to_owned()
             };
             (display_frac, label, detail)
         }

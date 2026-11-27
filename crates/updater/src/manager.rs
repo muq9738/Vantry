@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, Response, StatusCode, Url};
 use std::{
-    io::{BufWriter, Write},
+    io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -18,10 +18,19 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 pub use vantry_protocol::AppUpdateInfo;
 
-/// Default GitHub release download proxies tried in order for mainland China users
-/// (public repositories only), always falling back to direct `github.com`.
-const DEFAULT_CN_GITHUB_PROXIES: &[&str] = &["https://gh-proxy.com/", "https://ghfast.top/"];
-const PROXY_CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default GitHub release download proxies tried with hedged racing for mainland China users
+/// (public repositories only), always including direct `github.com` as fallback.
+const DEFAULT_CN_GITHUB_PROXIES: &[&str] = &[
+    "https://gh-proxy.org/",
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+];
+const PROXY_CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
+const DIRECT_CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+const HEDGE_DELAY: Duration = Duration::from_millis(1_500);
+const CHUNK_READ_TIMEOUT: Duration = Duration::from_secs(12);
+const LOW_SPEED_GRACE: Duration = Duration::from_secs(5);
+const MIN_PROXY_SPEED_BPS: u64 = 64 * 1024;
 const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_millis(120);
 const MAX_CONCURRENT_DELTA_DOWNLOADS: usize = 4;
 const DOWNLOAD_WRITE_BUFFER: usize = 256 * 1024;
@@ -393,7 +402,7 @@ impl UpdateManager {
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
             ensure!(
-                chunk.len() <= (1 << 20) - body.len(),
+                chunk.len() <= crate::release::MAX_METADATA - body.len(),
                 "release metadata too large"
             );
             body.extend_from_slice(&chunk);
@@ -502,7 +511,7 @@ impl UpdateManager {
     async fn download_asset(
         &mut self,
         a: &Asset,
-        on_chunk: &mut impl FnMut(u64, u64),
+        on_chunk: &mut impl FnMut(u64, u64, u64),
     ) -> Result<(tempfile::NamedTempFile, u64)> {
         let origin = self.metadata_url()?;
         let proxies = resolve_github_proxies(self.opts.github_proxy.as_deref());
@@ -530,6 +539,7 @@ impl UpdateManager {
         self.info.phase = "downloading".into();
         self.info.downloaded_bytes = 0;
         self.info.total_bytes = a.size.try_into().unwrap_or(i64::MAX);
+        self.info.speed_bps = 0;
         self.info.delta_step = 0;
         self.info.delta_steps = 0;
         self.info.error.clear();
@@ -539,9 +549,10 @@ impl UpdateManager {
         let mut snapshot = self.info.clone();
         let mut last_publish = Instant::now();
         let (file, _) = self
-            .download_asset(a, &mut |done, total| {
+            .download_asset(a, &mut |done, total, speed_bps| {
                 snapshot.downloaded_bytes = done.try_into().unwrap_or(i64::MAX);
                 snapshot.total_bytes = total.try_into().unwrap_or(i64::MAX);
+                snapshot.speed_bps = speed_bps.try_into().unwrap_or(i64::MAX);
                 if done >= total || last_publish.elapsed() >= PROGRESS_PUBLISH_INTERVAL {
                     last_publish = Instant::now();
                     info_tx.send_replace(snapshot.clone());
@@ -552,6 +563,7 @@ impl UpdateManager {
 
         self.info.downloaded_bytes = snapshot.downloaded_bytes;
         self.info.total_bytes = snapshot.total_bytes;
+        self.info.speed_bps = 0;
         self.info.phase = "verifying".into();
         self.publish_info();
 
@@ -584,6 +596,7 @@ impl UpdateManager {
         self.info.phase = "downloading".into();
         self.info.downloaded_bytes = 0;
         self.info.total_bytes = total_bytes.try_into().unwrap_or(i64::MAX);
+        self.info.speed_bps = 0;
         self.info.delta_steps = total_steps as i64;
         self.info.delta_step = 1;
         self.info.error.clear();
@@ -594,6 +607,8 @@ impl UpdateManager {
         let token = self.token.clone();
         let auth_denied = Arc::new(AtomicBool::new(false));
         let combined_done = Arc::new(AtomicU64::new(0));
+        let step_speeds: Arc<Vec<AtomicU64>> =
+            Arc::new((0..total_steps).map(|_| AtomicU64::new(0)).collect());
         let completed_steps = Arc::new(AtomicUsize::new(0));
         let last_publish = Arc::new(Mutex::new(Instant::now()));
         let info_tx = self.info_tx.clone();
@@ -609,6 +624,7 @@ impl UpdateManager {
             let proxies = proxies.clone();
             let auth_denied = auth_denied.clone();
             let combined_done = combined_done.clone();
+            let step_speeds = step_speeds.clone();
             let completed_steps = completed_steps.clone();
             let last_publish = last_publish.clone();
             let info_tx = info_tx.clone();
@@ -632,14 +648,23 @@ impl UpdateManager {
                     &proxies,
                     &asset,
                     &auth_denied,
-                    &mut |done, step_total| {
-                        let delta = done.saturating_sub(prev_step_done);
-                        prev_step_done = done;
-                        let now_done = if delta > 0 {
-                            combined_done.fetch_add(delta, Ordering::Relaxed) + delta
+                    &mut |done, step_total, speed_bps| {
+                        let now_done = if done >= prev_step_done {
+                            let delta = done - prev_step_done;
+                            prev_step_done = done;
+                            if delta > 0 {
+                                combined_done.fetch_add(delta, Ordering::Relaxed) + delta
+                            } else {
+                                combined_done.load(Ordering::Relaxed)
+                            }
                         } else {
-                            combined_done.load(Ordering::Relaxed)
+                            let rollback = prev_step_done - done;
+                            prev_step_done = done;
+                            combined_done
+                                .fetch_sub(rollback.min(combined_done.load(Ordering::Relaxed)), Ordering::Relaxed)
+                                .saturating_sub(rollback)
                         };
+                        step_speeds[idx].store(speed_bps, Ordering::Relaxed);
                         let now_total = if total_bytes > 0 {
                             total_bytes.max(now_done)
                         } else {
@@ -659,9 +684,12 @@ impl UpdateManager {
                                     }
                                 });
                         if should_publish {
+                            let total_speed: u64 =
+                                step_speeds.iter().map(|s| s.load(Ordering::Relaxed)).sum();
                             let mut snap = (*base_snapshot).clone();
                             snap.downloaded_bytes = now_done.try_into().unwrap_or(i64::MAX);
                             snap.total_bytes = now_total.try_into().unwrap_or(i64::MAX);
+                            snap.speed_bps = total_speed.try_into().unwrap_or(i64::MAX);
                             snap.delta_step = (completed_steps.load(Ordering::Relaxed) + 1)
                                 .min(total_steps) as i64;
                             info_tx.send_replace(snap);
@@ -669,11 +697,15 @@ impl UpdateManager {
                     },
                 )
                 .await?;
+                step_speeds[idx].store(0, Ordering::Relaxed);
                 let done_steps = completed_steps.fetch_add(1, Ordering::Relaxed) + 1;
                 let now_done = combined_done.load(Ordering::Relaxed);
+                let total_speed: u64 =
+                    step_speeds.iter().map(|s| s.load(Ordering::Relaxed)).sum();
                 let mut snap = (*base_snapshot).clone();
                 snap.downloaded_bytes = now_done.try_into().unwrap_or(i64::MAX);
                 snap.total_bytes = total_bytes.max(now_done).try_into().unwrap_or(i64::MAX);
+                snap.speed_bps = total_speed.try_into().unwrap_or(i64::MAX);
                 snap.delta_step = done_steps.min(total_steps) as i64;
                 info_tx.send_replace(snap);
                 Ok::<_, anyhow::Error>((idx, file, from, to, step_bytes))
@@ -740,6 +772,7 @@ impl UpdateManager {
             .max(downloaded_total)
             .try_into()
             .unwrap_or(i64::MAX);
+        self.info.speed_bps = 0;
         self.info.phase = "applying_delta".into();
         self.info.delta_step = 1;
         self.publish_info();
@@ -829,6 +862,7 @@ impl UpdateManager {
             Ok(p) => {
                 self.plan = Some(p);
                 self.info.phase = "ready".into();
+                self.info.speed_bps = 0;
                 self.info.error.clear();
                 self.publish_info();
                 self.set(UpdateState::ReadyToInstall);
@@ -836,6 +870,7 @@ impl UpdateManager {
             }
             Err(e) => {
                 self.info.phase = "failed".into();
+                self.info.speed_bps = 0;
                 self.info.error = e.to_string();
                 self.publish_info();
                 self.set(UpdateState::Failed(e.to_string()));
@@ -910,6 +945,256 @@ fn denied(status: StatusCode) -> bool {
     )
 }
 
+/// Parse an HTTP `Content-Range: bytes <start>-<end>/<total>` header.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    let total: u64 = total.trim().parse().ok()?;
+    (end >= start && end < total).then_some((start, end, total))
+}
+
+fn validate_response(
+    resp: &Response,
+    resume_offset: u64,
+    declared_size: u64,
+) -> Result<(bool, u64)> {
+    match resp.status() {
+        StatusCode::PARTIAL_CONTENT if resume_offset > 0 => {
+            let range_hdr = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .context("206 response missing Content-Range")?;
+            let (start, _end, total) =
+                parse_content_range(range_hdr).context("invalid Content-Range")?;
+            ensure!(
+                start == resume_offset
+                    && total <= MAX_ASSET
+                    && (declared_size == 0 || total == declared_size),
+                "unexpected Content-Range {range_hdr}"
+            );
+            Ok((true, total))
+        }
+        StatusCode::OK => {
+            let size = resp.content_length().unwrap_or(declared_size);
+            ensure!(
+                size <= MAX_ASSET && (declared_size == 0 || size == declared_size),
+                "release size mismatch"
+            );
+            Ok((false, size))
+        }
+        other => bail!("asset download returned {other}"),
+    }
+}
+
+/// Race untried candidate URLs using staggered hedging so a stalled or slow-to-connect
+/// proxy never blocks the download for 15 seconds at 0%.
+async fn race_candidates(
+    client: &Client,
+    candidates: &[(Url, bool)],
+    tried: &mut [bool],
+    resume_offset: u64,
+    declared_size: u64,
+) -> Result<(usize, Response, bool, u64)> {
+    let pending: Vec<usize> = (0..candidates.len()).filter(|&i| !tried[i]).collect();
+    ensure!(!pending.is_empty(), "no remaining download candidates");
+
+    let mut next_pos = 0usize;
+    let mut set: JoinSet<(usize, Result<(Response, bool, u64)>)> = JoinSet::new();
+    let mut last_err: Option<anyhow::Error> = None;
+
+    let spawn_one = |idx: usize, set: &mut JoinSet<(usize, Result<(Response, bool, u64)>)>| {
+        let client = client.clone();
+        let (url, is_proxy) = candidates[idx].clone();
+        let timeout = if is_proxy {
+            PROXY_CONNECT_RESPONSE_TIMEOUT
+        } else {
+            DIRECT_CONNECT_RESPONSE_TIMEOUT
+        };
+        set.spawn(async move {
+            let mut req = client
+                .get(url.clone())
+                .header("Accept", "application/octet-stream");
+            if resume_offset > 0 {
+                req = req.header(reqwest::header::RANGE, format!("bytes={resume_offset}-"));
+            }
+            let res = match tokio::time::timeout(timeout, req.send()).await {
+                Ok(Ok(resp)) => match validate_response(&resp, resume_offset, declared_size) {
+                    Ok((resumed, total)) => Ok((resp, resumed, total)),
+                    Err(e) => Err(e),
+                },
+                Ok(Err(e)) => Err(e.into()),
+                Err(_) => Err(anyhow::anyhow!("request timed out: {url}")),
+            };
+            (idx, res)
+        });
+    };
+
+    // Launch the first candidate immediately.
+    spawn_one(pending[next_pos], &mut set);
+    next_pos += 1;
+
+    let hedge = tokio::time::sleep(HEDGE_DELAY);
+    tokio::pin!(hedge);
+
+    while !set.is_empty() || next_pos < pending.len() {
+        if set.is_empty() && next_pos < pending.len() {
+            spawn_one(pending[next_pos], &mut set);
+            next_pos += 1;
+            hedge.as_mut().reset(tokio::time::Instant::now() + HEDGE_DELAY);
+        }
+        tokio::select! {
+            _ = &mut hedge, if next_pos < pending.len() => {
+                spawn_one(pending[next_pos], &mut set);
+                next_pos += 1;
+                hedge.as_mut().reset(tokio::time::Instant::now() + HEDGE_DELAY);
+            }
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, Ok((resp, resumed, total))))) => {
+                        set.abort_all();
+                        return Ok((idx, resp, resumed, total));
+                    }
+                    Some(Ok((idx, Err(e)))) => {
+                        tried[idx] = true;
+                        last_err = Some(e);
+                        // Immediately launch the next unstarted candidate on fast failure.
+                        if next_pos < pending.len() {
+                            spawn_one(pending[next_pos], &mut set);
+                            next_pos += 1;
+                            hedge.as_mut().reset(tokio::time::Instant::now() + HEDGE_DELAY);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if !e.is_cancelled() {
+                            last_err = Some(e.into());
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("asset download failed")))
+}
+
+async fn download_candidates_with_resume(
+    client: &Client,
+    candidates: &[(Url, bool)],
+    declared_size: u64,
+    on_chunk: &mut impl FnMut(u64, u64, u64),
+) -> Result<(tempfile::NamedTempFile, u64)> {
+    let mut tried = vec![false; candidates.len()];
+    let mut file = tempfile::NamedTempFile::new()?;
+    let mut written = 0u64;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    while tried.iter().any(|&t| !t) {
+        let (idx, mut resp, resumed, size) =
+            match race_candidates(client, candidates, &mut tried, written, declared_size).await {
+                Ok(winner) => winner,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            };
+        let is_proxy = candidates[idx].1;
+        tried[idx] = true;
+        let has_more_candidates = tried.iter().any(|&t| !t);
+
+        if !resumed && written > 0 {
+            file.as_file_mut().set_len(0)?;
+            file.as_file_mut().seek(SeekFrom::Start(0))?;
+            written = 0;
+        } else if resumed {
+            file.as_file_mut().seek(SeekFrom::Start(written))?;
+        }
+
+        let attempt_start = Instant::now();
+        let mut attempt_bytes = 0u64;
+        let mut speed_window_start = Instant::now();
+        let mut speed_window_bytes = 0u64;
+        let mut smoothed_bps = 0u64;
+
+        let mut writer = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
+        let stream_result: Result<()> = loop {
+            let chunk = match tokio::time::timeout(CHUNK_READ_TIMEOUT, resp.chunk()).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => break Err(e.into()),
+                Err(_) => break Err(anyhow::anyhow!("download stalled")),
+            };
+            let Some(chunk) = chunk else {
+                if size == 0 || written == size {
+                    break Ok(());
+                }
+                break Err(anyhow::anyhow!("incomplete download"));
+            };
+            let len = chunk.len() as u64;
+            written += len;
+            attempt_bytes += len;
+            speed_window_bytes += len;
+            if written > MAX_ASSET || (size > 0 && written > size) {
+                break Err(anyhow::anyhow!("download exceeds declared size"));
+            }
+            if let Err(e) = writer.write_all(&chunk) {
+                break Err(e.into());
+            }
+
+            let win_dt = speed_window_start.elapsed();
+            if win_dt >= Duration::from_millis(250) {
+                let inst_bps = ((speed_window_bytes as f64) / win_dt.as_secs_f64()) as u64;
+                smoothed_bps = if smoothed_bps == 0 {
+                    inst_bps
+                } else {
+                    (smoothed_bps * 3 + inst_bps) / 4
+                };
+                speed_window_start = Instant::now();
+                speed_window_bytes = 0;
+            } else if smoothed_bps == 0 {
+                let dt = attempt_start.elapsed().as_secs_f64();
+                if dt >= 0.05 {
+                    smoothed_bps = (attempt_bytes as f64 / dt) as u64;
+                }
+            }
+
+            on_chunk(written, size, smoothed_bps);
+
+            if is_proxy && has_more_candidates {
+                let elapsed = attempt_start.elapsed();
+                if elapsed >= LOW_SPEED_GRACE {
+                    let avg_bps = (attempt_bytes as f64 / elapsed.as_secs_f64()) as u64;
+                    if avg_bps < MIN_PROXY_SPEED_BPS {
+                        break Err(anyhow::anyhow!(
+                            "proxy throughput too slow ({avg_bps} B/s), switching mirror"
+                        ));
+                    }
+                }
+            }
+        };
+
+        writer.flush()?;
+        file = writer.into_inner().map_err(|e| e.into_error())?;
+
+        match stream_result {
+            Ok(()) => {
+                on_chunk(written, written, 0);
+                return Ok((file, written));
+            }
+            Err(e) if has_more_candidates => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("asset download failed")))
+}
+
 async fn download_asset_with_client(
     client: &Client,
     origin: &Url,
@@ -917,10 +1202,31 @@ async fn download_asset_with_client(
     proxies: &[String],
     a: &Asset,
     auth_denied: &AtomicBool,
-    on_chunk: &mut impl FnMut(u64, u64),
+    on_chunk: &mut impl FnMut(u64, u64, u64),
 ) -> Result<(tempfile::NamedTempFile, u64)> {
     ensure!(a.size <= MAX_ASSET, "asset too large");
-    let mut use_token = token.filter(|t| !t.is_empty()).filter(|_| !auth_denied.load(Ordering::Relaxed));
+    let mut use_token = token
+        .filter(|t| !t.is_empty())
+        .filter(|_| !auth_denied.load(Ordering::Relaxed));
+
+    // When proxies are configured (e.g. mainland China) and the asset has a public GitHub
+    // `browser_download_url`, race the public mirror pool first even if a local/bundled
+    // `update-token` exists. Private repositories (404 on public URL) cleanly fall back to
+    // authenticated `api.github.com` asset download below.
+    if !proxies.is_empty() && !a.browser_download_url.is_empty() {
+        if let Ok(browser_url) = origin.join(&a.browser_download_url) {
+            let candidates = github_download_candidates(&browser_url, false, proxies);
+            if candidates.len() > 1 {
+                match download_candidates_with_resume(client, &candidates, a.size, on_chunk).await {
+                    Ok(ok) => return Ok(ok),
+                    Err(err) if use_token.is_none() || a.url.is_empty() => return Err(err),
+                    Err(_) => {
+                        // Fall through to authenticated API download for private repositories.
+                    }
+                }
+            }
+        }
+    }
 
     let (base_url, send_auth) = loop {
         let auth = use_token.is_some();
@@ -933,7 +1239,9 @@ async fn download_asset_with_client(
         let url = origin.join(raw)?;
         let send_auth = auth && url.origin() == origin.origin();
         if send_auth {
-            let mut req = client.get(url.clone()).header("Accept", "application/octet-stream");
+            let mut req = client
+                .get(url.clone())
+                .header("Accept", "application/octet-stream");
             if let Some(tok) = use_token {
                 req = req.bearer_auth(tok);
             }
@@ -943,88 +1251,178 @@ async fn download_asset_with_client(
                 use_token = None;
                 continue;
             }
-            ensure!(
-                matches!(resp.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT),
-                "asset download returned {}",
-                resp.status()
-            );
-            return stream_response_to_file(resp, a.size, on_chunk).await;
+            let (_, size) = validate_response(&resp, 0, a.size)?;
+            return stream_single_response(resp, size, on_chunk).await;
         }
         break (url, false);
     };
 
     let candidates = github_download_candidates(&base_url, send_auth, proxies);
-    let mut last_err: Option<anyhow::Error> = None;
-
-    for (candidate_url, is_proxy) in candidates {
-        let req = client
-            .get(candidate_url.clone())
-            .header("Accept", "application/octet-stream");
-        let send_fut = req.send();
-        let resp_res = if is_proxy {
-            match tokio::time::timeout(PROXY_CONNECT_RESPONSE_TIMEOUT, send_fut).await {
-                Ok(r) => r.map_err(anyhow::Error::from),
-                Err(_) => Err(anyhow::anyhow!("proxy request timed out: {candidate_url}")),
-            }
-        } else {
-            send_fut.await.map_err(anyhow::Error::from)
-        };
-        let resp = match resp_res {
-            Ok(r) if matches!(r.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT) => r,
-            Ok(r) => {
-                let err = anyhow::anyhow!("asset download returned {}", r.status());
-                if is_proxy {
-                    last_err = Some(err);
-                    continue;
-                }
-                return Err(err);
-            }
-            Err(err) => {
-                if is_proxy {
-                    last_err = Some(err);
-                    continue;
-                }
-                return Err(err);
-            }
-        };
-        match stream_response_to_file(resp, a.size, on_chunk).await {
-            Ok(ok) => return Ok(ok),
-            Err(err) if is_proxy => {
-                last_err = Some(err);
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("asset download failed")))
+    download_candidates_with_resume(client, &candidates, a.size, on_chunk).await
 }
 
-async fn stream_response_to_file(
+async fn stream_single_response(
     mut resp: Response,
-    declared_size: u64,
-    on_chunk: &mut impl FnMut(u64, u64),
+    size: u64,
+    on_chunk: &mut impl FnMut(u64, u64, u64),
 ) -> Result<(tempfile::NamedTempFile, u64)> {
-    let size = resp.content_length().unwrap_or(declared_size);
-    ensure!(
-        size <= MAX_ASSET && (declared_size == 0 || size == declared_size),
-        "release size mismatch"
-    );
     let file = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
     let mut bytes = 0u64;
-    while let Some(chunk) = resp.chunk().await? {
+    let start = Instant::now();
+    while let Some(chunk) = tokio::time::timeout(CHUNK_READ_TIMEOUT, resp.chunk())
+        .await
+        .map_err(|_| anyhow::anyhow!("download stalled"))??
+    {
         bytes += chunk.len() as u64;
         ensure!(
             bytes <= MAX_ASSET && (size == 0 || bytes <= size),
             "download exceeds declared size"
         );
         writer.write_all(&chunk)?;
-        on_chunk(bytes, size);
+        let dt = start.elapsed().as_secs_f64();
+        let bps = if dt >= 0.05 { (bytes as f64 / dt) as u64 } else { 0 };
+        on_chunk(bytes, size, bps);
     }
     ensure!(size == 0 || bytes == size, "incomplete download");
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
-    on_chunk(bytes, bytes);
+    on_chunk(bytes, bytes, 0);
     Ok((file, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn failover_resumes_mid_stream_via_http_range() -> Result<()> {
+        let payload: Vec<u8> = (0..131_072u32).map(|i| (i * 31 % 251) as u8).collect();
+        let split = payload.len() / 2;
+
+        // Server A sends half the body with full Content-Length and drops the connection.
+        let listener_a = TcpListener::bind("127.0.0.1:0").await?;
+        let url_a = Url::parse(&format!("http://{}/asset", listener_a.local_addr()?))?;
+        let payload_a = payload.clone();
+        let srv_a = tokio::spawn(async move {
+            let (mut sock, _) = listener_a.accept().await?;
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                req.push(sock.read_u8().await?);
+            }
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload_a.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+            sock.write_all(&payload_a[..split]).await?;
+            sock.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        // Server B honors `Range: bytes=<split>-` with 206 Partial Content.
+        let listener_b = TcpListener::bind("127.0.0.1:0").await?;
+        let url_b = Url::parse(&format!("http://{}/asset", listener_b.local_addr()?))?;
+        let payload_b = payload.clone();
+        let saw_range = Arc::new(AtomicBool::new(false));
+        let saw_range_srv = saw_range.clone();
+        let srv_b = tokio::spawn(async move {
+            let (mut sock, _) = listener_b.accept().await?;
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                req.push(sock.read_u8().await?);
+            }
+            let text = String::from_utf8(req)?.to_ascii_lowercase();
+            let expected = format!("range: bytes={split}-");
+            assert!(text.contains(&expected), "missing Range header in: {text}");
+            saw_range_srv.store(true, Ordering::Relaxed);
+            let tail = &payload_b[split..];
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                    tail.len(),
+                    split,
+                    payload_b.len() - 1,
+                    payload_b.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+            sock.write_all(tail).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let client = Client::builder().build()?;
+        let candidates = vec![(url_a, true), (url_b, false)];
+        let (file, got) =
+            download_candidates_with_resume(&client, &candidates, payload.len() as u64, &mut |_, _, _| {})
+                .await?;
+        srv_a.await??;
+        srv_b.await??;
+
+        assert!(saw_range.load(Ordering::Relaxed));
+        assert_eq!(got as usize, payload.len());
+        assert_eq!(std::fs::read(file.path())?, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hedged_racing_bypasses_stalled_first_mirror() -> Result<()> {
+        let payload = b"fast-mirror-wins-before-slow-timeout".to_vec();
+
+        // Server A accepts TCP and never replies.
+        let listener_a = TcpListener::bind("127.0.0.1:0").await?;
+        let url_a = Url::parse(&format!("http://{}/slow", listener_a.local_addr()?))?;
+        let _srv_a = tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener_a.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        // Server B responds immediately once hedged.
+        let listener_b = TcpListener::bind("127.0.0.1:0").await?;
+        let url_b = Url::parse(&format!("http://{}/fast", listener_b.local_addr()?))?;
+        let payload_b = payload.clone();
+        let srv_b = tokio::spawn(async move {
+            let (mut sock, _) = listener_b.accept().await?;
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                req.push(sock.read_u8().await?);
+            }
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload_b.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+            sock.write_all(&payload_b).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let client = Client::builder().build()?;
+        let start = Instant::now();
+        let candidates = vec![(url_a, true), (url_b, false)];
+        let (file, got) =
+            download_candidates_with_resume(&client, &candidates, payload.len() as u64, &mut |_, _, _| {})
+                .await?;
+        let elapsed = start.elapsed();
+        srv_b.await??;
+
+        assert_eq!(got as usize, payload.len());
+        assert_eq!(std::fs::read(file.path())?, payload);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expected hedge to win quickly, took {elapsed:?}"
+        );
+        Ok(())
+    }
 }

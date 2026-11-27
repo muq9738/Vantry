@@ -35,14 +35,16 @@ pub(crate) fn compress(data: &[u8]) -> Result<Vec<u8>> {
     Ok(enc.finish()?)
 }
 const CHUNK: usize = 32 * 1024;
-/// Match a shifted suffix and encode the aligned prefix as byte differences.
-/// This produces ordinary bsdiff control triples without a whole-file suffix array.
+const MAX_BSDIFF_SIZE: u64 = 128 << 20;
+
+/// Encode a v1-compatible bsdiff patch. Uses full suffix-array bsdiff with
+/// fuzzy forward/backward extension for files up to 128 MiB so moved functions
+/// and shifted PC-relative offsets compress tightly while remaining 100%
+/// decodable by existing `vantry-delta-1` clients.
 pub(crate) fn encode(old: &mut File, new: &mut File, out: &mut File) -> Result<()> {
     let (a, b) = (old.metadata()?.len(), new.metadata()?.len());
-    // Release binaries move functions and sections between builds. Re-align at
-    // matching byte runs before encoding differences in the existing v1 format.
-    if a.max(b) <= 64 << 20 {
-        return encode_indexed(old, new, out);
+    if a.max(b) <= MAX_BSDIFF_SIZE {
+        return encode_bsdiff(old, new, out);
     }
     let mut suffix = 0;
     let (mut left, mut right) = ([0; CHUNK], [0; CHUNK]);
@@ -114,75 +116,343 @@ pub(crate) fn encode(old: &mut File, new: &mut File, out: &mut File) -> Result<(
     literals.finish()?;
     Ok(())
 }
-fn encode_indexed(old: &mut File, new: &mut File, out: &mut File) -> Result<()> {
-    use std::collections::HashMap;
+fn qsufsort_split(sa: &mut [i32], rank: &mut [i32], start: usize, len: usize, h: usize) {
+    let mut work = vec![(start, len)];
+    while let Some((start, len)) = work.pop() {
+        if len < 16 {
+            let mut k = start;
+            while k < start + len {
+                let mut j = 1usize;
+                let mut x = rank[sa[k] as usize + h];
+                let mut i = 1usize;
+                while k + i < start + len {
+                    let v = rank[sa[k + i] as usize + h];
+                    if v < x {
+                        x = v;
+                        j = 0;
+                    }
+                    if v == x {
+                        sa.swap(k + j, k + i);
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                for m in 0..j {
+                    rank[sa[k + m] as usize] = (k + j - 1) as i32;
+                }
+                if j == 1 {
+                    sa[k] = -1;
+                }
+                k += j;
+            }
+            continue;
+        }
+
+        let x = rank[sa[start + len / 2] as usize + h];
+        let mut jj = 0usize;
+        let mut kk = 0usize;
+        for i in start..start + len {
+            let v = rank[sa[i] as usize + h];
+            if v < x {
+                jj += 1;
+            } else if v == x {
+                kk += 1;
+            }
+        }
+        jj += start;
+        kk += jj;
+
+        let mut i = start;
+        let mut j = 0usize;
+        let mut k = 0usize;
+        while i < jj {
+            let v = rank[sa[i] as usize + h];
+            if v < x {
+                i += 1;
+            } else if v == x {
+                sa.swap(i, jj + j);
+                j += 1;
+            } else {
+                sa.swap(i, kk + k);
+                k += 1;
+            }
+        }
+        while jj + j < kk {
+            if rank[sa[jj + j] as usize + h] == x {
+                j += 1;
+            } else {
+                sa.swap(jj + j, kk + k);
+                k += 1;
+            }
+        }
+
+        if start + len > kk {
+            work.push((kk, start + len - kk));
+        }
+        for m in 0..(kk - jj) {
+            rank[sa[jj + m] as usize] = (kk - 1) as i32;
+        }
+        if kk == jj + 1 {
+            sa[jj] = -1;
+        }
+        if jj > start {
+            work.push((start, jj - start));
+        }
+    }
+}
+
+/// Larsson-Sadakane suffix sort (`qsufsort`) producing the suffix array `sa[0..=old.len()]`.
+fn qsufsort(old: &[u8]) -> Vec<i32> {
+    let n = old.len();
+    let mut sa = vec![0i32; n + 1];
+    let mut rank = vec![0i32; n + 1];
+    let mut buckets = [0i32; 256];
+
+    for &b in old {
+        buckets[b as usize] += 1;
+    }
+    for c in 1..256 {
+        buckets[c] += buckets[c - 1];
+    }
+    for c in (1..256).rev() {
+        buckets[c] = buckets[c - 1];
+    }
+    buckets[0] = 0;
+
+    for (idx, &b) in old.iter().enumerate() {
+        let c = b as usize;
+        buckets[c] += 1;
+        sa[buckets[c] as usize] = idx as i32;
+    }
+    sa[0] = n as i32;
+
+    for (idx, &b) in old.iter().enumerate() {
+        rank[idx] = buckets[b as usize];
+    }
+    rank[n] = 0;
+
+    for c in 1..256 {
+        if buckets[c] == buckets[c - 1] + 1 {
+            sa[buckets[c] as usize] = -1;
+        }
+    }
+    sa[0] = -1;
+
+    let mut h = 1usize;
+    while sa[0] != -(n as i32 + 1) {
+        let mut len: i32 = 0;
+        let mut i = 0usize;
+        while i < n + 1 {
+            if sa[i] < 0 {
+                len -= sa[i];
+                i = (i as i32 - sa[i]) as usize;
+            } else {
+                if len != 0 {
+                    sa[i - len as usize] = -len;
+                }
+                let group_len = rank[sa[i] as usize] + 1 - i as i32;
+                qsufsort_split(&mut sa, &mut rank, i, group_len as usize, h);
+                i += group_len as usize;
+                len = 0;
+            }
+        }
+        if len != 0 {
+            sa[i - len as usize] = -len;
+        }
+        h += h;
+    }
+
+    for i in 0..=n {
+        sa[rank[i] as usize] = i as i32;
+    }
+    sa
+}
+
+#[inline]
+fn matchlen(old: &[u8], new: &[u8]) -> usize {
+    let limit = old.len().min(new.len());
+    let mut i = 0usize;
+    while i + 8 <= limit && old[i..i + 8] == new[i..i + 8] {
+        i += 8;
+    }
+    while i < limit && old[i] == new[i] {
+        i += 1;
+    }
+    i
+}
+
+#[inline]
+fn search_suffix(sa: &[i32], old: &[u8], new: &[u8]) -> (usize, usize) {
+    let mut st = 0usize;
+    let mut en = old.len();
+    while en - st >= 2 {
+        let mid = st + (en - st) / 2;
+        let pos = sa[mid] as usize;
+        let cmp_len = (old.len() - pos).min(new.len());
+        if old[pos..pos + cmp_len] < new[..cmp_len] {
+            st = mid;
+        } else {
+            en = mid;
+        }
+    }
+    let pos_st = sa[st] as usize;
+    let pos_en = sa[en] as usize;
+    let x = matchlen(&old[pos_st..], new);
+    let y = matchlen(&old[pos_en..], new);
+    if x > y { (x, pos_st) } else { (y, pos_en) }
+}
+
+fn encode_bsdiff(old: &mut File, new: &mut File, out: &mut File) -> Result<()> {
     let (mut base, mut target) = (Vec::new(), Vec::new());
     old.rewind()?;
     new.rewind()?;
     old.read_to_end(&mut base)?;
     new.read_to_end(&mut target)?;
-    const ANCHOR: usize = 32;
-    let key = |s: &[u8]| u64::from_le_bytes(s[..8].try_into().unwrap());
-    let mut index = HashMap::new();
-    for (i, chunk) in base.chunks_exact(64).enumerate() {
-        index.entry(key(chunk)).or_insert(i * 64);
-    }
+
+    let oldsize = base.len();
+    let newsize = target.len();
+    let sa = qsufsort(&base);
+
     let mut control = Vec::new();
     let mut diffs = DeflateEncoder::new(Vec::new(), Compression::best());
     let mut literals = DeflateEncoder::new(Vec::new(), Compression::best());
-    let (mut start, mut pos, mut cursor, mut blocks) = (0, 0, 0, 0);
-    loop {
-        let span = cursor - start;
-        let aligned = pos + span;
-        let remaining = &target[cursor..];
-        if remaining.len() >= ANCHOR
-            && base.get(aligned..aligned + ANCHOR) == Some(&remaining[..ANCHOR])
-        {
-            cursor += ANCHOR;
-            continue;
-        }
-        let next = if remaining.is_empty() {
-            pos
-        } else {
-            let found = remaining.get(..ANCHOR).and_then(|anchor| {
-                let &at = index.get(&key(anchor))?;
-                (base[at..at + ANCHOR] == *anchor).then_some(at)
-            });
-            let Some(found) = found else {
-                cursor += 1;
-                continue;
-            };
-            found
-        };
-        let n = span.min(base.len() - pos);
-        put(&mut control, n as u64)?;
-        put(&mut control, (span - n) as u64)?;
-        let seek = next as i64 - (pos + n) as i64;
-        put(&mut control, ((seek << 1) ^ (seek >> 63)) as u64)?;
-        for (i, chunk) in target[start..start + n].chunks(CHUNK).enumerate() {
-            let mut buf = [0u8; CHUNK];
-            for (j, &byte) in chunk.iter().enumerate() {
-                buf[j] = byte.wrapping_sub(base[pos + i * CHUNK + j]);
+    let mut diff_buf = [0u8; CHUNK];
+    let mut blocks = 0u64;
+
+    let mut scan = 0usize;
+    let mut len = 0usize;
+    let mut pos = 0usize;
+    let mut lastscan = 0usize;
+    let mut lastpos = 0usize;
+    let mut lastoffset: isize = 0;
+
+    while scan < newsize {
+        let mut oldscore = 0usize;
+        scan += len;
+        let mut scsc = scan;
+        while scan < newsize {
+            let (m_len, m_pos) = search_suffix(&sa, &base, &target[scan..]);
+            len = m_len;
+            pos = m_pos;
+            while scsc < scan + len {
+                let old_idx = scsc as isize + lastoffset;
+                if old_idx >= 0
+                    && (old_idx as usize) < oldsize
+                    && base[old_idx as usize] == target[scsc]
+                {
+                    oldscore += 1;
+                }
+                scsc += 1;
             }
-            diffs.write_all(&buf[..chunk.len()])?;
+            if (len == oldscore && len != 0) || len > oldscore + 8 {
+                break;
+            }
+            let old_idx = scan as isize + lastoffset;
+            if old_idx >= 0
+                && (old_idx as usize) < oldsize
+                && base[old_idx as usize] == target[scan]
+            {
+                oldscore -= 1;
+            }
+            scan += 1;
         }
-        literals.write_all(&target[start + n..cursor])?;
-        blocks += 1;
-        if remaining.is_empty() {
-            break;
+
+        if len != oldscore || scan == newsize {
+            let mut s: isize = 0;
+            let mut sf: isize = 0;
+            let mut lenf = 0usize;
+            let mut i = 0usize;
+            while lastscan + i < scan && lastpos + i < oldsize {
+                if base[lastpos + i] == target[lastscan + i] {
+                    s += 1;
+                }
+                i += 1;
+                if s * 2 - i as isize > sf * 2 - lenf as isize {
+                    sf = s;
+                    lenf = i;
+                }
+            }
+
+            let mut lenb = 0usize;
+            if scan < newsize {
+                let mut s: isize = 0;
+                let mut sb: isize = 0;
+                let mut i = 1usize;
+                while scan >= lastscan + i && pos >= i {
+                    if base[pos - i] == target[scan - i] {
+                        s += 1;
+                    }
+                    if s * 2 - i as isize > sb * 2 - lenb as isize {
+                        sb = s;
+                        lenb = i;
+                    }
+                    i += 1;
+                }
+            }
+
+            if lastscan + lenf > scan - lenb {
+                let overlap = (lastscan + lenf) - (scan - lenb);
+                let mut s: isize = 0;
+                let mut ss: isize = 0;
+                let mut lens = 0usize;
+                for i in 0..overlap {
+                    if target[lastscan + lenf - overlap + i]
+                        == base[lastpos + lenf - overlap + i]
+                    {
+                        s += 1;
+                    }
+                    if target[scan - lenb + i] == base[pos - lenb + i] {
+                        s -= 1;
+                    }
+                    if s > ss {
+                        ss = s;
+                        lens = i + 1;
+                    }
+                }
+                lenf += lens;
+                lenf -= overlap;
+                lenb -= lens;
+            }
+
+            let extra_start = lastscan + lenf;
+            let extra_end = scan - lenb;
+            let extra_len = extra_end - extra_start;
+            let seek = (pos - lenb) as i64 - (lastpos + lenf) as i64;
+
+            put(&mut control, lenf as u64)?;
+            put(&mut control, extra_len as u64)?;
+            put(&mut control, ((seek << 1) ^ (seek >> 63)) as u64)?;
+
+            let mut written = 0usize;
+            while written < lenf {
+                let n = (lenf - written).min(CHUNK);
+                for j in 0..n {
+                    diff_buf[j] =
+                        target[lastscan + written + j].wrapping_sub(base[lastpos + written + j]);
+                }
+                diffs.write_all(&diff_buf[..n])?;
+                written += n;
+            }
+            if extra_len > 0 {
+                literals.write_all(&target[extra_start..extra_end])?;
+            }
+            blocks += 1;
+
+            lastscan = scan - lenb;
+            lastpos = pos - lenb;
+            lastoffset = pos as isize - scan as isize;
         }
-        start = cursor;
-        pos = next;
-        cursor += ANCHOR;
     }
+
     let ctrl = compress(&control)?;
     let diff = diffs.finish()?;
+    let extra = literals.finish()?;
     put(&mut *out, blocks)?;
     put(&mut *out, ctrl.len() as u64)?;
     put(&mut *out, diff.len() as u64)?;
     out.write_all(&ctrl)?;
     out.write_all(&diff)?;
-    out.write_all(&literals.finish()?)?;
+    out.write_all(&extra)?;
     Ok(())
 }
 
@@ -234,6 +504,16 @@ pub(crate) fn decode(
     let mut pos = 0i64;
     let mut remaining = size;
     let old_size = i64::try_from(old.metadata()?.len())?;
+    // Cache base file in RAM for files <= 128 MiB to avoid tens of thousands of seek+read syscalls
+    // when applying fine-grained bsdiff patches.
+    let old_mem = if old_size >= 0 && (old_size as u64) <= MAX_BSDIFF_SIZE {
+        old.rewind()?;
+        let mut data = Vec::with_capacity(old_size as usize);
+        old.read_to_end(&mut data)?;
+        Some(data)
+    } else {
+        None
+    };
     let (mut buf, mut prev) = ([0u8; CHUNK], [0; CHUNK]);
     for _ in 0..blocks {
         let (mut d, e, z) = (
@@ -254,9 +534,14 @@ pub(crate) fn decode(
             let hi = (pos + n as i64).min(old_size);
             if lo < hi {
                 let count = (hi - lo) as usize;
-                old.seek(SeekFrom::Start(lo as u64))?;
-                old.read_exact(&mut prev[..count])?;
-                for (dst, src) in buf[(lo - pos) as usize..].iter_mut().zip(&prev[..count]) {
+                let src_slice: &[u8] = if let Some(mem) = old_mem.as_deref() {
+                    &mem[lo as usize..hi as usize]
+                } else {
+                    old.seek(SeekFrom::Start(lo as u64))?;
+                    old.read_exact(&mut prev[..count])?;
+                    &prev[..count]
+                };
+                for (dst, src) in buf[(lo - pos) as usize..].iter_mut().zip(src_slice) {
                     *dst = dst.wrapping_add(*src);
                 }
             }

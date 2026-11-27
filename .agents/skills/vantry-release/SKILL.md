@@ -62,26 +62,37 @@ gh run download "$run_id" --name release-windows-amd64 --dir "$release_dir/windo
 
 ## Publish the GitHub Release
 
-When publication is requested, generate desktop deltas against the previous public stable release before uploading the versioned files. For a re-run, set `previous` to the same base tag used originally. Both inputs are the actual distributed ZIPs. Generate deltas only for platforms requested in this release. If the previous release has no ZIP for an explicitly requested platform, publish its full ZIP without a delta and state that limitation. `make-delta` reconstructs the target and verifies the file hashes before publishing its output.
+When publication is requested, generate cross-version desktop deltas against recent published stable releases (exponential skip-list offsets `1, 2, 3, 5, 8` before `$tag`, up to 5 bases) before uploading the versioned files. This allows users who are 1, 2, 3, 5, or 8 versions behind to update in a **single** direct incremental delta, and users further behind to bridge in at most 2–3 hops via Dijkstra planning. Both inputs are the actual distributed ZIPs. Generate deltas only for platforms requested in this release. If a base release has no ZIP for an explicitly requested platform, skip that base and continue. `xtask make-deltas` builds all deltas in parallel, drops any delta that exceeds the savings threshold, and reconstructs + SHA-256-verifies every output before publishing.
 
 ```bash
-previous=${previous:-$(gh release view --json tagName --jq .tagName)}
-test "$previous" != "$tag"
-base=${previous#v}
-mkdir -p "$release_dir/base"
+# Collect skip-list base tags (offsets 0,1,2,4,7 among recent non-draft stable releases != $tag).
+base_tags=($(gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName \
+  --jq "[.[] | select(.tagName != \"$tag\") | .tagName] | [.[0], .[1], .[2], .[4], .[7]] | map(select(. != null)) | unique | .[]"))
+test "${#base_tags[@]}" -gt 0
+mkdir -p "$release_dir/base" "$release_dir/deltas"
 # Default release; add windows-amd64 only for an explicit Windows x64 request.
 platforms=(darwin-arm64)
-deltas=()
 for platform in "${platforms[@]}"; do
   folder=desktop
   if [[ $platform == windows-amd64 ]]; then folder=windows/desktop; fi
-  asset="vantry-$base-$platform.zip"
-  gh release download "$previous" --pattern "$asset" --dir "$release_dir/base" --clobber
-  patch="$release_dir/vantry-$base-to-$version-$platform.delta"
-  cargo run --locked -p xtask -- make-delta --from "$base" --to "$version" \
-    --old "$release_dir/base/$asset" --new "$release_dir/$folder/vantry-$version-$platform.zip" --out "$patch"
-  deltas+=("$patch")
+  base_args=()
+  for prev_tag in "${base_tags[@]}"; do
+    base=${prev_tag#v}
+    asset="vantry-$base-$platform.zip"
+    if gh release download "$prev_tag" --pattern "$asset" --dir "$release_dir/base" --clobber 2>/dev/null; then
+      base_args+=(--base "$base=$release_dir/base/$asset")
+    fi
+  done
+  if [[ "${#base_args[@]}" -gt 0 ]]; then
+    cargo run --release --locked -p xtask -- make-deltas \
+      --to "$version" --platform "$platform" \
+      --new "$release_dir/$folder/vantry-$version-$platform.zip" \
+      --out-dir "$release_dir/deltas" "${base_args[@]}"
+  fi
 done
+shopt -s nullglob
+deltas=("$release_dir"/deltas/*.delta)
+shopt -u nullglob
 
 assets=(
   "$release_dir/desktop/Vantry-$version-macos-arm64.dmg"

@@ -277,3 +277,92 @@ fn delta_threshold_rejects_low_savings_and_github_proxy_candidates() -> Result<(
     assert!(!local_candidates[0].1);
     Ok(())
 }
+
+#[test]
+fn cross_version_direct_and_skiplist_delta_planning() -> Result<()> {
+    let releases = parse_releases(
+        br#"[
+            {"tag_name":"v0.2.20","assets":[
+                {"name":"vantry-0.2.15-to-0.2.20-darwin-arm64.delta","size":5200000}
+            ]},
+            {"tag_name":"v0.2.22","assets":[
+                {"name":"vantry-0.2.21-to-0.2.22-darwin-arm64.delta","size":4800000}
+            ]},
+            {"tag_name":"v0.2.23","assets":[
+                {"name":"vantry-0.2.22-to-0.2.23-darwin-arm64.delta","size":4200000},
+                {"name":"vantry-0.2.21-to-0.2.23-darwin-arm64.delta","size":6300000},
+                {"name":"vantry-0.2.20-to-0.2.23-darwin-arm64.delta","size":6500000},
+                {"name":"vantry-0.2.23-darwin-arm64.zip","size":24100000}
+            ]}
+        ]"#,
+        Channel::Stable,
+    )?;
+
+    // Direct 0.2.21 -> 0.2.23 (6.3 MB, 1 hop) beats 2-hop chain (4.8 + 4.2 = 9.0 MB).
+    let direct = plan_delta_chain(
+        &releases,
+        "vantry",
+        "darwin-arm64",
+        "0.2.21",
+        "0.2.23",
+        Some(24_100_000),
+    );
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].from, "0.2.21");
+    assert_eq!(direct[0].to, "0.2.23");
+
+    // 8 versions behind (0.2.15 -> 0.2.23) bridges in 2 skip-list hops (11.7 MB = 48.5% < 65%).
+    let skiplist = plan_delta_chain(
+        &releases,
+        "vantry",
+        "darwin-arm64",
+        "0.2.15",
+        "0.2.23",
+        Some(24_100_000),
+    );
+    assert_eq!(skiplist.len(), 2);
+    assert_eq!((skiplist[0].from.as_str(), skiplist[0].to.as_str()), ("0.2.15", "0.2.20"));
+    assert_eq!((skiplist[1].from.as_str(), skiplist[1].to.as_str()), ("0.2.20", "0.2.23"));
+    Ok(())
+}
+
+#[test]
+fn bsdiff_compresses_shifted_binary_with_frequent_relocations() -> Result<()> {
+    let tmp = tempdir()?;
+    let (old, new, out) = (tmp.path().join("old"), tmp.path().join("new"), tmp.path().join("out"));
+    fs::create_dir(&old)?;
+    fs::create_dir(&new)?;
+
+    // Simulate an ARM64 binary where a 4-byte branch immediate changes every 24 bytes
+    // (no 32-byte verbatim anchor exists anywhere!) AND functions shift by +137 bytes.
+    let mut state = 0x1234_5678u32;
+    let mut base: Vec<u8> = (0..200_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let mut target = vec![0xAAu8; 137];
+    target.extend_from_slice(&base);
+    for off in (0..base.len()).step_by(24) {
+        target[137 + off] = target[137 + off].wrapping_add(4);
+    }
+    base[0] ^= 0xFF;
+
+    fs::write(old.join("app.bin"), &base)?;
+    fs::write(new.join("app.bin"), &target)?;
+
+    let mut patch = Vec::new();
+    write_delta(&mut patch, "0.2.21", "0.2.23", &old, &new)?;
+    // Real bsdiff captures all shifted bytes via fuzzy diffing, compressing well below 25% of raw size.
+    assert!(
+        patch.len() < 40_000,
+        "expected tight bsdiff patch, got {} bytes",
+        patch.len()
+    );
+    apply_delta(Cursor::new(&patch), "0.2.21", "0.2.23", &old, &out)?;
+    assert_eq!(fs::read(out.join("app.bin"))?, target);
+    Ok(())
+}

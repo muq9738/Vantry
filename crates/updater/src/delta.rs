@@ -224,7 +224,7 @@ pub fn apply_delta(
                 continue;
             }
             input.seek(SeekFrom::Start(offset))?;
-            let mut out = File::create_new(&dest)?;
+            let mut out = io::BufWriter::with_capacity(256 * 1024, File::create_new(&dest)?);
             if e.from.is_empty() {
                 tree::copy_exact(
                     DeflateDecoder::new((&mut input).take(e.data)),
@@ -244,6 +244,7 @@ pub fn apply_delta(
                     patch::decode(&mut input, e.data, &mut base, e.size, &mut out)?;
                 }
             }
+            out.flush()?;
             drop(out);
             ensure!(
                 file_sum(&mut File::open(&dest)?)? == e.sha256,

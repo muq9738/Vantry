@@ -1774,6 +1774,9 @@ pub struct AppUpdateInfo {
     pub downloaded_bytes: i64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub total_bytes: i64,
+    /// Current smoothed download throughput in bytes per second.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub speed_bps: i64,
     /// Total number of incremental delta hops planned or used (e.g. 3 when jumping across 3 releases).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub delta_steps: i64,

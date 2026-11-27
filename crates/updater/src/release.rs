@@ -339,10 +339,13 @@ pub fn combine_release_notes(releases: &[Release], current: &str, latest: &str) 
     }
 }
 
+/// Maximum GitHub releases JSON payload accepted (8 MiB supports 100 releases with multi-base deltas).
+pub(crate) const MAX_METADATA: usize = 8 << 20;
+
 /// Accept GitHub release objects/arrays and custom manifests with a `releases` array.
 /// Returns all eligible releases for `channel`, sorted ascending by version.
 pub fn parse_releases(data: &[u8], channel: Channel) -> Result<Vec<Release>> {
-    ensure!(data.len() <= 1 << 20, "release metadata too large");
+    ensure!(data.len() <= MAX_METADATA, "release metadata too large");
     let v: serde_json::Value = serde_json::from_slice(data)?;
     let releases: Vec<Release> = if let Some(rs) = v.get("releases") {
         serde_json::from_value(rs.clone())?
