@@ -26,6 +26,8 @@ pub(crate) mod sidebar;
 pub(crate) mod timeline;
 pub(crate) mod update_dialog;
 pub(crate) mod visuals;
+#[cfg(test)]
+mod approval_layout_tests;
 
 use nsh_core::prelude::*;
 use vantry_protocol::RunStatus;

@@ -19,6 +19,9 @@ use vantry_pi_runtime::{
 use vantry_platform::{hostfs, workspace};
 use vantry_protocol::{ControlResponse, ProviderRequest, WorkspaceSpec};
 
+/// A controlled-provider message containing this asks for an approval first.
+pub const CONTROLLED_APPROVAL_MARKER: &str = "[controlled:approval]";
+
 pub struct Provider {
     pub core: vantry_core::Core,
     pub data: PathBuf,
@@ -220,6 +223,15 @@ impl Provider {
                     result: serde_json::json!({"ok":true}),
                 },
             ];
+            // Offline approval rehearsal (clients' end-to-end tests): the
+            // run waits on a confirm, as the approval extension asks one.
+            if job.request.message.contains(CONTROLLED_APPROVAL_MARKER) {
+                steps.push(ControlledStep::Approval {
+                    title: "允许执行 bash？".into(),
+                    message: serde_json::json!({"command": "ls -la; rg -i \"qmt\" .\nls -lh"})
+                        .to_string(),
+                });
+            }
             for chunk in format!(
                 "这是 Vantry 的本机受控 Provider。\n\n已收到：{}\n\n任务已完成。",
                 job.request.message

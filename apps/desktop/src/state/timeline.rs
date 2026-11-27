@@ -571,7 +571,7 @@ fn reindex(rows: &mut ThreadRows, segments: &HashMap<String, Segment>) {
 
 /// Request statuses shown in the timeline.
 fn shown_request(r: &PendingRequest) -> bool {
-    matches!(r.status.as_str(), "pending" | "responding" | "failed")
+    matches!(r.status.as_str(), "pending" | "responding" | "failed" | super::SETTLED_ELSEWHERE)
 }
 
 fn build_tool_entry(tool: &ToolCall, has_pending_approval: bool) -> ToolEntry {

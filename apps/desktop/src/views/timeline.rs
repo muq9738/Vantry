@@ -19,7 +19,8 @@ use crate::{
     controller,
     icons::{Icon, icon},
     state::{
-        ApprovalDecision, ApprovalView, Risk, TimelineItem, ToolEntry, ToolKind, ToolStatus,
+        ApprovalDecision, ApprovalView, RequestKind, Risk, TimelineItem, ToolEntry, ToolKind,
+        ToolStatus,
         language::Language, markdown::MarkdownDoc,
     },
     theme::{metrics, palette},
@@ -1391,6 +1392,9 @@ fn tool_details(entry: Memo<Option<ToolEntry>>) -> impl IntoElement {
         ))
 }
 
+/// A request's card: the one place an approval is answered (T3 Code's
+/// `TimelinePendingApprovalRow`). What it will run is shown as it will run;
+/// the answers stay until the Core settles the request, on any client.
 pub(crate) fn approval_row(item: ItemMemo) -> impl IntoElement {
     let colors = palette();
     let view_of = computed(move || match item.get() {
@@ -1400,17 +1404,44 @@ pub(crate) fn approval_row(item: ItemMemo) -> impl IntoElement {
     let headline =
         move || view_of.with(|v| v.as_ref().map(|v| v.headline.clone()).unwrap_or_default());
     let body = move || view_of.with(|v| v.as_ref().map(|v| v.body.clone()).unwrap_or_default());
-    let state_text = move || {
-        view_of.with(|v| match v.as_ref().map(|v| v.status.as_str()) {
-            Some("responding") => "正在提交响应…".to_owned(),
-            Some("failed") => "响应失败".to_owned(),
-            _ => "需要你的确认".to_owned(),
-        })
+    let details =
+        move || view_of.with(|v| v.as_ref().map(|v| v.details.clone()).unwrap_or_default());
+    let error = move || view_of.with(|v| v.as_ref().map(|v| v.error.clone()).unwrap_or_default());
+    // This window's answer on its way (vs. one already with the Core).
+    let submitting = computed(move || {
+        let key = view_of.with(|v| v.as_ref().map(|v| format!("request:{}", v.request_id)));
+        key.is_some_and(|key| controller::state().with(|s| s.in_flight(&key)))
+    });
+    let status = move || view_of.with(|v| v.as_ref().map(|v| v.status.clone()).unwrap_or_default());
+    let settled = move || !matches!(status().as_str(), "pending" | "responding");
+    let state_text = move || match status().as_str() {
+        "responding" if submitting.get() => "正在提交你的回答…".to_owned(),
+        "responding" => "已回答，等待 Agent 继续…".to_owned(),
+        "failed" => "回答未送达 Agent".to_owned(),
+        crate::state::SETTLED_ELSEWHERE => "已在其他端处理".to_owned(),
+        _ => view_of.with(|v| match v.as_ref().map(|v| v.kind) {
+            Some(RequestKind::Approval) | None => "需要你的确认".to_owned(),
+            Some(kind) => kind.label().to_owned(),
+        }),
+    };
+    let state_color = move || match status().as_str() {
+        "failed" => colors.danger,
+        "pending" => colors.warning,
+        _ => colors.muted,
     };
     let risk = move || view_of.with(|v| v.as_ref().map_or(Risk::Low, |v: &ApprovalView| v.risk));
+    let risk_color = move || match risk() {
+        Risk::Low => colors.success,
+        Risk::Medium => colors.warning,
+        Risk::High => colors.danger,
+    };
     let answerable = move || view_of.with(|v| v.as_ref().is_some_and(ApprovalView::answerable));
+    let approval = move || view_of.with(|v| v.as_ref().is_some_and(ApprovalView::is_approval));
     let quick = move || view_of.with(|v| v.as_ref().is_some_and(|v| v.is_approval() && v.answerable()));
-    let session = move || view_of.with(|v| v.as_ref().is_some_and(|v| v.allow_session.is_some()));
+    let form_label = move || {
+        view_of.with(|v| v.as_ref().map(|v| format!("打开{}", v.kind.label())).unwrap_or_default())
+    };
+    let session_label = move || view_of.with(|v| v.as_ref().and_then(|v| v.allow_session.clone()));
     let id = move || view_of.with_untracked(|v| v.as_ref().map(|v| v.request_id.clone()).unwrap_or_default());
     view()
         .flex_col()
@@ -1418,9 +1449,9 @@ pub(crate) fn approval_row(item: ItemMemo) -> impl IntoElement {
         .px_4()
         .py_3()
         .rounded(px(12.0))
-        .bg(colors.approval)
+        .bg(move || if settled() { colors.soft } else { colors.approval })
         .border_1()
-        .border_color(colors.approval_border)
+        .border_color(move || if settled() { colors.line_soft } else { colors.approval_border })
         .child(
             view()
                 .flex_row()
@@ -1429,64 +1460,115 @@ pub(crate) fn approval_row(item: ItemMemo) -> impl IntoElement {
                 .child(icon(Icon::ShieldCheck, 14.0, colors.warning))
                 .child(
                     text(state_text)
+                        .flex_1()
                         .text_size(px(12.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.warning),
-                ),
+                        .text_color(state_color),
+                )
+                .child(when(
+                    move || !settled() && approval(),
+                    move || {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .child(dot(risk_color))
+                            .child(
+                                text(move || match risk() {
+                                    Risk::Low => "低风险",
+                                    Risk::Medium => "需核对",
+                                    Risk::High => "高风险",
+                                })
+                                .text_size(px(11.5))
+                                .text_color(colors.muted),
+                            )
+                    },
+                )),
         )
         .child(
             text(headline)
                 .select_text()
-                .number_of_lines(2u32)
+                .number_of_lines(3u32)
                 .text_size(px(13.5))
                 .text_color(colors.ink),
         )
         .child(when(
             move || !body().is_empty(),
             move || {
-                text(body)
+                scroll()
+                    .max_h(px(220.0))
+                    .bg(colors.code)
+                    .rounded(px(6.0))
+                    .child(
+                        text(body)
+                            .select_text()
+                            .font_family("Menlo")
+                            .text_size(px(12.0))
+                            .line_height(LineHeight::Multiple(1.45))
+                            .text_color(colors.ink)
+                            .px(px(10.0))
+                            .py(px(6.0)),
+                    )
+            },
+        ))
+        .child(when(
+            move || !details().is_empty(),
+            move || {
+                text(details)
                     .select_text()
                     .number_of_lines(4u32)
                     .font_family("Menlo")
-                    .text_size(px(12.0))
-                    .text_color(colors.ink)
-                    .bg(colors.code)
-                    .rounded(px(6.0))
-                    .px_2()
-                    .py_1()
+                    .text_size(px(11.5))
+                    .text_color(colors.muted)
             },
         ))
-        .child(
-            text(move || risk().hint())
-                .text_size(px(11.5))
-                .text_color(colors.muted),
-        )
-        .child(
-            view()
-                .flex_row()
-                .gap_2()
-                .child(view().flex_1())
-                .child(when(quick, move || {
-                    view()
-                        .flex_row()
-                        .gap_2()
-                        .child(ghost_button("拒绝", move || {
-                            controller::respond(id(), ApprovalDecision::Deny)
-                        }))
-                        .child(when(session, move || {
-                            ghost_button("本会话允许", move || {
+        .child(when(
+            move || answerable() && approval(),
+            move || {
+                text(move || risk().hint())
+                    .text_size(px(11.5))
+                    .text_color(colors.muted)
+            },
+        ))
+        .child(when(
+            move || !error().is_empty(),
+            move || text(error).select_text().text_size(px(11.5)).text_color(colors.danger),
+        ))
+        .child(when(
+            answerable,
+            move || {
+                // One wrapping row: on a narrow column the answers flow onto
+                // a second line rather than past the card.
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .justify_end()
+                    .items_center()
+                    .gap_2()
+                    .child(when(quick, move || {
+                        ghost_button("拒绝", move || controller::respond(id(), ApprovalDecision::Deny))
+                    }))
+                    .child(dynamic(move || {
+                        session_label().filter(|_| quick()).map(|label| {
+                            ghost_button(label, move || {
                                 controller::respond(id(), ApprovalDecision::AllowSession)
                             })
-                        }))
-                        .child(primary_button("仅允许本次", move || {
+                            .into_element()
+                        })
+                    }))
+                    .child(when(quick, move || {
+                        primary_button("仅允许本次", move || {
                             controller::respond(id(), ApprovalDecision::Allow)
-                        }))
-                }))
-                .child(when(
-                    move || answerable() && !quick(),
-                    move || ghost_button("处理", move || controller::reopen_request(id())),
-                )),
-        )
+                        })
+                    }))
+                    .child(when(
+                        move || !quick(),
+                        move || primary_button(form_label, move || controller::reopen_request(id())),
+                    ))
+            },
+        ))
+        .child(super::approval_modal::retry_answer(view_of))
 }
 
 fn status_row(item: ItemMemo) -> impl IntoElement {

@@ -387,7 +387,7 @@ fn tools_with_unknown_offsets_follow_the_text() {
 // --------------------------------------------------------------- approvals
 
 #[test]
-fn an_approval_request_queues_and_shows_in_the_modal() {
+fn an_approval_request_queues_and_shows_only_in_the_timeline() {
     let mut state = live_state();
     let tool = ToolCall {
         id: "k1".into(),
@@ -401,7 +401,11 @@ fn an_approval_request_queues_and_shows_in_the_modal() {
     state.apply_event(&request_event(12, &approval_request("q1", "pending")));
     assert_eq!(state.thread_status("t1"), ThreadStatus::NeedsApproval);
     assert_eq!(state.approval_queue().len(), 1);
-    let view = state.modal_request().unwrap();
+    assert!(state.modal_request().is_none());
+    let rows = state.timeline();
+    let Some(TimelineItem::Approval { view, .. }) = rows.last() else {
+        panic!("missing inline approval");
+    };
     assert_eq!(view.request_id, "q1");
     assert_eq!(view.headline, "允许执行 bash？");
     assert_eq!(view.body, "rm -rf build");
@@ -415,6 +419,101 @@ fn an_approval_request_queues_and_shows_in_the_modal() {
 }
 
 #[test]
+fn an_inline_approval_waits_in_the_background_and_leaves_forms_accessible() {
+    let mut state = live_state();
+    state.apply_event(&request_event(11, &approval_request("q1", "pending")));
+    state.select_thread(None);
+    assert!(state.modal_request().is_none());
+    assert_eq!(state.thread_status("t1"), ThreadStatus::NeedsApproval);
+
+    state.select_thread(Some("t1".into()));
+    let form = PendingRequest {
+        method: "input".into(),
+        title: "请输入备注".into(),
+        ..approval_request("form", "pending")
+    };
+    state.apply_event(&request_event(12, &form));
+    assert_eq!(state.modal_request().unwrap().request_id, "form");
+    state.defer_request("form");
+    assert!(state.modal_request().is_none());
+    assert_eq!(state.approval_queue().len(), 2);
+}
+
+#[test]
+fn an_approval_without_a_loaded_run_can_still_be_answered() {
+    let mut state = live_state();
+    let request = PendingRequest {
+        run_id: "loading".into(),
+        ..approval_request("q1", "pending")
+    };
+    state.apply_event(&request_event(11, &request));
+    assert_eq!(state.modal_request().unwrap().request_id, "q1");
+}
+
+#[test]
+fn bash_approval_displays_the_command_and_preserves_additional_arguments() {
+    let command = "ls -la; rg -i \"qmt\" .\nls -lh";
+    let mut req = approval_request("q1", "pending");
+    req.title = format!("允许执行 bash？\n{}", json!({"command": command}));
+    assert_eq!(approval_view(&req).body, command);
+    let args = json!({"command": command, "timeout": 60}).to_string();
+    req.title = format!("允许执行 bash？\n{args}");
+    let view = approval_view(&req);
+    assert_eq!(view.body, command);
+    assert_eq!(view.details, "timeout: 60");
+}
+
+#[test]
+fn approval_text_shows_what_runs_including_its_end_and_undrawn_characters() {
+    // The approval extension cut a long summary mid-string: the command still reads as one.
+    let mut req = approval_request("q1", "pending");
+    req.title = "允许执行 bash？\n{\"command\":\"echo hi\\nrm -rf /tmp/x\\u00".into();
+    let view = approval_view(&req);
+    assert_eq!(view.body, "echo hi\nrm -rf /tmp/x");
+    assert!(view.details.contains("开头"));
+    // A zero-width space and a bidi override are named, not hidden.
+    let text = approval::approval_text("ls\u{200B}x\u{202E}y", 100, 10);
+    assert_eq!(text, "ls⟨U+200B⟩x⟨U+202E⟩y");
+    // Too long: the beginning and the end, and how much is left out between.
+    let long = format!("{}{}", "a".repeat(50), "TAIL");
+    let cut = approval::approval_text(&long, 20, 4);
+    assert!(cut.starts_with(&"a".repeat(16)));
+    assert!(cut.ends_with("TAIL"));
+    assert!(cut.contains("中间省略 34 个字符"));
+    // Risk reads the whole command, not only what is shown.
+    req.title = format!(
+        "允许执行 bash？\n{}",
+        json!({"command": format!("{} && rm -rf ~", "echo ok; ".repeat(3000))})
+    );
+    let view = approval_view(&req);
+    assert_eq!(view.risk, Risk::High);
+    assert!(view.body.ends_with("&& rm -rf ~"));
+}
+
+#[test]
+fn an_answer_refused_because_another_client_answered_first_settles_the_card() {
+    let mut state = live_state();
+    state.apply_event(&request_event(11, &approval_request("q1", "pending")));
+    let command = state.respond("q1", &ApprovalDecision::Allow).unwrap();
+    // The Core takes one answer per request: this one lost the race.
+    state.on_command_result(
+        &command.command_id,
+        Err(BridgeError::new(ErrorCode::Conflict, "request is no longer pending")),
+    );
+    assert_eq!(state.requests[0].status, crate::state::SETTLED_ELSEWHERE);
+    assert!(state.pending.is_empty());
+    assert_eq!(state.notice.as_ref().unwrap().level, NoticeLevel::Info);
+    assert!(state.respond("q1", &ApprovalDecision::Deny).is_err(), "not answerable again");
+    assert_eq!(state.thread_status("t1"), ThreadStatus::Running);
+    let rows = state.timeline();
+    assert!(rows.iter().any(|row| matches!(row, TimelineItem::Approval { view, .. }
+        if view.status == crate::state::SETTLED_ELSEWHERE && !view.answerable())));
+    // The Core's word replaces the local guess.
+    state.apply_event(&request_event(12, &approval_request("q1", "responded")));
+    assert!(state.timeline().iter().all(|row| !matches!(row, TimelineItem::Approval { .. })));
+}
+
+#[test]
 fn allowing_sends_the_option_and_the_core_closes_the_request() {
     let mut state = live_state();
     state.apply_event(&request_event(11, &approval_request("q1", "pending")));
@@ -424,7 +523,8 @@ fn allowing_sends_the_option_and_the_core_closes_the_request() {
     assert_eq!(command.run_id, "r1");
     assert_eq!(command.value, "允许本次");
     assert!(!command.confirmed && !command.cancelled);
-    // Responding: no second answer, the modal keeps it until the Core speaks.
+    // Keep the pending answer on its original surface until Core settles it.
+    assert!(state.modal_request().is_none());
     assert_eq!(state.requests[0].status, "responding");
     assert!(state.in_flight("request:q1"));
     assert_eq!(
@@ -507,7 +607,7 @@ fn a_rejected_answer_reopens_the_request_and_an_unknown_one_retries_the_same_com
     let command = state.respond("q1", &ApprovalDecision::Allow).unwrap();
     state.on_command_result(
         &command.command_id,
-        Err(BridgeError::new(ErrorCode::Conflict, "request expired")),
+        Err(BridgeError::new(ErrorCode::InvalidCommand, "value not in options")),
     );
     assert_eq!(state.requests[0].status, "pending");
     assert!(state.pending.is_empty());
@@ -536,13 +636,18 @@ fn the_modal_prefers_the_shown_threads_request() {
         "",
         json!({ "thread": thread("t2", "2026-11-23T01:00:00Z") }),
     ));
+    let form = |id| PendingRequest {
+        method: "input".into(),
+        ..approval_request(id, "pending")
+    };
     let other = PendingRequest {
         thread_id: "t2".into(),
+        run_id: "r2".into(),
         created_at: "2026-11-23T00:00:00Z".into(),
-        ..approval_request("q-other", "pending")
+        ..form("q-other")
     };
     state.apply_event(&request_event(12, &other));
-    state.apply_event(&request_event(13, &approval_request("q-mine", "pending")));
+    state.apply_event(&request_event(13, &form("q-mine")));
     state.select_thread(Some("t1".into()));
     assert_eq!(state.modal_request().unwrap().request_id, "q-mine");
     state.select_thread(Some("t2".into()));
@@ -552,10 +657,15 @@ fn the_modal_prefers_the_shown_threads_request() {
 #[test]
 fn a_request_put_aside_leaves_the_modal_but_stays_queued() {
     let mut state = live_state();
-    state.apply_event(&request_event(11, &approval_request("q1", "pending")));
+    let first = PendingRequest {
+        method: "editor".into(),
+        ..approval_request("q1", "pending")
+    };
+    state.apply_event(&request_event(11, &first));
     let second = PendingRequest {
+        id: "q2".into(),
         created_at: "2026-11-23T00:00:02Z".into(),
-        ..approval_request("q2", "pending")
+        ..first
     };
     state.apply_event(&request_event(12, &second));
     assert_eq!(state.modal_request().unwrap().request_id, "q1");
@@ -1094,4 +1204,110 @@ fn decoupled_run_blocks_preserve_causal_order_multi_reasoning_and_mid_run_steer(
         ..Snapshot::default()
     });
     assert_eq!(state.timeline(), cold.timeline());
+}
+
+// ------------------------------------------------- one entry, any client
+
+#[test]
+fn another_threads_request_never_covers_the_screen_and_is_pointed_to() {
+    let mut state = live_state();
+    state.apply_event(&ev(
+        11,
+        "thread.created",
+        "t2",
+        "",
+        json!({ "thread": thread("t2", "2026-11-23T01:00:00Z") }),
+    ));
+    state.select_thread(Some("t1".into()));
+    let secret = PendingRequest {
+        thread_id: "t2".into(),
+        run_id: "r2".into(),
+        method: "input".into(),
+        title: "请输入 API 密码".into(),
+        ..approval_request("q-secret", "pending")
+    };
+    state.apply_event(&request_event(12, &secret));
+    let approval = PendingRequest {
+        id: "q-bash".into(),
+        created_at: "2026-11-23T00:00:05Z".into(),
+        ..approval_request("q-bash", "pending")
+    };
+    let approval = PendingRequest { thread_id: "t2".into(), run_id: "r2".into(), ..approval };
+    state.apply_event(&request_event(13, &approval));
+    assert!(state.modal_request().is_none(), "the thread being read stays readable");
+    let attention = state.background_attention();
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].thread_id, "t2");
+    assert_eq!(attention[0].count, 2);
+    assert_eq!(attention[0].kind, RequestKind::Secret);
+    assert_eq!(attention[0].title, "会话 t2");
+
+    // Opening it from its card shows it, whichever thread is shown; Escape puts it back.
+    state.reopen_request("q-secret");
+    assert_eq!(state.modal_request().unwrap().request_id, "q-secret");
+    state.defer_request("q-secret");
+    assert!(state.modal_request().is_none());
+
+    // Shown: its form opens the modal, its approval stays on its card.
+    state.select_thread(Some("t2".into()));
+    assert!(state.background_attention().is_empty());
+    state.reopen_request("q-secret");
+    assert_eq!(state.modal_request().unwrap().request_id, "q-secret");
+
+    // Answered elsewhere: the modal lets go.
+    state.apply_event(&request_event(14, &PendingRequest { status: "responded".into(), ..secret }));
+    assert!(state.focused_request.is_none());
+    // Its approval has no card while run r2 is not loaded: the modal is its one entry until then.
+    assert_eq!(state.modal_request().unwrap().request_id, "q-bash");
+}
+
+#[test]
+fn a_resync_keeps_an_answer_in_flight_and_drops_one_another_client_settled() {
+    let mut state = live_state();
+    state.apply_event(&request_event(11, &approval_request("q1", "pending")));
+    let command = state.respond("q1", &ApprovalDecision::Allow).unwrap();
+    state.on_command_result(&command.command_id, Err(BridgeError::unavailable("socket closed")));
+    assert_eq!(state.requests[0].status, "responding");
+
+    // Reconnected; the Core still waits on it: the answer stays ours to retry.
+    let resync = |status: &str| Snapshot {
+        sequence: 20,
+        threads: Some(vec![thread("t1", "2026-11-23T00:00:00Z")]),
+        runs: Some(vec![run("r1", "t1", RunStatus::Running)]),
+        requests: vec![approval_request("q1", status)],
+        ..Snapshot::default()
+    };
+    state.apply_snapshot(resync("pending"));
+    assert_eq!(state.requests[0].status, "responding", "no second answer meanwhile");
+    assert!(state.respond("q1", &ApprovalDecision::Deny).is_err());
+    let again = state.retry("request:q1").unwrap();
+    assert_eq!(again, command, "same command id: the Core takes it once");
+    state.on_command_result(&command.command_id, Err(BridgeError::unavailable("socket closed")));
+
+    // Another client answered while this one was away: the answer is over.
+    state.apply_snapshot(resync("responded"));
+    assert!(state.pending_by_key("request:q1").is_none());
+    assert!(state.timeline().iter().all(|row| !matches!(row, TimelineItem::Approval { .. })));
+}
+
+#[test]
+fn a_summary_resync_points_to_threads_waiting_before_their_detail_loads() {
+    let mut state = AppState::default();
+    let summary = |id: &str, pending| ThreadSummary {
+        id: id.into(),
+        title: format!("会话 {id}"),
+        created_at: "2026-11-23T08:00:00Z".into(),
+        updated_at: "2026-11-23T08:00:00Z".into(),
+        pending_requests: pending,
+        ..ThreadSummary::default()
+    };
+    state.apply_summaries(ThreadSummaries {
+        sequence: 7,
+        threads: Some(vec![summary("t1", 0), summary("t2", 1)]),
+    });
+    state.select_thread(Some("t1".into()));
+    let attention = state.background_attention();
+    assert_eq!(attention.len(), 1);
+    assert_eq!((attention[0].thread_id.as_str(), attention[0].count), ("t2", 0));
+    assert!(state.modal_request().is_none());
 }

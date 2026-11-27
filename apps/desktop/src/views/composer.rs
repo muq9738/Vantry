@@ -379,6 +379,7 @@ pub(crate) fn composer(dragging: Signal<bool>) -> impl IntoElement {
     }));
     let status = computed(|| controller::state().with(|s| s.composer_status()));
     let notice = computed(|| controller::state().with(|s| s.notice.clone()));
+    let attention = computed(|| controller::state().with(|s| s.background_attention()));
     let running_action = computed(|| controller::state().with(|s| s.running_action));
     let queue = computed(|| controller::state().with(|s| s.queue_items()));
     let todo = computed(|| {
@@ -551,6 +552,10 @@ pub(crate) fn composer(dragging: Signal<bool>) -> impl IntoElement {
                 .max_w(px(metrics::READING_WIDTH))
                 .flex_col()
                 .gap_1p5()
+                .child(when(
+                    move || attention.with(|a| !a.is_empty()),
+                    move || attention_line(attention),
+                ))
                 .child(when(
                     move || notice.with(Option::is_some),
                     move || notice_line(notice),
@@ -1718,6 +1723,74 @@ fn model_picker(anchor: ElementRef) -> impl IntoElement {
                 )
         },
     )
+}
+
+/// Other threads waiting on the user: one quiet line that leads there,
+/// instead of a dialog over the thread being read (T3 Code's in-app
+/// "Approval needed · Open thread" toast).
+pub(super) fn attention_line(attention: Memo<Vec<crate::state::Attention>>) -> impl IntoElement {
+    use crate::state::RequestKind;
+    let colors = palette();
+    let first = move || attention.with(|a| a.first().cloned());
+    let label = move || {
+        let Some(a) = first() else { return String::new() };
+        let ask = match a.kind {
+            RequestKind::Approval => "等待你的确认",
+            RequestKind::Secret => "需要私密输入",
+            RequestKind::Terminal => "需要在终端操作",
+            RequestKind::Choice => "需要你选择",
+            RequestKind::Text => "需要你输入",
+        };
+        let more = attention.with(Vec::len).saturating_sub(1);
+        let count = if a.count > 1 { format!("（{} 项）", a.count) } else { String::new() };
+        // What is asked first: a narrow column cuts the title, not the ask.
+        if more > 0 {
+            format!("{} 个会话在等你 · 最早：「{}」{ask}{count}", more + 1, a.title)
+        } else {
+            format!("{ask}{count} · 「{}」", a.title)
+        }
+    };
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .pl_3()
+        .pr_1()
+        .py_1()
+        .rounded(px(10.0))
+        .bg(colors.approval)
+        .border_1()
+        .border_color(colors.approval_border)
+        .child(icon(Icon::ShieldCheck, 13.0, colors.warning))
+        .child(
+            text(label)
+                .flex_1()
+                .min_w_0()
+                .number_of_lines(1u32)
+                .text_size(px(12.0))
+                .text_color(colors.ink),
+        )
+        .child(
+            nsh_base::button()
+                .accessibility_label("前往等待中的会话")
+                .on_press(move || {
+                    if let Some(a) = first() {
+                        controller::select_thread(a.thread_id);
+                    }
+                })
+                .flex_shrink_0()
+                .px_2()
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .hover(|s| s.bg(colors.card))
+                .active(|s| s.opacity(0.6))
+                .child(
+                    text("前往")
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.warning),
+                ),
+        )
 }
 
 fn notice_line(notice: Memo<Option<crate::state::Notice>>) -> impl IntoElement {

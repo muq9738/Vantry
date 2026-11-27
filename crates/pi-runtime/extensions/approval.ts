@@ -643,7 +643,8 @@ export default function (pi: ExtensionAPI) {
         const allowSession = grantScope ? `本会话允许 ${grantScope}` : null;
         const deny = "拒绝";
         const options = allowSession ? [allowOnce, allowSession, deny] : [allowOnce, deny];
-        const selectTitle = `${promptTitle}\n${summarizeInput(event.input, 1200)}`;
+        // Clients show what runs in full or cut in its middle, keeping the end.
+        const selectTitle = `${promptTitle}\n${summarizeInput(event.input, 16_000)}`;
         let selectUnavailable = false;
         let allowedChoice: string | undefined;
         try {

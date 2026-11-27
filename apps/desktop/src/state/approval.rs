@@ -113,8 +113,11 @@ pub struct ApprovalView {
     pub method: String,
     /// The first line: what is asked ("允许执行 bash？").
     pub headline: String,
-    /// The parameters: the command, the path (may be empty).
+    /// The parameters: the command, the path (may be empty), as it will
+    /// run: undrawn characters named, a long text cut in its middle.
     pub body: String,
+    /// The tool's other arguments, one `key: value` per line (may be empty).
+    pub details: String,
     pub options: Vec<String>,
     pub prefill: String,
     /// Parsed `vantry_terminal_run` command & directory when `kind == RequestKind::Terminal`.
@@ -143,8 +146,13 @@ impl ApprovalView {
     }
 }
 
-/// The longest parameter text the modal shows.
-const MAX_BODY_CHARS: usize = 1200;
+/// The most parameter text a card shows, its beginning and its end together
+/// (T3 Code's `APPROVAL_TEXT_LIMIT`, scaled to a native text view).
+const MAX_BODY_CHARS: usize = 12_000;
+/// How much of the end a cut text keeps: what runs last is often what matters.
+const TAIL_CHARS: usize = 2_000;
+/// The keys whose value is what a tool call is about, in order of preference.
+const PRIMARY_ARGS: &[&str] = &["command", "cmd", "path", "file_path", "url"];
 
 /// The modal's view of `request`.
 pub fn approval_view(request: &PendingRequest) -> ApprovalView {
@@ -182,6 +190,11 @@ pub fn request_kind(request: &PendingRequest, secret_tool: bool) -> RequestKind 
 pub fn approval_view_with(request: &PendingRequest, secret_tool: bool) -> ApprovalView {
     let terminal_run = parse_terminal_run_payload(request);
     let (mut headline, mut body) = split_title(request);
+    let mut details = String::new();
+    if let Some((primary, rest)) = tool_arguments(&body) {
+        body = primary;
+        details = rest;
+    }
     if let Some(ref tr) = terminal_run {
         if !tr.title.is_empty() {
             headline = tr.title.clone();
@@ -192,9 +205,9 @@ pub fn approval_view_with(request: &PendingRequest, secret_tool: bool) -> Approv
         }
         body = lines.join("\n");
     }
-    let body = truncate_chars(&body, MAX_BODY_CHARS);
-    let (allow_once, allow_session, deny) = approval_options(request);
     let risk = assess_risk(&request.title, &body, &request.message);
+    let body = approval_text(&body, MAX_BODY_CHARS, TAIL_CHARS);
+    let (allow_once, allow_session, deny) = approval_options(request);
     let kind = request_kind(request, secret_tool);
     ApprovalView {
         request_id: request.id.clone(),
@@ -203,6 +216,7 @@ pub fn approval_view_with(request: &PendingRequest, secret_tool: bool) -> Approv
         method: request.method.clone(),
         headline,
         body,
+        details,
         options: request.options.clone(),
         // A secret is never prefilled.
         prefill: if kind == RequestKind::Secret {
@@ -260,11 +274,115 @@ fn approval_options(request: &PendingRequest) -> (Option<String>, Option<String>
     }
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text.to_owned(),
+/// A tool call's JSON arguments (as the approval extension summarizes them)
+/// split into what it acts on (the command, the path) and the rest. A
+/// summary cut short by the extension still yields its command, marked cut.
+fn tool_arguments(body: &str) -> Option<(String, String)> {
+    let body = body.trim();
+    if !body.starts_with('{') {
+        return None;
     }
+    let Ok(serde_json::Value::Object(args)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return cut_tool_arguments(body);
+    };
+    let key = PRIMARY_ARGS
+        .iter()
+        .find(|key| args.get(**key).is_some_and(serde_json::Value::is_string))?;
+    let primary = args[*key].as_str().unwrap_or_default().to_owned();
+    let details = args
+        .iter()
+        .filter(|(k, _)| k.as_str() != *key)
+        .map(|(k, v)| {
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            format!("{k}: {}", approval_text(&value, 400, 0))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((primary, details))
+}
+
+/// `{"command":"…` cut before its end: decodes the string as far as it goes.
+fn cut_tool_arguments(body: &str) -> Option<(String, String)> {
+    let key = PRIMARY_ARGS.iter().find(|key| {
+        body.strip_prefix('{')
+            .and_then(|rest| rest.strip_prefix(&format!("\"{key}\":\"")))
+            .is_some()
+    })?;
+    let start = format!("{{\"{key}\":\"").len();
+    let mut out = String::new();
+    let mut chars = body[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return None, // a complete string: the JSON was malformed elsewhere
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(c) if hex.len() == 4 => out.push(c),
+                        _ => break,
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    Some((out, "（参数过长，审批请求只带来了开头）".to_owned()))
+}
+
+/// Whether `c` draws nothing (or moves text around) on screen, so a reader
+/// could not see it: control characters other than line breaks and tabs,
+/// zero-width and bidirectional marks.
+fn undrawn(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(c,
+            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}')
+}
+
+/// What an approval asks to run, as it will run (T3 Code's `ApprovalText`):
+/// characters a screen would not draw are shown by name, and text past
+/// `max` characters keeps its beginning and its last `tail`, with a line
+/// between them saying how much is left out.
+pub fn approval_text(text: &str, max: usize, tail: usize) -> String {
+    let named = |s: &str| {
+        s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
+            if undrawn(c) {
+                out.push_str(&format!("⟨U+{:04X}⟩", c as u32));
+            } else {
+                out.push(c);
+            }
+            out
+        })
+    };
+    let total = text.chars().count();
+    if total <= max {
+        return named(text);
+    }
+    let tail = tail.min(max);
+    let head_len = max - tail;
+    let head: String = text.chars().take(head_len).collect();
+    let end: String = text.chars().skip(total - tail).collect();
+    let hidden = total - head_len - tail;
+    if tail == 0 {
+        return format!("{}…（另有 {hidden} 个字符未显示）", named(&head));
+    }
+    format!(
+        "{}\n… 中间省略 {hidden} 个字符，结尾为 …\n{}",
+        named(&head),
+        named(&end)
+    )
 }
 
 /// A coarse reading of what the request would do. Only a hint for the

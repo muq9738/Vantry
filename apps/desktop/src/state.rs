@@ -58,6 +58,11 @@ pub use self::{
 };
 use crate::bridge::{BridgeError, events, new_command_id};
 
+/// A request status only this client uses: its answer was refused because
+/// the request was already answered (elsewhere) or gone. Not answerable;
+/// the Core's next word on the request replaces it.
+pub const SETTLED_ELSEWHERE: &str = "settled";
+
 /// The draft key of the unsaved new thread (it has no id until its first
 /// message creates it).
 pub const NEW_THREAD: &str = "";
@@ -180,6 +185,17 @@ pub enum NoticeLevel {
 pub struct Notice {
     pub level: NoticeLevel,
     pub text: String,
+}
+
+/// A thread not shown that waits on the user ([`AppState::background_attention`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attention {
+    pub thread_id: String,
+    pub title: String,
+    /// Its unanswered requests, 0 when only its summary says it waits.
+    pub count: usize,
+    /// What its oldest request asks for.
+    pub kind: RequestKind,
 }
 
 impl Notice {
@@ -354,6 +370,9 @@ pub struct AppState {
     /// Requests the user put aside ("稍后处理"): the modal skips them, the
     /// timeline keeps showing them.
     pub deferred: BTreeSet<String>,
+    /// A request the user opened from its card (处理): the modal shows it
+    /// even when it belongs to a thread not shown (a child task's form).
+    pub focused_request: Option<String>,
     /// Results delivered in the background since this window connected.
     pub unread: BTreeSet<String>,
     /// Who the desktop talks to ("本机 Core").
@@ -417,6 +436,7 @@ impl Default for AppState {
             notice: None,
             pending: Vec::new(),
             deferred: BTreeSet::new(),
+            focused_request: None,
             unread: BTreeSet::new(),
             endpoint_label: String::new(),
             workspace_label: String::new(),
@@ -707,20 +727,78 @@ impl AppState {
         queue
     }
 
-    /// The request the modal shows: the shown thread's first, else any
-    /// thread's first, skipping those put aside.
+    /// The one request the modal shows, if any. Each request has one place to
+    /// answer it: an approval (allow / deny) is answered on its timeline card;
+    /// a form (secret, terminal, choice, text) of the shown thread opens the
+    /// modal, which it needs for focus and masking. Another thread's request
+    /// never covers the screen: [`Self::background_attention`] points to it,
+    /// and its card's 处理 opens it here on purpose.
     pub fn modal_request(&self) -> Option<ApprovalView> {
-        let queue: Vec<&PendingRequest> = self
-            .approval_queue()
-            .into_iter()
-            .filter(|r| !self.deferred.contains(&r.id))
-            .collect();
-        let selected = self.selected.as_deref();
+        let queue = self.approval_queue();
+        let view = |r: &PendingRequest| approval_view_with(r, self.inside_secret_tool(&r.run_id));
+        if let Some(id) = &self.focused_request
+            && let Some(r) = queue.iter().find(|r| &r.id == id)
+        {
+            return Some(view(r));
+        }
+        let selected = self.selected.as_deref()?;
         queue
-            .iter()
-            .find(|r| Some(r.thread_id.as_str()) == selected)
-            .or_else(|| queue.first())
-            .map(|r| approval_view_with(r, self.inside_secret_tool(&r.run_id)))
+            .into_iter()
+            .filter(|r| r.thread_id == selected && !self.deferred.contains(&r.id))
+            .map(view)
+            .find(|v| !v.is_approval() || !self.has_inline_card(v))
+    }
+
+    /// Whether `view` has its answerable card in the shown timeline.
+    fn has_inline_card(&self, view: &ApprovalView) -> bool {
+        self.timeline.run_items(&view.run_id).iter().any(|item| {
+            matches!(item, TimelineItem::Approval { view: v, .. } if v.request_id == view.request_id)
+        })
+    }
+
+    /// Threads other than the shown one that wait on the user, oldest request
+    /// first: what the background reminder above the composer names. Known
+    /// from the requests the stream carries, or from a summary's count when
+    /// the thread's detail is not loaded (after a reconnect).
+    pub fn background_attention(&self) -> Vec<Attention> {
+        let selected = self.selected.as_deref();
+        let mut out: Vec<Attention> = Vec::new();
+        for r in self.approval_queue() {
+            if r.status != "pending" || Some(r.thread_id.as_str()) == selected {
+                continue;
+            }
+            match out.iter_mut().find(|a| a.thread_id == r.thread_id) {
+                Some(a) => a.count += 1,
+                None => out.push(Attention {
+                    thread_id: r.thread_id.clone(),
+                    title: String::new(),
+                    count: 1,
+                    kind: approval_view(r).kind,
+                }),
+            }
+        }
+        for (id, status) in &self.summary_statuses {
+            if *status == ThreadStatus::NeedsApproval
+                && Some(id.as_str()) != selected
+                && self.thread_status(id) == ThreadStatus::NeedsApproval
+                && !out.iter().any(|a| &a.thread_id == id)
+            {
+                out.push(Attention {
+                    thread_id: id.clone(),
+                    title: String::new(),
+                    count: 0,
+                    kind: RequestKind::Approval,
+                });
+            }
+        }
+        out.retain_mut(|a| match self.thread(&a.thread_id) {
+            Some(t) if !t.archived => {
+                a.title = sidebar::display_title(t);
+                true
+            }
+            _ => false,
+        });
+        out
     }
 
     /// Whether run `run_id` is inside the secret-input tool now.
@@ -1065,7 +1143,10 @@ impl AppState {
         if self.selected.as_deref() == Some(thread)
             && matches!(
                 kind,
-                CommandKind::SteerMessage | CommandKind::SteerRun | CommandKind::StopRun
+                CommandKind::SteerMessage
+                    | CommandKind::SteerRun
+                    | CommandKind::StopRun
+                    | CommandKind::RespondRequest
             )
             && result
                 .as_ref()
@@ -1133,6 +1214,7 @@ impl AppState {
         self.requests.extend(requests.unwrap_or_default());
         self.inputs.extend(inputs.unwrap_or_default());
         self.tasks.extend(tasks.unwrap_or_default());
+        self.reconcile_responses(Some(&id));
         // Keep `self.sequence` anchored to `summary_sequence` when summaries
         // already established the event stream cursor, so subscribing after
         // `self.sequence` will not skip events for other threads that landed
@@ -1249,6 +1331,7 @@ impl AppState {
             clear_zero_time(&mut run.created_at);
         }
         self.snapshot_loaded = true;
+        self.reconcile_responses(None);
         if self.notice.as_ref().is_some_and(|notice| {
             notice.text == "正在加载完整会话…" || notice.text == "正在加载会话内容…"
         }) {
@@ -1763,6 +1846,9 @@ impl AppState {
             self.pending.retain(|p| p.key != key);
             if request.status != "responding" {
                 self.deferred.remove(&request.id);
+                if self.focused_request.as_deref() == Some(request.id.as_str()) {
+                    self.focused_request = None;
+                }
             }
         }
         let run_id = request.run_id.clone();
@@ -1970,11 +2056,38 @@ impl AppState {
     /// Puts request `id` aside: the modal moves on to the next one.
     pub fn defer_request(&mut self, id: &str) {
         self.deferred.insert(id.to_owned());
+        if self.focused_request.as_deref() == Some(id) {
+            self.focused_request = None;
+        }
     }
 
-    /// Brings a request put aside back into the modal.
+    /// Opens request `id` in the modal (its card's 处理), whichever thread
+    /// it belongs to.
     pub fn reopen_request(&mut self, id: &str) {
         self.deferred.remove(id);
+        self.focused_request = Some(id.to_owned());
+    }
+
+    /// After the Core's entities were replaced (a resync, a thread's detail):
+    /// an answer still on its way keeps its request shown as responding; an
+    /// answer whose request the Core no longer waits on is over, whoever
+    /// answered it. Requests of threads not loaded (`scope` names the one
+    /// that was, `None` for all) are left alone.
+    fn reconcile_responses(&mut self, scope: Option<&str>) {
+        let requests = &mut self.requests;
+        self.pending.retain(|p| {
+            let Purpose::Respond { request_id } = &p.purpose else {
+                return true;
+            };
+            match requests.iter_mut().find(|r| &r.id == request_id) {
+                Some(r) if r.status == "pending" => {
+                    r.status = "responding".to_owned();
+                    true
+                }
+                Some(_) => false,
+                None => scope.is_some_and(|thread| p.command.thread_id != thread),
+            }
+        });
     }
 
     fn take_draft(&mut self) -> Draft {
@@ -2260,6 +2373,28 @@ impl AppState {
                 self.notice = Some(Notice::new(
                     NoticeLevel::Warn,
                     format!("{label}结果待确认，可重试原操作。"),
+                ));
+                None
+            }
+            // Another client (or the request's deadline) got there first: the
+            // Core takes one answer per request. Not a failure to undo: the
+            // card stays settled until the Core's state arrives.
+            Err(err)
+                if err.code == crate::bridge::ErrorCode::Conflict
+                    && matches!(self.pending[index].purpose, Purpose::Respond { .. }) =>
+            {
+                let pending = self.pending.remove(index);
+                if let Purpose::Respond { request_id } = pending.purpose
+                    && let Some(r) = self.requests.iter_mut().find(|r| r.id == request_id)
+                    && matches!(r.status.as_str(), "pending" | "responding")
+                {
+                    r.status = SETTLED_ELSEWHERE.to_owned();
+                    let run_id = r.run_id.clone();
+                    self.refresh_run(&run_id);
+                }
+                self.notice = Some(Notice::new(
+                    NoticeLevel::Info,
+                    "这项请求已在其他端处理或已失效，以先到的回答为准。",
                 ));
                 None
             }

@@ -821,7 +821,11 @@ async fn a_conversation_against_the_mock_core_streams_asks_and_completes() {
     send(&bridge, &mut state, create).await;
     let thread = state.selected.clone().unwrap();
     pump(&bridge, &mut state, &mut events, |s| !s.approval_queue().is_empty()).await;
-    let request = state.modal_request().unwrap();
+    assert!(state.modal_request().is_none());
+    let request = state.timeline().into_iter().find_map(|row| match row {
+        TimelineItem::Approval { view, .. } => Some(view),
+        _ => None,
+    }).expect("inline approval");
     assert!(request.is_approval());
     let respond = state.respond(&request.request_id, &ApprovalDecision::Allow).unwrap();
     send(&bridge, &mut state, respond).await;

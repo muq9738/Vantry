@@ -1,8 +1,10 @@
-//! The approval modal: the first unanswered extension request (the shown
-//! thread's first), with what it will do, a risk hint, and its answers.
-//! Each answer sends `request.respond` with the request's id; the modal
-//! stays until the Core's `request.updated` settles the request. Escape
-//! puts it aside ("稍后处理"); the timeline keeps its card.
+//! The modal handles the shown thread's forms (a secret, an interactive
+//! terminal, a choice or text) and an approval that has no card yet; an
+//! approval with a card is answered there, and another thread's request
+//! only opens here from its card's 打开 (`AppState::modal_request`). Each
+//! answer sends `request.respond` with the request's id; the modal stays
+//! until the Core's `request.updated` settles the request, wherever it was
+//! answered. Escape puts it aside ("稍后处理"); the timeline keeps its card.
 //!
 //! Three kinds of request: a tool approval (allow once / for the session /
 //! deny), a secret (typed masked, never prefilled, cleared once sent and
@@ -45,17 +47,6 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
         move || current.with(|v| v.as_ref().map(f).unwrap_or_default())
     };
     let busy = computed(move || current.with(|v| v.as_ref().is_none_or(|v| !v.answerable())));
-    let retry_key = format!("request:{request_id}");
-    let unconfirmed = computed({
-        let key = retry_key.clone();
-        move || {
-            controller::state().with(|s| {
-                s.pending
-                    .iter()
-                    .any(|p| p.key == key && !p.in_flight && p.unconfirmed.is_some())
-            })
-        }
-    });
     let thread_title = computed(move || {
         controller::state().with(|s| {
             let thread_id = current.with(|v| v.as_ref().map(|v| v.thread_id.clone()))?;
@@ -65,7 +56,15 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
             s.thread(&thread_id).map(|t| t.title.clone())
         })
     });
-    let queue_len = computed(|| controller::state().with(|s| s.approval_queue().len()));
+    let queue_len = computed(move || {
+        let thread = current.with(|v| v.as_ref().map(|v| v.thread_id.clone()));
+        controller::state().with(|s| {
+            s.approval_queue()
+                .iter()
+                .filter(|r| Some(&r.thread_id) == thread.as_ref())
+                .count()
+        })
+    });
     let value = signal(
         current.with_untracked(|v| v.as_ref().map(|v| v.prefill.clone()).unwrap_or_default()),
     );
@@ -119,7 +118,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                 .child(when(
                                     move || queue_len.get() > 1,
                                     move || {
-                                        text(move || format!("共 {} 项待处理", queue_len.get()))
+                                        text(move || format!("此会话共 {} 项待处理", queue_len.get()))
                                             .text_size(px(11.5))
                                             .text_color(colors.muted)
                                     },
@@ -166,6 +165,19 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                                     )
                             },
                         ))
+                        .child(when(
+                            move || {
+                                current.with(|v| v.as_ref().is_some_and(|v| !v.details.is_empty()))
+                            },
+                            move || {
+                                text(field(|v| v.details.clone()))
+                                    .select_text()
+                                    .number_of_lines(4u32)
+                                    .font_family("Menlo")
+                                    .text_size(px(11.5))
+                                    .text_color(colors.muted)
+                            },
+                        ))
                         .child(
                             view()
                                 .flex_row()
@@ -195,25 +207,7 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                             },
                         ))
                         .child(answers(view_of(), value, busy, answer))
-                        .child(when(
-                            move || unconfirmed.get(),
-                            move || {
-                                let key = retry_key.clone();
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        text("响应未确认，重试将沿用原来的回答。")
-                                            .flex_1()
-                                            .text_size(px(11.5))
-                                            .text_color(colors.warning),
-                                    )
-                                    .child(ghost_button("重试", move || {
-                                        controller::retry(key.clone())
-                                    }))
-                            },
-                        ))
+                        .child(retry_answer(current))
                         .child(
                             view()
                                 .flex_row()
@@ -224,6 +218,29 @@ fn modal_for(request_id: String, current: Memo<Option<ApprovalView>>) -> impl In
                         ),
                 ),
         )
+}
+
+pub(super) fn retry_answer(request: Memo<Option<ApprovalView>>) -> impl IntoElement {
+    let colors = palette();
+    let key = computed(move || request.with(|v| {
+        v.as_ref().map(|v| format!("request:{}", v.request_id)).unwrap_or_default()
+    }));
+    when(
+        move || key.with(|key| {
+            controller::state().with(|s| {
+                s.pending.iter().any(|p| &p.key == key && !p.in_flight && p.unconfirmed.is_some())
+            })
+        }),
+        move || {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(text("响应未确认，重试将沿用原来的回答。")
+                    .flex_1().text_size(px(11.5)).text_color(colors.warning))
+                .child(ghost_button("重试", move || controller::retry(key.get_untracked())))
+        },
+    )
 }
 
 /// The answer buttons for the request's method.
